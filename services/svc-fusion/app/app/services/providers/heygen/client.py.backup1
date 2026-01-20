@@ -1,0 +1,662 @@
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from app.config import settings
+from app.services.providers.base import ProviderSubmitResult, ProviderPollResult
+
+logger = logging.getLogger("heygen_av4")
+
+
+class HeyGenApiError(RuntimeError):
+    """HeyGen API specific errors"""
+    pass
+
+
+def _headers() -> Dict[str, str]:
+    """Standard headers for HeyGen API"""
+    if not settings.HEYGEN_API_KEY:
+        raise HeyGenApiError("HEYGEN_API_KEY is not set.")
+    return {
+        "X-Api-Key": settings.HEYGEN_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def _normalize_status(raw_status: Any) -> str:
+    """Normalize various status values to standard form"""
+    s = str(raw_status or "").strip().lower()
+    if s in ("completed", "complete", "done", "succeeded", "success"):
+        return "succeeded"
+    if s in ("failed", "error"):
+        return "failed"
+    if s in ("waiting", "pending", "processing", "running", "in_progress", "in-progress", "queued"):
+        return "processing"
+    return "processing"
+
+
+def _extract_video_url(obj: Dict[str, Any]) -> Optional[str]:
+    """Extract video URL from various response structures"""
+    return (
+        obj.get("video_url")
+        or obj.get("url")
+        or (obj.get("result") or {}).get("video_url")
+        or (obj.get("data") or {}).get("video_url")
+        or (obj.get("data") or {}).get("url")
+    )
+
+
+def _extract_error_message(obj: Dict[str, Any]) -> Optional[str]:
+    """Extract error message from various response structures"""
+    error = obj.get("error")
+    if isinstance(error, dict):
+        return error.get("message") or error.get("code")
+    
+    return (
+        obj.get("error_message")
+        or error
+        or (obj.get("data") or {}).get("error_message")
+        or (obj.get("data") or {}).get("error")
+        or (obj.get("result") or {}).get("error_message")
+        or (obj.get("result") or {}).get("error")
+    )
+
+
+class HeyGenAV4Client:
+    """
+    Production-ready HeyGen AV4 client for DESIFaces
+    
+    Features:
+    - Image upload with retry logic
+    - Voice ID validation and fallback
+    - Audio URL support (recommended for Azure TTS)
+    - Comprehensive error handling
+    - Status polling with multiple fallbacks
+    """
+    
+    provider_name = "heygen_av4"
+
+    def __init__(self) -> None:
+        self.base = settings.HEYGEN_BASE_URL.rstrip("/")
+        self.upload_base = "https://upload.heygen.com"
+        self.timeout = settings.HEYGEN_TIMEOUT_SECONDS
+        self.api_key = settings.HEYGEN_API_KEY
+        
+        # Cache for voice validation
+        self._valid_voices_cache: Optional[list] = None
+        self._default_voice_id: Optional[str] = None
+
+    # ==========================================================================
+    # IMAGE UPLOAD
+    # ==========================================================================
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.6, min=0.6, max=6.0),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.TransportError)),
+    )
+    async def upload_image(self, image_path: str) -> str:
+        """
+        Upload image to HeyGen and return talking_photo_id
+        
+        Args:
+            image_path: Path to local image file (JPEG/PNG)
+            
+        Returns:
+            talking_photo_id for use in video generation
+            
+        Raises:
+            HeyGenApiError: If upload fails
+            FileNotFoundError: If image file doesn't exist
+        """
+        import os
+        
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        
+        # Validate file size (HeyGen limit: ~10MB)
+        file_size = os.path.getsize(image_path)
+        if file_size > 10 * 1024 * 1024:
+            raise HeyGenApiError(f"Image too large: {file_size} bytes (max 10MB)")
+        
+        # Read image as binary
+        with open(image_path, 'rb') as f:
+            image_data = f.read()
+        
+        # Determine content type
+        ext = Path(image_path).suffix.lower()
+        content_type = "image/png" if ext == ".png" else "image/jpeg"
+        
+        url = f"{self.upload_base}/v1/talking_photo"
+        headers = {
+            "X-Api-Key": self.api_key,
+            "Content-Type": content_type
+        }
+        
+        logger.info(f"Uploading image to HeyGen: {image_path} ({file_size:,} bytes)")
+        
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.post(url, headers=headers, content=image_data)
+        
+        if r.status_code != 200:
+            error_text = r.text
+            logger.error(f"Image upload failed {r.status_code}: {error_text}")
+            raise HeyGenApiError(f"Image upload failed {r.status_code}: {error_text}")
+        
+        data = r.json()
+        
+        if data.get('code') != 100:
+            logger.error(f"Image upload failed: {data}")
+            raise HeyGenApiError(f"Image upload failed: {data.get('message', data)}")
+        
+        talking_photo_id = data.get('data', {}).get('talking_photo_id')
+        
+        if not talking_photo_id:
+            raise HeyGenApiError(f"No talking_photo_id in response: {data}")
+        
+        logger.info(f"Image uploaded successfully: {talking_photo_id}")
+        
+        return talking_photo_id
+
+    # ==========================================================================
+    # VOICE VALIDATION
+    # ==========================================================================
+
+    async def get_available_voices(self) -> list:
+        """
+        Fetch and cache available voices from HeyGen
+        
+        Returns:
+            List of voice dictionaries
+        """
+        if self._valid_voices_cache is not None:
+            return self._valid_voices_cache
+        
+        url = f"{self.base}/v2/voices"
+        headers = {
+            "X-Api-Key": self.api_key,
+            "Accept": "application/json"
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.get(url, headers=headers)
+            
+            if r.status_code == 200:
+                data = r.json()
+                voices = data.get('data', {}).get('voices', [])
+                self._valid_voices_cache = voices
+                logger.info(f"Loaded {len(voices)} available voices from HeyGen")
+                return voices
+        except Exception as e:
+            logger.warning(f"Failed to fetch voices from HeyGen: {e}")
+        
+        return []
+
+    async def get_default_voice_id(self) -> str:
+        """
+        Get a valid default voice ID
+        
+        Returns:
+            Valid voice_id (English female by default)
+        """
+        if self._default_voice_id:
+            return self._default_voice_id
+        
+        # Try to get from API
+        voices = await self.get_available_voices()
+        
+        # Find first English voice
+        for voice in voices:
+            lang = voice.get('language', '')
+            if lang.startswith('en'):
+                voice_id = voice.get('voice_id')
+                if voice_id:
+                    self._default_voice_id = voice_id
+                    logger.info(f"Using default voice: {voice.get('name')} ({voice_id})")
+                    return voice_id
+        
+        # Fallback to known working voice
+        fallback = "1bd001e7e50f421d891986aad5158bc8"
+        logger.info(f"Using fallback voice ID: {fallback}")
+        self._default_voice_id = fallback
+        return fallback
+
+    async def validate_voice_id(self, voice_id: str) -> str:
+        """
+        Validate voice ID and return valid one (or fallback to default)
+        
+        Args:
+            voice_id: Voice ID to validate
+            
+        Returns:
+            Valid voice_id
+        """
+        if not voice_id:
+            return await self.get_default_voice_id()
+        
+        voices = await self.get_available_voices()
+        valid_ids = [v.get('voice_id') for v in voices if v.get('voice_id')]
+        
+        if voice_id in valid_ids:
+            logger.info(f"Voice ID validated: {voice_id}")
+            return voice_id
+        
+        logger.warning(f"Voice ID {voice_id} not found in available voices, using default")
+        return await self.get_default_voice_id()
+
+    # ==========================================================================
+    # PAYLOAD BUILDERS
+    # ==========================================================================
+
+    def build_payload_with_audio_url(
+        self,
+        talking_photo_id: str,
+        audio_url: str,
+        dimension: Dict[str, int] = None,
+        test: bool = False,
+        background_color: str = None
+    ) -> Dict[str, Any]:
+        """
+        Build payload for video generation using audio URL (RECOMMENDED)
+        
+        Args:
+            talking_photo_id: ID from upload_image()
+            audio_url: Public URL to audio file (Azure Blob SAS URL)
+            dimension: Video dimensions (default: 1920x1080)
+            test: If True, creates test video (faster, uses credits)
+            background_color: Optional background color (hex, e.g., "#FFFFFF")
+            
+        Returns:
+            Payload dict ready for submit()
+        """
+        if dimension is None:
+            dimension = {"width": 1920, "height": 1080}
+        
+        payload = {
+            "video_inputs": [{
+                "character": {
+                    "type": "talking_photo",
+                    "talking_photo_id": talking_photo_id,
+                    "talking_photo_style": "normal"
+                },
+                "voice": {
+                    "type": "audio",
+                    "audio_url": audio_url
+                }
+            }],
+            "test": test,
+            "dimension": dimension
+        }
+        
+        # Add background if specified
+        if background_color:
+            payload["video_inputs"][0]["background"] = {
+                "type": "color",
+                "value": background_color
+            }
+        
+        return payload
+
+    async def build_payload_with_text(
+        self,
+        talking_photo_id: str,
+        script: str,
+        voice_id: Optional[str] = None,
+        dimension: Dict[str, int] = None,
+        test: bool = False,
+        background_color: str = None
+    ) -> Dict[str, Any]:
+        """
+        Build payload for video generation using text script
+        
+        Args:
+            talking_photo_id: ID from upload_image()
+            script: Text for avatar to speak
+            voice_id: HeyGen voice ID (auto-validates, uses default if invalid)
+            dimension: Video dimensions (default: 1920x1080)
+            test: Test mode
+            background_color: Optional background color
+            
+        Returns:
+            Payload dict ready for submit()
+        """
+        if dimension is None:
+            dimension = {"width": 1920, "height": 1080}
+        
+        # Validate voice ID
+        validated_voice_id = await self.validate_voice_id(voice_id)
+        
+        payload = {
+            "video_inputs": [{
+                "character": {
+                    "type": "talking_photo",
+                    "talking_photo_id": talking_photo_id,
+                    "talking_photo_style": "normal"
+                },
+                "voice": {
+                    "type": "text",
+                    "input_text": script,
+                    "voice_id": validated_voice_id
+                }
+            }],
+            "test": test,
+            "dimension": dimension
+        }
+        
+        if background_color:
+            payload["video_inputs"][0]["background"] = {
+                "type": "color",
+                "value": background_color
+            }
+        
+        return payload
+
+    # ==========================================================================
+    # VIDEO SUBMISSION
+    # ==========================================================================
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=0.6, min=0.6, max=6.0),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.TransportError)),
+    )
+    async def submit(self, payload: Dict[str, Any], idempotency_key: str) -> ProviderSubmitResult:
+        """
+        Submit video generation job to HeyGen AV4
+        
+        Args:
+            payload: Video generation payload (from build_payload_* methods)
+            idempotency_key: Unique key for this request
+            
+        Returns:
+            ProviderSubmitResult with provider_job_id
+            
+        Raises:
+            HeyGenApiError: If submission fails
+        """
+        url = f"{self.base}/v2/video/av4/generate"
+        headers = _headers()
+        headers["Idempotency-Key"] = idempotency_key
+
+        logger.info(f"Submitting video to HeyGen AV4 (key: {idempotency_key})")
+        logger.debug(f"Payload: {payload}")
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.post(url, headers=headers, json=payload)
+
+        if r.status_code >= 400:
+            error_text = r.text
+            logger.error(f"HeyGen submit failed {r.status_code}: {error_text}")
+            
+            # Parse error for better message
+            try:
+                error_data = r.json()
+                error_obj = error_data.get('error', {})
+                error_code = error_obj.get('code', 'unknown')
+                error_msg = error_obj.get('message', error_text)
+                
+                # Provide helpful context for common errors
+                if 'Voice not found' in error_msg:
+                    error_msg += " (Use build_payload_with_text() for auto-validation or build_payload_with_audio_url() to skip voice_id)"
+                elif 'talking_photo_id' in error_msg.lower():
+                    error_msg += " (Ensure you called upload_image() first)"
+                
+                raise HeyGenApiError(f"HeyGen submit failed [{error_code}]: {error_msg}")
+            except (ValueError, KeyError):
+                raise HeyGenApiError(f"HeyGen submit failed {r.status_code}: {error_text}")
+
+        data = r.json()
+
+        # Extract video_id from various response structures
+        provider_job_id = (
+            (data.get("data") or {}).get("video_id")
+            or data.get("video_id")
+            or (data.get("data") or {}).get("id")
+            or data.get("id")
+        )
+        
+        if not provider_job_id:
+            raise HeyGenApiError(f"HeyGen submit missing video_id. Response: {data}")
+
+        logger.info(f"Video submitted successfully: {provider_job_id}")
+
+        return ProviderSubmitResult(provider_job_id=str(provider_job_id), raw_response=data)
+
+    # ==========================================================================
+    # CONVENIENCE SUBMIT METHODS
+    # ==========================================================================
+
+    async def submit_with_audio_url(
+        self,
+        talking_photo_id: str,
+        audio_url: str,
+        idempotency_key: str,
+        **kwargs
+    ) -> ProviderSubmitResult:
+        """
+        Convenience method: Submit with audio URL (RECOMMENDED for Azure TTS)
+        
+        Args:
+            talking_photo_id: ID from upload_image()
+            audio_url: Public URL to audio file
+            idempotency_key: Unique key
+            **kwargs: Additional args for build_payload_with_audio_url()
+            
+        Returns:
+            ProviderSubmitResult
+        """
+        payload = self.build_payload_with_audio_url(
+            talking_photo_id=talking_photo_id,
+            audio_url=audio_url,
+            **kwargs
+        )
+        return await self.submit(payload, idempotency_key)
+
+    async def submit_with_text(
+        self,
+        talking_photo_id: str,
+        script: str,
+        idempotency_key: str,
+        voice_id: Optional[str] = None,
+        **kwargs
+    ) -> ProviderSubmitResult:
+        """
+        Convenience method: Submit with text script
+        
+        Args:
+            talking_photo_id: ID from upload_image()
+            script: Text for avatar to speak
+            idempotency_key: Unique key
+            voice_id: Voice ID (auto-validates)
+            **kwargs: Additional args for build_payload_with_text()
+            
+        Returns:
+            ProviderSubmitResult
+        """
+        payload = await self.build_payload_with_text(
+            talking_photo_id=talking_photo_id,
+            script=script,
+            voice_id=voice_id,
+            **kwargs
+        )
+        return await self.submit(payload, idempotency_key)
+
+    # ==========================================================================
+    # STATUS POLLING
+    # ==========================================================================
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(6),
+        wait=wait_exponential(multiplier=0.6, min=0.6, max=8.0),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.TransportError)),
+    )
+    async def poll(self, provider_job_id: str) -> ProviderPollResult:
+        """
+        Poll video generation status
+        
+        Tries status endpoint first, falls back to list endpoint if unavailable.
+        
+        Args:
+            provider_job_id: Video ID from submit()
+            
+        Returns:
+            ProviderPollResult with status and video_url (if completed)
+        """
+        # Try status endpoint first (most reliable)
+        res = await self._poll_via_status(provider_job_id)
+        if res is not None:
+            return res
+
+        # Fallback to list endpoint
+        return await self._poll_via_list(provider_job_id)
+
+    async def _poll_via_status(self, provider_job_id: str) -> Optional[ProviderPollResult]:
+        """Poll via /v1/video_status.get endpoint"""
+        url = f"{self.base}/v1/video_status.get"
+        headers = _headers()
+        params = {"video_id": provider_job_id}
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(url, headers=headers, params=params)
+
+        # Account might not have access
+        if r.status_code in (404, 405):
+            logger.info(f"Status endpoint unavailable: {r.status_code}")
+            return None
+
+        if r.status_code >= 400:
+            raise HeyGenApiError(f"Status check failed {r.status_code}: {r.text}")
+
+        data = r.json()
+
+        # Extract core data
+        core = data.get("data") if isinstance(data.get("data"), dict) else data
+        if isinstance(core, dict) and isinstance(core.get("data"), dict):
+            core = core["data"]
+
+        if not isinstance(core, dict):
+            return ProviderPollResult(
+                status="processing",
+                raw_response={"note": "unexpected status shape", "response": data}
+            )
+
+        raw_status = core.get("status") or core.get("state") or core.get("video_status")
+        status = _normalize_status(raw_status)
+
+        if status == "succeeded":
+            video_url = _extract_video_url(core) or _extract_video_url(data)
+            return ProviderPollResult(status="succeeded", video_url=video_url, raw_response=core)
+
+        if status == "failed":
+            msg = _extract_error_message(core) or _extract_error_message(data) or "provider failed"
+            return ProviderPollResult(status="failed", error_message=str(msg), raw_response=core)
+
+        return ProviderPollResult(status="processing", raw_response=core)
+
+    async def _poll_via_list(self, provider_job_id: str) -> ProviderPollResult:
+        """Poll via /v1/video.list endpoint (fallback)"""
+        url = f"{self.base}/v1/video.list"
+        headers = _headers()
+        params = {"limit": 50}
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(url, headers=headers, params=params)
+
+        if r.status_code >= 400:
+            raise HeyGenApiError(f"Video list failed {r.status_code}: {r.text}")
+
+        data = r.json()
+
+        # Extract videos list
+        container = data.get("data")
+        videos = None
+        if isinstance(container, dict):
+            videos = container.get("videos") or container.get("list") or container.get("items")
+        elif isinstance(container, list):
+            videos = container
+        if videos is None:
+            videos = data.get("videos") or data.get("list") or data.get("items")
+
+        if not isinstance(videos, list):
+            return ProviderPollResult(
+                status="processing",
+                raw_response={"note": "unexpected list shape", "video_id": provider_job_id}
+            )
+
+        # Find our video
+        item = None
+        for v in videos:
+            if isinstance(v, dict):
+                vid = v.get("video_id") or v.get("id")
+                if str(vid) == str(provider_job_id):
+                    item = v
+                    break
+
+        if item is None:
+            return ProviderPollResult(
+                status="processing",
+                raw_response={"note": "video not found in list", "video_id": provider_job_id}
+            )
+
+        status = _normalize_status(item.get("status") or item.get("state"))
+        video_url = _extract_video_url(item)
+
+        if status == "succeeded":
+            return ProviderPollResult(status="succeeded", video_url=video_url, raw_response=item)
+
+        if status == "failed":
+            msg = _extract_error_message(item) or "provider failed"
+            return ProviderPollResult(status="failed", error_message=str(msg), raw_response=item)
+
+        return ProviderPollResult(status="processing", raw_response=item)
+
+    # ==========================================================================
+    # ADDITIONAL UTILITIES
+    # ==========================================================================
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=0.6, min=0.6, max=6.0),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.TransportError)),
+    )
+    async def get_share_url(self, provider_job_id: str) -> dict:
+        """
+        Get sharable video URL
+        
+        Args:
+            provider_job_id: Video ID
+            
+        Returns:
+            dict with share_url and raw response
+        """
+        url = f"{self.base}/v1/video/share"
+        headers = _headers()
+        payload = {"video_id": provider_job_id}
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.post(url, headers=headers, json=payload)
+
+        if r.status_code >= 400:
+            raise HeyGenApiError(f"Get share URL failed {r.status_code}: {r.text}")
+
+        data = r.json()
+
+        share_url = (
+            (data.get("data") or {}).get("url")
+            or (data.get("data") or {}).get("share_url")
+            or data.get("url")
+            or data.get("share_url")
+        )
+
+        return {"share_url": share_url, "raw": data}

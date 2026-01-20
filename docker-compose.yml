@@ -1,0 +1,381 @@
+name: desifaces
+
+x-common-env: &common_env
+  env_file:
+    - ./infra/.env
+
+x-common-python-service: &python_service
+  <<: *common_env
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 20s
+  networks: [df-net]
+  depends_on:
+    desifaces-db:
+      condition: service_healthy
+    desifaces-redis:
+      condition: service_started
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # -------------------------
+  # Database
+  # -------------------------
+  desifaces-db:
+    image: postgres:16
+    container_name: desifaces-db
+    networks: [df-net]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-desifaces}
+      POSTGRES_USER: ${POSTGRES_USER:-desifaces_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-desifaces_mahadev}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "15432:5432"
+    volumes:
+      - df_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options: { max-size: "10m", max-file: "3" }
+
+  # -------------------------
+  # Redis
+  # -------------------------
+  desifaces-redis:
+    image: redis:7-alpine
+    container_name: desifaces-redis
+    networks: [df-net]
+    expose:
+      - "6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - df_redisdata:/data
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options: { max-size: "10m", max-file: "3" }
+
+  # -------------------------
+  # Core API
+  # -------------------------
+  svc-core:
+    <<: *python_service
+    container_name: df-svc-core
+    build:
+      context: ./services/svc-core/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8000"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      REFRESH_TOKEN_HMAC_SECRET: ${REFRESH_TOKEN_HMAC_SECRET}
+      PYTHONPATH: "/app"
+    expose: ["8000"]
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+
+  # -------------------------
+  # Fusion API
+  # -------------------------
+  svc-fusion:
+    <<: *python_service
+    container_name: df-svc-fusion
+    build:
+      context: ./services/svc-fusion/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8002"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      PYTHONPATH: "/app"
+
+      # Feature flag (your code reads this)
+      DF_FUSION_STUDIO_ENABLED: ${DF_FUSION_STUDIO_ENABLED:-true}
+
+      # JWT (needed because svc-fusion now decodes access tokens)
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+      # Keep as HEYGEN_API_KEY inside container; source from DF_HEYGEN_API_KEY in infra/.env
+      HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
+      HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
+    expose: ["8002"]
+    ports: ["8002:8002"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  # -------------------------
+  # Fusion Worker - consumes queued jobs
+  # -------------------------
+  svc-fusion-worker:
+    <<: *python_service
+    container_name: df-svc-fusion-worker
+    build:
+      context: ./services/svc-fusion/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      PYTHONPATH: "/app"
+      HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
+      HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
+      DF_FUSION_STUDIO_ENABLED: ${DF_FUSION_STUDIO_ENABLED:-true}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      REFRESH_TOKEN_HMAC_SECRET: ${REFRESH_TOKEN_HMAC_SECRET}
+    command: ["bash", "-lc", "python -m app.workers.fusion_worker"]
+
+
+  # -------------------------
+  # Face API
+  # -------------------------
+  svc-face:
+    <<: *python_service
+    container_name: df-svc-face
+    build:
+      context: ./services/svc-face/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8003"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      FACE_OUTPUT_CONTAINER: "face-output"
+      PYTHONPATH: "/app"
+      
+      # JWT
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+      
+      # fal.ai
+      FAL_API_KEY: ${FAL_API_KEY}
+      FAL_MODEL: "fal-ai/flux-pro/v1.1"
+      
+      # Azure OpenAI (GPT-4 for prompt generation)
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT}
+      
+      # Azure Content Moderator
+      AZURE_CONTENT_MODERATOR_ENDPOINT: ${AZURE_CONTENT_MODERATOR_ENDPOINT}
+      AZURE_CONTENT_MODERATOR_KEY: ${AZURE_CONTENT_MODERATOR_KEY}
+    expose: ["8003"]
+    ports: ["8003:8003"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  # -------------------------
+  # Face Worker - consumes queued face generation jobs
+  # -------------------------
+  svc-face-worker:
+    <<: *python_service
+    container_name: df-svc-face-worker
+    build:
+      context: ./services/svc-face/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      FACE_OUTPUT_CONTAINER: "face-output"
+      PYTHONPATH: "/app"
+      
+      # JWT
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      
+      # fal.ai
+      FAL_API_KEY: ${FAL_API_KEY}
+      FAL_MODEL: "fal-ai/flux-pro/v1.1"
+      
+      # Azure OpenAI
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT}
+      
+      # Azure Content Moderator
+      AZURE_CONTENT_MODERATOR_ENDPOINT: ${AZURE_CONTENT_MODERATOR_ENDPOINT}
+      AZURE_CONTENT_MODERATOR_KEY: ${AZURE_CONTENT_MODERATOR_KEY}
+    command: ["bash", "-lc", "python -m app.workers.face_worker"]
+
+  # -------------------------
+  # Audio API
+  # -------------------------
+  svc-audio:
+    <<: *python_service
+    container_name: df-svc-audio
+    build:
+      context: ./services/svc-audio/app
+      dockerfile: Dockerfile
+    image: desifaces-svc-audio
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8004"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      # JWT decode in deps.py
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+      JWT_ALG: ${JWT_ALG:-HS256}
+
+      # Azure
+      AZURE_SPEECH_KEY: ${AZURE_SPEECH_KEY}
+      AZURE_SPEECH_REGION: ${AZURE_SPEECH_REGION:-eastus}
+      AZURE_TRANSLATOR_KEY: ${AZURE_TRANSLATOR_KEY}
+      AZURE_TRANSLATOR_ENDPOINT: ${AZURE_TRANSLATOR_ENDPOINT:-https://api.cognitive.microsofttranslator.com}
+      AZURE_TRANSLATOR_REGION: ${AZURE_TRANSLATOR_REGION:-eastus}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AUDIO_OUTPUT_CONTAINER: ${AUDIO_OUTPUT_CONTAINER:-audio-output}
+      AUDIO_SAS_HOURS: ${AUDIO_SAS_HOURS:-24}
+
+    expose: ["8004"]
+    ports: ["8004:8004"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  # -------------------------
+  # Audio Worker - consumes queued audio jobs
+  # -------------------------
+  svc-audio-worker:
+    <<: *python_service
+    container_name: df-svc-audio-worker
+    build:
+      context: ./services/svc-audio/app
+      dockerfile: Dockerfile
+    image: desifaces-svc-audio
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      AUDIO_STUDIO_TYPE: "audio"
+      WORKER_POLL_SECS: "1.5"
+      WORKER_BATCH_SIZE: "1"
+
+      # JWT decode in deps.py (even if worker doesn't call routes, keep consistent)
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+      JWT_ALG: ${JWT_ALG:-HS256}
+
+      # Azure
+      AZURE_SPEECH_KEY: ${AZURE_SPEECH_KEY}
+      AZURE_SPEECH_REGION: ${AZURE_SPEECH_REGION:-eastus}
+      AZURE_TRANSLATOR_KEY: ${AZURE_TRANSLATOR_KEY}
+      AZURE_TRANSLATOR_ENDPOINT: ${AZURE_TRANSLATOR_ENDPOINT:-https://api.cognitive.microsofttranslator.com}
+      AZURE_TRANSLATOR_REGION: ${AZURE_TRANSLATOR_REGION:-eastus}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AUDIO_OUTPUT_CONTAINER: ${AUDIO_OUTPUT_CONTAINER:-audio-output}
+      AUDIO_SAS_HOURS: ${AUDIO_SAS_HOURS:-24}
+
+    command: ["bash", "-lc", "python -m app.workers.audio_worker"]
+
+
+  # -------------------------
+  # Dashboard API
+  # -------------------------
+  svc-dashboard:
+    <<: *python_service
+    container_name: df-svc-dashboard
+    build:
+      context: ./services/svc-dashboard/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      HOST: "0.0.0.0"
+      PORT: "8005"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app/app"
+      # Auth: ensure this matches svc-core token signing
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: "HS256"
+      # Dashboard behavior
+      DASHBOARD_STALE_SECONDS: "30"
+      DASHBOARD_FORCE_REFRESH_ON_MISS: "true"
+    expose: ["8005"]
+    ports: ["8005:8005"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  svc-dashboard-worker:
+    <<: *python_service
+    container_name: df-svc-dashboard-worker
+    build:
+      context: ./services/svc-dashboard/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app/app"
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: "HS256"
+      DASHBOARD_WORKER_ENABLED: "true"
+      DASHBOARD_WORKER_POLL_SECONDS: "0.75"
+      DASHBOARD_WORKER_BATCH_SIZE: "50"
+    command: ["bash", "-lc", "python -m app.worker.refresh_worker"]
+
+networks:
+  df-net:
+    name: df-net
+    driver: bridge
+
+volumes:
+  df_pgdata:
+  df_redisdata:
