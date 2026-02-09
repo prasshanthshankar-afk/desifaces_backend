@@ -26,7 +26,7 @@ services:
   # Database
   # -------------------------
   desifaces-db:
-    image: postgres:16
+    image: pgvector/pgvector:pg16
     container_name: desifaces-db
     networks: [df-net]
     environment:
@@ -83,6 +83,10 @@ services:
       REDIS_URL: ${REDIS_URL}
       JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
       REFRESH_TOKEN_HMAC_SECRET: ${REFRESH_TOKEN_HMAC_SECRET}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
       PYTHONPATH: "/app"
     expose: ["8000"]
     ports: ["8000:8000"]
@@ -111,16 +115,14 @@ services:
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       PYTHONPATH: "/app"
 
-      # Feature flag (your code reads this)
       DF_FUSION_STUDIO_ENABLED: ${DF_FUSION_STUDIO_ENABLED:-true}
 
-      # JWT (needed because svc-fusion now decodes access tokens)
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
       JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
-      # Keep as HEYGEN_API_KEY inside container; source from DF_HEYGEN_API_KEY in infra/.env
+
       HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
       HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
     expose: ["8002"]
@@ -133,7 +135,7 @@ services:
       start_period: 20s
 
   # -------------------------
-  # Fusion Worker - consumes queued jobs
+  # Fusion Worker
   # -------------------------
   svc-fusion-worker:
     <<: *python_service
@@ -148,15 +150,19 @@ services:
       REDIS_URL: ${REDIS_URL}
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       PYTHONPATH: "/app"
+
       HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
       HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
+
       DF_FUSION_STUDIO_ENABLED: ${DF_FUSION_STUDIO_ENABLED:-true}
+
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
       JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
       REFRESH_TOKEN_HMAC_SECRET: ${REFRESH_TOKEN_HMAC_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
     command: ["bash", "-lc", "python -m app.workers.fusion_worker"]
-
 
   # -------------------------
   # Face API
@@ -174,25 +180,21 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
-      FACE_OUTPUT_CONTAINER: "face-output"
+      FACE_OUTPUT_CONTAINER: ${FACE_OUTPUT_CONTAINER:-face-output}
       PYTHONPATH: "/app"
-      
-      # JWT
+
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
-      
-      # fal.ai
+
       FAL_API_KEY: ${FAL_API_KEY}
-      FAL_MODEL: "fal-ai/flux-pro/v1.1"
-      
-      # Azure OpenAI (GPT-4 for prompt generation)
+      FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
+
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
       AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY}
       AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT}
-      
-      # Azure Content Moderator
+
       AZURE_CONTENT_MODERATOR_ENDPOINT: ${AZURE_CONTENT_MODERATOR_ENDPOINT}
       AZURE_CONTENT_MODERATOR_KEY: ${AZURE_CONTENT_MODERATOR_KEY}
     expose: ["8003"]
@@ -205,7 +207,7 @@ services:
       start_period: 20s
 
   # -------------------------
-  # Face Worker - consumes queued face generation jobs
+  # Face Worker
   # -------------------------
   svc-face-worker:
     <<: *python_service
@@ -215,26 +217,23 @@ services:
       dockerfile: Dockerfile
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
-      FACE_OUTPUT_CONTAINER: "face-output"
+      FACE_OUTPUT_CONTAINER: ${FACE_OUTPUT_CONTAINER:-face-output}
       PYTHONPATH: "/app"
-      
-      # JWT
+
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
-      
-      # fal.ai
+
       FAL_API_KEY: ${FAL_API_KEY}
-      FAL_MODEL: "fal-ai/flux-pro/v1.1"
-      
-      # Azure OpenAI
+      FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
+
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
       AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY}
       AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT}
-      
-      # Azure Content Moderator
+
       AZURE_CONTENT_MODERATOR_ENDPOINT: ${AZURE_CONTENT_MODERATOR_ENDPOINT}
       AZURE_CONTENT_MODERATOR_KEY: ${AZURE_CONTENT_MODERATOR_KEY}
     command: ["bash", "-lc", "python -m app.workers.face_worker"]
@@ -257,22 +256,20 @@ services:
       REDIS_URL: ${REDIS_URL}
       PYTHONPATH: "/app"
 
-      # JWT decode in deps.py
       JWT_SECRET: ${JWT_SECRET}
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
       JWT_ALG: ${JWT_ALG:-HS256}
 
-      # Azure
       AZURE_SPEECH_KEY: ${AZURE_SPEECH_KEY}
       AZURE_SPEECH_REGION: ${AZURE_SPEECH_REGION:-eastus}
       AZURE_TRANSLATOR_KEY: ${AZURE_TRANSLATOR_KEY}
       AZURE_TRANSLATOR_ENDPOINT: ${AZURE_TRANSLATOR_ENDPOINT:-https://api.cognitive.microsofttranslator.com}
       AZURE_TRANSLATOR_REGION: ${AZURE_TRANSLATOR_REGION:-eastus}
+
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       AUDIO_OUTPUT_CONTAINER: ${AUDIO_OUTPUT_CONTAINER:-audio-output}
       AUDIO_SAS_HOURS: ${AUDIO_SAS_HOURS:-24}
-
     expose: ["8004"]
     ports: ["8004:8004"]
     healthcheck:
@@ -283,7 +280,7 @@ services:
       start_period: 20s
 
   # -------------------------
-  # Audio Worker - consumes queued audio jobs
+  # Audio Worker
   # -------------------------
   svc-audio-worker:
     <<: *python_service
@@ -303,24 +300,21 @@ services:
       WORKER_POLL_SECS: "1.5"
       WORKER_BATCH_SIZE: "1"
 
-      # JWT decode in deps.py (even if worker doesn't call routes, keep consistent)
       JWT_SECRET: ${JWT_SECRET}
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
       JWT_ALG: ${JWT_ALG:-HS256}
 
-      # Azure
       AZURE_SPEECH_KEY: ${AZURE_SPEECH_KEY}
       AZURE_SPEECH_REGION: ${AZURE_SPEECH_REGION:-eastus}
       AZURE_TRANSLATOR_KEY: ${AZURE_TRANSLATOR_KEY}
       AZURE_TRANSLATOR_ENDPOINT: ${AZURE_TRANSLATOR_ENDPOINT:-https://api.cognitive.microsofttranslator.com}
       AZURE_TRANSLATOR_REGION: ${AZURE_TRANSLATOR_REGION:-eastus}
+
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       AUDIO_OUTPUT_CONTAINER: ${AUDIO_OUTPUT_CONTAINER:-audio-output}
       AUDIO_SAS_HOURS: ${AUDIO_SAS_HOURS:-24}
-
     command: ["bash", "-lc", "python -m app.workers.audio_worker"]
-
 
   # -------------------------
   # Dashboard API
@@ -338,12 +332,10 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
       PYTHONPATH: "/app/app"
-      # Auth: ensure this matches svc-core token signing
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALG: "HS256"
-      # Dashboard behavior
-      DASHBOARD_STALE_SECONDS: "30"
-      DASHBOARD_FORCE_REFRESH_ON_MISS: "true"
+      DASHBOARD_STALE_SECONDS: ${DASHBOARD_STALE_SECONDS:-30}
+      DASHBOARD_FORCE_REFRESH_ON_MISS: ${DASHBOARD_FORCE_REFRESH_ON_MISS:-true}
     expose: ["8005"]
     ports: ["8005:8005"]
     healthcheck:
@@ -367,9 +359,228 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALG: "HS256"
       DASHBOARD_WORKER_ENABLED: "true"
-      DASHBOARD_WORKER_POLL_SECONDS: "0.75"
-      DASHBOARD_WORKER_BATCH_SIZE: "50"
+      DASHBOARD_WORKER_POLL_SECONDS: ${DASHBOARD_WORKER_POLL_SECONDS:-0.75}
+      DASHBOARD_WORKER_BATCH_SIZE: ${DASHBOARD_WORKER_BATCH_SIZE:-50}
     command: ["bash", "-lc", "python -m app.worker.refresh_worker"]
+
+  # -------------------------
+  # Fusion Extension (Longform) API
+  # -------------------------
+  svc-fusion-extension:
+    <<: *python_service
+    container_name: df-svc-fusion-extension
+    build:
+      context: ./services/svc-fusion-extension/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8006"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://df-svc-fusion:8002}
+      SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://df-svc-audio:8004}
+      SVC_TO_SVC_BEARER: ${SVC_TO_SVC_BEARER}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AZURE_FINAL_VIDEO_CONTAINER: ${AZURE_FINAL_VIDEO_CONTAINER:-video-output}
+      FINAL_SAS_TTL_SECONDS: ${FINAL_SAS_TTL_SECONDS:-1296000}
+
+      DEFAULT_SEGMENT_SECONDS: ${DEFAULT_SEGMENT_SECONDS:-60}
+      MAX_SEGMENT_SECONDS: ${MAX_SEGMENT_SECONDS:-120}
+      MAX_INFLIGHT_SEGMENTS_PER_JOB: ${MAX_INFLIGHT_SEGMENTS_PER_JOB:-2}
+      MAX_TOTAL_SEGMENTS_PER_JOB: ${MAX_TOTAL_SEGMENTS_PER_JOB:-500}
+
+      AUDIO_POLL_SECONDS: ${AUDIO_POLL_SECONDS:-1.5}
+      AUDIO_TIMEOUT_SECONDS: ${AUDIO_TIMEOUT_SECONDS:-300}
+      FUSION_POLL_SECONDS: ${FUSION_POLL_SECONDS:-3.0}
+      FUSION_TIMEOUT_SECONDS: ${FUSION_TIMEOUT_SECONDS:-900}
+    expose: ["8006"]
+    ports: ["8006:8006"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  svc-fusion-extension-worker:
+    <<: *python_service
+    container_name: df-svc-fusion-extension-worker
+    build:
+      context: ./services/svc-fusion-extension/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      SVC_TO_SVC_BEARER: ${SVC_TO_SVC_BEARER}
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://df-svc-fusion:8002}
+      SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://df-svc-audio:8004}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AZURE_FINAL_VIDEO_CONTAINER: ${AZURE_FINAL_VIDEO_CONTAINER:-video-output}
+      FINAL_SAS_TTL_SECONDS: ${FINAL_SAS_TTL_SECONDS:-1296000}
+
+      WORKER_ENABLED: "true"
+      WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-1.0}
+      WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-10}
+
+      DEFAULT_SEGMENT_SECONDS: ${DEFAULT_SEGMENT_SECONDS:-60}
+      MAX_SEGMENT_SECONDS: ${MAX_SEGMENT_SECONDS:-120}
+      MAX_INFLIGHT_SEGMENTS_PER_JOB: ${MAX_INFLIGHT_SEGMENTS_PER_JOB:-2}
+      MAX_TOTAL_SEGMENTS_PER_JOB: ${MAX_TOTAL_SEGMENTS_PER_JOB:-500}
+
+      AUDIO_POLL_SECONDS: ${AUDIO_POLL_SECONDS:-1.5}
+      AUDIO_TIMEOUT_SECONDS: ${AUDIO_TIMEOUT_SECONDS:-300}
+      FUSION_POLL_SECONDS: ${FUSION_POLL_SECONDS:-3.0}
+      FUSION_TIMEOUT_SECONDS: ${FUSION_TIMEOUT_SECONDS:-900}
+    command: ["bash", "-lc", "python -m app.workers.longform_worker"]
+
+  svc-fusion-extension-stitch-worker:
+    <<: *python_service
+    container_name: df-svc-fusion-extension-stitch-worker
+    build:
+      context: ./services/svc-fusion-extension/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AZURE_FINAL_VIDEO_CONTAINER: ${AZURE_FINAL_VIDEO_CONTAINER:-video-output}
+      FINAL_SAS_TTL_SECONDS: ${FINAL_SAS_TTL_SECONDS:-1296000}
+
+      STITCH_WORKER_ENABLED: "true"
+      STITCH_WORKER_POLL_SECONDS: ${STITCH_WORKER_POLL_SECONDS:-2.0}
+      STITCH_WORKER_BATCH_SIZE: ${STITCH_WORKER_BATCH_SIZE:-2}
+    command: ["bash", "-lc", "python -m app.workers.stitch_worker"]
+
+  # -------------------------
+  # Music API
+  # -------------------------
+  svc-music:
+    <<: *python_service
+    container_name: df-svc-music
+    build:
+      context: ./services/svc-music/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8007"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      # JWT (MUST match svc-core signing/claims)
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      MUSIC_OUTPUT_CONTAINER: ${MUSIC_OUTPUT_CONTAINER:-music-output}
+      MUSIC_SAS_HOURS: ${MUSIC_SAS_HOURS:-24}
+
+      HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
+      HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
+
+    command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8007}"]
+    expose: ["8007"]
+    ports: ["8007:8007"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 25s
+
+  # -------------------------
+  # Music Worker
+  # -------------------------
+  svc-music-worker:
+    <<: *python_service
+    container_name: df-svc-music-worker
+    build:
+      context: ./services/svc-music/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      # worker should NOT run uvicorn
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      MUSIC_OUTPUT_CONTAINER: ${MUSIC_OUTPUT_CONTAINER:-music-output}
+      MUSIC_SAS_HOURS: ${MUSIC_SAS_HOURS:-24}
+
+      HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
+      HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
+
+      WORKER_POLL_SECS: ${MUSIC_WORKER_POLL_SECS:-1.5}
+
+    # worker should NOT run uvicorn
+    command: ["bash", "-lc", "python -m app.workers.music_worker"]
+
+
+  svc-music-preset-embedder:
+    <<: *python_service
+    container_name: df-svc-music-preset-embedder
+    build:
+      context: ./services/svc-music/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: "INFO"
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION}
+      AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT: ${AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}
+
+      PRESET_EMBED_TAG: "seed_v120"
+      PRESET_EMBED_BATCH_SIZE: "16"
+      PRESET_EMBED_SLEEP_SECS: "1.2"
+      PRESET_EMBED_DIM: "1536"
+
+    command: ["bash", "-lc", "python -m app.workers.preset_embedding_worker"]
 
 networks:
   df-net:

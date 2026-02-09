@@ -21,17 +21,23 @@ async def get_current_user_id(claims: dict = Depends(get_current_claims)) -> str
     """
     Extract user UUID from JWT and verify user exists.
     Returns UUID as string.
+
+    For internal service-to-service calls (Option A), allow a bypass.
     """
+    # ✅ internal service token bypass
+    if claims.get("is_service") or claims.get("token_type") == "service":
+        # return a sentinel; endpoints should not assume this is a UUID
+        return "svc-fusion-extension"
+
     sub = claims.get("sub")
     if not sub:
         raise HTTPException(status_code=401, detail="missing_sub")
-    
+
     try:
         user_uuid = str(UUID(str(sub)))
     except Exception:
         raise HTTPException(status_code=401, detail="invalid_sub")
-    
-    # Verify user exists
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         exists = await conn.fetchval(
@@ -40,5 +46,5 @@ async def get_current_user_id(claims: dict = Depends(get_current_claims)) -> str
         )
         if not exists:
             raise HTTPException(status_code=401, detail="user_not_found")
-    
+
     return user_uuid

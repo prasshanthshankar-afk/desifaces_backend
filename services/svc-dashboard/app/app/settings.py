@@ -19,6 +19,21 @@ class Settings(BaseSettings):
     DASHBOARD_WORKER_POLL_SECONDS: float = Field(default=0.75)
     DASHBOARD_WORKER_BATCH_SIZE: int = Field(default=50)
 
+    # Azure Blob (SAS signing)
+    AZURE_STORAGE_CONNECTION_STRING: str = Field(
+        ..., description="Azure Storage connection string (must include AccountName and AccountKey)"
+    )
+    # Optional default container (only needed if storage_path doesn't include container)
+    AZURE_STORAGE_CONTAINER_NAME: str = Field(
+        default="", description="Default Azure Blob container name (optional if storage_path includes container)"
+    )
+
+    # SAS TTL policy for dashboard items
+    DASHBOARD_FACE_SAS_TTL_SECONDS: int = Field(default=15 * 24 * 3600)
+    DASHBOARD_VIDEO_SAS_TTL_SECONDS: int = Field(default=15 * 24 * 3600)
+    DASHBOARD_RECENT_VIDEO_SAS_TTL_SECONDS: int = Field(default=15 * 24 * 3600)
+    DASHBOARD_RECENT_WINDOW_DAYS: int = Field(default=15)
+
     LOG_LEVEL: str = Field(default="INFO")
 
     class Config:

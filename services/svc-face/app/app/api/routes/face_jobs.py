@@ -42,9 +42,54 @@ router = APIRouter()
 
 logger = logging.getLogger("api.face_jobs")
 
+
+
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# Friendly error mapping (prompt safety)
+# ------------------------------------------------------------------------------
+
+def _parse_unsafe_prompt_reason(err: Exception) -> Optional[str]:
+    """
+    Extracts a human-readable reason from exceptions thrown by prompt validation,
+    e.g. ValueError("unsafe_prompt: Blocked keyword detected: naked")
+    """
+    msg = str(err or "").strip()
+    if not msg:
+        return None
+
+    # Current convention in CreatorPromptService:
+    # raise ValueError(f"unsafe_prompt: {reason}")
+    if msg.startswith("unsafe_prompt:"):
+        return msg.split("unsafe_prompt:", 1)[1].strip() or "unsafe_prompt"
+
+    return None
+
+
+def _raise_friendly_unsafe_prompt(user_id: str, reason: str) -> None:
+    """
+    Raise a clean 400 error payload the client can show nicely.
+    We keep the reason (for debugging) but provide a friendly message.
+    """
+    logger.info("Blocked unsafe prompt user_id=%s reason=%s", user_id, reason)
+
+    # Friendly message shown to end user (safe wording)
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "error": "unsafe_prompt",
+            "code": "DF_UNSAFE_PROMPT",
+            "message": (
+                "That prompt isn’t allowed. Please remove sexual or explicit content "
+                "and try again."
+            ),
+            "reason": reason,
+            "action": "edit_prompt",
+        },
+    )
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
     """Safe getter for dicts, pydantic models, and asyncpg Records."""
@@ -297,7 +342,22 @@ async def creator_generate_faces(
     """
     pool = await get_pool()
     orch = CreatorOrchestrator(pool)
-    return await orch.create_job(user_id=user_id, request=req)
+
+    try:
+        return await orch.create_job(user_id=user_id, request=req)
+    except ValueError as e:
+        reason = _parse_unsafe_prompt_reason(e)
+        if reason:
+            _raise_friendly_unsafe_prompt(user_id=str(user_id), reason=reason)
+        # Not an unsafe prompt; treat as a normal validation error
+        logger.warning("creator_generate_faces ValueError user_id=%s err=%s", user_id, str(e))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "bad_request", "message": str(e)},
+        )
+    except HTTPException:
+        # Preserve explicit HTTP errors
+        raise
     
 
 @router.get("/creator/jobs/{job_id}/status", response_model=JobStatusResponse)
