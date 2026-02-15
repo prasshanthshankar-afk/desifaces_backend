@@ -1,0 +1,811 @@
+{
+  "project_id": "19fda0b8-c3c3-4912-9d86-0d7a2bb4929e",
+  "audio": {
+    "track_type": "full_mix",
+    "artifact_id": "8ba30002-7054-4e7f-8d29-40ab53c8536c",
+    "media_asset_id": "aec4019b-065a-403a-adfa-5249fff397d6",
+    "duration_ms": 30000,
+    "content_type": "audio/wav"
+  },
+  "lyrics_text": "Verse 1:\nIn the uplifting night, we find our way\nOne small step, then we sway\nHeartbeats sync to pop dreams\nNothing’s ever as it seems\n\nChorus:\nMy Song, My Song\nWe rise with a uplifting glow\nMy Song, My Song\nLet the whole world know\n\nVerse 2:\nHold the line, don’t let it fade\nMoments bright that we have made\nFrom today into the new\nI believe, and so do you\n\nBridge:\nBreathe in… breathe out…\nWe’re not alone, we’re here right now\n\nChorus:\nMy Song, My Song\nWe rise with a uplifting glow\nMy Song, My Song\nLet the whole world know\n",
+  "clip_manifest": {
+    "version": 2,
+    "generated_at": 1770669889,
+    "source": "music_plan",
+    "mode": "autopilot",
+    "language_hint": "C.UTF-8",
+    "audio_duration_ms": 30000,
+    "no_face": false,
+    "seed": null,
+    "exports": [
+      "9:16"
+    ],
+    "clips": [
+      {
+        "clip_id": "instagram_reels_clip_1",
+        "segment": "segment_1",
+        "platform": "instagram_reels",
+        "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography.\nFraming: Center framing, leave safe zones for UI.",
+        "duration_ms": 3913,
+        "exports": [
+          "9:16"
+        ],
+        "quality": "standard",
+        "language_hint": "C.UTF-8",
+        "duet_layout": "split_screen",
+        "safe_zone": null,
+        "preset_refs": {
+          "style": []
+        }
+      },
+      {
+        "clip_id": "instagram_reels_clip_2",
+        "segment": "segment_2",
+        "platform": "instagram_reels",
+        "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — verse\nFraming: Center framing, leave safe zones for UI.",
+        "duration_ms": 6522,
+        "exports": [
+          "9:16"
+        ],
+        "quality": "standard",
+        "language_hint": "C.UTF-8",
+        "duet_layout": "split_screen",
+        "safe_zone": null,
+        "preset_refs": {
+          "style": []
+        }
+      },
+      {
+        "clip_id": "instagram_reels_clip_3",
+        "segment": "segment_3",
+        "platform": "instagram_reels",
+        "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — chorus\nFraming: Center framing, leave safe zones for UI.",
+        "duration_ms": 9130,
+        "exports": [
+          "9:16"
+        ],
+        "quality": "standard",
+        "language_hint": "C.UTF-8",
+        "duet_layout": "split_screen",
+        "safe_zone": null,
+        "preset_refs": {
+          "style": []
+        }
+      },
+      {
+        "clip_id": "instagram_reels_clip_4",
+        "segment": "segment_4",
+        "platform": "instagram_reels",
+        "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — bridge\nFraming: Center framing, leave safe zones for UI.",
+        "duration_ms": 6522,
+        "exports": [
+          "9:16"
+        ],
+        "quality": "standard",
+        "language_hint": "C.UTF-8",
+        "duet_layout": "split_screen",
+        "safe_zone": null,
+        "preset_refs": {
+          "style": []
+        }
+      },
+      {
+        "clip_id": "instagram_reels_clip_5",
+        "segment": "segment_5",
+        "platform": "instagram_reels",
+        "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — outro\nFraming: Center framing, leave safe zones for UI.",
+        "duration_ms": 3913,
+        "exports": [
+          "9:16"
+        ],
+        "quality": "standard",
+        "language_hint": "C.UTF-8",
+        "duet_layout": "split_screen",
+        "safe_zone": null,
+        "preset_refs": {
+          "style": []
+        }
+      }
+    ],
+    "platform_targets": [
+      "instagram_reels",
+      "youtube_shorts",
+      "tiktok",
+      "youtube_long",
+      "instagram_feed",
+      "facebook_reels",
+      "whatsapp_status"
+    ],
+    "platform_exports": {
+      "instagram_reels": [
+        "9:16"
+      ],
+      "youtube_shorts": [
+        "9:16"
+      ],
+      "tiktok": [
+        "9:16"
+      ],
+      "youtube_long": [
+        "16:9"
+      ],
+      "instagram_feed": [
+        "4:5",
+        "1:1"
+      ],
+      "facebook_reels": [
+        "9:16"
+      ],
+      "whatsapp_status": [
+        "9:16"
+      ]
+    },
+    "safe_zone": null,
+    "platform_variants": {
+      "instagram_reels": {
+        "exports": [
+          "9:16"
+        ],
+        "safe_zone": null,
+        "clips": [
+          {
+            "clip_id": "instagram_reels_clip_1",
+            "segment": "segment_1",
+            "platform": "instagram_reels",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography.\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 3913,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "instagram_reels_clip_2",
+            "segment": "segment_2",
+            "platform": "instagram_reels",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — verse\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 6522,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "instagram_reels_clip_3",
+            "segment": "segment_3",
+            "platform": "instagram_reels",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — chorus\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 9130,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "instagram_reels_clip_4",
+            "segment": "segment_4",
+            "platform": "instagram_reels",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — bridge\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 6522,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "instagram_reels_clip_5",
+            "segment": "segment_5",
+            "platform": "instagram_reels",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — outro\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 3913,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          }
+        ]
+      },
+      "youtube_shorts": {
+        "exports": [
+          "9:16"
+        ],
+        "safe_zone": null,
+        "clips": [
+          {
+            "clip_id": "youtube_shorts_clip_1",
+            "segment": "segment_1",
+            "platform": "youtube_shorts",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography.\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 3913,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "youtube_shorts_clip_2",
+            "segment": "segment_2",
+            "platform": "youtube_shorts",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — verse\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 6522,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "youtube_shorts_clip_3",
+            "segment": "segment_3",
+            "platform": "youtube_shorts",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — chorus\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 9130,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "youtube_shorts_clip_4",
+            "segment": "segment_4",
+            "platform": "youtube_shorts",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — bridge\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 6522,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "youtube_shorts_clip_5",
+            "segment": "segment_5",
+            "platform": "youtube_shorts",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — outro\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 3913,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          }
+        ]
+      },
+      "tiktok": {
+        "exports": [
+          "9:16"
+        ],
+        "safe_zone": null,
+        "clips": [
+          {
+            "clip_id": "tiktok_clip_1",
+            "segment": "segment_1",
+            "platform": "tiktok",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography.\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 3913,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "tiktok_clip_2",
+            "segment": "segment_2",
+            "platform": "tiktok",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — verse\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 6522,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "tiktok_clip_3",
+            "segment": "segment_3",
+            "platform": "tiktok",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — chorus\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 9130,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "tiktok_clip_4",
+            "segment": "segment_4",
+            "platform": "tiktok",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — bridge\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 6522,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "tiktok_clip_5",
+            "segment": "segment_5",
+            "platform": "tiktok",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — outro\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 3913,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          }
+        ]
+      },
+      "youtube_long": {
+        "exports": [
+          "16:9"
+        ],
+        "safe_zone": null,
+        "clips": [
+          {
+            "clip_id": "youtube_long_clip_1",
+            "segment": "segment_1",
+            "platform": "youtube_long",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography.\nFraming: Wide staging, keep action within title-safe.",
+            "duration_ms": 3913,
+            "exports": [
+              "16:9"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "youtube_long_clip_2",
+            "segment": "segment_2",
+            "platform": "youtube_long",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — verse\nFraming: Wide staging, keep action within title-safe.",
+            "duration_ms": 6522,
+            "exports": [
+              "16:9"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "youtube_long_clip_3",
+            "segment": "segment_3",
+            "platform": "youtube_long",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — chorus\nFraming: Wide staging, keep action within title-safe.",
+            "duration_ms": 9130,
+            "exports": [
+              "16:9"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "youtube_long_clip_4",
+            "segment": "segment_4",
+            "platform": "youtube_long",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — bridge\nFraming: Wide staging, keep action within title-safe.",
+            "duration_ms": 6522,
+            "exports": [
+              "16:9"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "youtube_long_clip_5",
+            "segment": "segment_5",
+            "platform": "youtube_long",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — outro\nFraming: Wide staging, keep action within title-safe.",
+            "duration_ms": 3913,
+            "exports": [
+              "16:9"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          }
+        ]
+      },
+      "instagram_feed": {
+        "exports": [
+          "4:5",
+          "1:1"
+        ],
+        "safe_zone": null,
+        "clips": [
+          {
+            "clip_id": "instagram_feed_clip_1",
+            "segment": "segment_1",
+            "platform": "instagram_feed",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography.\nFraming: Crop-safe composition.",
+            "duration_ms": 3913,
+            "exports": [
+              "4:5",
+              "1:1"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "instagram_feed_clip_2",
+            "segment": "segment_2",
+            "platform": "instagram_feed",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — verse\nFraming: Crop-safe composition.",
+            "duration_ms": 6522,
+            "exports": [
+              "4:5",
+              "1:1"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "instagram_feed_clip_3",
+            "segment": "segment_3",
+            "platform": "instagram_feed",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — chorus\nFraming: Crop-safe composition.",
+            "duration_ms": 9130,
+            "exports": [
+              "4:5",
+              "1:1"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "instagram_feed_clip_4",
+            "segment": "segment_4",
+            "platform": "instagram_feed",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — bridge\nFraming: Crop-safe composition.",
+            "duration_ms": 6522,
+            "exports": [
+              "4:5",
+              "1:1"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "instagram_feed_clip_5",
+            "segment": "segment_5",
+            "platform": "instagram_feed",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — outro\nFraming: Crop-safe composition.",
+            "duration_ms": 3913,
+            "exports": [
+              "4:5",
+              "1:1"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          }
+        ]
+      },
+      "facebook_reels": {
+        "exports": [
+          "9:16"
+        ],
+        "safe_zone": null,
+        "clips": [
+          {
+            "clip_id": "facebook_reels_clip_1",
+            "segment": "segment_1",
+            "platform": "facebook_reels",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography.\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 3913,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "facebook_reels_clip_2",
+            "segment": "segment_2",
+            "platform": "facebook_reels",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — verse\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 6522,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "facebook_reels_clip_3",
+            "segment": "segment_3",
+            "platform": "facebook_reels",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — chorus\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 9130,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "facebook_reels_clip_4",
+            "segment": "segment_4",
+            "platform": "facebook_reels",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — bridge\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 6522,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "facebook_reels_clip_5",
+            "segment": "segment_5",
+            "platform": "facebook_reels",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — outro\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 3913,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          }
+        ]
+      },
+      "whatsapp_status": {
+        "exports": [
+          "9:16"
+        ],
+        "safe_zone": null,
+        "clips": [
+          {
+            "clip_id": "whatsapp_status_clip_1",
+            "segment": "segment_1",
+            "platform": "whatsapp_status",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography.\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 3913,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "whatsapp_status_clip_2",
+            "segment": "segment_2",
+            "platform": "whatsapp_status",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — verse\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 6522,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "whatsapp_status_clip_3",
+            "segment": "segment_3",
+            "platform": "whatsapp_status",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — chorus\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 9130,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "whatsapp_status_clip_4",
+            "segment": "segment_4",
+            "platform": "whatsapp_status",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — bridge\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 6522,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          },
+          {
+            "clip_id": "whatsapp_status_clip_5",
+            "segment": "segment_5",
+            "platform": "whatsapp_status",
+            "prompt": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography. — outro\nFraming: Center framing, leave safe zones for UI.",
+            "duration_ms": 3913,
+            "exports": [
+              "9:16"
+            ],
+            "quality": "standard",
+            "language_hint": "C.UTF-8",
+            "duet_layout": "split_screen",
+            "safe_zone": null,
+            "preset_refs": {
+              "style": []
+            }
+          }
+        ]
+      }
+    },
+    "summary": "A vibrant and energetic music video that captures the essence of a festival celebration, showcasing a diverse crowd enjoying the music, with dynamic visuals and engaging typography.",
+    "hash": "8f186472e0be8065a1a1bf6740d2a7ee26f8008ccafdf4e67a05d5fd9274f0d0"
+  },
+  "consent": {
+    "accepted": true,
+    "scope": "generate_music_video"
+  },
+  "target": "fusion_extension"
+}

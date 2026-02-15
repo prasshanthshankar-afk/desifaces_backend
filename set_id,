@@ -1,0 +1,246 @@
+{
+    "studio_job": {
+        "id": "7062d555-d20f-4a30-92c2-ade5ab1dd6df",
+        "status": "succeeded",
+        "user_id": "fd66ea03-9f55-4982-abd6-a06469830208",
+        "meta_json": {
+            "mode": "text-to-image",
+            "job_seed": 7447710747131647808,
+            "language": "en",
+            "seed_mode": "random",
+            "api_version": "v2",
+            "request_type": "creator_platform",
+            "request_nonce": "6a811620dabf477e835afd835f81226a",
+            "config_validated": true,
+            "safety_validated": false,
+            "source_image_url": null,
+            "translation_success": true,
+            "preservation_strength": null
+        },
+        "created_at": "2026-02-13T15:26:13.009297+00:00",
+        "error_code": null,
+        "updated_at": "2026-02-13T15:26:58.973929+00:00",
+        "next_run_at": "2026-02-13T15:26:13.009297+00:00",
+        "studio_type": "face",
+        "payload_json": {
+            "mode": "text-to-image",
+            "seed": null,
+            "gender": null,
+            "job_seed": 7447710747131647808,
+            "language": "en",
+            "subjects": [
+                {
+                    "gender": null,
+                    "relationship_role": null
+                }
+            ],
+            "seed_mode": "random",
+            "style_code": null,
+            "region_code": null,
+            "user_prompt": null,
+            "context_code": null,
+            "num_variants": 1,
+            "platform_code": null,
+            "request_nonce": "6a811620dabf477e835afd835f81226a",
+            "use_case_code": null,
+            "age_range_code": "established_professional",
+            "skin_tone_code": "medium_brown",
+            "facial_features": {},
+            "source_image_url": null,
+            "image_format_code": "business_card",
+            "clothing_style_code": null,
+            "preferred_variations": [],
+            "preservation_strength": 0.75,
+            "subject_composition_code": "single_person"
+        },
+        "request_hash": "9960324fe71bd56e",
+        "attempt_count": 1,
+        "error_message": null
+    },
+    "face_job_id": "7062d555-d20f-4a30-92c2-ade5ab1dd6df",
+    "media_assets": [
+        {
+            "id": "aec59885-cdbe-4ce4-b041-1ea11d56548f",
+            "kind": "face_image",
+            "bytes": 2338618,
+            "width": null,
+            "height": null,
+            "sha256": null,
+            "user_id": "fd66ea03-9f55-4982-abd6-a06469830208",
+            "meta_json": {
+                "mode": "text-to-image",
+                "seed": 1853436070,
+                "job_id": "7062d555-d20f-4a30-92c2-ade5ab1dd6df",
+                "prompt": "established professional, 29-35 years old, career growth phase, female person, medium brown warm skin, authentic Indian features, natural appearance, culturally accurate, commercial advertising style, product marketing ready, brand alignment, consumer appeal, dramatic studio lighting, professional photography, strong contrast, confident power pose, leadership stance, authoritative positioning, fully clothed, decent attire, appropriate clothing, \n        family-friendly, culturally respectful, el",
+                "variant": 1,
+                "job_seed": 7447710747131647808,
+                "provider": "openai",
+                "seed_mode": "random",
+                "storage_path": "fd66ea03-9f55-4982-abd6-a06469830208/7062d555-d20f-4a30-92c2-ade5ab1dd6df/variant_1.png",
+                "provider_meta": {
+                    "mode": "t2i"
+                },
+                "technical_specs": {
+                    "width": 1200,
+                    "height": 1200,
+                    "aspect_ratio": "1:1"
+                },
+                "source_image_ref": null,
+                "source_image_url": null,
+                "identity_signature": "88e54e784c2d",
+                "creative_variations": {
+                    "pose": {
+                        "code": "power_stance",
+                        "mood_impact": "commanding, confident",
+                        "prompt_modifier": "confident power pose, leadership stance, authoritative positioning",
+                        "creativity_level": 6,
+                        "professional_level": 9,
+                        "use_case_compatibility": [
+                            "executive_portrait",
+                            "advertisement_model"
+                        ]
+                    },
+                    "lighting": {
+                        "code": "studio_dramatic",
+                        "mood_impact": "powerful, authoritative",
+                        "prompt_modifier": "dramatic studio lighting, professional photography, strong contrast",
+                        "creativity_level": 8,
+                        "professional_level": 9,
+                        "use_case_compatibility": [
+                            "executive_portrait",
+                            "advertisement_model"
+                        ]
+                    }
+                },
+                "preservation_strength": null
+            },
+            "created_at": "2026-02-13T15:26:58.965701+00:00",
+            "updated_at": "2026-02-13T15:26:58.965701+00:00",
+            "duration_ms": null,
+            "storage_ref": "https://desifacesstore.blob.core.windows.net/face-output/fd66ea03-9f55-4982-abd6-a06469830208/7062d555-d20f-4a30-92c2-ade5ab1dd6df/variant_1.png?se=2026-02-14T15%3A26%3A58Z&sp=r&sv=2023-11-03&sr=b&sig=bqHF5X1jPg8pzpQTBHOM2b%2BNVpkJePrmgPDdtRbValE%3D",
+            "content_type": "image/png"
+        }
+    ],
+    "face_profiles": [
+        {
+            "id": "58de8479-8a76-4141-8e23-dedf75ffb8df",
+            "status": "active",
+            "user_id": "fd66ea03-9f55-4982-abd6-a06469830208",
+            "meta_json": {
+                "mode": "text-to-image",
+                "seed": 1853436070,
+                "job_id": "7062d555-d20f-4a30-92c2-ade5ab1dd6df",
+                "variant": 1,
+                "job_seed": 7447710747131647808,
+                "provider": "openai",
+                "resolved": {
+                    "region": null,
+                    "use_case": "advertisement_model",
+                    "age_range": "established_professional",
+                    "skin_tone": "medium_brown",
+                    "image_format": "business_card"
+                },
+                "seed_mode": "random",
+                "provider_meta": {
+                    "mode": "t2i"
+                },
+                "negative_prompt": "different age, different skin tone, different ethnicity, different gender, demographic change, western-only features, face morphing, identity drift, clone-like, identical appearance, monotonous, generic stock photo, low quality, blurry, distorted, deformed, watermark, text overlay, nude, nudity, naked, nsfw, explicit, sexual, pornographic, obscene, \ninappropriate, adult content, revealing clothing, transparent clothing, \nsee-through, exposed body parts, sexual acts, suggestive poses,\nviolence, blood, gore, weapons, fighting, abuse, \nchild in inappropriate context, underage, \npolitical symbols, political figures, controversial symbols,\nhate symbols, offensive gestures, drugs, smoking, alcohol abuse,\nugly, distorted, deformed, extra limbs, bad anatomy,\nlow quality, blurry, watermark, text overlay, same person, identical face, twin, clone, repeated identity, same facial structure, same bone structure, same nose, same jawline, same cheekbones, overly generic face, stock photo face",
+                "technical_specs": {
+                    "width": 1200,
+                    "height": 1200,
+                    "aspect_ratio": "1:1"
+                },
+                "demographic_base": "established professional, 29-35 years old, career growth phase, female person, medium brown warm skin, authentic Indian features, natural appearance, culturally accurate",
+                "source_image_ref": null,
+                "source_image_url": null,
+                "generation_prompt": "established professional, 29-35 years old, career growth phase, female person, medium brown warm skin, authentic Indian features, natural appearance, culturally accurate, commercial advertising style, product marketing ready, brand alignment, consumer appeal, dramatic studio lighting, professional photography, strong contrast, confident power pose, leadership stance, authoritative positioning, fully clothed, decent attire, appropriate clothing, \n        family-friendly, culturally respectful, elegant, \n        professional photography, high-quality portrait,\n        SFW, safe for work, appropriate content, different person, distinct facial identity, unique individual, softly angular face, defined jawline, sharp nose bridge, deep-set eyes, average eye spacing, balanced proportions, subtle eyebrows, thin lips, small chin, neutral expression, light smile lines, natural facial asymmetry, realistic pores, realistic skin texture",
+                "identity_signature": "88e54e784c2d",
+                "creative_variations": {
+                    "pose": {
+                        "code": "power_stance",
+                        "mood_impact": "commanding, confident",
+                        "prompt_modifier": "confident power pose, leadership stance, authoritative positioning",
+                        "creativity_level": 6,
+                        "professional_level": 9,
+                        "use_case_compatibility": [
+                            "executive_portrait",
+                            "advertisement_model"
+                        ]
+                    },
+                    "lighting": {
+                        "code": "studio_dramatic",
+                        "mood_impact": "powerful, authoritative",
+                        "prompt_modifier": "dramatic studio lighting, professional photography, strong contrast",
+                        "creativity_level": 8,
+                        "professional_level": 9,
+                        "use_case_compatibility": [
+                            "executive_portrait",
+                            "advertisement_model"
+                        ]
+                    }
+                },
+                "preservation_strength": null
+            },
+            "created_at": "2026-02-13T15:26:58.967777+00:00",
+            "updated_at": "2026-02-13T15:26:58.967777+00:00",
+            "display_name": "Face Variant 1",
+            "attributes_json": {
+                "gender": "person",
+                "style_code": null,
+                "region_code": null,
+                "context_code": null,
+                "platform_code": null,
+                "use_case_code": "advertisement_model",
+                "age_range_code": "established_professional",
+                "skin_tone_code": "medium_brown",
+                "image_format_code": "business_card",
+                "clothing_style_code": null
+            },
+            "primary_image_asset_id": "aec59885-cdbe-4ce4-b041-1ea11d56548f"
+        }
+    ],
+    "face_job_outputs": [
+        {
+            "id": "ab85cbf7-1d1c-4d5b-b833-9e80767ed15d",
+            "job_id": "7062d555-d20f-4a30-92c2-ade5ab1dd6df",
+            "created_at": "2026-02-13T15:26:58.969118+00:00",
+            "prompt_used": "established professional, 29-35 years old, career growth phase, female person, medium brown warm skin, authentic Indian features, natural appearance, culturally accurate, commercial advertising style, product marketing ready, brand alignment, consumer appeal, dramatic studio lighting, professional photography, strong contrast, confident power pose, leadership stance, authoritative positioning, fully clothed, decent attire, appropriate clothing, \n        family-friendly, culturally respectful, elegant, \n        professional photography, high-quality portrait,\n        SFW, safe for work, appropriate content",
+            "identity_score": null,
+            "variant_number": 1,
+            "face_profile_id": "58de8479-8a76-4141-8e23-dedf75ffb8df",
+            "negative_prompt": "different age, different skin tone, different ethnicity, different gender, demographic change, western-only features, face morphing, identity drift, clone-like, identical appearance, monotonous, generic stock photo, low quality, blurry, distorted, deformed, watermark, text overlay, nude, nudity, naked, nsfw, explicit, sexual, pornographic, obscene, \ninappropriate, adult content, revealing clothing, transparent clothing, \nsee-through, exposed body parts, sexual acts, suggestive poses,\nviolence, blood, gore, weapons, fighting, abuse, \nchild in inappropriate context, underage, \npolitical symbols, political figures, controversial symbols,\nhate symbols, offensive gestures, drugs, smoking, alcohol abuse,\nugly, distorted, deformed, extra limbs, bad anatomy,\nlow quality, blurry, watermark, text overlay, same person, identical face, twin, clone, repeated identity, same facial structure, same bone structure, same nose, same jawline, same cheekbones, overly generic face, stock photo face",
+            "output_asset_id": "aec59885-cdbe-4ce4-b041-1ea11d56548f",
+            "source_asset_id": null,
+            "technical_specs": {
+                "width": 1200,
+                "height": 1200,
+                "aspect_ratio": "1:1"
+            },
+            "identity_verified": null,
+            "creative_variations": {
+                "pose": {
+                    "code": "power_stance",
+                    "mood_impact": "commanding, confident",
+                    "prompt_modifier": "confident power pose, leadership stance, authoritative positioning",
+                    "creativity_level": 6,
+                    "professional_level": 9,
+                    "use_case_compatibility": [
+                        "executive_portrait",
+                        "advertisement_model"
+                    ]
+                },
+                "lighting": {
+                    "code": "studio_dramatic",
+                    "mood_impact": "powerful, authoritative",
+                    "prompt_modifier": "dramatic studio lighting, professional photography, strong contrast",
+                    "creativity_level": 8,
+                    "professional_level": 9,
+                    "use_case_compatibility": [
+                        "executive_portrait",
+                        "advertisement_model"
+                    ]
+                }
+            }
+        }
+    ]
+}

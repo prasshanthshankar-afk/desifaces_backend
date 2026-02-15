@@ -43,6 +43,8 @@ class MusicProjectsRepo:
         )
         return pid
 
+
+
     async def get(self, *, project_id: UUID, user_id: UUID) -> dict | None:
         pool = await get_pool()
         row = await pool.fetchrow(
@@ -52,6 +54,7 @@ class MusicProjectsRepo:
         )
         return dict(row) if row else None
 
+
     async def set_status(self, *, project_id: UUID, user_id: UUID, status: str) -> None:
         pool = await get_pool()
         await pool.execute(
@@ -60,6 +63,28 @@ class MusicProjectsRepo:
             user_id,
             status,
         )
+
+    async def set_intent_text(self, *, project_id: UUID, user_id: UUID, intent_text: str | None) -> None:
+        pool = await get_pool()
+        await pool.execute(
+            """
+            update music_projects
+            set intent_text=$3,
+                intent_updated_at=case when $3 is null then intent_updated_at else now() end
+            where id=$1 and user_id=$2
+            """,
+            project_id, user_id, intent_text
+        )
+
+
+    async def get_intent_text(self, *, project_id: UUID, user_id: UUID) -> str | None:
+        pool = await get_pool()
+        row = await pool.fetchrow(
+            "select intent_text from music_projects where id=$1 and user_id=$2",
+            project_id, user_id
+        )
+        return (row["intent_text"] if row else None)
+
 
     async def update_style(
         self,
@@ -92,6 +117,10 @@ class MusicProjectsRepo:
             camera_edit,
             band_pack or [],  # avoid NULL into NOT NULL text[]
         )
+
+
+
+    
 
     async def upsert_performer(
         self,

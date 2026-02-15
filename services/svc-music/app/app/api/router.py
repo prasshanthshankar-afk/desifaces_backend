@@ -1,0 +1,2 @@
+from app.api.routes.music_candidates_routes import router as music_candidates_router
+app.include_router(music_candidates_router)

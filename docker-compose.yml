@@ -239,6 +239,103 @@ services:
     command: ["bash", "-lc", "python -m app.workers.face_worker"]
 
   # -------------------------
+  # Commerce API
+  # -------------------------
+  svc-commerce:
+    <<: *python_service
+    container_name: df-svc-commerce
+    build:
+      context: ./services/svc-commerce/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8008"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      PYTHONPATH: "/app"
+
+      # JWT (match svc-core signing/claims)
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      # Pricing stub knobs (svc-pricing later)
+      PRICING_SERVICE_URL: ${PRICING_SERVICE_URL:-}
+      COMMERCE_QUOTE_TTL_SECONDS: ${COMMERCE_QUOTE_TTL_SECONDS:-900}
+      COMMERCE_CREDIT_USD_RATE: ${COMMERCE_CREDIT_USD_RATE:-0.03}
+      COMMERCE_CREDIT_INR_RATE: ${COMMERCE_CREDIT_INR_RATE:-2.5}
+      COMMERCE_CREDITS_PER_IMAGE: ${COMMERCE_CREDITS_PER_IMAGE:-30}
+      COMMERCE_CREDITS_PER_VIDEO: ${COMMERCE_CREDITS_PER_VIDEO:-120}
+      COMMERCE_CREDITS_PER_CHANNEL_EXPORT: ${COMMERCE_CREDITS_PER_CHANNEL_EXPORT:-10}
+      COMMERCE_CREDITS_MARKETPLACE_PACK: ${COMMERCE_CREDITS_MARKETPLACE_PACK:-25}
+
+      # Providers (optional now; wire later)
+      FAL_API_KEY: ${FAL_API_KEY:-}
+      FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
+
+      # Optional service-to-service (future use)
+      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://df-svc-fusion:8002}
+      SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://df-svc-audio:8004}
+
+    command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8008}"]
+    expose: ["8008"]
+    ports: ["8008:8008"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  # -------------------------
+  # Commerce Worker
+  # -------------------------
+  svc-commerce-worker:
+    <<: *python_service
+    container_name: df-svc-commerce-worker
+    build:
+      context: ./services/svc-commerce/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      PYTHONPATH: "/app"
+
+      # JWT (match svc-core signing/claims)
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      # Pricing stub knobs (svc-pricing later)
+      PRICING_SERVICE_URL: ${PRICING_SERVICE_URL:-}
+      COMMERCE_QUOTE_TTL_SECONDS: ${COMMERCE_QUOTE_TTL_SECONDS:-900}
+      COMMERCE_CREDIT_USD_RATE: ${COMMERCE_CREDIT_USD_RATE:-0.03}
+      COMMERCE_CREDIT_INR_RATE: ${COMMERCE_CREDIT_INR_RATE:-2.5}
+      COMMERCE_CREDITS_PER_IMAGE: ${COMMERCE_CREDITS_PER_IMAGE:-30}
+      COMMERCE_CREDITS_PER_VIDEO: ${COMMERCE_CREDITS_PER_VIDEO:-120}
+      COMMERCE_CREDITS_PER_CHANNEL_EXPORT: ${COMMERCE_CREDITS_PER_CHANNEL_EXPORT:-10}
+      COMMERCE_CREDITS_MARKETPLACE_PACK: ${COMMERCE_CREDITS_MARKETPLACE_PACK:-25}
+
+      # Providers (optional now; wire later)
+      FAL_API_KEY: ${FAL_API_KEY:-}
+      FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
+
+      # Worker tuning (optional)
+      WORKER_POLL_SECS: ${COMMERCE_WORKER_POLL_SECS:-1.5}
+      WORKER_BATCH_SIZE: ${COMMERCE_WORKER_BATCH_SIZE:-1}
+
+    command: ["bash", "-lc", "python -m app.workers.commerce_worker"]
+
+  # -------------------------
   # Audio API
   # -------------------------
   svc-audio:
@@ -492,10 +589,13 @@ services:
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
-      PORT: "8007"
+      PYTHONPATH: "/app"
+
+      # Standardize internal port across services
+      PORT: "8000"
+
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
-      PYTHONPATH: "/app"
 
       # JWT (MUST match svc-core signing/claims)
       JWT_SECRET: ${JWT_SECRET}
@@ -507,13 +607,26 @@ services:
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       MUSIC_OUTPUT_CONTAINER: ${MUSIC_OUTPUT_CONTAINER:-music-output}
       MUSIC_SAS_HOURS: ${MUSIC_SAS_HOURS:-24}
-
+      
       HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
       HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
 
-    command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8007}"]
-    expose: ["8007"]
-    ports: ["8007:8007"]
+      # Cross-service (Docker network) — ALWAYS use :8000 internally
+      SVC_FACE_URL: ${SVC_FACE_URL:-http://svc-face:8000}
+      SVC_FACE_BEARER_TOKEN: ${SVC_FACE_BEARER_TOKEN:-}
+
+      # Optional tuning knobs (safe defaults)
+      SVC_FACE_TIMEOUT_SECS: ${SVC_FACE_TIMEOUT_SECS:-60}
+      SVC_FACE_POLL_SECS: ${SVC_FACE_POLL_SECS:-2}
+      SVC_FACE_WAIT_TIMEOUT_SECS: ${SVC_FACE_WAIT_TIMEOUT_SECS:-180}
+
+    command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT}"]
+    expose: ["8000"]
+    ports: ["8007:8000"]
+
+    init: true
+    restart: unless-stopped
+
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
       interval: 5s
@@ -533,11 +646,11 @@ services:
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
       PYTHONPATH: "/app"
 
-      # worker should NOT run uvicorn
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+
       JWT_SECRET: ${JWT_SECRET}
       JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
@@ -553,34 +666,17 @@ services:
 
       WORKER_POLL_SECS: ${MUSIC_WORKER_POLL_SECS:-1.5}
 
-    # worker should NOT run uvicorn
+      # Cross-service (Docker network)
+      SVC_FACE_URL: ${SVC_FACE_URL:-http://svc-face:8000}
+      SVC_FACE_TIMEOUT_SECS: ${SVC_FACE_TIMEOUT_SECS:-60}
+      SVC_FACE_POLL_SECS: ${SVC_FACE_POLL_SECS:-2}
+      SVC_FACE_WAIT_TIMEOUT_SECS: ${SVC_FACE_WAIT_TIMEOUT_SECS:-180}
+      SVC_FACE_BEARER_TOKEN: ${SVC_FACE_BEARER_TOKEN:-}
+
+    init: true
+    restart: unless-stopped
+
     command: ["bash", "-lc", "python -m app.workers.music_worker"]
-
-
-  svc-music-preset-embedder:
-    <<: *python_service
-    container_name: df-svc-music-preset-embedder
-    build:
-      context: ./services/svc-music/app
-      dockerfile: Dockerfile
-    environment:
-      LOG_LEVEL: "INFO"
-      PYTHONUNBUFFERED: "1"
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      PYTHONPATH: "/app"
-
-      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
-      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY}
-      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION}
-      AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT: ${AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}
-
-      PRESET_EMBED_TAG: "seed_v120"
-      PRESET_EMBED_BATCH_SIZE: "16"
-      PRESET_EMBED_SLEEP_SECS: "1.2"
-      PRESET_EMBED_DIM: "1536"
-
-    command: ["bash", "-lc", "python -m app.workers.preset_embedding_worker"]
 
 networks:
   df-net:

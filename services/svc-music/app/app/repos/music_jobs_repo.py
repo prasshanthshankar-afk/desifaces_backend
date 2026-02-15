@@ -41,9 +41,24 @@ class MusicJobsRepo:
         )
         return jid
 
-    async def get_video_job(self, *, job_id: UUID) -> Optional[dict]:
+    async def get_video_job(self, *, job_id: UUID) -> dict | None:
         pool = await get_pool()
-        row = await pool.fetchrow("select * from music_video_jobs where id=$1", job_id)
+        row = await pool.fetchrow(
+            """
+            select
+            sj.id,
+            (sj.meta_json->>'music_project_id')::uuid as project_id,
+            sj.status,
+            sj.payload_json,
+            sj.error_message as error,
+            sj.created_at,
+            sj.updated_at
+            from public.studio_jobs sj
+            where sj.id=$1
+            and sj.studio_type='music'
+            """,
+            job_id,
+        )
         return dict(row) if row else None
 
     async def list_queued_video_jobs(self, *, limit: int = 10) -> list[dict]:

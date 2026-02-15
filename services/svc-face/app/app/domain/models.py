@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, ConfigDict, model_validator
 # ENUMS
 # ============================================================================
 
+
 class Gender(str, Enum):
     MALE = "male"
     FEMALE = "female"
@@ -104,6 +105,7 @@ class StyleConfigView(BaseModel):
 # CREATOR PLATFORM (Phase-1: single_person / two_people)
 # ============================================================================
 
+
 class SubjectSpec(BaseModel):
     """
     One subject in the frame.
@@ -112,7 +114,6 @@ class SubjectSpec(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     gender: Optional[Gender] = None
-    # optional: couple/friends/acquaintances etc (config-table later)
     relationship_role: Optional[str] = None  # e.g., "partner", "friend", "colleague"
 
 
@@ -124,6 +125,12 @@ class CreatorPlatformRequest(BaseModel):
       - subject_composition_code: "single_person" | "two_people"
       - gender: optional hint for single_person
       - subjects: optional list (lets UI specify M+M, M+F, F+F)
+
+    I2I support:
+      - Old path: source_image_url
+      - New path: source_image_asset_id (returned by /api/face/assets/upload)
+        If source_image_asset_id is present and source_image_url is missing,
+        we automatically mirror asset_id into source_image_url so older code paths work.
     """
     model_config = ConfigDict(extra="ignore")
 
@@ -162,8 +169,10 @@ class CreatorPlatformRequest(BaseModel):
     seed: Optional[int] = None
     request_nonce: Optional[str] = None
 
-    # I2I
+    # I2I (old + new)
     source_image_url: Optional[str] = None
+    source_image_asset_id: Optional[str] = None
+
     preservation_strength: float = Field(0.75, ge=0.0, le=1.0)
     # higher = preserve identity more (minimal change)
 
@@ -182,22 +191,26 @@ class CreatorPlatformRequest(BaseModel):
         if self.subject_composition_code == "single_person":
             if not self.subjects:
                 self.subjects = [SubjectSpec(gender=self.gender)]
-            # keep gender in sync with first subject if not provided
             if self.gender is None and self.subjects and self.subjects[0].gender is not None:
                 self.gender = self.subjects[0].gender
 
         if self.subject_composition_code == "two_people":
             if not self.subjects:
                 self.subjects = [SubjectSpec(), SubjectSpec()]
-            # if UI accidentally sends 1 subject, pad it
             if len(self.subjects) == 1:
                 self.subjects = [self.subjects[0], SubjectSpec()]
+
+        # Bridge: if new field provided, mirror into source_image_url for older code paths.
+        if (not (self.source_image_url or "").strip()) and (self.source_image_asset_id or "").strip():
+            self.source_image_url = (self.source_image_asset_id or "").strip()
+
         return self
 
 
 # ============================================================================
 # RESPONSES (creator platform)
 # ============================================================================
+
 
 class JobCreatedResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -245,8 +258,9 @@ class CreatorConfigResponse(BaseModel):
 
 
 # ============================================================================
-# DB TABLE MODELS (keep if you actually use them; otherwise can live elsewhere)
+# DB TABLE MODELS
 # ============================================================================
+
 
 class StudioJobDB(BaseModel):
     model_config = ConfigDict(extra="ignore")

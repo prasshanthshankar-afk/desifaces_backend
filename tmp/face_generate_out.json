@@ -1,0 +1,1 @@
+{"job_id":"e9e91e9c-4f11-47ac-a7e1-4cf2a8168389","status":"queued","message":"Creator face generation started","estimated_completion_time":"~60 seconds","config":{"use_case":null,"image_format":"business_card","platform_optimized":true,"variants_requested":2,"demographics_fixed":true,"creativity_varied":true,"mode":"text-to-image"}}

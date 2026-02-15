@@ -398,7 +398,11 @@ async def creator_list_jobs(
 
     creator_job_ids: List[str] = []
     for j in jobs:
-        meta = j.get("meta_json") or {}
+        # meta = j.get("meta_json") or {}
+        if isinstance(j, dict):
+            meta = j.get("meta_json") or {}
+        else:
+            meta = getattr(j, "meta_json", None) or {}
         if meta.get("request_type") == "creator_platform":
             creator_job_ids.append(str(j["id"]))
 

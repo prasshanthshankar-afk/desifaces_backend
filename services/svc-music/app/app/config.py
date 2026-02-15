@@ -34,11 +34,26 @@ class Settings(BaseSettings):
     FAL_QUEUE_BASE_URL: str = "https://queue.fal.run"
 
     # Music autopilot provider routing
-    MUSIC_AUTOPILOT_PROVIDER: str = "fal_sonauto_v2"  # default
+    MUSIC_AUTOPILOT_PROVIDER: str = "fal_sonauto_v2"
     MUSIC_FAL_POLL_SECONDS: float = 2.5
-    MUSIC_FAL_TIMEOUT_SECONDS: int = 900  # 15 minutes
-    MUSIC_FAL_OBJECT_LIFECYCLE_SECONDS: int = 3600  # 1 hour on fal storage
-    MUSIC_FAL_START_TIMEOUT_SECONDS: int | None = None  # optional “start within N seconds”
+    MUSIC_FAL_TIMEOUT_SECONDS: int = 900
+    MUSIC_FAL_OBJECT_LIFECYCLE_SECONDS: int = 3600
+    MUSIC_FAL_START_TIMEOUT_SECONDS: int | None = None
+
+    # -----------------------------
+    # svc-face integration (KEEP CURRENT PORTS)
+    # -----------------------------
+    # Inside docker network, svc-face is reachable at service-name:8003
+    SVC_FACE_URL: str = "http://svc-face:8003"
+
+    # Optional: service-to-service token for worker calls (no user request context)
+    # For now you can set this to your admin TOKEN during E2E testing.
+    SVC_FACE_BEARER_TOKEN: str | None = None
+
+    # Optional tuning knobs
+    SVC_FACE_TIMEOUT_SECS: float = 60.0
+    SVC_FACE_POLL_SECS: float = 2.0
+    SVC_FACE_WAIT_TIMEOUT_SECS: float = 180.0
 
 
 settings = Settings()

@@ -8,7 +8,7 @@ import time
 import wave
 from pathlib import Path
 from typing import Optional, Any, Dict, List, Tuple
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app.config import settings
 from app.db import get_pool
@@ -26,6 +26,8 @@ from app.repos.steps_repo import StepsRepo
 from app.services.azure_storage_service import AzureStorageService
 
 from .music_graph import MusicGraphState, MusicGraphTools, GraphTrack, run_video_pipeline
+
+from app.clients.svc_face_client import SvcFaceClient
 
 # Optional: keep orchestrator lean; planner lives elsewhere.
 try:
@@ -58,6 +60,9 @@ except Exception:
 # -----------------------------
 # Queue / worker integration
 # -----------------------------
+from app.services.music_tools import ConcreteMusicTools
+
+
 async def enqueue_video_job(job_id: UUID) -> None:
     # DB polling worker: can be no-op. If you later add a real queue (Redis/ASB),
     # enqueue a message here.
@@ -84,6 +89,271 @@ def _as_dict(x: Any) -> Dict[str, Any]:
                 return {}
         return {}
     return {}
+
+
+def _normalize_jsonb_payload(x: Any) -> Dict[str, Any]:
+    """
+    Handles jsonb that is:
+      - a dict already
+      - a JSON string representing a dict
+      - a JSON string-scalar whose value is JSON text (needs json.loads twice)
+    """
+    if x is None:
+        return {}
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return {}
+        for _ in range(2):
+            try:
+                obj = json.loads(s)
+            except Exception:
+                return {}
+            if isinstance(obj, dict):
+                return obj
+            if isinstance(obj, str):
+                s = obj.strip()
+                continue
+            return {}
+        return {}
+    return {}
+
+
+def _default_face_prompt_from_music(*, proj: Dict[str, Any], input_json: Dict[str, Any], which: str) -> str:
+    """
+    Deterministic, safe default face prompt for music videos.
+    You can later make this richer (region/style/etc).
+    """
+    computed = _as_dict(input_json.get("computed"))
+    hints = _as_dict(input_json.get("provider_hints"))
+
+    # Allow caller overrides from payload
+    key_prompt = f"{which}_face_prompt"
+    p = (computed.get(key_prompt) or hints.get(key_prompt) or computed.get("performer_face_prompt") or hints.get("performer_face_prompt") or "").strip()
+    if p:
+        return p
+
+    title = str(proj.get("title") or "Music Video").strip()
+    lang = str(proj.get("language_hint") or "en").strip()
+
+    # Neutral + broadly “Indian performer” but not overfitted; safe for demos.
+    return (
+        f"High-quality studio headshot portrait of an Indian performer for '{title}'. "
+        f"Photorealistic, natural skin texture, cinematic soft lighting, centered, sharp focus, "
+        f"neutral background, 4k. Language hint: {lang}. "
+        f"Distinct person, unique face."
+    )
+
+
+def _svc_face_internal_bearer_token(bearer_token: Optional[str]) -> Optional[str]:
+    """
+    Prefer request bearer_token (API call path).
+    Fallback to service token for worker context.
+
+    NOTE: SvcFaceClient also has its own fallback, but keeping this helper
+    makes the intent explicit and avoids surprising missing-token errors.
+    """
+    t = (bearer_token or "").strip()
+    if t:
+        return t
+    # do NOT crash if Settings doesn't define it
+    fb = getattr(settings, "SVC_FACE_BEARER_TOKEN", None)
+    fb = (str(fb).strip() if fb else "")
+    return fb or None
+
+
+async def _ensure_performer_face_image_url(
+    *,
+    bearer_token: Optional[str],
+    face_prompt: str,
+    request_nonce: Optional[str] = None,
+) -> str:
+    """
+    Generates a face via svc-face and returns a usable image_url (SAS).
+
+    IMPORTANT:
+    - Uses seed_mode=random and a request_nonce to avoid deterministic repeats.
+    - Works in worker context via SVC_FACE_BEARER_TOKEN fallback.
+    """
+    token = _svc_face_internal_bearer_token(bearer_token)
+
+    face = SvcFaceClient(settings.SVC_FACE_URL)
+
+    payload = {
+        "mode": "text-to-image",
+        "num_variants": 1,
+        "language": "en",
+        "user_prompt": face_prompt,
+        "seed_mode": "random",
+        "request_nonce": request_nonce or uuid4().hex,
+    }
+
+    # Use explicit timeouts if you’ve added them in compose/env; safe defaults otherwise.
+    post_timeout_s = float(getattr(settings, "SVC_FACE_TIMEOUT_SECS", 60) or 60)
+    poll_s = float(getattr(settings, "SVC_FACE_POLL_SECS", 2) or 2)
+    wait_timeout_s = float(getattr(settings, "SVC_FACE_WAIT_TIMEOUT_SECS", 180) or 180)
+
+    face_job_id = await face.create_creator_face_job(
+        bearer_token=token,
+        payload=payload,
+        timeout_s=post_timeout_s,
+        retries=0,  # keep 0 to avoid duplicate jobs if svc-face doesn't dedupe by request_nonce
+    )
+
+    res = await face.wait_for_creator_face(
+        bearer_token=token,
+        job_id=face_job_id,
+        timeout_s=wait_timeout_s,
+        poll_s=poll_s,
+    )
+
+    st = str(getattr(res, "status", "") or "").strip().lower()
+    img = str(getattr(res, "image_url", "") or "").strip()
+
+    # IMPORTANT: tolerate "jobstatus.succeeded"
+    if ("succeeded" not in st) or not img:
+        raise RuntimeError(
+            f"svc-face failed or timed out: job_id={face_job_id} status={st} has_image={bool(img)}"
+        )
+
+    return img
+
+
+def _safe_default_face_prompt_from_music(
+    *, proj: Dict[str, Any], input_json: Dict[str, Any], which: str
+) -> str:
+    """
+    Uses your existing _default_face_prompt_from_music() if present; otherwise a safe fallback.
+    Prevents NameError and guarantees a usable prompt.
+    """
+    fn = globals().get("_default_face_prompt_from_music")
+    if callable(fn):
+        try:
+            p = fn(proj=proj, input_json=input_json, which=which)
+            p = str(p or "").strip()
+            if p:
+                return p
+        except Exception:
+            pass
+
+    computed = _as_dict(input_json.get("computed"))
+    lang = str(proj.get("language_hint") or computed.get("language_hint") or "en-IN").strip()
+    title = str(proj.get("title") or computed.get("title") or "Untitled").strip()
+    gender_hint = str(computed.get(f"{which}_gender") or computed.get("gender_hint") or "").strip()
+
+    base = (
+        "Ultra-realistic portrait photo, high detail, natural skin texture, "
+        "soft studio lighting, sharp focus, neutral background, looking at camera."
+    )
+    who = "Indian performer A" if which == "performer_a" else "Indian performer B"
+    extra = f" {gender_hint}." if gender_hint else ""
+    return f"{base} {who}.{extra} For music video titled '{title}'. Language hint {lang}."
+
+
+async def _ensure_music_job_performer_faces(
+    *,
+    jobs: MusicJobsRepo,
+    steps: StepsRepo,
+    job_id: UUID,
+    proj: Dict[str, Any],
+    input_json: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Ensures performer face image URL(s) exist in input_json['computed'].
+    Writes:
+      computed.performer_a_image_url
+      computed.performer_b_image_url (if duet layout)
+      computed.performer_images = [..]
+    """
+    computed = _as_dict(input_json.get("computed"))
+    duet_layout = str(proj.get("duet_layout") or "split_screen").strip().lower()
+
+    # Expand safely if you add layouts later
+    needs_two = duet_layout in {
+        "split_screen",
+        "split-screen",
+        "duet",
+        "side_by_side",
+        "side-by-side",
+        "two_shot",
+        "two-shot",
+        "two_shots",
+        "two-shots",
+        "dual",
+        "double",
+    }
+
+    # Read current values
+    a_url = str(computed.get("performer_a_image_url") or "").strip()
+    b_url = str(computed.get("performer_b_image_url") or "").strip()
+
+    # If duet not needed, ignore B in performer_images (but keep stored if present)
+    if a_url and (b_url or not needs_two):
+        computed["performer_images"] = [a_url] + ([b_url] if (needs_two and b_url) else [])
+        input_json["computed"] = computed
+        return input_json
+
+    # Mark step running (best-effort)
+    try:
+        await steps.upsert_step(
+            job_id=job_id,
+            step_code="ensure_performer_faces",
+            status="running",
+            meta_json={"duet_layout": duet_layout, "needs_two": needs_two},
+        )
+    except Exception:
+        pass
+
+    # Worker path: no user JWT; _ensure_performer_face_image_url() will fallback to internal token.
+    token: Optional[str] = None
+
+    # Generate performer A if missing
+    if not a_url:
+        prompt_a = _safe_default_face_prompt_from_music(proj=proj, input_json=input_json, which="performer_a")
+        a_url = await _ensure_performer_face_image_url(
+            bearer_token=token,
+            face_prompt=prompt_a,
+            request_nonce=f"a_{uuid4().hex}",
+        )
+        computed["performer_a_image_url"] = a_url
+
+    # Generate performer B if needed + missing
+    if needs_two and not b_url:
+        prompt_b = _safe_default_face_prompt_from_music(proj=proj, input_json=input_json, which="performer_b")
+        # Nudge distinctness (minimal, won’t change overall semantics)
+        prompt_b = f"{prompt_b} Different person from performer A."
+        b_url = await _ensure_performer_face_image_url(
+            bearer_token=token,
+            face_prompt=prompt_b,
+            request_nonce=f"b_{uuid4().hex}",
+        )
+        computed["performer_b_image_url"] = b_url
+
+    # Always write performer_images deterministically
+    computed["performer_images"] = [a_url] + ([b_url] if (needs_two and b_url) else [])
+    input_json["computed"] = computed
+
+    # Persist for downstream tools/pipeline (this is important; don't swallow failures)
+    await jobs.set_video_job_input_json(job_id=job_id, input_json=input_json)
+
+    # Mark step succeeded (best-effort)
+    try:
+        await steps.upsert_step(
+            job_id=job_id,
+            step_code="ensure_performer_faces",
+            status="succeeded",
+            meta_json={
+                "performer_a": bool(a_url),
+                "performer_b": bool(b_url) if needs_two else False,
+                "needs_two": needs_two,
+            },
+        )
+    except Exception:
+        pass
+
+    return input_json
 
 
 def _as_list(x: Any) -> List[Any]:
@@ -179,7 +449,6 @@ def _fallback_music_plan(*, mode: str, language: str | None, hints: Dict[str, An
     if not isinstance(style_refs, list):
         style_refs = []
 
-    # Simple mode-aware structure
     if str(mode).lower() == MusicProjectMode.byo.value:
         steps = [
             {"step": "ingest_audio", "why": "Use your uploaded track as the master audio"},
@@ -414,7 +683,7 @@ def _maybe_import_alignment():
 
 
 # -----------------------------
-# studio_jobs envelope helpers (NEW / FIXED)
+# studio_jobs envelope helpers
 # -----------------------------
 async def _table_exists(*, pool, regclass_text: str) -> bool:
     try:
@@ -458,7 +727,6 @@ def _studio_request_hash(*, user_id: UUID, studio_type: str, job_id: UUID, paylo
 
 
 def _studio_type_candidates() -> List[str]:
-    # Try common enum/check variants
     vals = ["music", "MUSIC", "music_studio", "MUSIC_STUDIO", "svc_music", "SVC_MUSIC"]
     out: List[str] = []
     seen = set()
@@ -492,7 +760,7 @@ async def _ensure_studio_job_envelope(
     input_json: Dict[str, Any] | None = None,
     meta_json: Dict[str, Any] | None = None,
 ) -> None:
-    if not await _table_exists(pool, regclass_text="public.studio_jobs"):
+    if not await _table_exists(pool=pool, regclass_text="public.studio_jobs"):
         return
 
     try:
@@ -502,7 +770,7 @@ async def _ensure_studio_job_envelope(
     except Exception:
         pass
 
-    cols = await _get_table_columns(pool, schema="public", table="studio_jobs")
+    cols = await _get_table_columns(pool=pool, schema="public", table="studio_jobs")
     required = {"id", "studio_type", "status", "request_hash", "payload_json", "meta_json", "user_id"}
     if not required.issubset(cols):
         return
@@ -556,14 +824,13 @@ async def _update_studio_job_status_best_effort(
     if not cols:
         return
 
-    # Try a few status variants in case of enum/check constraints
     for st in _studio_status_candidates(status):
         sets: List[str] = []
         params: List[Any] = []
 
-        def set_param(expr_col: str, val: Any) -> None:
+        def set_param(col: str, val: Any) -> None:
             params.append(val)
-            sets.append(f"{expr_col}=${len(params) + 1}")  # +1 because id is $1 in execute below
+            sets.append(f"{col}=${len(params) + 1}")  # +1 because id is $1
 
         if "status" in cols:
             set_param("status", st)
@@ -599,6 +866,47 @@ async def _update_studio_job_status_best_effort(
             continue
 
     return
+
+
+async def _persist_fusion_payload_best_effort(*, job_id: UUID, fusion_payload: Dict[str, Any]) -> None:
+    """
+    Persist fusion_payload into public.studio_jobs.payload_json for dashboard access.
+    Safe no-op if studio_jobs/payload_json isn't present.
+    """
+    pool = await get_pool()
+    if not await _table_exists(pool=pool, regclass_text="public.studio_jobs"):
+        return
+
+    cols = await _get_table_columns(pool=pool, schema="public", table="studio_jobs")
+    if "payload_json" not in cols:
+        return
+
+    try:
+        await pool.execute(
+            """
+            update public.studio_jobs
+            set payload_json = jsonb_set(
+                    case
+                        when payload_json is null then '{}'::jsonb
+                        when jsonb_typeof(payload_json) = 'object' then payload_json
+                        when jsonb_typeof(payload_json) = 'string'
+                         and left(payload_json #>> '{}', 1) in ('{','[')
+                        then (payload_json #>> '{}')::jsonb
+                        else '{}'::jsonb
+                    end,
+                    '{fusion_payload}',
+                    $2::jsonb,
+                    true
+                ),
+                updated_at = now()
+            where id = $1
+            """,
+            job_id,
+            json.dumps(fusion_payload),
+        )
+    except Exception:
+        # Never fail publish because dashboard persistence failed.
+        return
 
 
 # -----------------------------
@@ -667,7 +975,6 @@ async def _update_media_asset_refs_best_effort(
             meta_obj if meta_obj else {},
         )
     except Exception:
-        # If meta_json update fails for any reason, still update storage_ref
         await pool.execute(
             """
             update public.media_assets
@@ -693,13 +1000,17 @@ def _resolve_container_and_path(
 
     url_container, url_path = (None, None)
     if storage_ref:
-        url_container, url_path = AzureStorageService.parse_blob_url(storage_ref)
+        try:
+            url_container, url_path = AzureStorageService.parse_blob_url(storage_ref)
+        except Exception:
+            url_container, url_path = (None, None)
 
     blob_path = meta_path or url_path
 
     container = meta_container or url_container
     if not container and blob_path:
-        container = _fallback_input_container()
+        # default container is chosen by caller; leave None here to allow caller selection.
+        container = None
 
     return container, blob_path, meta_container, url_container
 
@@ -754,7 +1065,6 @@ async def _resolve_voice_ref_sas_url(
         if c and c not in candidates:
             candidates.append(c)
 
-    last_err: Optional[Exception] = None
     for c in candidates:
         try:
             storage = AzureStorageService(container=c)
@@ -768,44 +1078,181 @@ async def _resolve_voice_ref_sas_url(
                 storage_path=blob_path,
             )
             return refreshed
-        except Exception as e:
-            last_err = e
+        except Exception:
             continue
 
-    _ = last_err
     return storage_ref or None
+
+
+# -----------------------------
+# FULL MIX URL resolution (production-grade)
+# -----------------------------
+async def _resolve_full_mix_audio_url_from_track(*, project_id: UUID, user_id: UUID | None = None) -> Optional[str]:
+    """
+    Resolve a *fresh* SAS URL for the full_mix audio by reading music_tracks refs.
+    Priority:
+      1) music_tracks.media_asset_id -> media_assets(storage_ref/meta_json) -> refresh SAS using container+storage_path if possible
+      2) music_tracks.artifact_id    -> music_artifacts(storage_path) -> SAS via MUSIC_OUTPUT_CONTAINER
+      3) fallback to stored media_assets.storage_ref if it is already a URL
+    """
+    pool = await get_pool()
+
+    track = await pool.fetchrow(
+        """
+        select media_asset_id, artifact_id
+        from public.music_tracks
+        where project_id=$1 and track_type='full_mix'
+        limit 1
+        """,
+        project_id,
+    )
+    if not track:
+        return None
+
+    media_asset_id = track.get("media_asset_id")
+    if media_asset_id:
+        try:
+            if user_id:
+                ma = await pool.fetchrow(
+                    "select id, user_id, storage_ref, meta_json from public.media_assets where id=$1 and user_id=$2",
+                    media_asset_id,
+                    user_id,
+                )
+            else:
+                ma = await pool.fetchrow(
+                    "select id, user_id, storage_ref, meta_json from public.media_assets where id=$1",
+                    media_asset_id,
+                )
+
+            if ma:
+                storage_ref = str(ma.get("storage_ref") or "") or None
+                meta_json = ma.get("meta_json")
+
+                container, blob_path, meta_container, url_container = _resolve_container_and_path(
+                    storage_ref=storage_ref,
+                    meta_json=meta_json,
+                )
+
+                # Full-mix is output by default, but allow meta/url container if present.
+                candidates: List[str] = []
+                for c in (meta_container, url_container, container):
+                    if c and c not in candidates:
+                        candidates.append(c)
+                for c in (_fallback_output_container(), _fallback_input_container()):
+                    if c and c not in candidates:
+                        candidates.append(c)
+
+                if blob_path:
+                    for c in candidates:
+                        try:
+                            storage = AzureStorageService(container=c)
+                            refreshed = storage.sas_url_for(blob_path)
+                            try:
+                                await _update_media_asset_refs_best_effort(
+                                    pool=pool,
+                                    asset_id=UUID(str(media_asset_id)),
+                                    new_storage_ref=refreshed,
+                                    container=c,
+                                    storage_path=blob_path,
+                                )
+                            except Exception:
+                                pass
+                            return refreshed
+                        except Exception:
+                            continue
+
+                # If we can't refresh, last resort: return stored URL if present (may still be valid).
+                if storage_ref and storage_ref.startswith("http"):
+                    return storage_ref
+        except Exception:
+            pass
+
+    artifact_id = track.get("artifact_id")
+    if artifact_id:
+        try:
+            r = await pool.fetchrow(
+                "select storage_path from public.music_artifacts where id=$1",
+                artifact_id,
+            )
+            sp = str(r["storage_path"]).strip() if r and r.get("storage_path") else None
+            if sp:
+                storage = AzureStorageService(container=_fallback_output_container())
+                return storage.sas_url_for(sp)
+        except Exception:
+            pass
+
+    return None
 
 
 async def _resolve_url_from_refs(
     *, user_id: UUID, media_asset_id: UUID | None, artifact_id: UUID | None
 ) -> Optional[str]:
     """
-    Best-effort: resolve a URL from media_assets.storage_ref or artifacts.storage_ref.
+    Best-effort URL resolution:
+      - media_assets: refresh SAS using meta_json.container + storage_path if available; else return storage_ref if URL
+      - music_artifacts: SAS from storage_path via MUSIC_OUTPUT_CONTAINER
     """
     pool = await get_pool()
+
     if media_asset_id:
         try:
             r = await pool.fetchrow(
-                "select storage_ref from public.media_assets where id=$1 and user_id=$2",
+                "select storage_ref, meta_json from public.media_assets where id=$1 and user_id=$2",
                 media_asset_id,
                 user_id,
             )
-            if r and r.get("storage_ref"):
-                return str(r["storage_ref"])
+            if r:
+                storage_ref = str(r.get("storage_ref") or "") or None
+                container, blob_path, meta_container, url_container = _resolve_container_and_path(
+                    storage_ref=storage_ref,
+                    meta_json=r.get("meta_json"),
+                )
+
+                candidates: List[str] = []
+                for c in (meta_container, url_container, container):
+                    if c and c not in candidates:
+                        candidates.append(c)
+                for c in (_fallback_output_container(), _fallback_input_container()):
+                    if c and c not in candidates:
+                        candidates.append(c)
+
+                if blob_path:
+                    for c in candidates:
+                        try:
+                            storage = AzureStorageService(container=c)
+                            refreshed = storage.sas_url_for(blob_path)
+                            try:
+                                await _update_media_asset_refs_best_effort(
+                                    pool=pool,
+                                    asset_id=UUID(str(media_asset_id)),
+                                    new_storage_ref=refreshed,
+                                    container=c,
+                                    storage_path=blob_path,
+                                )
+                            except Exception:
+                                pass
+                            return refreshed
+                        except Exception:
+                            continue
+
+                if storage_ref and storage_ref.startswith("http"):
+                    return storage_ref
         except Exception:
             pass
+
     if artifact_id:
-        for col in ("storage_ref", "url", "blob_url"):
-            try:
-                r = await pool.fetchrow(
-                    f"select {col} from public.artifacts where id=$1 and user_id=$2",
-                    artifact_id,
-                    user_id,
-                )
-                if r and r.get(col):
-                    return str(r[col])
-            except Exception:
-                continue
+        try:
+            r = await pool.fetchrow(
+                "select storage_path from public.music_artifacts where id=$1",
+                artifact_id,
+            )
+            sp = str(r["storage_path"]).strip() if r and r.get("storage_path") else None
+            if sp:
+                storage = AzureStorageService(container=_fallback_output_container())
+                return storage.sas_url_for(sp)
+        except Exception:
+            pass
+
     return None
 
 
@@ -822,12 +1269,18 @@ async def get_video_job_status(*, job_id: UUID, user_id: UUID) -> Optional[Music
     if not job:
         return None
 
+    payload = _normalize_jsonb_payload(job.get("payload_json"))
+
+    computed: Dict[str, Any] = _as_dict(payload.get("computed"))
+    clip_manifest_raw = computed.get("clip_manifest") or payload.get("clip_manifest")
+    clip_manifest_dict = clip_manifest_raw if isinstance(clip_manifest_raw, dict) else _as_dict(clip_manifest_raw)
+    clip_manifest: Optional[Dict[str, Any]] = clip_manifest_dict if clip_manifest_dict else None
+
     proj = await projects.get(project_id=job["project_id"], user_id=user_id)
     if not proj:
         return None
 
     track_rows = await tracks_repo.list_by_project(project_id=job["project_id"])
-
     last = await steps.latest_step(job_id=job_id)
 
     progress01 = _progress01(job.get("progress"))
@@ -852,12 +1305,20 @@ async def get_video_job_status(*, job_id: UUID, user_id: UUID) -> Optional[Music
             for r in track_rows
         ],
         error=job.get("error"),
+        computed=computed,
+        clip_manifest=clip_manifest,
     )
 
 
 async def publish_project_to_video_or_fusion(
     *, job_id: UUID, user_id: UUID, publish_in: PublishMusicIn
 ) -> Optional[PublishMusicOut]:
+    """
+    Production-grade publish:
+      - Enforces consent
+      - Resolves FULL MIX URL from music_tracks refs (media_assets / music_artifacts) with fresh SAS
+      - Persists fusion_payload into studio_jobs.payload_json for dashboards
+    """
     jobs = MusicJobsRepo()
     projects = MusicProjectsRepo()
     tracks_repo = MusicTracksRepo()
@@ -870,6 +1331,14 @@ async def publish_project_to_video_or_fusion(
     if not proj:
         return None
 
+    consent_dict = _as_dict(getattr(publish_in, "consent", None))
+    if not _is_truthy(consent_dict.get("accepted")):
+        return PublishMusicOut(status="error_consent_required", video_job_id=job_id, fusion_payload=None)
+
+    target = str(getattr(publish_in, "target", "fusion") or "fusion").strip().lower()
+    if target not in ("viewer", "fusion"):
+        target = "fusion"
+
     if str(job["status"]) == MusicJobStatus.failed.value:
         return PublishMusicOut(status="error_job_failed", video_job_id=job_id, fusion_payload=None)
 
@@ -880,6 +1349,7 @@ async def publish_project_to_video_or_fusion(
     hints = _as_dict(input_json.get("provider_hints"))
     computed = _as_dict(input_json.get("computed"))
 
+    # Start with any hinted BYO URL (legacy), but we will override with track refs if present.
     audio_url, _ = _get_byo_audio(hints, input_json)
     if not audio_url:
         audio_url = computed.get("audio_master_url") or computed.get("byo_audio_url") or computed.get("demo_audio_url")
@@ -898,10 +1368,25 @@ async def publish_project_to_video_or_fusion(
     if not full:
         return PublishMusicOut(status="error_missing_full_mix", video_job_id=job_id, fusion_payload=None)
 
+    # 1) If meta_json already has url, it is acceptable (but may be stale). Prefer refreshing from refs.
+    # 2) If refs exist, resolve fresh SAS from media_assets/music_artifacts.
+    resolved_from_track: Optional[str] = None
+    try:
+        if full.get("media_asset_id") or full.get("artifact_id"):
+            resolved_from_track = await _resolve_full_mix_audio_url_from_track(
+                project_id=UUID(str(proj["id"])),
+                user_id=user_id,
+            )
+    except Exception:
+        resolved_from_track = None
+
     track_url = _track_url(full.get("meta_json"))
-    if track_url:
+    if resolved_from_track:
+        audio_url = resolved_from_track
+    elif track_url:
         audio_url = track_url
 
+    # Final fallback: resolve from refs directly
     if not audio_url:
         try:
             audio_url = await _resolve_url_from_refs(
@@ -912,10 +1397,11 @@ async def publish_project_to_video_or_fusion(
         except Exception:
             audio_url = None
 
-    has_audio_ref = bool(full.get("artifact_id") or full.get("media_asset_id") or audio_url)
+    has_audio_ref = bool(audio_url or full.get("artifact_id") or full.get("media_asset_id"))
     if not has_audio_ref:
         return PublishMusicOut(status="error_missing_full_mix_ref", video_job_id=job_id, fusion_payload=None)
 
+    # Voice reference (fresh SAS) — optional
     voice_ref_asset_id = None
     try:
         if proj.get("voice_ref_asset_id"):
@@ -932,13 +1418,31 @@ async def publish_project_to_video_or_fusion(
         except Exception:
             vr_uuid = None
         if vr_uuid:
-            fresh = await _resolve_voice_ref_sas_url(
-                project_id=UUID(str(proj["id"])),
-                user_id=user_id,
-                voice_ref_asset_id=vr_uuid,
+            try:
+                fresh = await _resolve_voice_ref_sas_url(
+                    project_id=UUID(str(proj["id"])),
+                    user_id=user_id,
+                    voice_ref_asset_id=vr_uuid,
+                )
+                if fresh:
+                    voice_ref_url = fresh
+            except Exception:
+                pass
+
+    # Duration: prefer track row; if empty/zero try media_assets.duration_ms (best effort)
+    duration_ms = int(full.get("duration_ms") or 0)
+    if duration_ms <= 0 and full.get("media_asset_id"):
+        try:
+            pool = await get_pool()
+            d = await pool.fetchval(
+                "select duration_ms from public.media_assets where id=$1 and user_id=$2",
+                full.get("media_asset_id"),
+                user_id,
             )
-            if fresh:
-                voice_ref_url = fresh
+            if d:
+                duration_ms = int(d)
+        except Exception:
+            pass
 
     base_payload = {
         "project_id": str(proj["id"]),
@@ -947,7 +1451,8 @@ async def publish_project_to_video_or_fusion(
             "artifact_id": str(full["artifact_id"]) if full.get("artifact_id") else None,
             "media_asset_id": str(full["media_asset_id"]) if full.get("media_asset_id") else None,
             "url": audio_url,
-            "duration_ms": int(full.get("duration_ms") or 0),
+            "duration_ms": duration_ms,
+            "content_type": _guess_audio_content_type(audio_url, default=_track_ct(full.get("meta_json")) or "audio/mpeg"),
         },
         "voice_reference": {"voice_ref_asset_id": voice_ref_asset_id, "url": voice_ref_url}
         if (voice_ref_asset_id or voice_ref_url)
@@ -957,531 +1462,20 @@ async def publish_project_to_video_or_fusion(
         "timed_lyrics_inline": computed.get("timed_lyrics_json"),
         "duet_layout": proj["duet_layout"],
         "language_hint": proj.get("language_hint"),
-        "target": publish_in.target,
-        "consent": publish_in.consent,
+        "target": target,
+        "consent": consent_dict,
     }
 
-    if publish_in.target == "viewer":
+    # Persist for dashboards (your stored_audio_url query)
+    try:
+        await _persist_fusion_payload_best_effort(job_id=job_id, fusion_payload=base_payload)
+    except Exception:
+        pass
+
+    if target == "viewer":
         return PublishMusicOut(status="published_viewer", video_job_id=job_id, fusion_payload=base_payload)
 
     return PublishMusicOut(status="published", video_job_id=job_id, fusion_payload=base_payload)
-
-
-# -----------------------------
-# Tool implementation (pipeline actions)
-# -----------------------------
-class ConcreteMusicTools(MusicGraphTools):
-    """
-    Updated behavior to match modes:
-
-    - autopilot/co_create:
-        lyrics default generate (user doesn't need to type)
-    - byo:
-        lyrics default none (unless user uploads lyrics or timed_lyrics_json requested)
-    - timed_lyrics_json requested:
-        if lyrics missing, we auto-generate to allow alignment to succeed
-    """
-
-    def __init__(self, *, job_id: UUID, project_id: UUID, user_id: UUID, input_json: Dict[str, Any] | None = None):
-        self.job_id = job_id
-        self.project_id = project_id
-        self.user_id = user_id
-        self.input_json = input_json or {}
-
-        self.hints = _as_dict(self.input_json.get("provider_hints"))
-        self.quality = str(self.input_json.get("quality") or "standard")
-        self.seed = self.input_json.get("seed")
-
-        self._align_real, self._align_naive = _maybe_import_alignment()
-        self._planner = MusicPlanningService() if MusicPlanningService else None
-
-    def _demo_use_voice_ref_as_audio(self) -> bool:
-        return _is_truthy(self.hints.get("demo_use_voice_ref_as_audio") or self.hints.get("demo_voice_ref_as_audio"))
-
-    def _computed(self) -> Dict[str, Any]:
-        return _as_dict(self.input_json.get("computed"))
-
-    def _set_computed(self, key: str, value: Any) -> None:
-        c = _as_dict(self.input_json.get("computed"))
-        c[key] = value
-        self.input_json["computed"] = c
-
-    def _get_mode(self, s: MusicGraphState) -> str:
-        return _normalize_mode(getattr(s, "mode", None))
-
-    def _get_requested_outputs(self, s: MusicGraphState) -> set[str]:
-        return _outputs_set(getattr(s, "requested_outputs", []) or [])
-
-    def _pick_lyrics_source(self, *, mode: str, outputs: set[str], provided_lyrics: bool) -> str:
-        src = ((self.input_json.get("lyrics_source") or self.hints.get("lyrics_source") or "").strip().lower())
-
-        if provided_lyrics:
-            return "upload"
-
-        if src in ("generate", "upload", "none"):
-            if src == "none" and MusicTrackType.timed_lyrics_json.value in outputs:
-                return "generate"
-            return src
-
-        if mode == MusicProjectMode.byo.value:
-            return "generate" if MusicTrackType.timed_lyrics_json.value in outputs else "none"
-
-        return "generate"
-
-    def _generate_fallback_lyrics(self, s: MusicGraphState) -> str:
-        title = str(self.hints.get("title") or self.input_json.get("title") or "My Song").strip()
-        mood = str(self.hints.get("mood") or self.hints.get("vibe_hint") or "uplifting").strip()
-        genre = str(self.hints.get("genre") or self.hints.get("genre_hint") or "pop").strip()
-
-        chorus = f"{title}, {title}\nWe rise with a {mood} glow\n{title}, {title}\nLet the whole world know"
-        verse1 = (
-            f"Verse 1:\nIn the {mood} night, we find our way\nOne small step, then we sway\n"
-            f"Heartbeats sync to {genre} dreams\nNothing’s ever as it seems"
-        )
-        verse2 = (
-            "Verse 2:\nHold the line, don’t let it fade\nMoments bright that we have made\n"
-            "From today into the new\nI believe, and so do you"
-        )
-        bridge = "Bridge:\nBreathe in… breathe out…\nWe’re not alone, we’re here right now"
-
-        return f"{verse1}\n\nChorus:\n{chorus}\n\n{verse2}\n\n{bridge}\n\nChorus:\n{chorus}\n"
-
-    async def intent(self, s: MusicGraphState) -> Dict[str, Any]:
-        await self.ensure_music_plan(s)
-        return {
-            "mode": getattr(s, "mode", None),
-            "language_hint": getattr(s, "language_hint", None),
-            "quality": self.quality,
-            "seed": self.seed,
-        }
-
-    async def ensure_music_plan(self, s: MusicGraphState) -> None:
-        computed = self._computed()
-        force = _is_truthy(self.hints.get("force_replan") or self.input_json.get("force_replan"))
-        if not force and computed.get("music_plan"):
-            return
-
-        mode = self._get_mode(s)
-        language = getattr(s, "language_hint", None)
-
-        plan_payload: Any = None
-        if self._planner:
-            plan_out = await self._planner.build_plan(
-                mode=mode,
-                language=language,
-                hints=self.hints,
-                computed=computed,
-            )
-            if hasattr(plan_out, "model_dump"):
-                plan_payload = plan_out.model_dump(mode="json")  # type: ignore
-            elif isinstance(plan_out, dict):
-                plan_payload = plan_out
-            else:
-                plan_payload = {"summary": str(plan_out)}
-        else:
-            plan_payload = _fallback_music_plan(mode=mode, language=language, hints=self.hints)
-
-        self._set_computed("music_plan", plan_payload)
-
-        summary = _as_dict(plan_payload).get("summary")
-        if summary:
-            self._set_computed("plan_summary", summary)
-
-    async def creative_brief(self, s: MusicGraphState) -> Dict[str, Any]:
-        brief = {
-            "title": self.hints.get("title"),
-            "genre": self.hints.get("genre"),
-            "mood": self.hints.get("mood"),
-            "tempo": self.hints.get("tempo"),
-            "style_refs": self.hints.get("style_refs"),
-        }
-
-        await self.ensure_music_plan(s)
-
-        plan_summary = _as_dict(self._computed().get("music_plan")).get("summary") or self._computed().get("plan_summary")
-        if plan_summary:
-            brief["plan_summary"] = plan_summary
-
-        return brief
-
-    async def lyrics(self, s: MusicGraphState) -> Dict[str, Any]:
-        mode = self._get_mode(s)
-        outputs = self._get_requested_outputs(s)
-
-        provided = (
-            self.input_json.get("lyrics_text")
-            or self.hints.get("lyrics_text")
-            or self.hints.get("lyrics")
-            or self._computed().get("lyrics_text")
-        )
-        provided_text = str(provided).strip() if provided else ""
-        provided_lyrics = bool(provided_text)
-
-        src = self._pick_lyrics_source(mode=mode, outputs=outputs, provided_lyrics=provided_lyrics)
-
-        needs_lyrics = src in ("generate", "upload") or (MusicTrackType.timed_lyrics_json.value in outputs)
-        if not needs_lyrics or src == "none":
-            self._set_computed("lyrics_source_effective", "none")
-            return {}
-
-        if src == "upload" and not provided_text:
-            if MusicTrackType.timed_lyrics_json.value in outputs:
-                src = "generate"
-            else:
-                self._set_computed("lyrics_source_effective", "none")
-                return {}
-
-        if src == "generate" and not provided_text:
-            provided_text = self._generate_fallback_lyrics(s)
-
-        self._set_computed("lyrics_text", provided_text)
-        self._set_computed("lyrics_source_effective", src)
-        return {"lyrics_text": provided_text, "lyrics_source": src}
-
-    async def arrangement(self, s: MusicGraphState) -> Dict[str, Any]:
-        return {"arrangement_hint": self.hints.get("arrangement_hint")}
-
-    async def route_provider(self, s: MusicGraphState) -> Dict[str, Any]:
-        computed = self._computed()
-        byo_url, _ = _get_byo_audio(self.hints, self.input_json)
-
-        has_audio_master = bool(
-            byo_url
-            or computed.get("audio_master_url")
-            or computed.get("byo_audio_url")
-            or computed.get("demo_audio_url")
-        )
-        has_demo_voice_ref_audio = self._demo_use_voice_ref_as_audio() and bool(computed.get("voice_ref_url"))
-
-        mode = self._get_mode(s)
-        if mode == MusicProjectMode.byo.value or has_audio_master or has_demo_voice_ref_audio:
-            return {"provider": "byo"}
-
-        provider = (
-            self.hints.get("music_provider")
-            or self.hints.get("provider")
-            or getattr(settings, "MUSIC_AUTOPILOT_PROVIDER", None)
-        )
-        provider = normalize_provider(provider) if provider else default_autopilot_provider()
-        return {"provider": provider or "native"}
-
-    def _ffmpeg_available(self) -> bool:
-        return bool(shutil.which("ffmpeg"))
-
-    def _write_silence_wav(self, *, path: Path, duration_ms: int, sample_rate: int = 44100) -> None:
-        # Pure-python WAV fallback if ffmpeg is not available.
-        duration_ms = max(1000, int(duration_ms or 30_000))
-        frames = int(sample_rate * (duration_ms / 1000.0))
-        silence = b"\x00\x00" * frames  # 16-bit mono silence
-        with wave.open(str(path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(sample_rate)
-            wf.writeframes(silence)
-
-    async def _generate_native_fallback_full_mix(self, *, duration_ms: int) -> Tuple[str, int, str]:
-        """
-        Generate deterministic fallback audio and upload to Azure music-output.
-        Prefers ffmpeg if available, otherwise uses pure-python wav writer.
-        Returns (sas_url, duration_ms, content_type).
-        """
-        duration_ms = max(1000, int(duration_ms or 30_000))
-        dur_s = max(1, int(round(duration_ms / 1000.0)))
-
-        out_dir = Path("/tmp/df_music_native")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"fallback_full_mix_{int(time.time())}.wav"
-
-        if self._ffmpeg_available():
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                f"sine=frequency=220:sample_rate=44100:duration={dur_s}",
-                "-c:a",
-                "pcm_s16le",
-                str(out_path),
-            ]
-            try:
-                subprocess.run(cmd, check=True)
-            except Exception:
-                # If ffmpeg fails for any reason, fallback to pure-python wav.
-                self._write_silence_wav(path=out_path, duration_ms=duration_ms)
-        else:
-            self._write_silence_wav(path=out_path, duration_ms=duration_ms)
-
-        storage = AzureStorageService.for_output()
-        sas_url = await storage.upload_music_fallback_audio_and_get_sas_url(
-            user_id=str(self.user_id),
-            project_id=str(self.project_id),
-            job_id=str(self.job_id),
-            local_path=out_path,
-            content_type="audio/wav",
-            blob_filename="fallback_full_mix.wav",
-        )
-
-        return (str(sas_url), duration_ms, "audio/wav")
-
-    async def generate_audio(self, s: MusicGraphState) -> List[GraphTrack]:
-        """
-        Contract: MUST produce at least one 'full_mix' track (or raise).
-
-        Separation:
-          - audio_master_url/byo_audio_url = actual song audio
-          - voice_ref_url = voice reference only
-          - demo_use_voice_ref_as_audio=true can optionally use voice_ref_url as audio for demos
-        """
-        computed = self._computed()
-        mode = self._get_mode(s)
-
-        audio_url, audio_dur = _get_byo_audio(self.hints, self.input_json)
-
-        if not audio_url:
-            audio_url = computed.get("audio_master_url") or computed.get("byo_audio_url") or computed.get("demo_audio_url")
-
-        demo_audio_url = None
-        if not audio_url and self._demo_use_voice_ref_as_audio():
-            vr = computed.get("voice_ref_url")
-            if vr:
-                demo_audio_url = str(vr)
-
-        final_audio_url = audio_url or demo_audio_url
-
-        # ---- BYO (or already have master audio) ----
-        if mode == MusicProjectMode.byo.value or final_audio_url:
-            if not final_audio_url:
-                raise Exception("missing_audio_master_url")
-
-            if not audio_dur:
-                audio_dur = int(
-                    self.input_json.get("audio_master_duration_ms")
-                    or self.hints.get("audio_master_duration_ms")
-                    or computed.get("audio_master_duration_ms")
-                    or 0
-                ) or 30_000
-
-            ct = _guess_audio_content_type(str(final_audio_url) if final_audio_url else None, "audio/mpeg")
-
-            meta: Dict[str, Any] = {
-                "audio_duration_ms": int(audio_dur),
-                "url": str(final_audio_url),
-                "content_type": ct,
-                "audio_master_url": str(final_audio_url),
-                "byo_audio_url": str(final_audio_url),
-                "byo_duration_ms": int(audio_dur),
-            }
-
-            if demo_audio_url:
-                meta.update(
-                    {
-                        "demo_audio_url": str(demo_audio_url),
-                        "audio_source": "demo_voice_ref_url",
-                        "is_demo": True,
-                    }
-                )
-            else:
-                meta.update(
-                    {
-                        "audio_source": "hints" if _get_byo_audio(self.hints, self.input_json)[0] else "computed",
-                        "source": "byo",
-                    }
-                )
-
-            return [
-                GraphTrack(
-                    track_type=MusicTrackType.full_mix.value,
-                    duration_ms=int(audio_dur),
-                    artifact_id=None,
-                    media_asset_id=None,
-                    meta=meta,
-                )
-            ]
-
-        # ---- AUTOPILOT / CO_CREATE ----
-        provider = normalize_provider(
-            self.hints.get("music_provider")
-            or self.hints.get("provider")
-            or computed.get("audio_provider")
-            or getattr(settings, "MUSIC_AUTOPILOT_PROVIDER", None)
-            or default_autopilot_provider()
-        )
-
-        # 1) Try Fal Sonauto v2 if available/configured
-        if provider in ("fal_sonauto_v2", "sonauto_v2", "sonauto") and callable(compose_full_mix_fal_sonauto_v2):
-            try:
-                seed_i: Optional[int] = None
-                if self.seed is not None:
-                    seed_i = int(float(self.seed))
-
-                res: AutopilotComposeResult = await compose_full_mix_fal_sonauto_v2(  # type: ignore
-                    user_id=str(self.user_id),
-                    project_id=str(self.project_id),
-                    job_id=str(self.job_id),
-                    language_hint=getattr(s, "language_hint", None),
-                    quality=str(self.quality or "standard"),
-                    seed=seed_i,
-                    hints=self.hints,
-                    computed=self._computed(),
-                )
-
-                # Persist for downstream publish/status consistency
-                self._set_computed("audio_provider", getattr(res, "provider", "fal_sonauto_v2"))
-                self._set_computed("provider_request_id", getattr(res, "provider_request_id", None))
-                self._set_computed("audio_master_url", getattr(res, "sas_url", None))
-                self._set_computed("byo_audio_url", getattr(res, "sas_url", None))
-                self._set_computed("audio_master_duration_ms", int(getattr(res, "duration_ms", 0) or 0))
-
-                # If provider generated lyrics and user didn't provide lyrics, store them
-                prov_lyrics = getattr(res, "lyrics", None)
-                if prov_lyrics and not str(self._computed().get("lyrics_text") or "").strip():
-                    self._set_computed("lyrics_text", str(prov_lyrics))
-                    self._set_computed("lyrics_source_effective", "generate")
-
-                meta2: Dict[str, Any] = {
-                    "audio_duration_ms": int(getattr(res, "duration_ms", 0) or 0),
-                    "url": str(getattr(res, "sas_url", "")),
-                    "content_type": str(getattr(res, "content_type", "audio/mpeg") or "audio/mpeg"),
-                    "audio_master_url": str(getattr(res, "sas_url", "")),
-                    "byo_audio_url": str(getattr(res, "sas_url", "")),
-                    "byo_duration_ms": int(getattr(res, "duration_ms", 0) or 0),
-                    "audio_source": "autopilot_provider",
-                    "provider": str(getattr(res, "provider", "fal_sonauto_v2")),
-                    "provider_request_id": getattr(res, "provider_request_id", None),
-                    "provider_seed": int(getattr(res, "provider_seed", 0) or 0),
-                    "provider_tags": list(getattr(res, "tags", []) or []),
-                    "source_url": getattr(res, "source_url", None),
-                    "is_demo": False,
-                    "source": "autopilot",
-                }
-
-                dur_ms = int(getattr(res, "duration_ms", 0) or 0) or 30_000
-                return [
-                    GraphTrack(
-                        track_type=MusicTrackType.full_mix.value,
-                        duration_ms=dur_ms,
-                        artifact_id=None,
-                        media_asset_id=None,
-                        meta=meta2,
-                    )
-                ]
-            except Exception as e:
-                # Never break UX: record the failure and continue with native fallback
-                self._set_computed("autopilot_provider_error", str(e))
-
-        # 2) Always-works native fallback so pipeline never fails
-        plan = _as_dict(self._computed().get("music_plan"))
-        duration_ms = _coerce_int(
-            plan.get("duration_ms")
-            or self.input_json.get("duration_ms")
-            or self.hints.get("duration_ms")
-            or self._computed().get("audio_master_duration_ms")
-            or 30_000,
-            30_000,
-        )
-
-        fallback_url, fallback_dur_ms, ct = await self._generate_native_fallback_full_mix(duration_ms=duration_ms)
-
-        meta2: Dict[str, Any] = {
-            "audio_duration_ms": int(fallback_dur_ms),
-            "url": fallback_url,
-            "content_type": ct,
-            "audio_master_url": fallback_url,
-            "byo_audio_url": fallback_url,
-            "byo_duration_ms": int(fallback_dur_ms),
-            "audio_source": "fallback_native",
-            "provider": "native",
-            "source": "autopilot",
-            "is_demo": True,
-        }
-
-        return [
-            GraphTrack(
-                track_type=MusicTrackType.full_mix.value,
-                duration_ms=int(fallback_dur_ms),
-                artifact_id=None,
-                media_asset_id=None,
-                meta=meta2,
-            )
-        ]
-
-    async def align_lyrics(self, s: MusicGraphState) -> Optional[GraphTrack]:
-        outputs = self._get_requested_outputs(s)
-        if MusicTrackType.timed_lyrics_json.value not in outputs:
-            return None
-
-        computed = self._computed()
-        lyrics_text = str(
-            computed.get("lyrics_text") or self.hints.get("lyrics_text") or self.hints.get("lyrics") or ""
-        ).strip()
-        if not lyrics_text:
-            return None
-
-        dur = 0
-        for t in getattr(s, "tracks", []) or []:
-            if str(getattr(t, "track_type", "")) == MusicTrackType.full_mix.value:
-                dur = int(getattr(t, "duration_ms", 0) or 0)
-                break
-        if dur <= 0:
-            return None
-
-        audio_url, _ = _get_byo_audio(self.hints, self.input_json)
-        if not audio_url:
-            audio_url = computed.get("audio_master_url") or computed.get("byo_audio_url") or computed.get("demo_audio_url")
-        if not audio_url and self._demo_use_voice_ref_as_audio():
-            audio_url = computed.get("voice_ref_url")
-
-        timed: Dict[str, Any] | None = None
-        try:
-            if audio_url and callable(self._align_real):
-                try:
-                    timed = await self._align_real(
-                        audio_url=audio_url,
-                        lyrics_text=lyrics_text,
-                        language=getattr(s, "language_hint", None),
-                    )  # type: ignore
-                except TypeError:
-                    timed = await self._align_real(audio_url, lyrics_text, getattr(s, "language_hint", None))  # type: ignore
-
-            if timed is None and callable(self._align_naive):
-                timed = self._align_naive(lyrics_text, dur, language=getattr(s, "language_hint", None))  # type: ignore
-        except Exception:
-            timed = None
-
-        if not timed:
-            return None
-
-        return GraphTrack(
-            track_type=MusicTrackType.timed_lyrics_json.value,
-            duration_ms=0,
-            artifact_id=None,
-            media_asset_id=None,
-            meta={"inline_json": timed},
-        )
-
-    async def generate_performer_videos(self, s: MusicGraphState) -> Dict[str, Any]:
-        render_video = bool(self.hints.get("render_video") or self.hints.get("generate_video"))
-        if not render_video:
-            return {"skipped": True}
-        return {"skipped": True, "reason": "performer_video_not_implemented"}
-
-    async def compose_video(self, s: MusicGraphState) -> Dict[str, Any]:
-        render_video = bool(self.hints.get("render_video") or self.hints.get("generate_video"))
-        if not render_video:
-            return {"skipped": True}
-        return {"skipped": True, "reason": "compose_not_implemented"}
-
-    async def qc(self, s: MusicGraphState) -> Dict[str, Any]:
-        have_full = any(
-            str(getattr(t, "track_type", "")) == MusicTrackType.full_mix.value for t in getattr(s, "tracks", []) or []
-        )
-        if not have_full:
-            raise Exception("qc_failed_missing_full_mix")
-        return {"ok": True}
 
 
 # -----------------------------
@@ -1496,40 +1490,58 @@ async def run_music_video_job(job_id: UUID) -> None:
     if not job:
         return
 
+    job_status = str(job.get("status") or "").strip()
+
     pool = await get_pool()
+    input_json = _as_dict(job.get("input_json"))
+
     proj_row = await pool.fetchrow("select * from music_projects where id=$1", job["project_id"])
     if not proj_row:
-        # keep existing behavior
+        if job_status in (MusicJobStatus.succeeded.value, MusicJobStatus.failed.value):
+            return
         await jobs.set_video_job_failed(job_id=job_id, error="project_not_found")
         return
-    proj = dict(proj_row)
 
-    # ✅ ALWAYS ensure studio_jobs envelope (even if job already succeeded/failed)
+    proj = dict(proj_row)
+    proj_user_id = UUID(str(proj["user_id"]))
+    proj_id = UUID(str(proj["id"]))
+
+    # ALWAYS ensure studio_jobs envelope (even if job already succeeded/failed)
     try:
-        current_status = str(job.get("status") or "queued")
+        current_status = job_status or "queued"
         await _ensure_studio_job_envelope(
             pool=pool,
             job_id=job_id,
-            user_id=UUID(str(proj["user_id"])),
-            project_id=UUID(str(proj["id"])),
+            user_id=proj_user_id,
+            project_id=proj_id,
             status=current_status,
-            input_json=_as_dict(job.get("input_json")),
-            meta_json={"source": "svc-music", "music_project_id": str(proj["id"]), "request_type": "music_video"},
+            input_json=input_json,
+            meta_json={"source": "svc-music", "music_project_id": str(proj_id), "request_type": "music_video"},
         )
         await _update_studio_job_status_best_effort(
             pool=pool,
             job_id=job_id,
             status=current_status,
-            meta_patch={"svc": "svc-music", "music_project_id": str(proj["id"])},
+            meta_patch={"svc": "svc-music", "music_project_id": str(proj_id)},
         )
     except Exception:
         pass
 
-    #  NOW we can safely early-return
-    if job["status"] in (MusicJobStatus.succeeded.value, MusicJobStatus.failed.value):
+    if job_status in (MusicJobStatus.succeeded.value, MusicJobStatus.failed.value):
         return
 
-    input_json = _as_dict(job.get("input_json"))
+    await jobs.set_video_job_running(job_id=job_id)
+
+    try:
+        await _update_studio_job_status_best_effort(
+            pool=pool,
+            job_id=job_id,
+            status="running",
+            meta_patch={"svc": "svc-music", "music_project_id": str(proj_id)},
+        )
+    except Exception:
+        pass
+
     computed_pre = _as_dict(input_json.get("computed"))
 
     vr_raw = input_json.get("voice_ref_asset_id") or proj.get("voice_ref_asset_id")
@@ -1538,16 +1550,48 @@ async def run_music_video_job(job_id: UUID) -> None:
     except Exception:
         vr_id = None
 
-    voice_ref_url = await _resolve_voice_ref_sas_url(
-        project_id=UUID(str(proj["id"])),
-        user_id=UUID(str(proj["user_id"])),
-        voice_ref_asset_id=vr_id,
-    )
+    try:
+        voice_ref_url = await _resolve_voice_ref_sas_url(
+            project_id=proj_id,
+            user_id=proj_user_id,
+            voice_ref_asset_id=vr_id,
+        )
+    except Exception:
+        voice_ref_url = None
 
     if computed_pre.get("voice_ref_url") != voice_ref_url:
         computed_pre["voice_ref_url"] = voice_ref_url
         input_json["computed"] = computed_pre
         await jobs.set_video_job_input_json(job_id=job_id, input_json=input_json)
+
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # NEW: Ensure performer face image(s) exist via svc-face BEFORE pipeline runs
+    # This is the svc-music -> svc-face "handoff" you asked for.
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    try:
+        input_json = await _ensure_music_job_performer_faces(
+            jobs=jobs,
+            steps=steps,
+            job_id=job_id,
+            proj=proj,
+            input_json=input_json,
+        )
+    except Exception as e:
+        # If faces are truly required for your pipeline, you may want to fail hard here.
+        # For now: fail hard, because "hand-off to svc-face" is a pipeline prerequisite.
+        await jobs.set_video_job_failed(job_id=job_id, error=f"ensure_performer_faces_failed:{e}")
+        try:
+            await _update_studio_job_status_best_effort(
+                pool=pool,
+                job_id=job_id,
+                status="failed",
+                error_message=f"ensure_performer_faces_failed:{e}",
+                meta_patch={"music_project_id": str(proj_id), "svc": "svc-music"},
+            )
+        except Exception:
+            pass
+        return
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     try:
         computed_before = json.loads(json.dumps(_as_dict(input_json.get("computed"))))
@@ -1621,8 +1665,7 @@ async def run_music_video_job(job_id: UUID) -> None:
             if k in tool_computed and tool_computed.get(k) is not None:
                 computed[k] = tool_computed.get(k)
 
-        changed = computed != computed_before
-        if changed:
+        if computed != computed_before:
             input_json["computed"] = computed
             await jobs.set_video_job_input_json(job_id=job_id, input_json=input_json)
 
@@ -1644,19 +1687,17 @@ async def run_music_video_job(job_id: UUID) -> None:
             performer_b_video_asset_id=state.performer_b_video_asset_id,
         )
 
-        # ---- Best-effort envelope status update for dashboard ----
         try:
             await _update_studio_job_status_best_effort(
                 pool=pool,
                 job_id=job_id,
                 status="succeeded",
-                meta_patch={"music_project_id": str(proj["id"]), "svc": "svc-music"},
+                meta_patch={"music_project_id": str(proj_id), "svc": "svc-music"},
             )
         except Exception:
             pass
 
     except Exception as e:
-        # Fix: use meta_json (consistent with music_graph.py usage) to avoid signature mismatch bugs.
         try:
             await steps.upsert_step(
                 job_id=job_id,
@@ -1669,14 +1710,13 @@ async def run_music_video_job(job_id: UUID) -> None:
 
         await jobs.set_video_job_failed(job_id=job_id, error=str(e))
 
-        # ---- Best-effort envelope status update for dashboard ----
         try:
             await _update_studio_job_status_best_effort(
                 pool=pool,
                 job_id=job_id,
                 status="failed",
                 error_message=str(e),
-                meta_patch={"music_project_id": str(proj["id"]), "svc": "svc-music"},
+                meta_patch={"music_project_id": str(proj_id), "svc": "svc-music"},
             )
         except Exception:
             pass

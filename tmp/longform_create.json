@@ -1,0 +1,10 @@
+{
+  "image_ref": "cc81b639-5a89-4d76-9d10-7443b1626fee",
+  "script": "Quick test script. This should create a longform job and split into segments.\n",
+  "aspect_ratio": "9:16",
+  "segment_seconds": 60,
+  "max_segment_seconds": 120,
+  "tags": {
+    "source": "e2e"
+  }
+}

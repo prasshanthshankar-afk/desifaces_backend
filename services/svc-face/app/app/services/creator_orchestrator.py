@@ -9,7 +9,7 @@ import re
 import secrets
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from ..domain.models import (
     CreatorPlatformRequest,
@@ -237,6 +237,71 @@ class CreatorOrchestrator:
             f = float(default)
         return max(0.10, min(0.60, f))
 
+    @classmethod
+    def _stable_source_url_for_hash(cls, url: str) -> str:
+        """
+        Keep existing behavior for normal URLs, but if it *looks like* an Azure SAS URL,
+        strip the query to avoid "same blob, different SAS" changing request_hash.
+
+        This is intentionally conservative: only strips when query contains SAS-ish keys.
+        """
+        u = (url or "").strip()
+        if not u:
+            return ""
+        try:
+            p = urlparse(u)
+            if p.scheme in ("http", "https") and p.netloc:
+                qs = parse_qs(p.query or "")
+                sas_keys = {"sig", "se", "sp", "sv", "sr", "st"}
+                if ("blob.core.windows.net" in (p.netloc or "")) and (sas_keys & set(qs.keys())):
+                    return f"{p.scheme}://{p.netloc}{p.path}"
+        except Exception:
+            pass
+        return u
+
+    async def _get_media_asset_row(self, asset_id: str) -> Optional[Dict[str, Any]]:
+        """
+        DB fallback to resolve asset_id -> storage_ref/meta_json if MediaAssetsRepo lacks get_asset().
+        Best-effort: returns None on any failure.
+        """
+        try:
+            q = """
+            SELECT id::text as id, storage_ref, meta_json
+            FROM public.media_assets
+            WHERE id = $1::uuid
+            LIMIT 1
+            """
+            rows = await self.jobs_repo.execute_queries(q, asset_id)
+            if not rows:
+                return None
+            r0 = self.jobs_repo.convert_db_row(rows[0])
+            return {
+                "id": str(r0.get("id") or ""),
+                "storage_ref": str(r0.get("storage_ref") or ""),
+                "meta_json": self._coerce_dict(r0.get("meta_json")),
+            }
+        except Exception:
+            return None
+
+    async def _refresh_read_sas_best_effort(self, storage_ref: str, meta_json: Dict[str, Any]) -> str:
+        """
+        If storage_service supports SAS refresh, do it. Never fails.
+        """
+        try:
+            fn = getattr(self.storage_service, "get_readonly_sas_url", None)
+            if callable(fn):
+                refreshed = await fn(
+                    storage_ref=storage_ref or None,
+                    meta_json=meta_json if meta_json else None,
+                    hours=24,
+                    refresh_if_within_minutes=60,
+                )
+                if refreshed:
+                    return str(refreshed).strip()
+        except Exception:
+            pass
+        return storage_ref
+
     def _validate_http_url(self, url: str) -> None:
         u = (url or "").strip()
         p = urlparse(u)
@@ -284,12 +349,32 @@ class CreatorOrchestrator:
         if p.scheme == "file":
             return raw
 
+        # ✅ UUID asset id path (new I2I)
         if self._UUID_RE.match(raw):
-            ma = await self.assets_repo.get_asset(raw) if hasattr(self.assets_repo, "get_asset") else None
             storage_ref = None
-            if ma:
-                storage_ref = ma.get("storage_ref") if isinstance(ma, dict) else getattr(ma, "storage_ref", None)
+            meta_json: Dict[str, Any] = {}
+
+            # Prefer repo method if present
+            if hasattr(self.assets_repo, "get_asset") and callable(getattr(self.assets_repo, "get_asset")):
+                try:
+                    ma = await self.assets_repo.get_asset(raw)  # type: ignore[attr-defined]
+                    if ma:
+                        storage_ref = ma.get("storage_ref") if isinstance(ma, dict) else getattr(ma, "storage_ref", None)
+                        mj = ma.get("meta_json") if isinstance(ma, dict) else getattr(ma, "meta_json", None)
+                        meta_json = self._coerce_dict(mj)
+                except Exception:
+                    storage_ref = None
+
+            # Fallback to direct DB query
+            if not storage_ref:
+                row = await self._get_media_asset_row(raw)
+                if row:
+                    storage_ref = row.get("storage_ref") or None
+                    meta_json = self._coerce_dict(row.get("meta_json"))
+
             if storage_ref:
+                # Best-effort refresh SAS if supported
+                storage_ref = await self._refresh_read_sas_best_effort(str(storage_ref), meta_json)
                 return await self._resolve_source_image_ref(str(storage_ref))
 
         head = raw.split("?", 1)[0].split("#", 1)[0].strip()
@@ -674,10 +759,19 @@ class CreatorOrchestrator:
         request_dict: JsonDict = request.model_dump(mode="json")
 
         mode = self._coerce_mode(request_dict.get("mode"))
-        if mode == "image-to-image":
-            ref = (request_dict.get("source_image_url") or "").strip()
-            logger.debug("Image-to-image mode; resolving source image URL", extra={"ref": ref})
 
+        # ---- UPDATED (safe): prefer source_image_asset_id, fallback to source_image_url
+        if mode == "image-to-image":
+            asset_ref = (request_dict.get("source_image_asset_id") or "").strip()
+            url_ref = (request_dict.get("source_image_url") or "").strip()
+            ref = asset_ref or url_ref
+
+            logger.debug(
+                "Image-to-image mode; resolving source image ref",
+                extra={"asset_ref": asset_ref or None, "url_ref": url_ref or None},
+            )
+
+            # Keep original error string for maximum backward compatibility
             if not ref:
                 raise ValueError("missing_required_fields: ['source_image_url'] for image-to-image mode")
 
@@ -686,7 +780,16 @@ class CreatorOrchestrator:
             except Exception as e:
                 raise ValueError(f"invalid_source_image_url:{ref} err={e!s}") from e
 
+            # Persist both: original ref + resolved URL
+            request_dict["source_image_ref"] = ref
             request_dict["source_image_url"] = resolved
+
+            # If caller passed asset-id, keep it; if ref itself is a UUID and caller didn't pass,
+            # store it as source_image_asset_id for traceability (safe, optional).
+            if asset_ref:
+                request_dict["source_image_asset_id"] = asset_ref
+            elif self._UUID_RE.match(ref) and not request_dict.get("source_image_asset_id"):
+                request_dict["source_image_asset_id"] = ref
 
         translation_meta: Dict[str, Any] = {}
         if request_dict.get("user_prompt"):
@@ -697,6 +800,7 @@ class CreatorOrchestrator:
             request_dict["translated_prompt"] = (
                 translation_meta.get("user_prompt_translated_en") or request_dict.get("user_prompt")
             )
+            request_dict["translated_prompt"] = request_dict.get("translated_prompt")
             request_dict.update(translation_meta)
 
         request_dict = await self._ensure_required_config_codes(request_dict)
@@ -739,7 +843,16 @@ class CreatorOrchestrator:
 
         if mode == "image-to-image":
             request_hash_payload["mode"] = "image-to-image"
-            request_hash_payload["source_image_url"] = request_dict.get("source_image_url")
+
+            # Prefer stable asset-id for hash when present (new path)
+            if (request_dict.get("source_image_asset_id") or "").strip():
+                request_hash_payload["source_image_asset_id"] = request_dict.get("source_image_asset_id")
+            else:
+                # Keep URL clients working; only strip SAS-ish query for Azure blobs
+                request_hash_payload["source_image_url"] = self._stable_source_url_for_hash(
+                    str(request_dict.get("source_image_url") or "")
+                )
+
             request_hash_payload["preservation_strength"] = request_dict.get("preservation_strength")
 
         request_hash = self._generate_request_hash(request_hash_payload)
@@ -769,6 +882,8 @@ class CreatorOrchestrator:
                 "job_seed": int(job_seed),
                 "request_nonce": request_dict.get("request_nonce"),
                 "mode": mode,
+                "source_image_ref": request_dict.get("source_image_ref") if mode == "image-to-image" else None,
+                "source_image_asset_id": request_dict.get("source_image_asset_id") if mode == "image-to-image" else None,
                 "source_image_url": request_dict.get("source_image_url") if mode == "image-to-image" else None,
                 "preservation_strength": request_dict.get("preservation_strength") if mode == "image-to-image" else None,
             },
@@ -843,17 +958,40 @@ class CreatorOrchestrator:
 
             request_hash = str(getattr(job, "request_hash", "") or "")
 
+            # ---- UPDATED (safe): if i2i and source_image_url missing, try resolving from source_image_ref / asset_id
             source_image_url = (payload_json.get("source_image_url") or "").strip()
             if mode == "text-to-image" and source_image_url:
                 mode = "image-to-image"
+
             if mode == "image-to-image" and not source_image_url:
-                await self.jobs_repo.update_status(
-                    job_id,
-                    "failed",
-                    error_code="MISSING_SOURCE_IMAGE",
-                    error_message="image-to-image mode requires source_image_url",
+                ref = (
+                    (payload_json.get("source_image_ref") or "").strip()
+                    or (payload_json.get("source_image_asset_id") or "").strip()
                 )
-                return
+                if ref:
+                    try:
+                        resolved = await self._resolve_source_image_ref(ref)
+                        payload_json["source_image_url"] = resolved
+                        payload_json["source_image_ref"] = ref
+                        if self._UUID_RE.match(ref) and not payload_json.get("source_image_asset_id"):
+                            payload_json["source_image_asset_id"] = ref
+                        source_image_url = resolved
+                    except Exception as e:
+                        await self.jobs_repo.update_status(
+                            job_id,
+                            "failed",
+                            error_code="INVALID_SOURCE_IMAGE",
+                            error_message=f"invalid_source_image_ref:{ref} err={e!s}",
+                        )
+                        return
+                else:
+                    await self.jobs_repo.update_status(
+                        job_id,
+                        "failed",
+                        error_code="MISSING_SOURCE_IMAGE",
+                        error_message="image-to-image mode requires source_image_url or source_image_asset_id",
+                    )
+                    return
 
             variants, resolved = await self.prompt_service.build_variants(
                 request_dict=payload_json,
@@ -975,7 +1113,9 @@ class CreatorOrchestrator:
         provider_name = "openai"  # your orchestrator currently forces openai
         payload_version = "face:v1"
         base_rh = str(variant.get("request_hash") or "").strip() or str(job_id)
-        rh_variant = hashlib.sha256(f"{base_rh}|v={variant_num}|mode={mode}".encode("utf-8")).hexdigest()[: self.PRIME_HASH_BYTES]
+        rh_variant = hashlib.sha256(f"{base_rh}|v={variant_num}|mode={mode}".encode("utf-8")).hexdigest()[
+            : self.PRIME_HASH_BYTES
+        ]
         idem_key = provider_idempotency_key(provider_name, payload_version, rh_variant)
 
         async def _download_to_tmp(url: str, dst_path: str) -> None:
@@ -1010,8 +1150,10 @@ class CreatorOrchestrator:
             if mode == "image-to-image":
                 payload_json = request_dict
 
+                # ---- UPDATED (safe): accept source_image_ref, asset_id, or url
                 source_image_ref = (
                     (payload_json.get("source_image_ref") or "").strip()
+                    or (payload_json.get("source_image_asset_id") or "").strip()
                     or (payload_json.get("source_image_url") or "").strip()
                 )
                 if not source_image_ref:
@@ -1181,6 +1323,7 @@ class CreatorOrchestrator:
                     "storage_path": storage_path,
                     "source_image_ref": source_image_ref,
                     "source_image_url": source_image_url,
+                    "source_image_asset_id": (request_dict.get("source_image_asset_id") or None),
                     "preservation_strength": float(strength) if strength is not None else None,
                 },
             )
@@ -1234,6 +1377,7 @@ class CreatorOrchestrator:
                     "provider_meta": out.meta,
                     "source_image_ref": source_image_ref,
                     "source_image_url": source_image_url,
+                    "source_image_asset_id": (request_dict.get("source_image_asset_id") or None),
                     "preservation_strength": float(strength) if strength is not None else None,
                 },
             )
@@ -1274,6 +1418,7 @@ class CreatorOrchestrator:
                     "provider_meta": out.meta,
                     "source_image_ref": source_image_ref,
                     "source_image_url": source_image_url,
+                    "source_image_asset_id": (request_dict.get("source_image_asset_id") or None),
                     "preservation_strength": float(strength) if strength is not None else None,
                 },
             )
@@ -1370,14 +1515,20 @@ class CreatorOrchestrator:
           fjo.variant_number,
           fjo.face_profile_id::text as face_profile_id,
           fjo.output_asset_id::text as media_asset_id,
-          coalesce(a.url, ma.storage_ref) as image_url,
+
+          a.url as artifact_url,
+          a.meta_json as artifact_meta_json,
+
+          ma.storage_ref as storage_ref,
+          ma.meta_json as asset_meta_json,
+
           fjo.prompt_used,
           fjo.technical_specs,
           fjo.creative_variations
         FROM face_job_outputs fjo
         LEFT JOIN media_assets ma ON ma.id = fjo.output_asset_id
         LEFT JOIN LATERAL (
-          SELECT url
+          SELECT url, meta_json
           FROM artifacts
           WHERE job_id = fjo.job_id
             AND kind = 'face_image'
@@ -1395,12 +1546,46 @@ class CreatorOrchestrator:
             tech = self._coerce_dict(r.get("technical_specs"))
             crea = self._coerce_dict(r.get("creative_variations"))
 
+            # Prefer artifact URL else fall back to media_assets.storage_ref
+            artifact_url = str(r.get("artifact_url") or "").strip()
+            storage_ref = str(r.get("storage_ref") or "").strip()
+            base_url = artifact_url or storage_ref
+
+            asset_meta = self._coerce_dict(r.get("asset_meta_json"))
+            artifact_meta = self._coerce_dict(r.get("artifact_meta_json"))
+            meta_for_refresh: Dict[str, Any] = asset_meta or artifact_meta or {}
+
+            image_url = base_url
+
+            # Refresh SAS on read (best-effort, never break endpoint)
+            try:
+                fn = getattr(self.storage_service, "get_readonly_sas_url", None)
+                if callable(fn):
+                    has_blob_meta = bool(
+                        meta_for_refresh.get("blob_name")
+                        or meta_for_refresh.get("storage_path")
+                        or meta_for_refresh.get("storage_container")
+                    )
+                    looks_azure = bool(image_url) and ("blob.core.windows.net" in image_url)
+
+                    if looks_azure or has_blob_meta:
+                        refreshed = await fn(
+                            storage_ref=image_url or None,
+                            meta_json=meta_for_refresh if meta_for_refresh else None,
+                            hours=24,
+                            refresh_if_within_minutes=60,
+                        )
+                        if refreshed:
+                            image_url = str(refreshed).strip()
+            except Exception:
+                pass
+
             variants.append(
                 GeneratedVariant(
                     variant_number=int(r.get("variant_number") or 0),
                     face_profile_id=str(r.get("face_profile_id") or ""),
                     media_asset_id=str(r.get("media_asset_id") or ""),
-                    image_url=str(r.get("image_url") or ""),
+                    image_url=str(image_url or ""),
                     prompt_used=str(r.get("prompt_used") or ""),
                     technical_specs=tech,
                     creative_variations=crea,

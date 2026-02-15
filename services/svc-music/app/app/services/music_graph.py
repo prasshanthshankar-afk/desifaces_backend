@@ -53,6 +53,18 @@ def _safe_jsonable(x: Any) -> Any:
             return {"_non_jsonable": True, "repr": repr(x)}
 
 
+def record_decision(state: MusicGraphState, *, step: str, decision: str, reason: str, extra: Optional[Dict[str, Any]] = None) -> None:
+    state.meta.setdefault("decisions", [])
+    item = {
+        "step": step,
+        "decision": decision,
+        "reason": reason,
+    }
+    if extra:
+        item["extra"] = _safe_jsonable(extra)
+    state.meta["decisions"].append(item)
+
+
 def _output_set(outputs: Iterable[Any]) -> set[str]:
     """
     Normalize outputs into a set of lowercase strings.
@@ -294,11 +306,23 @@ async def run_video_pipeline(
         await _safe_progress_update()
         await _safe_step_upsert(step_code=stage, status="running", meta={"progress": state.progress})
 
+
+
     async def succeed(stage: str, payload: Any = None) -> None:
         meta: Dict[str, Any] = {"progress": state.progress}
         if payload is not None:
             meta["output"] = payload
+
+        # ✅ store a compact step output trail in state.meta (agent trace)
+        state.meta.setdefault("step_outputs", {})
+        try:
+            state.meta["step_outputs"][stage] = _safe_jsonable(payload)
+        except Exception:
+            state.meta["step_outputs"][stage] = {"_non_jsonable": True}
+
         await _safe_step_upsert(step_code=stage, status="succeeded", meta=meta)
+
+
 
     async def skip(stage: str, reason: str) -> None:
         await _safe_step_upsert(step_code=stage, status="skipped", meta={"progress": state.progress, "reason": reason})

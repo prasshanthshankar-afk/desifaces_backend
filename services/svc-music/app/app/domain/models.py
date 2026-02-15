@@ -5,7 +5,7 @@ from enum import Enum as PyEnum
 from typing import Any, Dict, List, Optional, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .enums import (
     MusicProjectMode,
@@ -152,7 +152,9 @@ class MusicJobStatusOut(BaseModel):
     progress: float = 0.0
     tracks: List[TrackItem] = Field(default_factory=list)
     error: Optional[str] = None
-
+    
+    computed: Optional[Dict[str, Any]] = None
+    clip_manifest: Optional[Dict[str, Any]] = None
 
 # -----------------------------
 # Publish
@@ -162,6 +164,29 @@ class MusicJobStatusOut(BaseModel):
 class PublishMusicIn(BaseModel):
     target: Literal["viewer", "fusion"] = "fusion"
     consent: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_shapes(cls, v: Any) -> Any:
+        if v is None:
+            return {}
+
+        if not isinstance(v, dict):
+            return v
+
+        t = v.get("target")
+        if isinstance(t, str):
+            v["target"] = t.strip().lower()
+
+        c = v.get("consent")
+        if isinstance(c, bool):
+            v["consent"] = {"accepted": c}
+        elif isinstance(c, str):
+            s = c.strip().lower()
+            if s in ("true", "false"):
+                v["consent"] = {"accepted": (s == "true")}
+
+        return v
 
 
 class PublishMusicOut(BaseModel):

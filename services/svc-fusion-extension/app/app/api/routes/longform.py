@@ -42,6 +42,21 @@ def _normalize_bearer(token_or_header: Optional[str]) -> Optional[str]:
     return f"Bearer {t}"
 
 
+def _coerce_uuid(v: object, field: str) -> UUID:
+    if v is None:
+        raise HTTPException(status_code=401, detail=f"missing_{field}")
+    if isinstance(v, UUID):
+        return v
+    if isinstance(v, str):
+        v = v.strip()
+        if not v:
+            raise HTTPException(status_code=401, detail=f"missing_{field}")
+        try:
+            return UUID(v)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"invalid_{field}")
+    raise HTTPException(status_code=400, detail=f"invalid_{field}")
+
 def _service_bearer_for_workers() -> Optional[str]:
     """
     Product-grade rule:
@@ -94,7 +109,7 @@ async def create_longform_job(
     if voice_gender is not None:
         voice_gender = str(voice_gender).strip().lower() or None
 
-    # ✅ Persist service bearer for workers (NOT the user JWT)
+    #  Persist service bearer for workers (NOT the user JWT)
     worker_auth_token = _service_bearer_for_workers()
     if not worker_auth_token:
         # Product-grade: fail early rather than accept a job that will likely fail async.
