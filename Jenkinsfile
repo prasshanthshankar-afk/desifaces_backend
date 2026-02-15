@@ -13,24 +13,19 @@ pipeline {
             }
         }
 
-        stage('Build All Services') {
-            steps {
-                sh 'docker compose build'
-            }
-        }
-
-        stage('Deploy to Azure VM') {
+        stage('Deploy and Build on Azure VM') {
             steps {
                 sshagent(credentials: ['deploy-vm-ssh']) {
                     sh """
                         rsync -avz --delete \
+                            --exclude '.git' \
                             -e 'ssh -o StrictHostKeyChecking=no' \
                             . ${DEPLOY_USER}@${DEPLOY_HOST}:/opt/desifaces/
                     """
                     sh """
                         ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} '
                             cd /opt/desifaces
-                            docker compose down
+                            docker compose down || true
                             docker compose build
                             docker compose up -d
                             docker compose ps
