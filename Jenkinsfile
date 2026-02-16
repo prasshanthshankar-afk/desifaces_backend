@@ -25,10 +25,10 @@ pipeline {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} '
                             cd /opt/desifaces
-                            docker compose down || true
-                            docker compose build
-                            docker compose up -d
-                            docker compose ps
+                            docker compose --env-file ./infra/.env down || true
+                            docker compose --env-file ./infra/.env build
+                            docker compose --env-file ./infra/.env up -d
+                            docker compose --env-file ./infra/.env ps
                         '
                     """
                 }
