@@ -19,6 +19,10 @@ pipeline {
                     sh """
                         rsync -avz --delete \
                             --exclude '.git' \
+                            --exclude '.venv' \
+                            --exclude '__pycache__' \
+                            --exclude '*.pyc' \
+                            --exclude 'infra/.env' \
                             -e 'ssh -o StrictHostKeyChecking=no' \
                             . ${DEPLOY_USER}@${DEPLOY_HOST}:/opt/desifaces/
                     """
