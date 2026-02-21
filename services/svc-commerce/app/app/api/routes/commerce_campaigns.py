@@ -46,7 +46,6 @@ def _jwt_meta() -> tuple[Optional[str], Optional[str], str]:
 
 
 def _allow_unverified_jwt() -> bool:
-    # Explicit opt-in only (dev convenience)
     v = (os.getenv("JWT_ALLOW_UNVERIFIED") or os.getenv("DF_JWT_ALLOW_UNVERIFIED") or "").strip().lower()
     return v in ("1", "true", "yes", "y", "on")
 
@@ -61,10 +60,12 @@ def _as_dict(x: Any) -> Dict[str, Any]:
     if isinstance(x, str):
         try:
             v = json.loads(x)
+            if isinstance(v, str):
+                v2 = json.loads(v)
+                return v2 if isinstance(v2, dict) else {}
             return v if isinstance(v, dict) else {}
         except Exception:
             return {}
-    # asyncpg.Record / Mapping / pydantic models
     try:
         v = dict(x)
         return v if isinstance(v, dict) else {}
@@ -78,6 +79,16 @@ def _pick_str(d: Dict[str, Any], key: str) -> Optional[str]:
         return None
     s = str(v).strip()
     return s if s else None
+
+
+def _extract_stage(payload: Dict[str, Any]) -> Optional[str]:
+    # support both patterns
+    if "stage" in payload and payload.get("stage") is not None:
+        return str(payload.get("stage"))
+    comp = _as_dict(payload.get("computed"))
+    if comp.get("stage") is not None:
+        return str(comp.get("stage"))
+    return None
 
 
 async def get_current_user_id(authorization: str | None = Header(default=None)) -> UUID:
@@ -193,7 +204,6 @@ async def confirm(req: CommerceConfirmIn, user_id: UUID = Depends(get_current_us
         mj = _as_dict(existing["meta_json"])
         sj = mj.get("studio_job_id")
         if not sj:
-            # best-effort: find job by request_hash
             sj = await pool.fetchval(
                 """
                 select id
@@ -207,10 +217,22 @@ async def confirm(req: CommerceConfirmIn, user_id: UUID = Depends(get_current_us
             )
         if not sj:
             raise HTTPException(status_code=500, detail="Campaign exists but missing studio_job_id")
+
+        # ✅ return actual job status
+        job_status = await pool.fetchval(
+            """
+            select status
+            from public.studio_jobs
+            where id=$1 and user_id=$2 and studio_type='commerce'
+            """,
+            UUID(str(sj)),
+            user_id,
+        )
+
         return CommerceConfirmOut(
             campaign_id=UUID(str(existing["id"])),
             studio_job_id=UUID(str(sj)),
-            status="queued",
+            status=str(job_status or "queued"),
         )
 
     payload = {
@@ -266,6 +288,31 @@ async def confirm(req: CommerceConfirmIn, user_id: UUID = Depends(get_current_us
                 json.dumps({**meta, "studio_job_id": str(studio_job_id)}),
             )
 
+            # ✅ Link campaign_id into studio_job payload/meta (E2E-critical)
+            await con.execute(
+                """
+                update public.studio_jobs
+                set
+                  payload_json = jsonb_set(
+                    coalesce(payload_json,'{}'::jsonb),
+                    '{commerce_campaign_id}',
+                    to_jsonb($2::text),
+                    true
+                  ),
+                  meta_json = jsonb_set(
+                    coalesce(meta_json,'{}'::jsonb),
+                    '{commerce_campaign_id}',
+                    to_jsonb($2::text),
+                    true
+                  ),
+                  updated_at = now()
+                where id=$1 and user_id=$3 and studio_type='commerce'
+                """,
+                UUID(str(studio_job_id)),
+                str(campaign_id),
+                user_id,
+            )
+
             # mark quote confirmed
             await con.execute(
                 """
@@ -277,7 +324,11 @@ async def confirm(req: CommerceConfirmIn, user_id: UUID = Depends(get_current_us
                 user_id,
             )
 
-    return CommerceConfirmOut(campaign_id=UUID(str(campaign_id)), studio_job_id=UUID(str(studio_job_id)), status="queued")
+    return CommerceConfirmOut(
+        campaign_id=UUID(str(campaign_id)),
+        studio_job_id=UUID(str(studio_job_id)),
+        status="queued",
+    )
 
 
 @router.get("/jobs/{studio_job_id}/status")
@@ -295,13 +346,20 @@ async def job_status(studio_job_id: UUID, user_id: UUID = Depends(get_current_us
     if not row:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    payload = _as_dict(row["payload_json"])
+    meta = _as_dict(row["meta_json"])
+    computed = _as_dict(payload.get("computed"))
+    stage = _extract_stage(payload) or _pick_str(computed, "stage")
+
     return {
         "studio_job_id": str(row["id"]),
         "studio_type": row["studio_type"],
         "status": row["status"],
+        "stage": stage,
+        "computed": computed,
         "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
         "error_code": row["error_code"],
         "error_message": row["error_message"],
-        "payload_json": row["payload_json"] or {},
-        "meta_json": row["meta_json"] or {},
+        "payload_json": payload,
+        "meta_json": meta,
     }

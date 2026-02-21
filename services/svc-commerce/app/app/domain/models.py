@@ -1,13 +1,101 @@
+# services/svc-commerce/app/app/domain/models.py
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel, Field
 
 from app.domain.enums import CommerceChannel, CommerceMode, CommerceProductType, MarketplaceAddon, Resolution
 
+
+# -------------------------
+# VTON input envelope
+# -------------------------
+
+class ModelRef(BaseModel):
+    """
+    Explicit model/human reference for VTON.
+
+    Preferred:
+      - image_url (or human_image_url)
+
+    Optional future:
+      - asset_id: media_assets row (resolver can fetch SAS)
+      - platform_model_id: platform model catalog id
+    """
+    image_url: Optional[AnyHttpUrl] = None
+    human_image_url: Optional[AnyHttpUrl] = None
+
+    asset_id: Optional[UUID] = None
+    platform_model_id: Optional[str] = None
+
+    # legacy/compat keys (accepted if client sends them)
+    url: Optional[AnyHttpUrl] = None
+    ref_url: Optional[AnyHttpUrl] = None
+    photo_url: Optional[AnyHttpUrl] = None
+
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ProductAssetItem(BaseModel):
+    """
+    One component in an outfit. Supports multi-item outfits:
+      - pant + shirt
+      - saree + blouse
+      - accessories/jewelry etc.
+    """
+    component_code: str = Field(..., min_length=1)  # vendor-defined (DB-driven catalog later)
+    kind: str = "garment"  # garment|accessory|jewelry|footwear|other
+
+    # Primary image
+    image_url: Optional[AnyHttpUrl] = None
+
+    # Optional alternates: back view, flat-lay, closeups, etc.
+    image_urls: List[AnyHttpUrl] = Field(default_factory=list)
+
+    # Optional hinting
+    is_primary: bool = False
+    dominance_rank: Optional[int] = None  # smaller = more dominant (vendor hint)
+
+    # Optional metadata
+    display_name: Optional[str] = None
+    vendor_sku: Optional[str] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ProductAssets(BaseModel):
+    """
+    product_assets.items[] is the primary schema.
+
+    Resolver (commerce_processor.py) will:
+      - choose dominant item
+      - set garment_image_url
+      - set dominant_component_code
+    """
+    items: List[ProductAssetItem] = Field(default_factory=list)
+
+    # Optional global hints
+    product_type: Optional[str] = None
+    cloth_type: Optional[str] = None  # upper|lower|dress (provider-specific ok)
+
+    # Canonical resolved keys (client may provide; resolver will populate if items[] present)
+    dominant_component_code: Optional[str] = None
+    garment_image_url: Optional[AnyHttpUrl] = None
+
+    # Legacy compatibility keys (optional)
+    primary_image_url: Optional[AnyHttpUrl] = None
+    product_image_url: Optional[AnyHttpUrl] = None
+    saree_image_url: Optional[AnyHttpUrl] = None
+    blouse_image_url: Optional[AnyHttpUrl] = None
+
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+# -------------------------
+# Existing quote models
+# -------------------------
 
 class QuoteOutputs(BaseModel):
     num_images: int = 0
@@ -27,6 +115,7 @@ class QuoteCTA(BaseModel):
 class CommerceQuoteIn(BaseModel):
     mode: CommerceMode
     product_type: CommerceProductType
+
     # Either look_sets or products; allow both for future (mixed)
     look_set_ids: List[UUID] = Field(default_factory=list)
     product_ids: List[UUID] = Field(default_factory=list)
@@ -47,6 +136,10 @@ class CommerceQuoteIn(BaseModel):
 
     provider_policy: str = "auto"  # auto|fal|internal
     currency_hint: str = "USD"     # USD|INR (UI convenience)
+
+    # NEW: VTON/try-on inputs
+    product_assets: ProductAssets = Field(default_factory=ProductAssets)
+    model_ref: ModelRef = Field(default_factory=ModelRef)
 
 
 class QuoteLineItem(BaseModel):

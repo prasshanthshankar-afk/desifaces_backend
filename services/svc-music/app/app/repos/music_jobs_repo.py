@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from uuid import UUID, uuid4
 
 from app.db import get_pool
@@ -41,21 +41,49 @@ class MusicJobsRepo:
         )
         return jid
 
+    async def get_music_video_job_row(self, *, job_id: UUID) -> dict | None:
+        pool = await get_pool()
+        row = await pool.fetchrow(
+            """
+            select id, project_id, status, progress, input_json, error, created_at, updated_at
+            from music_video_jobs
+            where id=$1
+            """,
+            job_id,
+        )
+        return dict(row) if row else None
+
     async def get_video_job(self, *, job_id: UUID) -> dict | None:
+        """
+        Unified read for API/status flows.
+
+        - Primary state lives in music_video_jobs (status/progress/input_json).
+        - studio_jobs is the cross-studio envelope (payload_json/meta_json/error_message).
+        We join so callers don't have to guess where to read from.
+        """
         pool = await get_pool()
         row = await pool.fetchrow(
             """
             select
-            sj.id,
-            (sj.meta_json->>'music_project_id')::uuid as project_id,
-            sj.status,
-            sj.payload_json,
-            sj.error_message as error,
-            sj.created_at,
-            sj.updated_at
+              sj.id,
+              coalesce(mvj.project_id, (sj.meta_json->>'music_project_id')::uuid) as project_id,
+              coalesce(mvj.status, sj.status) as status,
+              coalesce(mvj.progress, 0) as progress,
+
+              -- canonical job input/payload for svc-music callers
+              coalesce(mvj.input_json, sj.payload_json) as input_json,
+
+              -- keep original envelope payload too (backwards compatibility)
+              sj.payload_json,
+
+              coalesce(mvj.error, sj.error_message, sj.error) as error,
+              sj.created_at,
+              sj.updated_at
             from public.studio_jobs sj
+            left join public.music_video_jobs mvj
+              on mvj.id = sj.id
             where sj.id=$1
-            and sj.studio_type='music'
+              and sj.studio_type='music'
             """,
             job_id,
         )
@@ -139,7 +167,6 @@ class MusicJobsRepo:
             final_video_asset_id,
         )
 
-
     async def claim_video_jobs(self, *, limit: int = 10, stale_after_secs: int | None = None) -> list[dict]:
         pool = await get_pool()
 
@@ -148,13 +175,13 @@ class MusicJobsRepo:
             rows = await pool.fetch(
                 """
                 with cte as (
-                select id
-                from music_video_jobs
-                where status='queued'
-                    or (status='running' and updated_at < now() - ($2::int * interval '1 second'))
-                order by created_at asc
-                for update skip locked
-                limit $1
+                  select id
+                  from music_video_jobs
+                  where status='queued'
+                     or (status='running' and updated_at < now() - ($2::int * interval '1 second'))
+                  order by created_at asc
+                  for update skip locked
+                  limit $1
                 )
                 update music_video_jobs j
                 set status='running',
@@ -171,12 +198,12 @@ class MusicJobsRepo:
             rows = await pool.fetch(
                 """
                 with cte as (
-                select id
-                from music_video_jobs
-                where status='queued'
-                order by created_at asc
-                for update skip locked
-                limit $1
+                  select id
+                  from music_video_jobs
+                  where status='queued'
+                  order by created_at asc
+                  for update skip locked
+                  limit $1
                 )
                 update music_video_jobs j
                 set status='running',
@@ -190,7 +217,6 @@ class MusicJobsRepo:
             )
 
         return [dict(r) for r in rows]
-
 
     # -------- music_compose_jobs (internal stitch job) --------
     async def create_compose_job(

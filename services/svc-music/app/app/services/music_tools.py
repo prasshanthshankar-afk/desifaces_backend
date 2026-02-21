@@ -1,33 +1,23 @@
 from __future__ import annotations
 
-import hashlib
+import os
+import inspect
 import json
+import logging
 import shutil
 import subprocess
 import time
 import wave
-import logging
+import base64
 from pathlib import Path
-
-from typing import Optional, Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
 from app.config import settings
-from app.db import get_pool
-from app.domain.enums import (
-    MusicJobStage,
-    MusicTrackType,
-    MusicJobStatus,
-    MusicProjectMode,
-)
-from app.domain.models import MusicJobStatusOut, TrackItem, PublishMusicIn, PublishMusicOut
-from app.repos.music_jobs_repo import MusicJobsRepo
-from app.repos.music_projects_repo import MusicProjectsRepo
-from app.repos.music_tracks_repo import MusicTracksRepo
-from app.repos.steps_repo import StepsRepo
+from app.domain.enums import MusicProjectMode, MusicTrackType
 from app.services.azure_storage_service import AzureStorageService
 
-from .music_graph import MusicGraphState, MusicGraphTools, GraphTrack, run_video_pipeline
+from .music_graph import GraphTrack, MusicGraphState, MusicGraphTools
 
 logger = logging.getLogger(__name__)
 
@@ -53,17 +43,26 @@ except Exception:
         return str(p or "").strip().lower().replace("-", "_")
 
     def default_autopilot_provider() -> str:  # type: ignore
-        # If the external provider module isn't installed, do NOT advertise fal provider here.
         return "native"
 
     compose_full_mix_fal_sonauto_v2 = None  # type: ignore
 
 
 # -----------------------------
+# Core auth cache (in-memory, worker process)
+# -----------------------------
+_CORE_TOKEN: str | None = None
+_CORE_TOKEN_EXP: float = 0.0
+_CORE_REFRESH: str | None = None
+
+
+# -----------------------------
 # Helpers
 # -----------------------------
+JsonDict = Dict[str, Any]
 
-def _as_dict(x: Any) -> Dict[str, Any]:
+
+def _as_dict(x: Any) -> JsonDict:
     if x is None:
         return {}
     if isinstance(x, dict):
@@ -81,6 +80,56 @@ def _as_dict(x: Any) -> Dict[str, Any]:
         return {}
     return {}
 
+
+def _as_dict_loose(x: Any) -> JsonDict:
+    """
+    Handles:
+      - dict
+      - JSON string of dict
+      - JSON string-scalar whose value is JSON text (double json.loads)
+    """
+    if x is None:
+        return {}
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return {}
+        for _ in range(2):
+            try:
+                obj = json.loads(s)
+            except Exception:
+                return {}
+            if isinstance(obj, dict):
+                return obj
+            if isinstance(obj, str):
+                s = obj.strip()
+                continue
+            return {}
+        return {}
+    return {}
+
+
+def _as_list(x: Any) -> List[Any]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return []
+        if s.startswith("["):
+            try:
+                obj = json.loads(s)
+                return obj if isinstance(obj, list) else []
+            except Exception:
+                return []
+        return [s]
+    return []
+
+
 def _is_truthy(x: Any) -> bool:
     if x is True:
         return True
@@ -92,11 +141,48 @@ def _is_truthy(x: Any) -> bool:
         return x.strip().lower() in ("1", "true", "yes", "y", "on")
     return bool(x)
 
+
 def _coerce_int(v: Any, default: int) -> int:
     try:
         return int(float(v))
     except Exception:
         return default
+
+
+def _jwt_exp_epoch_seconds(token: str) -> float:
+    """
+    Best-effort parse of JWT exp without PyJWT dependency.
+    Returns 0.0 if unknown.
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return 0.0
+        payload_b64 = parts[1]
+        pad = "=" * (-len(payload_b64) % 4)
+        payload = base64.urlsafe_b64decode((payload_b64 + pad).encode("utf-8"))
+        obj = json.loads(payload.decode("utf-8"))
+        exp = obj.get("exp")
+        if exp is None:
+            return 0.0
+        return float(exp)
+    except Exception:
+        return 0.0
+
+
+def _running_in_docker() -> bool:
+    return os.path.exists("/.dockerenv")
+
+
+def _default_fusion_base() -> str:
+    # inside docker network -> service DNS; on host -> localhost
+    return "http://svc-fusion:8002" if _running_in_docker() else "http://localhost:8002"
+
+
+def _get_fusion_base() -> str:
+    base = (os.getenv("DF_FUSION_URL") or os.getenv("FUSION_URL") or "").strip()
+    return (base or _default_fusion_base()).rstrip("/")
+
 
 def _guess_audio_content_type(url: Optional[str], default: str = "audio/mpeg") -> str:
     if not url:
@@ -114,89 +200,197 @@ def _guess_audio_content_type(url: Optional[str], default: str = "audio/mpeg") -
         return "audio/ogg"
     return default
 
-def _fallback_music_plan(*, mode: str, language: str | None, hints: Dict[str, Any]) -> Dict[str, Any]:
+
+def _first_http_url(*vals: Any) -> str:
+    for v in vals:
+        s = str(v or "").strip()
+        if s.startswith("http"):
+            return s
+    return ""
+
+
+def _first_nonempty(*vals: Any) -> str:
+    for v in vals:
+        s = str(v or "").strip()
+        if s:
+            return s
+    return ""
+
+
+async def _get_core_access_token(*, force_refresh: bool = False) -> str:
     """
-    Tiny, deterministic fallback plan generator.
-    Purpose: always provide a usable 'music_plan' even when MusicPlanningService is unavailable.
-    Keep this compact + JSON-serializable (mobile can render this).
+    Product-grade runtime token minting for service-to-service calls.
+
+    Preference order:
+      1) DF_SERVICE_REFRESH_TOKEN (long-lived) -> /api/auth/refresh
+      2) cached refresh_token from prior login
+      3) DF_SERVICE_EMAIL + DF_SERVICE_PASSWORD -> /api/auth/login
     """
-    title = str(hints.get("title") or "Untitled").strip() or "Untitled"
-    genre = str(hints.get("genre") or hints.get("genre_hint") or "pop").strip() or "pop"
-    mood = str(hints.get("mood") or hints.get("vibe_hint") or "uplifting").strip() or "uplifting"
-    tempo = str(hints.get("tempo") or "mid").strip() or "mid"
-    style_refs = hints.get("style_refs") or hints.get("style_ref") or []
+    global _CORE_TOKEN, _CORE_TOKEN_EXP, _CORE_REFRESH
 
-    # Normalize style refs into list[str]
-    if isinstance(style_refs, str):
-        s = style_refs.strip()
-        if s and s.startswith("["):
-            try:
-                style_refs = json.loads(s)
-            except Exception:
-                style_refs = [style_refs]
-        elif s:
-            style_refs = [style_refs]
-        else:
-            style_refs = []
-    if not isinstance(style_refs, list):
-        style_refs = []
+    try:
+        import httpx  # type: ignore
+    except Exception as e:
+        raise RuntimeError("httpx_missing_required_for_core_auth") from e
 
-    if str(mode).lower() == MusicProjectMode.byo.value:
-        steps = [
-            {"step": "ingest_audio", "why": "Use your uploaded track as the master audio"},
-            {"step": "lyrics_strategy", "why": "Lyrics optional unless timed_lyrics_json requested"},
-            {"step": "alignment_optional", "why": "If timed lyrics requested, align lyrics to audio"},
-            {"step": "publish", "why": "Prepare payload for Viewer/Fusion"},
-        ]
-    else:
-        steps = [
-            {"step": "creative_brief", "why": "Lock title/genre/mood/tempo"},
-            {"step": "lyrics", "why": "Generate or use provided lyrics"},
-            {"step": "arrangement", "why": "Define sections (intro/verse/chorus/bridge/outro)"},
-            {"step": "provider_route", "why": "Choose provider based on availability/constraints"},
-            {"step": "generate_audio", "why": "Produce full mix + stems if requested"},
-            {"step": "align_lyrics_optional", "why": "Generate timed_lyrics_json if requested"},
-            {"step": "publish", "why": "Prepare payload for Viewer/Fusion"},
-        ]
+    now = time.time()
+    if not force_refresh and _CORE_TOKEN and now < (_CORE_TOKEN_EXP - 30):
+        return _CORE_TOKEN
 
-    summary = f"{title} — {genre}, {mood}, tempo {tempo} ({language or 'en'})"
+    core = (os.getenv("DF_CORE_URL") or "http://svc-core:8000").rstrip("/")
 
-    return {
-        "version": 1,
-        "source": "fallback",
-        "summary": summary,
-        "mode": str(mode),
-        "language": language,
-        "brief": {
-            "title": title,
-            "genre": genre,
-            "mood": mood,
-            "tempo": tempo,
-            "style_refs": [str(x) for x in style_refs if str(x).strip()],
-        },
-        "steps": steps,
-        "notes": [
-            "This is a lightweight fallback plan.",
-            "If MusicPlanningService is enabled, its plan will replace this.",
-        ],
+    env_refresh = (os.getenv("DF_SERVICE_REFRESH_TOKEN") or "").strip()
+    if env_refresh:
+        _CORE_REFRESH = env_refresh
+
+    # Try refresh first if we have one
+    if _CORE_REFRESH:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    f"{core}/api/auth/refresh",
+                    headers={"Content-Type": "application/json"},
+                    json={"refresh_token": _CORE_REFRESH},
+                )
+                if r.status_code < 400:
+                    j = r.json()
+                    tok = str(j.get("access_token") or j.get("token") or "").strip()
+                    if tok:
+                        exp_epoch = _jwt_exp_epoch_seconds(tok)
+                        if exp_epoch > 0:
+                            _CORE_TOKEN_EXP = exp_epoch
+                        else:
+                            exp_in = int(j.get("expires_in") or 900)
+                            _CORE_TOKEN_EXP = time.time() + max(60, exp_in)
+                        _CORE_TOKEN = tok
+                        return _CORE_TOKEN
+        except Exception:
+            pass
+
+    email = (os.getenv("DF_SERVICE_EMAIL") or "").strip()
+    password = (os.getenv("DF_SERVICE_PASSWORD") or "").strip()
+
+    # IMPORTANT: don't ever default to client_type="service" (your DB constraint rejects it)
+    client_type = (os.getenv("DF_AUTH_CLIENT_TYPE") or "web").strip()
+    device_id = (os.getenv("DF_AUTH_DEVICE_ID") or "svc-music-worker").strip()
+
+    if not email or not password:
+        raise RuntimeError("missing_service_account_creds_set_DF_SERVICE_EMAIL_DF_SERVICE_PASSWORD_or_DF_SERVICE_REFRESH_TOKEN")
+
+    payload = {
+        "email": email,
+        "password": password,
+        "device_id": device_id,
+        "client_type": client_type,
     }
 
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{core}/api/auth/login",
+            headers={"Content-Type": "application/json"},
+            json=payload,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"core_login_failed code={r.status_code} email={email} pass_len={len(password)} body={r.text[:240]}"
+            )
+
+        j = r.json()
+        tok = str(j.get("access_token") or j.get("token") or "").strip()
+        if not tok:
+            raise RuntimeError("core_login_missing_access_token")
+
+        _CORE_REFRESH = str(j.get("refresh_token") or "").strip() or _CORE_REFRESH
+
+        exp_epoch = _jwt_exp_epoch_seconds(tok)
+        if exp_epoch > 0:
+            _CORE_TOKEN_EXP = exp_epoch
+        else:
+            exp_in = int(j.get("expires_in") or 900)
+            _CORE_TOKEN_EXP = time.time() + max(60, exp_in)
+
+        _CORE_TOKEN = tok
+        return _CORE_TOKEN
+
+
+async def _get_fusion_bearer_token() -> Tuple[str, str]:
+    """
+    Returns (authorization_header_value, source)
+      - If DF_FUSION_BEARER_TOKEN / DF_INTERNAL_BEARER_TOKEN exists, use it
+      - Else mint via svc-core (refresh or login), cache in-memory
+    """
+    raw = (
+        (os.getenv("DF_INTERNAL_BEARER_TOKEN") or "").strip()
+        or (os.getenv("DF_FUSION_BEARER_TOKEN") or "").strip()
+        or (os.getenv("DF_AUTH_TOKEN") or "").strip()
+        or (os.getenv("BEARER_TOKEN") or "").strip()
+    )
+
+    if raw:
+        tok = raw
+        if not tok.lower().startswith("bearer "):
+            tok = f"Bearer {tok}"
+        return tok, "env"
+
+    tok = await _get_core_access_token()
+    return f"Bearer {tok}", "core"
+
+
+def _fusion_headers(*, user_id: str, authorization: str) -> Dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": authorization,
+        "X-User-Id": user_id,
+        "X-Request-Source": "svc-music",
+    }
+
+
+def _extract_fusion_job_id(obj: Dict[str, Any]) -> str:
+    for k in ("job_id", "id"):
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _extract_fusion_status(obj: Dict[str, Any]) -> str:
+    v = obj.get("status")
+    return str(v or "").strip().lower()
+
+
+def _extract_fusion_video_url(obj: Dict[str, Any]) -> Optional[str]:
+    arts = obj.get("artifacts")
+    if isinstance(arts, list):
+        for a in arts:
+            if not isinstance(a, dict):
+                continue
+            url = str(a.get("url") or "").strip()
+            kind = str(a.get("kind") or "").lower()
+            if url.startswith("http") and ("mp4" in url.lower() or "video" in kind):
+                return url
+
+    for k in ("video_url", "final_url", "url", "preview_url", "mp4_url"):
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip().startswith("http"):
+            return v.strip()
+
+    return None
+
+
+def _outputs_set(outputs: List[str]) -> set[str]:
+    return {str(x).strip().lower() for x in (outputs or []) if x}
+
+
 def _normalize_mode(val: Any) -> str:
-    # allow enum inputs without producing "MusicProjectMode.autopilot"
     v = getattr(val, "value", val)
     s = str(v or "").strip()
     if not s:
         return MusicProjectMode.autopilot.value
     return s.lower()
 
-def _outputs_set(outputs: List[str]) -> set[str]:
-    return {str(x).strip().lower() for x in (outputs or []) if x}
 
 def _get_byo_audio(hints: Dict[str, Any], input_json: Dict[str, Any] | None = None) -> Tuple[Optional[str], Optional[int]]:
-    """
-    Standardize BYO audio hint keys across earlier experiments.
-    IMPORTANT: This is the *actual song audio* (not voice reference).
-    """
     ij = input_json or {}
     url = (
         ij.get("uploaded_audio_url")
@@ -214,16 +408,13 @@ def _get_byo_audio(hints: Dict[str, Any], input_json: Dict[str, Any] | None = No
         or hints.get("audio_master_duration_ms")
     )
     try:
-        dur_i = int(dur) if dur is not None else None
+        dur_i = int(float(dur)) if dur is not None else None
     except Exception:
         dur_i = None
     return (str(url) if url else None, dur_i)
 
+
 def _maybe_import_alignment():
-    """
-    Try to use your real lyrics_alignment_service implementation if present.
-    Fallback to a deterministic naive implementation if not.
-    """
     try:
         import app.services.lyrics_alignment_service as las  # type: ignore
     except Exception:
@@ -282,18 +473,122 @@ def _maybe_import_alignment():
     return real, naive
 
 
+async def _call_any_upload_method(
+    storage: Any,
+    *,
+    user_id: str,
+    project_id: str,
+    job_id: str,
+    local_path: Path,
+    content_type: str,
+    blob_filename: str,
+) -> str:
+    candidates = [
+        "upload_music_fallback_audio_and_get_sas_url",
+        "upload_music_audio_and_get_sas_url",
+        "upload_audio_and_get_sas_url",
+        "upload_file_and_get_sas_url",
+        "upload_local_file_and_get_sas_url",
+        "upload_and_get_sas_url",
+    ]
+
+    kwargs = {
+        "user_id": user_id,
+        "project_id": project_id,
+        "job_id": job_id,
+        "local_path": local_path,
+        "path": local_path,
+        "file_path": local_path,
+        "content_type": content_type,
+        "mime": content_type,
+        "blob_filename": blob_filename,
+        "filename": blob_filename,
+        "dst_filename": blob_filename,
+    }
+
+    for name in candidates:
+        fn = getattr(storage, name, None)
+        if not callable(fn):
+            continue
+
+        try:
+            sig = inspect.signature(fn)
+            call_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+            res = fn(**call_kwargs)
+            if inspect.isawaitable(res):
+                res = await res
+            url = str(res or "").strip()
+            if url:
+                return url
+        except Exception:
+            continue
+
+    raise RuntimeError("azure_storage_upload_method_missing_for_fallback_audio")
+
+
+def _fallback_music_plan(*, mode: str, language: str | None, hints: Dict[str, Any]) -> JsonDict:
+    title = str(hints.get("title") or "Untitled").strip() or "Untitled"
+    genre = str(hints.get("genre") or hints.get("genre_hint") or "pop").strip() or "pop"
+    mood = str(hints.get("mood") or hints.get("vibe_hint") or "uplifting").strip() or "uplifting"
+    tempo = str(hints.get("tempo") or "mid").strip() or "mid"
+    style_refs = hints.get("style_refs") or hints.get("style_ref") or []
+
+    if isinstance(style_refs, str):
+        s = style_refs.strip()
+        if s and s.startswith("["):
+            try:
+                style_refs = json.loads(s)
+            except Exception:
+                style_refs = [style_refs]
+        elif s:
+            style_refs = [style_refs]
+        else:
+            style_refs = []
+    if not isinstance(style_refs, list):
+        style_refs = []
+
+    if str(mode).lower() == MusicProjectMode.byo.value:
+        steps = [
+            {"step": "ingest_audio", "why": "Use your uploaded track as the master audio"},
+            {"step": "lyrics_strategy", "why": "Lyrics optional unless timed_lyrics_json requested"},
+            {"step": "alignment_optional", "why": "If timed lyrics requested, align lyrics to audio"},
+            {"step": "publish", "why": "Prepare payload for Viewer/Fusion"},
+        ]
+    else:
+        steps = [
+            {"step": "creative_brief", "why": "Lock title/genre/mood/tempo"},
+            {"step": "lyrics", "why": "Generate or use provided lyrics"},
+            {"step": "arrangement", "why": "Define sections (intro/verse/chorus/bridge/outro)"},
+            {"step": "provider_route", "why": "Choose provider based on availability/constraints"},
+            {"step": "generate_audio", "why": "Produce full mix + stems if requested"},
+            {"step": "align_lyrics_optional", "why": "Generate timed_lyrics_json if requested"},
+            {"step": "publish", "why": "Prepare payload for Viewer/Fusion"},
+        ]
+
+    summary = f"{title} — {genre}, {mood}, tempo {tempo} ({language or 'en'})"
+
+    return {
+        "version": 1,
+        "source": "fallback",
+        "summary": summary,
+        "mode": str(mode),
+        "language": language,
+        "brief": {
+            "title": title,
+            "genre": genre,
+            "mood": mood,
+            "tempo": tempo,
+            "style_refs": [str(x) for x in style_refs if str(x).strip()],
+        },
+        "steps": steps,
+        "notes": [
+            "Lightweight fallback plan.",
+            "If MusicPlanningService is enabled, its plan will replace this.",
+        ],
+    }
+
+
 class ConcreteMusicTools(MusicGraphTools):
-    """
-    Updated behavior to match modes:
-
-    - autopilot/co_create:
-        lyrics default generate (user doesn't need to type)
-    - byo:
-        lyrics default none (unless user uploads lyrics or timed_lyrics_json requested)
-    - timed_lyrics_json requested:
-        if lyrics missing, we auto-generate to allow alignment to succeed
-    """
-
     def __init__(self, *, job_id: UUID, project_id: UUID, user_id: UUID, input_json: Dict[str, Any] | None = None):
         self.job_id = job_id
         self.project_id = project_id
@@ -310,11 +605,15 @@ class ConcreteMusicTools(MusicGraphTools):
     def _demo_use_voice_ref_as_audio(self) -> bool:
         return _is_truthy(self.hints.get("demo_use_voice_ref_as_audio") or self.hints.get("demo_voice_ref_as_audio"))
 
-    def _computed(self) -> Dict[str, Any]:
-        return _as_dict(self.input_json.get("computed"))
+    def _computed(self) -> JsonDict:
+        raw = self.input_json.get("computed")
+        c = _as_dict_loose(raw)
+        if c and not isinstance(raw, dict):
+            self.input_json["computed"] = c
+        return c
 
     def _set_computed(self, key: str, value: Any) -> None:
-        c = _as_dict(self.input_json.get("computed"))
+        c = self._computed()
         c[key] = value
         self.input_json["computed"] = c
 
@@ -339,6 +638,36 @@ class ConcreteMusicTools(MusicGraphTools):
             return "generate" if MusicTrackType.timed_lyrics_json.value in outputs else "none"
 
         return "generate"
+
+    def _set_audio_probe_from_known_duration(self, *, duration_ms: int) -> None:
+        try:
+            duration_ms = int(float(duration_ms or 0))
+        except Exception:
+            duration_ms = 0
+        if duration_ms <= 0:
+            return
+
+        c = self._computed()
+        ap = _as_dict(c.get("audio_probe"))
+
+        try:
+            existing_sec = float(ap.get("duration_sec") or 0)
+        except Exception:
+            existing_sec = 0.0
+
+        if existing_sec <= 0.0:
+            ap["duration_ms"] = duration_ms
+            ap["duration_sec"] = float(duration_ms) / 1000.0
+            ap.setdefault("beats_per_bar", 4)
+            ap.setdefault("source", "known_duration")
+            self._set_computed("audio_probe", ap)
+
+        try:
+            td = float(c.get("track_duration_sec") or 0)
+        except Exception:
+            td = 0.0
+        if td <= 0.0:
+            self._set_computed("track_duration_sec", float(duration_ms) / 1000.0)
 
     def _generate_fallback_lyrics(self, s: MusicGraphState) -> str:
         title = str(self.hints.get("title") or self.input_json.get("title") or "My Song").strip()
@@ -376,7 +705,6 @@ class ConcreteMusicTools(MusicGraphTools):
         mode = self._get_mode(s)
         language = getattr(s, "language_hint", None)
 
-        plan_payload: Any = None
         if self._planner:
             plan_out = await self._planner.build_plan(
                 mode=mode,
@@ -394,7 +722,6 @@ class ConcreteMusicTools(MusicGraphTools):
             plan_payload = _fallback_music_plan(mode=mode, language=language, hints=self.hints)
 
         self._set_computed("music_plan", plan_payload)
-
         summary = _as_dict(plan_payload).get("summary")
         if summary:
             self._set_computed("plan_summary", summary)
@@ -481,7 +808,6 @@ class ConcreteMusicTools(MusicGraphTools):
         return bool(shutil.which("ffmpeg"))
 
     def _write_silence_wav(self, *, path: Path, duration_ms: int, sample_rate: int = 44100) -> None:
-        # Pure-python WAV fallback if ffmpeg is not available.
         duration_ms = max(1000, int(duration_ms or 30_000))
         frames = int(sample_rate * (duration_ms / 1000.0))
         silence = b"\x00\x00" * frames  # 16-bit mono silence
@@ -492,15 +818,10 @@ class ConcreteMusicTools(MusicGraphTools):
             wf.writeframes(silence)
 
     async def _generate_native_fallback_full_mix(self, *, duration_ms: int) -> Tuple[str, int, str]:
-        """
-        Generate deterministic fallback audio and upload to Azure music-output.
-        Prefers ffmpeg if available, otherwise uses pure-python wav writer.
-        Returns (sas_url, duration_ms, content_type).
-        """
         duration_ms = max(1000, int(duration_ms or 30_000))
         dur_s = max(1, int(round(duration_ms / 1000.0)))
 
-        out_dir = Path("/tmp/df_music_native")
+        out_dir = Path("/tmp/df_music_native") / str(self.job_id)
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"fallback_full_mix_{int(time.time())}.wav"
 
@@ -526,8 +847,9 @@ class ConcreteMusicTools(MusicGraphTools):
         else:
             self._write_silence_wav(path=out_path, duration_ms=duration_ms)
 
-        storage = AzureStorageService.for_output()
-        sas_url = await storage.upload_music_fallback_audio_and_get_sas_url(
+        storage = AzureStorageService.for_output() if hasattr(AzureStorageService, "for_output") else AzureStorageService()  # type: ignore
+        sas_url = await _call_any_upload_method(
+            storage,
             user_id=str(self.user_id),
             project_id=str(self.project_id),
             job_id=str(self.job_id),
@@ -539,44 +861,50 @@ class ConcreteMusicTools(MusicGraphTools):
         return (str(sas_url), duration_ms, "audio/wav")
 
     async def generate_audio(self, s: MusicGraphState) -> List[GraphTrack]:
-        """
-        Contract: MUST produce at least one 'full_mix' track (or raise).
-
-        Separation:
-          - audio_master_url/byo_audio_url = actual song audio
-          - voice_ref_url = voice reference only
-          - demo_use_voice_ref_as_audio=true can optionally use voice_ref_url as audio for demos
-        """
         computed = self._computed()
         mode = self._get_mode(s)
 
+        voice_ref_url = str(computed.get("voice_ref_url") or "").strip()
         audio_url, audio_dur = _get_byo_audio(self.hints, self.input_json)
+
+        # never treat voice_ref as song audio unless demo flag is on
+        if audio_url and voice_ref_url and str(audio_url).strip() == voice_ref_url and not self._demo_use_voice_ref_as_audio():
+            audio_url = None
 
         if not audio_url:
             audio_url = computed.get("audio_master_url") or computed.get("byo_audio_url") or computed.get("demo_audio_url")
 
         demo_audio_url = None
         if not audio_url and self._demo_use_voice_ref_as_audio():
-            vr = computed.get("voice_ref_url")
-            if vr:
-                demo_audio_url = str(vr)
+            if voice_ref_url:
+                demo_audio_url = voice_ref_url
 
-        final_audio_url = audio_url or demo_audio_url
+        final_audio_url = str(audio_url).strip() if audio_url else (str(demo_audio_url).strip() if demo_audio_url else None)
 
-        # ---- BYO (or already have master audio) ----
+        # BYO / already have master audio
         if mode == MusicProjectMode.byo.value or final_audio_url:
             if not final_audio_url:
                 raise Exception("missing_audio_master_url")
 
             if not audio_dur:
-                audio_dur = int(
+                audio_dur = _coerce_int(
                     self.input_json.get("audio_master_duration_ms")
                     or self.hints.get("audio_master_duration_ms")
                     or computed.get("audio_master_duration_ms")
-                    or 0
+                    or 0,
+                    30_000,
                 ) or 30_000
 
-            ct = _guess_audio_content_type(str(final_audio_url) if final_audio_url else None, "audio/mpeg")
+            ct = _guess_audio_content_type(final_audio_url, "audio/mpeg")
+
+            self._set_computed("audio_master_url", str(final_audio_url))
+            self._set_computed("byo_audio_url", str(final_audio_url))
+            self._set_computed("audio_master_duration_ms", int(audio_dur))
+            self._set_computed("audio_duration_ms", int(audio_dur))
+            self._set_computed("audio_content_type", ct)
+            self._set_computed("audio_source", "demo_voice_ref_url" if demo_audio_url else "byo")
+
+            self._set_audio_probe_from_known_duration(duration_ms=int(audio_dur))
 
             meta: Dict[str, Any] = {
                 "audio_duration_ms": int(audio_dur),
@@ -588,20 +916,9 @@ class ConcreteMusicTools(MusicGraphTools):
             }
 
             if demo_audio_url:
-                meta.update(
-                    {
-                        "demo_audio_url": str(demo_audio_url),
-                        "audio_source": "demo_voice_ref_url",
-                        "is_demo": True,
-                    }
-                )
+                meta.update({"demo_audio_url": str(demo_audio_url), "is_demo": True, "source": "byo_demo"})
             else:
-                meta.update(
-                    {
-                        "audio_source": "hints" if _get_byo_audio(self.hints, self.input_json)[0] else "computed",
-                        "source": "byo",
-                    }
-                )
+                meta.update({"is_demo": False, "source": "byo"})
 
             return [
                 GraphTrack(
@@ -613,7 +930,7 @@ class ConcreteMusicTools(MusicGraphTools):
                 )
             ]
 
-        # ---- AUTOPILOT / CO_CREATE ----
+        # AUTOPILOT / CO_CREATE
         provider = normalize_provider(
             self.hints.get("music_provider")
             or self.hints.get("provider")
@@ -622,12 +939,14 @@ class ConcreteMusicTools(MusicGraphTools):
             or default_autopilot_provider()
         )
 
-        # 1) Try Fal Sonauto v2 if available/configured
         if provider in ("fal_sonauto_v2", "sonauto_v2", "sonauto") and callable(compose_full_mix_fal_sonauto_v2):
             try:
                 seed_i: Optional[int] = None
                 if self.seed is not None:
-                    seed_i = int(float(self.seed))
+                    try:
+                        seed_i = int(float(self.seed))
+                    except Exception:
+                        seed_i = None
 
                 res: AutopilotComposeResult = await compose_full_mix_fal_sonauto_v2(  # type: ignore
                     user_id=str(self.user_id),
@@ -640,40 +959,36 @@ class ConcreteMusicTools(MusicGraphTools):
                     computed=self._computed(),
                 )
 
-                # Persist for downstream publish/status consistency
+                sas = str(getattr(res, "sas_url", "") or "").strip() or None
+                dur_ms = int(getattr(res, "duration_ms", 0) or 0) or 30_000
+                ct = str(getattr(res, "content_type", "audio/mpeg") or "audio/mpeg")
+
+                if not sas:
+                    raise RuntimeError("autopilot_provider_missing_sas_url")
+
                 self._set_computed("audio_provider", getattr(res, "provider", "fal_sonauto_v2"))
                 self._set_computed("provider_request_id", getattr(res, "provider_request_id", None))
-                self._set_computed("audio_master_url", getattr(res, "sas_url", None))
-                self._set_computed("byo_audio_url", getattr(res, "sas_url", None))
-                self._set_computed("audio_master_duration_ms", int(getattr(res, "duration_ms", 0) or 0))
+                self._set_computed("audio_master_url", sas)
+                self._set_computed("byo_audio_url", sas)
+                self._set_computed("audio_master_duration_ms", dur_ms)
+                self._set_computed("audio_duration_ms", dur_ms)
+                self._set_computed("audio_content_type", ct)
+                self._set_computed("audio_source", "autopilot_provider")
 
-                prov_lyrics = getattr(res, "lyrics", None)
-                if prov_lyrics and not str(self._computed().get("lyrics_text") or "").strip():
-                    self._set_computed("lyrics_text", str(prov_lyrics))
-                    self._set_computed("lyrics_source_effective", "generate")
+                self._set_audio_probe_from_known_duration(duration_ms=int(dur_ms))
 
                 meta2: Dict[str, Any] = {
-                    "audio_duration_ms": int(getattr(res, "duration_ms", 0) or 0),
-                    "url": str(getattr(res, "sas_url", "")),
-                    "content_type": str(getattr(res, "content_type", "audio/mpeg") or "audio/mpeg"),
-                    "audio_master_url": str(getattr(res, "sas_url", "")),
-                    "byo_audio_url": str(getattr(res, "sas_url", "")),
-                    "byo_duration_ms": int(getattr(res, "duration_ms", 0) or 0),
-                    "audio_source": "autopilot_provider",
-                    "provider": str(getattr(res, "provider", "fal_sonauto_v2")),
-                    "provider_request_id": getattr(res, "provider_request_id", None),
-                    "provider_seed": int(getattr(res, "provider_seed", 0) or 0),
-                    "provider_tags": list(getattr(res, "tags", []) or []),
-                    "source_url": getattr(res, "source_url", None),
-                    "is_demo": False,
+                    "audio_duration_ms": int(dur_ms),
+                    "url": str(sas),
+                    "content_type": ct,
                     "source": "autopilot",
+                    "is_demo": False,
                 }
 
-                dur_ms = int(getattr(res, "duration_ms", 0) or 0) or 30_000
                 return [
                     GraphTrack(
                         track_type=MusicTrackType.full_mix.value,
-                        duration_ms=dur_ms,
+                        duration_ms=int(dur_ms),
                         artifact_id=None,
                         media_asset_id=None,
                         meta=meta2,
@@ -682,7 +997,7 @@ class ConcreteMusicTools(MusicGraphTools):
             except Exception as e:
                 self._set_computed("autopilot_provider_error", str(e))
 
-        # 2) Always-works native fallback so pipeline never fails
+        # Always-works native fallback
         plan = _as_dict(self._computed().get("music_plan"))
         duration_ms = _coerce_int(
             plan.get("duration_ms")
@@ -695,18 +1010,15 @@ class ConcreteMusicTools(MusicGraphTools):
 
         fallback_url, fallback_dur_ms, ct = await self._generate_native_fallback_full_mix(duration_ms=duration_ms)
 
-        meta2: Dict[str, Any] = {
-            "audio_duration_ms": int(fallback_dur_ms),
-            "url": fallback_url,
-            "content_type": ct,
-            "audio_master_url": fallback_url,
-            "byo_audio_url": fallback_url,
-            "byo_duration_ms": int(fallback_dur_ms),
-            "audio_source": "fallback_native",
-            "provider": "native",
-            "source": "autopilot",
-            "is_demo": True,
-        }
+        self._set_computed("audio_provider", "native")
+        self._set_computed("audio_master_url", fallback_url)
+        self._set_computed("byo_audio_url", fallback_url)
+        self._set_computed("audio_master_duration_ms", int(fallback_dur_ms))
+        self._set_computed("audio_duration_ms", int(fallback_dur_ms))
+        self._set_computed("audio_content_type", ct)
+        self._set_computed("audio_source", "fallback_native")
+
+        self._set_audio_probe_from_known_duration(duration_ms=int(fallback_dur_ms))
 
         return [
             GraphTrack(
@@ -714,7 +1026,7 @@ class ConcreteMusicTools(MusicGraphTools):
                 duration_ms=int(fallback_dur_ms),
                 artifact_id=None,
                 media_asset_id=None,
-                meta=meta2,
+                meta={"url": fallback_url, "content_type": ct, "source": "fallback_native", "is_demo": True},
             )
         ]
 
@@ -735,6 +1047,8 @@ class ConcreteMusicTools(MusicGraphTools):
             if str(getattr(t, "track_type", "")) == MusicTrackType.full_mix.value:
                 dur = int(getattr(t, "duration_ms", 0) or 0)
                 break
+        if dur <= 0:
+            dur = _coerce_int(computed.get("audio_master_duration_ms") or computed.get("audio_duration_ms") or 0, 0)
         if dur <= 0:
             return None
 
@@ -773,110 +1087,244 @@ class ConcreteMusicTools(MusicGraphTools):
         )
 
     async def generate_performer_videos(self, s: MusicGraphState) -> Dict[str, Any]:
-        # IMPORTANT: avoid bool("false") == True
-        render_video = _is_truthy(self.hints.get("render_video") or self.hints.get("generate_video"))
-        if not render_video:
-            return {"skipped": True}
-        return {"skipped": True, "reason": "performer_video_not_implemented"}
-
-    async def compose_video(self, s: MusicGraphState) -> Dict[str, Any]:
         """
-        Compose step (Phase-1): build clip manifest for svc-fusion-extension.
-        Does NOT render video yet — just produces deterministic manifest + persists to computed.
+        Product-grade performer generation via svc-fusion.
+
+        Fixes:
+          - Accepts face refs from ensure_performer_faces outputs:
+              computed.performer_a_image_url
+              computed.performer_b_image_url
+              computed.performer_images[0]
+          - Self-heals aliases:
+              computed.performer_face_image_url / performer_face_artifact_id
         """
-        render_video = _is_truthy(self.hints.get("render_video") or self.hints.get("generate_video"))
-        if not render_video:
-            # Persist skip reason so status/debug can explain why no manifest exists
-            self._set_computed("compose_video_skipped", True)
-            s.computed = self._computed()
-            return {"skipped": True}
+        try:
+            import httpx  # type: ignore
+        except Exception as e:
+            self._set_computed("performer_videos_skipped", True)
+            self._set_computed("performer_videos_skip_reason", "httpx_missing")
+            self._set_computed("performer_videos", [])
+            if _is_truthy(os.getenv("DF_REQUIRE_PERFORMER_VIDEOS", "0")):
+                raise RuntimeError("performer_videos_require_httpx") from e
+            return {"performer_videos": []}
 
-        from app.services.video_directory import build_clip_manifest, validate_manifest, validate_music_plan
+        enable = _is_truthy(os.getenv("DF_ENABLE_PERFORMER_VIDEOS", "0")) or _is_truthy(self.hints.get("enable_performer_videos"))
+        require = _is_truthy(os.getenv("DF_REQUIRE_PERFORMER_VIDEOS", "0")) or _is_truthy(self.hints.get("require_performer_videos"))
 
-        # Read computed safely (but persist via _set_computed)
+        if not enable:
+            self._set_computed("performer_videos_skipped", True)
+            self._set_computed("performer_videos_skip_reason", "disabled")
+            self._set_computed("performer_videos", [])
+            return {"performer_videos": []}
+
         computed = self._computed()
 
-        # Accept dict or JSON-string; tolerate missing keys
-        music_plan_raw = computed.get("music_plan") or computed.get("plan") or {}
-        music_plan = _as_dict(music_plan_raw)
+        # NEW: accept performer_images[0] as face ref
+        perf_imgs = computed.get("performer_images")
+        perf_imgs = perf_imgs if isinstance(perf_imgs, list) else []
+        perf_img0 = str(perf_imgs[0]).strip() if perf_imgs else ""
 
-        mode = self._get_mode(s) or str(self.hints.get("mode") or computed.get("mode") or "")
-        language_hint = (
-            self.hints.get("language_hint")
-            or self.hints.get("language")
-            or getattr(s, "language_hint", None)
-            or computed.get("language_hint")
-            or computed.get("language")
+        # Face reference (expanded fallbacks)
+        face_image_url = _first_http_url(
+            os.getenv("DF_PERFORMER_FACE_IMAGE_URL"),
+            self.hints.get("performer_face_image_url"),
+            computed.get("performer_face_image_url"),
+            # fallbacks from ensure_performer_faces
+            computed.get("performer_a_image_url"),
+            computed.get("performer_b_image_url"),
+            perf_img0,
+            computed.get("performer_image_url"),
         )
-        duet_layout = str(self.hints.get("duet_layout") or computed.get("duet_layout") or "split_screen")
-        quality = str(self.hints.get("quality") or computed.get("quality") or "standard")
 
-        seed_raw = self.hints.get("seed") if "seed" in self.hints else computed.get("seed")
-        seed: Optional[int] = None
+        face_artifact_id = _first_nonempty(
+            os.getenv("DF_PERFORMER_FACE_ARTIFACT_ID"),
+            self.hints.get("performer_face_artifact_id"),
+            computed.get("performer_face_artifact_id"),
+            computed.get("performer_a_artifact_id"),
+            computed.get("performer_b_artifact_id"),
+            computed.get("performer_artifact_id"),
+        )
+
+        # Self-heal aliases for downstream code / status visibility
+        if face_image_url and not str(computed.get("performer_face_image_url") or "").strip():
+            computed["performer_face_image_url"] = face_image_url
+        if face_artifact_id and not str(computed.get("performer_face_artifact_id") or "").strip():
+            computed["performer_face_artifact_id"] = face_artifact_id
+        self.input_json["computed"] = computed
+
+        if not face_image_url and not face_artifact_id:
+            self._set_computed("performer_videos_skipped", True)
+            self._set_computed("performer_videos_skip_reason", "missing_face_ref")
+            self._set_computed("performer_videos", [])
+            if require:
+                raise RuntimeError("performer_videos_missing_face_ref")
+            return {"performer_videos": []}
+
+        # Audio (song audio)
+        audio_url = (
+            str(computed.get("audio_master_url") or "").strip()
+            or str(computed.get("byo_audio_url") or "").strip()
+            or str(computed.get("demo_audio_url") or "").strip()
+            or str(self.input_json.get("uploaded_audio_url") or "").strip()
+        )
+        if not audio_url and self._demo_use_voice_ref_as_audio():
+            audio_url = str(computed.get("voice_ref_url") or "").strip()
+
+        if not audio_url:
+            self._set_computed("performer_videos_skipped", True)
+            self._set_computed("performer_videos_skip_reason", "missing_audio_url")
+            self._set_computed("performer_videos", [])
+            if require:
+                raise RuntimeError("performer_videos_missing_audio_url")
+            return {"performer_videos": []}
+
+        fusion_base = _get_fusion_base()
+
+        # Use the music job owner (must match token subject in most setups)
+        user_id = str(getattr(s, "user_id", "") or self.user_id)
+
+        # Debug breadcrumbs (safe: do not include token)
+        self._set_computed("performer_video_fusion_base", fusion_base)
+        self._set_computed("performer_video_user_id", user_id)
+
+        provider = str(os.getenv("DF_FUSION_PROVIDER") or self.hints.get("fusion_provider") or "heygen_av4")
+
+        payload: Dict[str, Any] = {
+            "voice_mode": "audio",
+            "voice_audio": {"audio_url": audio_url},
+            "provider": provider,
+            "consent": {"external_provider_ok": True},
+            "tags": {
+                "source": "svc-music",
+                "music_job_id": str(self.job_id),
+                "music_project_id": str(self.project_id),
+                "purpose": "performer_video",
+            },
+        }
+        if face_image_url:
+            payload["face_image_url"] = face_image_url
+        if face_artifact_id:
+            payload["face_artifact_id"] = face_artifact_id
+
+        timeout_s = _coerce_int(os.getenv("DF_FUSION_CREATE_TIMEOUT_SECS", 60), 60)
+        poll_timeout_s = _coerce_int(os.getenv("DF_FUSION_TIMEOUT_SECS", 900), 900)
+        poll_every_s = float(os.getenv("DF_FUSION_POLL_SECS", "5") or 5)
+
+        async def _run_once(*, force_refresh_token: bool = False) -> Dict[str, Any]:
+            if force_refresh_token:
+                auth = f"Bearer {await _get_core_access_token(force_refresh=True)}"
+                src = "core_refresh_forced"
+            else:
+                auth, src = await _get_fusion_bearer_token()
+
+            headers = _fusion_headers(user_id=user_id, authorization=auth)
+            self._set_computed("performer_video_auth_source", src)
+
+            create_url = f"{fusion_base}/jobs"
+
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
+                r = await client.post(create_url, headers=headers, json=payload)
+                self._set_computed("performer_video_create_http_status", int(r.status_code))
+
+                if r.status_code == 401:
+                    return {"_auth_401": True, "_body": (r.text or "")[:240]}
+
+                if r.status_code >= 400:
+                    return {"_error": f"fusion_create_http_{r.status_code}:{(r.text or '')[:240]}"}
+
+                try:
+                    create_json_any = r.json()
+                except Exception:
+                    create_json_any = {}
+
+                create_json = create_json_any if isinstance(create_json_any, dict) else {}
+                fjid = _extract_fusion_job_id(create_json)
+                if not fjid:
+                    return {"_error": f"fusion_create_missing_job_id keys={list(create_json.keys())[:25]}"}
+
+                get_url = f"{fusion_base}/jobs/{fjid}"
+                t0 = time.time()
+
+                while True:
+                    rr = await client.get(get_url, headers=headers)
+                    if rr.status_code == 401:
+                        return {"_auth_401": True, "_body": (rr.text or "")[:240], "_job_id": fjid}
+                    if rr.status_code >= 400:
+                        return {"_error": f"fusion_poll_http_{rr.status_code}:{(rr.text or '')[:240]}", "_job_id": fjid}
+
+                    try:
+                        j_any = rr.json()
+                    except Exception:
+                        j_any = {}
+                    j = j_any if isinstance(j_any, dict) else {}
+                    st = _extract_fusion_status(j)
+
+                    if st in ("succeeded", "success", "completed", "done"):
+                        vid = _extract_fusion_video_url(j)
+                        if not vid:
+                            return {"_error": "fusion_succeeded_but_missing_video_url", "_job_id": fjid}
+                        return {"video_url": vid, "fusion_job_id": fjid, "provider": provider}
+
+                    if st in ("failed", "error", "canceled", "cancelled"):
+                        err = str(j.get("error_message") or j.get("error") or j.get("message") or "fusion_failed")
+                        return {"_error": f"fusion_failed status={st} err={err}", "_job_id": fjid}
+
+                    if time.time() - t0 > poll_timeout_s:
+                        return {"_error": "fusion_timeout_waiting_for_video", "_job_id": fjid}
+
+                    await __import__("asyncio").sleep(poll_every_s)
+
         try:
-            if seed_raw is not None:
-                seed = int(float(seed_raw))
-        except Exception:
-            seed = None
+            out = await _run_once(force_refresh_token=False)
 
-        exports = (
-            self.hints.get("exports")
-            or self.hints.get("export_aspects")
-            or self.hints.get("aspects")
-            or computed.get("exports")
-            or computed.get("export_aspects")
-        )
+            if out.get("_auth_401"):
+                self._set_computed("performer_video_auth_401_body", str(out.get("_body") or ""))
+                out = await _run_once(force_refresh_token=True)
 
-        audio_duration_ms = (
-            computed.get("audio_duration_ms")
-            or computed.get("song_duration_ms")
-            or computed.get("track_duration_ms")
-            or computed.get("audio_master_duration_ms")
-        )
-        try:
-            audio_duration_ms = int(float(audio_duration_ms)) if audio_duration_ms is not None else None
-        except Exception:
-            audio_duration_ms = None
+            if out.get("_error"):
+                self._set_computed("performer_videos_skipped", True)
+                self._set_computed("performer_videos_skip_reason", str(out["_error"]))
+                self._set_computed("performer_videos", [])
+                if require:
+                    raise RuntimeError(str(out["_error"]))
+                return {"performer_videos": []}
 
-        no_face = _is_truthy(self.hints.get("no_face") or self.hints.get("no_lip_sync") or self.hints.get("faceless_video"))
+            item = {
+                "video_url": out["video_url"],
+                "provider": out.get("provider") or provider,
+                "fusion_job_id": out.get("fusion_job_id"),
+            }
+            self._set_computed("performer_videos_skipped", False)
+            self._set_computed("performer_videos_skip_reason", None)
+            self._set_computed("performer_videos", [item])
+            self._set_computed("performer_video_url", item["video_url"])
+            self._set_computed("performer_video_job_id", item.get("fusion_job_id"))
+            return {"performer_videos": [item]}
 
-        clip_manifest = build_clip_manifest(
-            music_plan=music_plan,
-            mode=str(mode or ""),
-            language_hint=str(language_hint) if language_hint else None,
-            duet_layout=duet_layout,
-            quality=quality,
-            seed=seed,
-            exports=exports,
-            audio_duration_ms=audio_duration_ms,
-            no_face=no_face,
-        )
+        except Exception as e:
+            self._set_computed("performer_videos_skipped", True)
+            self._set_computed("performer_videos_skip_reason", f"fusion_error:{e}")
+            self._set_computed("performer_videos", [])
+            if require:
+                raise
+            return {"performer_videos": []}
 
-        # warn-only validation (never block UX)
-        plan_warnings = validate_music_plan(music_plan)
-        if plan_warnings:
-            logger.warning("music_plan warnings: %s", plan_warnings[:50])
+    async def compose_video(self, s: MusicGraphState) -> Dict[str, Any]:
+        computed = self._computed()
+        existing = computed.get("clip_manifest")
+        if isinstance(existing, dict) and isinstance(existing.get("clips"), list) and existing["clips"]:
+            self._set_computed("compose_video_skipped", True)
+            return {"skipped": True, "reason": "clip_manifest_already_present"}
 
-        manifest_warnings = validate_manifest(clip_manifest)
-        if manifest_warnings:
-            logger.warning("clip_manifest warnings: %s", manifest_warnings[:50])
-
-        # ✅ CRITICAL: persist into DB-backed computed (not just s.computed)
-        self._set_computed("clip_manifest", clip_manifest)
-        self._set_computed("compose_video_skipped", False)
-        self._set_computed("compose_video_warnings", {"plan": plan_warnings, "manifest": manifest_warnings})
-
-        # keep state in sync too
-        s.computed = self._computed()
-
-        return {"skipped": False, "clip_manifest": clip_manifest}
-
-
+        self._set_computed("compose_video_skipped", True)
+        return {"skipped": True, "reason": "compose_video_disabled_in_v1_use_clip_manifest_service"}
 
     async def qc(self, s: MusicGraphState) -> Dict[str, Any]:
         have_full = any(
             str(getattr(t, "track_type", "")) == MusicTrackType.full_mix.value for t in getattr(s, "tracks", []) or []
         )
         if not have_full:
-            raise Exception("qc_failed_missing_full_mix")
+            c = self._computed()
+            if not (c.get("audio_master_url") or c.get("byo_audio_url") or c.get("demo_audio_url")):
+                raise Exception("qc_failed_missing_full_mix")
         return {"ok": True}

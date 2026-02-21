@@ -29,6 +29,43 @@ class CommerceCampaignsRepo:
         )
         return dict(row) if row else None
 
+    async def get_by_quote_id(self, *, user_id: UUID, quote_id: UUID) -> Optional[Dict[str, Any]]:
+        pool = await get_pool()
+        row = await pool.fetchrow(
+            f"""
+            SELECT *
+            FROM {_TABLE}
+            WHERE user_id=$1 AND quote_id=$2
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            user_id,
+            quote_id,
+        )
+        return dict(row) if row else None
+
+    async def get_for_user(self, *, user_id: UUID, campaign_id: UUID) -> Optional[Dict[str, Any]]:
+        pool = await get_pool()
+        row = await pool.fetchrow(
+            f"SELECT * FROM {_TABLE} WHERE user_id=$1 AND id=$2",
+            user_id,
+            campaign_id,
+        )
+        return dict(row) if row else None
+
+    async def set_status(self, *, user_id: UUID, campaign_id: UUID, status: str) -> None:
+        pool = await get_pool()
+        await pool.execute(
+            f"""
+            update {_TABLE}
+            set status=$3
+            where user_id=$1 and id=$2
+            """,
+            user_id,
+            campaign_id,
+            status,
+        )
+
     async def create(
         self,
         *,
@@ -52,7 +89,7 @@ class CommerceCampaignsRepo:
             product_type,
             status,
             quote_id,
-            input_json,
-            meta_json,
+            input_json or {},
+            meta_json or {},
         )
-        return row["id"
+        return row["id"]

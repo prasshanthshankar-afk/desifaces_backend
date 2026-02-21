@@ -62,6 +62,9 @@ def _as_dict(x: Any) -> Dict[str, Any]:
     if isinstance(x, str):
         try:
             v = json.loads(x)
+            if isinstance(v, str):
+                v2 = json.loads(v)
+                return v2 if isinstance(v2, dict) else {}
             return v if isinstance(v, dict) else {}
         except Exception:
             return {}
@@ -70,6 +73,29 @@ def _as_dict(x: Any) -> Dict[str, Any]:
         return v if isinstance(v, dict) else {}
     except Exception:
         return {}
+
+
+async def _set_payload_stage(con, job_id: UUID, stage: str, error_text: str | None = None) -> None:
+    row = await con.fetchrow(
+        "select payload_json from public.studio_jobs where id=$1 and studio_type='commerce'",
+        job_id,
+    )
+    payload = _as_dict(row["payload_json"] if row else {})
+    computed = _as_dict(payload.get("computed"))
+    computed["stage"] = stage
+    if error_text:
+        computed["error"] = error_text
+    payload["computed"] = computed
+    payload["stage"] = stage
+    await con.execute(
+        """
+        update public.studio_jobs
+        set payload_json=$2::jsonb, updated_at=now()
+        where id=$1 and studio_type='commerce'
+        """,
+        job_id,
+        json.dumps(payload),
+    )
 
 
 async def _mark_succeeded(con, job_id: UUID) -> None:
@@ -94,77 +120,28 @@ async def _mark_failed(con, job_id: UUID, code: str, msg: str) -> None:
         code,
         (msg or "")[:900],
     )
+    # ✅ reflect failure in payload_json too (so your SQL query isn't stuck on queued)
+    await _set_payload_stage(con, job_id, "failed", error_text=(msg or "")[:300])
 
 
 async def _process_job(*, job_id: UUID, payload: Dict[str, Any], meta: Dict[str, Any], user_id: UUID) -> None:
-    """
-    Hook point: call your real commerce pipeline here.
-
-    Supported processors:
-    - app.services.commerce_processor.process_commerce_job(job_id=..., payload=..., meta=..., user_id=...)
-    - app.services.commerce_orchestrator.CommerceOrchestrator().{run|process|handle|execute}(...)  (with or without job_id)
-    - app.services.commerce_service.CommerceService().{run|process|handle|execute}(...)            (with or without job_id)
-    """
     processor = None
 
-    # Prefer function processor first (most explicit / least ambiguity)
     try:
         from app.services.commerce_processor import process_commerce_job  # type: ignore
-
         processor = ("fn", process_commerce_job)
     except Exception:
         pass
 
-    # Then orchestrator/service object-based
-    if processor is None:
-        try:
-            from app.services.commerce_orchestrator import CommerceOrchestrator  # type: ignore
-
-            processor = ("obj", CommerceOrchestrator())
-        except Exception:
-            pass
-
-    if processor is None:
-        try:
-            from app.services.commerce_service import CommerceService  # type: ignore
-
-            processor = ("obj", CommerceService())
-        except Exception:
-            pass
-
     if processor is None:
         raise RuntimeError(
-            "No commerce processor found. Implement one of: "
-            "app.services.commerce_processor.process_commerce_job, "
-            "app.services.commerce_orchestrator.CommerceOrchestrator, "
-            "app.services.commerce_service.CommerceService"
+            "No commerce processor found. Implement app.services.commerce_processor.process_commerce_job"
         )
 
     kind, obj = processor
-
     if kind == "fn":
-        # required signature
         await obj(job_id=job_id, payload=payload, meta=meta, user_id=user_id)  # type: ignore[misc]
         return
-
-    # object-based processor: try common method names; support with or without job_id
-    for meth in ("run", "process", "handle", "execute"):
-        fn = getattr(obj, meth, None)
-        if not fn:
-            continue
-
-        # Try passing job_id first
-        try:
-            out = fn(job_id=job_id, payload=payload, meta=meta, user_id=user_id)  # type: ignore[misc]
-        except TypeError:
-            # Fallback: older signatures without job_id
-            out = fn(payload=payload, meta=meta, user_id=user_id)  # type: ignore[misc]
-
-        if asyncio.iscoroutine(out):
-            await out
-        return
-
-    raise RuntimeError(f"Processor {obj.__class__.__name__} has no known method (run/process/handle/execute).")
 
 
 async def run_worker_forever() -> None:
@@ -194,6 +171,9 @@ async def run_worker_forever() -> None:
                 attempt_count = int(row["attempt_count"] or 0)
 
                 logger.info("commerce_worker_claimed job_id=%s attempt=%s", job_id, attempt_count)
+
+                # ✅ set running stage in payload_json early (even if processor fails fast)
+                await _set_payload_stage(con, job_id, "running")
 
                 try:
                     await _process_job(job_id=job_id, payload=payload, meta=meta, user_id=user_id)

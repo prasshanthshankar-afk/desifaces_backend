@@ -1,60 +1,97 @@
 from __future__ import annotations
 
-import hashlib
-from typing import Any, Dict
-from uuid import UUID
+import json
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+from uuid import UUID, uuid4
 
 from app.db import get_pool
 
-_SCHEMA = "public"
-_TABLE = f"{_SCHEMA}.studio_jobs"
+_TABLE = "public.studio_jobs"
 
 
-def make_request_hash(*parts: str) -> str:
-    h = hashlib.sha256()
-    for p in parts:
-        h.update(p.encode("utf-8"))
-        h.update(b"|")
-    return h.hexdigest()
+def _as_dict(x: Any) -> Dict[str, Any]:
+    if x is None:
+        return {}
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            y = json.loads(x)
+            if isinstance(y, str):
+                y2 = json.loads(y)
+                return y2 if isinstance(y2, dict) else {}
+            return y if isinstance(y, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 class StudioJobsRepo:
-    async def create_or_get(
+    async def create_commerce_job(
         self,
         *,
         user_id: UUID,
-        studio_type: str,
-        request_hash: str,
+        campaign_id: UUID,
+        quote_id: UUID,
         payload_json: Dict[str, Any],
-        meta_json: Dict[str, Any],
-        status: str = "queued",
+        meta_json: Optional[Dict[str, Any]] = None,
     ) -> UUID:
+        jid = uuid4()
+        pool = await get_pool()
+
+        payload = _as_dict(payload_json)
+        payload.setdefault("commerce_campaign_id", str(campaign_id))
+        payload.setdefault("quote_id", str(quote_id))
+        payload.setdefault("stage", "queued")
+        payload.setdefault("computed", {})
+        payload.setdefault("error", None)
+
+        meta = _as_dict(meta_json)
+        meta.setdefault("commerce_campaign_id", str(campaign_id))
+        meta.setdefault("quote_id", str(quote_id))
+        if payload.get("idempotency_key"):
+            meta.setdefault("idempotency_key", payload.get("idempotency_key"))
+        meta.setdefault("request_type", meta.get("request_type") or "commerce_confirm")
+
+        await pool.execute(
+            f"""
+            insert into {_TABLE}(id, user_id, studio_type, status, payload_json, meta_json, created_at, updated_at)
+            values($1,$2,'commerce','queued',$3::jsonb,$4::jsonb,now(),now())
+            """,
+            jid,
+            user_id,
+            json.dumps(payload),
+            json.dumps(meta),
+        )
+        return jid
+
+    async def get_latest_commerce_job_for_campaign(self, *, user_id: UUID, campaign_id: UUID) -> Optional[dict]:
         pool = await get_pool()
         row = await pool.fetchrow(
             f"""
-            INSERT INTO {_TABLE}(studio_type, status, request_hash, payload_json, meta_json, user_id)
-            VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6)
-            ON CONFLICT (user_id, studio_type, request_hash) DO NOTHING
-            RETURNING id
+            select id, user_id, status, payload_json, meta_json, created_at, updated_at
+            from {_TABLE}
+            where user_id=$1 and studio_type='commerce'
+              and ((payload_json #>> '{{}}')::jsonb ->> 'commerce_campaign_id') = $2
+            order by created_at desc
+            limit 1
             """,
-            studio_type,
-            status,
-            request_hash,
-            payload_json,
-            meta_json,
             user_id,
+            str(campaign_id),
         )
-        if row:
-            return row["id"]
+        return dict(row) if row else None
 
-        row2 = await pool.fetchrow(
+    async def update_payload_json(self, *, job_id: UUID, payload_json: Dict[str, Any]) -> None:
+        pool = await get_pool()
+        payload = _as_dict(payload_json)
+        await pool.execute(
             f"""
-            SELECT id
-            FROM {_TABLE}
-            WHERE user_id=$1 AND studio_type=$2 AND request_hash=$3
+            update {_TABLE}
+            set payload_json=$2::jsonb, updated_at=$3
+            where id=$1 and studio_type='commerce'
             """,
-            user_id,
-            studio_type,
-            request_hash,
+            job_id,
+            json.dumps(payload),
+            datetime.now(timezone.utc),
         )
-        return row2["id"]

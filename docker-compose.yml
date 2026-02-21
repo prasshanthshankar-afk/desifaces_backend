@@ -277,6 +277,24 @@ services:
       FAL_API_KEY: ${FAL_API_KEY:-}
       FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
 
+      # ✅ VTON (Fal CatVTON queue) — REQUIRED for real provider runs
+      # FalVTONClient reads FAL_KEY (or FAL_API_KEY) + COMMERCE_FAL_VTON_URL/ PATH.
+      FAL_KEY: ${FAL_KEY:-}
+      FAL_AUTH_MODE: ${FAL_AUTH_MODE:-key}
+      COMMERCE_ENABLE_REAL_PROVIDERS: ${COMMERCE_ENABLE_REAL_PROVIDERS:-0}
+      COMMERCE_VTON_PROVIDER: ${COMMERCE_VTON_PROVIDER:-fal}
+      COMMERCE_MAX_PROVIDER_IMAGES: ${COMMERCE_MAX_PROVIDER_IMAGES:-1}
+      COMMERCE_FAL_VTON_URL: ${COMMERCE_FAL_VTON_URL:-https://queue.fal.run/fal-ai/cat-vton}
+      COMMERCE_FAL_VTON_PATH: ${COMMERCE_FAL_VTON_PATH:-}
+      COMMERCE_FAL_HTTP_TIMEOUT_SECS: ${COMMERCE_FAL_HTTP_TIMEOUT_SECS:-60}
+      COMMERCE_FAL_POLL_MAX_SECS: ${COMMERCE_FAL_POLL_MAX_SECS:-180}
+      COMMERCE_FAL_POLL_INTERVAL_SECS: ${COMMERCE_FAL_POLL_INTERVAL_SECS:-2}
+
+      COMMERCE_DEMO_MODE: ${COMMERCE_DEMO_MODE:-1}
+      COMMERCE_DEMO_HUMAN_IMAGE_URL: ${COMMERCE_DEMO_HUMAN_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/man5.jpg}
+      COMMERCE_DEMO_GARMENT_IMAGE_URL: ${COMMERCE_DEMO_GARMENT_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/tshirt.jpg}
+      COMMERCE_FAL_CLOTH_TYPE: ${COMMERCE_FAL_CLOTH_TYPE:-upper}
+
       # Optional service-to-service (future use)
       SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://df-svc-fusion:8002}
       SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://df-svc-audio:8004}
@@ -328,6 +346,23 @@ services:
       # Providers (optional now; wire later)
       FAL_API_KEY: ${FAL_API_KEY:-}
       FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
+
+      # ✅ VTON (Fal CatVTON queue) — REQUIRED for real provider runs
+      FAL_KEY: ${FAL_KEY:-}
+      FAL_AUTH_MODE: ${FAL_AUTH_MODE:-key}
+      COMMERCE_ENABLE_REAL_PROVIDERS: ${COMMERCE_ENABLE_REAL_PROVIDERS:-0}
+      COMMERCE_VTON_PROVIDER: ${COMMERCE_VTON_PROVIDER:-fal}
+      COMMERCE_MAX_PROVIDER_IMAGES: ${COMMERCE_MAX_PROVIDER_IMAGES:-1}
+      COMMERCE_FAL_VTON_URL: ${COMMERCE_FAL_VTON_URL:-https://queue.fal.run/fal-ai/cat-vton}
+      COMMERCE_FAL_VTON_PATH: ${COMMERCE_FAL_VTON_PATH:-}
+      COMMERCE_FAL_HTTP_TIMEOUT_SECS: ${COMMERCE_FAL_HTTP_TIMEOUT_SECS:-60}
+      COMMERCE_FAL_POLL_MAX_SECS: ${COMMERCE_FAL_POLL_MAX_SECS:-180}
+      COMMERCE_FAL_POLL_INTERVAL_SECS: ${COMMERCE_FAL_POLL_INTERVAL_SECS:-2}
+
+      COMMERCE_DEMO_MODE: ${COMMERCE_DEMO_MODE:-1}
+      COMMERCE_DEMO_HUMAN_IMAGE_URL: ${COMMERCE_DEMO_HUMAN_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/man5.jpg}
+      COMMERCE_DEMO_GARMENT_IMAGE_URL: ${COMMERCE_DEMO_GARMENT_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/tshirt.jpg}
+      COMMERCE_FAL_CLOTH_TYPE: ${COMMERCE_FAL_CLOTH_TYPE:-upper}
 
       # Worker tuning (optional)
       WORKER_POLL_SECS: ${COMMERCE_WORKER_POLL_SECS:-1.5}
@@ -607,7 +642,7 @@ services:
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       MUSIC_OUTPUT_CONTAINER: ${MUSIC_OUTPUT_CONTAINER:-music-output}
       MUSIC_SAS_HOURS: ${MUSIC_SAS_HOURS:-24}
-      
+
       HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
       HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
 
@@ -619,6 +654,8 @@ services:
       SVC_FACE_TIMEOUT_SECS: ${SVC_FACE_TIMEOUT_SECS:-60}
       SVC_FACE_POLL_SECS: ${SVC_FACE_POLL_SECS:-2}
       SVC_FACE_WAIT_TIMEOUT_SECS: ${SVC_FACE_WAIT_TIMEOUT_SECS:-180}
+      DF_FUSION_BEARER_TOKEN: "${DF_FUSION_BEARER_TOKEN:-}"
+      DF_X_USER_ID: "${DF_X_USER_ID:-}"
 
     command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT}"]
     expose: ["8000"]
@@ -672,6 +709,8 @@ services:
       SVC_FACE_POLL_SECS: ${SVC_FACE_POLL_SECS:-2}
       SVC_FACE_WAIT_TIMEOUT_SECS: ${SVC_FACE_WAIT_TIMEOUT_SECS:-180}
       SVC_FACE_BEARER_TOKEN: ${SVC_FACE_BEARER_TOKEN:-}
+      DF_FUSION_BEARER_TOKEN: "${DF_FUSION_BEARER_TOKEN:-}"
+      DF_X_USER_ID: "${DF_X_USER_ID:-}"
 
     init: true
     restart: unless-stopped

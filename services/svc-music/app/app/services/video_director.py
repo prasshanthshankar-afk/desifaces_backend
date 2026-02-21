@@ -6,10 +6,8 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    # Reuse the canonical mapping you already defined
     from app.services.music_planning.service import canonical_platform_key as _canon_platform  # type: ignore
 except Exception:
-    # Ultra-safe fallback (won't break runtime if planning module changes)
     def _canon_platform(x: Any) -> str:
         s = str(x or "").strip().lower().replace("-", "_").replace(" ", "_").replace("/", "_")
         while "__" in s:
@@ -17,7 +15,6 @@ except Exception:
         return s.strip("_") or "default"
 
 
-# Keep in sync with MusicPlanningService.CANONICAL_PLATFORMS (warn-only)
 _CANONICAL_PLATFORMS_SET = {
     "instagram_reels",
     "instagram_feed",
@@ -63,7 +60,6 @@ def _as_list(x: Any) -> List[Any]:
                 return obj if isinstance(obj, list) else []
             except Exception:
                 return []
-        # tolerate comma-separated
         if "," in s:
             return [p.strip() for p in s.split(",") if p.strip()]
     return []
@@ -106,7 +102,6 @@ def _normalize_exports(exports: Any) -> List[str]:
             out.append(v)
     if not out:
         out = ["9:16"]
-    # dedupe preserve order
     seen = set()
     dedup: List[str] = []
     for v in out:
@@ -117,10 +112,6 @@ def _normalize_exports(exports: Any) -> List[str]:
 
 
 def _normalize_exports_override(exports_arg: Any) -> Tuple[bool, List[str]]:
-    """
-    Treat exports override as "present" only when the caller actually provided
-    a non-empty value (so exports_arg="" does NOT accidentally override).
-    """
     if exports_arg is None:
         return False, []
     if isinstance(exports_arg, str) and not exports_arg.strip():
@@ -132,7 +123,6 @@ def _normalize_exports_override(exports_arg: Any) -> Tuple[bool, List[str]]:
 
 
 def _merge_exports(a: List[str], b: List[str]) -> List[str]:
-    # de-dupe preserve order
     out: List[str] = []
     seen = set()
     for x in (a or []) + (b or []):
@@ -144,11 +134,6 @@ def _merge_exports(a: List[str], b: List[str]) -> List[str]:
 
 
 def _extract_plan_core(music_plan: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Supports both envelopes:
-      A) MusicPlanningService: {version, summary, plan:{...}, selected_presets, flags, trace}
-      B) fallback_music_plan: {version, source, summary, brief, steps, notes}
-    """
     mp = _as_dict(music_plan)
     if isinstance(mp.get("plan"), dict):
         return _as_dict(mp.get("plan"))
@@ -161,7 +146,6 @@ def _extract_deliverable_prompts(plan_core: Dict[str, Any]) -> List[str]:
         out = [str(x).strip() for x in dp if str(x).strip()]
         return out
 
-    # fallback: build from segment info
     segs = plan_core.get("segments")
     if isinstance(segs, list):
         out: List[str] = []
@@ -206,9 +190,6 @@ def _extract_selected_presets(music_plan: Dict[str, Any]) -> Dict[str, List[Dict
 
 
 def _style_suffix_from_presets(selected_presets: Dict[str, List[Dict[str, Any]]]) -> str:
-    """
-    Deterministic, provider-agnostic suffix (no reliance on preset.content schema).
-    """
     styles = selected_presets.get("style") or []
     names = [str(p.get("name") or "").strip() for p in styles if str(p.get("name") or "").strip()]
     if not names:
@@ -232,28 +213,13 @@ def _extract_platform_targets_exports(
     plan_core: Dict[str, Any],
     exports_arg: Any,
 ) -> Tuple[List[str], Dict[str, List[str]], Optional[str]]:
-    """
-    Returns:
-      (platform_targets, platform_exports_map, safe_zone)
-
-    Priority:
-      1) plan_core.deliverables[*].aspects
-      2) music_plan.flags.platform_exports / platform_targets
-      3) plan_core.flags.platform_exports / platform_targets
-      4) exports_arg as override (if present)
-      5) default -> ["9:16"]
-
-    Canonicalizes platform keys before returning.
-    """
     mp = _as_dict(music_plan)
     flags_mp = _as_dict(mp.get("flags"))
     flags_core = _as_dict(plan_core.get("flags"))
 
-    # Deliverables map (preferred)
     deliverables = plan_core.get("deliverables")
     deliverables_map: Dict[str, Any] = deliverables if isinstance(deliverables, dict) else {}
 
-    # targets (raw first, canonicalized later)
     targets: List[str] = []
     for k in deliverables_map.keys():
         ks = str(k or "").strip()
@@ -265,17 +231,13 @@ def _extract_platform_targets_exports(
     if not targets:
         targets = [str(x).strip() for x in _as_list(flags_core.get("platform_targets")) if str(x).strip()]
 
-    # safe_zone (best effort)
     safe_zone = flags_mp.get("safe_zone") or flags_core.get("safe_zone")
     safe_zone_s = str(safe_zone).strip() if safe_zone else None
 
-    # exports override?
     has_override, exports_override = _normalize_exports_override(exports_arg)
 
-    # exports map (raw keys first, canonicalized later)
     exports_map: Dict[str, List[str]] = {}
 
-    # 1) deliverables.aspects
     if deliverables_map:
         for p, cfg in deliverables_map.items():
             p = str(p or "").strip()
@@ -286,14 +248,12 @@ def _extract_platform_targets_exports(
             aspects_norm = _normalize_exports(aspects)
             exports_map[p] = exports_override if has_override else aspects_norm
 
-            # safe_zone from deliverables.caption_rules.safe_zone if present
             if not safe_zone_s:
                 cap = _as_dict(d.get("caption_rules"))
                 sz = cap.get("safe_zone")
                 if sz:
                     safe_zone_s = str(sz).strip() or safe_zone_s
 
-    # 2) flags platform_exports
     if not exports_map:
         pe = flags_mp.get("platform_exports")
         if isinstance(pe, dict):
@@ -310,20 +270,16 @@ def _extract_platform_targets_exports(
                 if p:
                     exports_map[p] = exports_override if has_override else _normalize_exports(aspects)
 
-    # 3) if still nothing, default
     if not exports_map:
         exports_map = {"default": exports_override if has_override else ["9:16"]}
 
-    # if targets empty, derive from exports_map keys
     if not targets:
         targets = list(exports_map.keys())
 
-    # ensure every target has an exports list
     for p in targets:
         if p not in exports_map:
             exports_map[p] = exports_override if has_override else exports_map.get("default") or ["9:16"]
 
-    # normalize targets de-dupe preserve order
     seen = set()
     targets_dedup: List[str] = []
     for p in targets:
@@ -332,7 +288,6 @@ def _extract_platform_targets_exports(
             seen.add(ps)
             targets_dedup.append(ps)
 
-    # canonicalize targets + exports keys
     canon_targets: List[str] = []
     seen_t = set()
     for t in targets_dedup:
@@ -363,22 +318,14 @@ def _extract_platform_targets_exports(
 
 
 def _platform_prompt_suffix_from_deliverables(plan_core: Dict[str, Any], platform: str) -> str:
-    """
-    Stable suffix to nudge downstream generation towards crop-safe composition.
-    Uses plan_core.deliverables[platform].framing_notes + caption_rules.safe_zone where available.
-
-    Robust to non-canonical deliverables keys: will match by canonical equivalence.
-    """
     deliverables = plan_core.get("deliverables")
     if not isinstance(deliverables, dict) or not deliverables:
         return ""
 
     pcanon = _canon_platform(platform)
 
-    # direct hits
     cfg = deliverables.get(platform) or deliverables.get(pcanon) or deliverables.get("default")
 
-    # canonical match fallback
     if cfg is None:
         for k, v in deliverables.items():
             if _canon_platform(k) == pcanon:
@@ -413,16 +360,6 @@ def build_clip_manifest(
     audio_duration_ms: Optional[int],
     no_face: bool,
 ) -> Dict[str, Any]:
-    """
-    Agentic “Director” output:
-      - deterministic clip list derived from plan
-      - platform-aware variants derived from plan.deliverables / flags
-      - designed to be executed later by svc-fusion-extension
-
-    Back-compat:
-      - top-level "clips" still exists and uses a primary export list
-      - new "platform_variants" includes per-platform exports + per-platform clip prompts
-    """
     mp = _as_dict(music_plan)
     plan_core = _extract_plan_core(mp)
 
@@ -432,7 +369,6 @@ def build_clip_manifest(
     prompts = _extract_deliverable_prompts(plan_core)
     segments = _extract_segments(plan_core)
 
-    # If no prompts exist, create a minimal deterministic set
     if not prompts:
         summary = str(mp.get("summary") or plan_core.get("summary") or "").strip() or "Music video"
         prompts = [summary, f"{summary} — verse", f"{summary} — chorus", f"{summary} — bridge", f"{summary} — outro"]
@@ -441,25 +377,21 @@ def build_clip_manifest(
 
     dur_ms = _coerce_int(audio_duration_ms, 0)
     if dur_ms <= 0:
-        dur_ms = 30_000  # safe default
+        dur_ms = 30_000
 
-    # Platform-aware exports (now canonical)
     platform_targets, platform_exports_map, safe_zone = _extract_platform_targets_exports(
         music_plan=mp,
         plan_core=plan_core,
         exports_arg=exports,
     )
 
-    # Pick a primary exports for back-compat "clips" list
     primary_platform = platform_targets[0] if platform_targets else "default"
     primary_exports = platform_exports_map.get(primary_platform) or platform_exports_map.get("default") or ["9:16"]
     primary_exports_norm = _normalize_exports(primary_exports)
 
-    # Clip count bounded (mobile-friendly)
     max_clips = 8
     base_prompts = prompts[:max_clips]
 
-    # Allocate durations by stable weighting across N clips
     n = len(base_prompts)
     if n == 1:
         weights = [1.0]
@@ -472,7 +404,6 @@ def build_clip_manifest(
     wsum = sum(weights) or 1.0
     durations = [max(1500, int(round(dur_ms * (w / wsum)))) for w in weights]
 
-    # Normalize rounding error to exact dur_ms (best effort)
     delta = dur_ms - sum(durations)
     if durations and delta != 0:
         durations[-1] = max(1500, durations[-1] + delta)
@@ -517,10 +448,8 @@ def build_clip_manifest(
             )
         return clips_local
 
-    # Back-compat primary clips list
     clips_primary = _build_clips_for_exports(exports_list=primary_exports_norm, platform=primary_platform)
 
-    # Platform variants (keys already canonical)
     platform_variants: Dict[str, Any] = {}
     for p in platform_targets:
         exps = platform_exports_map.get(p) or platform_exports_map.get("default") or ["9:16"]
@@ -541,10 +470,8 @@ def build_clip_manifest(
         "audio_duration_ms": int(dur_ms),
         "no_face": bool(no_face),
         "seed": seed,
-        # Back-compat
         "exports": primary_exports_norm,
         "clips": clips_primary,
-        # New: platform-aware structure
         "platform_targets": platform_targets,
         "platform_exports": platform_exports_map,
         "safe_zone": safe_zone,
@@ -569,14 +496,7 @@ def build_clip_manifest(
     return manifest
 
 
-# ---------------------------------------------------------------------
-# Validation helpers (warn-only, never raise)
-# ---------------------------------------------------------------------
 def validate_music_plan(music_plan: Any) -> List[str]:
-    """
-    Best-effort validation of the incoming plan/envelope before manifest build.
-    Returns list of warnings. Never raises.
-    """
     warnings: List[str] = []
     mp = _as_dict(music_plan)
     if not mp:
@@ -586,7 +506,6 @@ def validate_music_plan(music_plan: Any) -> List[str]:
     if not isinstance(plan_core, dict) or not plan_core:
         warnings.append("music_plan: plan_core missing/empty")
 
-    # deliverables keys canonical check (warn only)
     deliverables = plan_core.get("deliverables")
     if isinstance(deliverables, dict) and deliverables:
         for k in list(deliverables.keys())[:25]:
@@ -598,22 +517,16 @@ def validate_music_plan(music_plan: Any) -> List[str]:
 
 
 def validate_manifest(manifest: Any) -> List[str]:
-    """
-    Validate manifest structure + canonical platform keys.
-    Returns list of warnings. Never raises. Safe to call in workers/logging.
-    """
     w: List[str] = []
     m = _as_dict(manifest)
     if not m:
         return ["manifest: empty or not a dict"]
 
-    # top-level keys
     if _coerce_int(m.get("version"), 0) < 1:
         w.append("manifest.version missing/invalid")
     if not isinstance(m.get("clips"), list) or not m.get("clips"):
         w.append("manifest.clips missing/empty list")
 
-    # canonical platform_targets
     pts = m.get("platform_targets")
     if pts is not None:
         if not isinstance(pts, list):
@@ -628,10 +541,8 @@ def validate_manifest(manifest: Any) -> List[str]:
                 if cp != ps:
                     w.append(f"manifest.platform_targets not canonical: '{ps}' -> '{cp}'")
                 if cp not in _CANONICAL_PLATFORMS_SET:
-                    # allow future platforms; still warn to surface typos
                     w.append(f"manifest.platform_targets unknown platform key: '{cp}'")
 
-    # platform_exports shape
     pe = m.get("platform_exports")
     if pe is not None:
         if not isinstance(pe, dict):
@@ -648,7 +559,6 @@ def validate_manifest(manifest: Any) -> List[str]:
                     if a not in _ALLOWED_ASPECTS:
                         w.append(f"manifest.platform_exports['{k}'] has non-standard aspect '{a}'")
 
-    # validate clips
     clips = m.get("clips")
     if isinstance(clips, list):
         for i, c in enumerate(clips[:50]):
@@ -685,7 +595,6 @@ def validate_manifest(manifest: Any) -> List[str]:
             if not prompt:
                 w.append(f"manifest.clips[{i}].prompt missing/empty")
 
-    # platform_variants coherence
     pv = m.get("platform_variants")
     if pv is not None:
         if not isinstance(pv, dict):
