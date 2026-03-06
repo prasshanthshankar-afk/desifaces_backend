@@ -6,3 +6,8 @@ python-jose[cryptography]
 httpx
 PyJWT>=2.8.0
 argon2-cffi==23.1.0
+Pillow
+azure-storage-blob
+requests
+python-multipart
+mediapipe==0.10.14

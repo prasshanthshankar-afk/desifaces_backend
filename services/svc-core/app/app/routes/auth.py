@@ -21,6 +21,8 @@ from app.audit import audit_log
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
+_ALLOWED_CLIENT_TYPES = ("web", "ios", "android")
+
 
 # -------------------------
 # Pydantic contracts
@@ -70,6 +72,22 @@ def _req_meta(request: Request) -> tuple[str | None, str | None, str | None]:
     ip = request.client.host if request.client else None
     ua = request.headers.get("user-agent")
     return request_id, ip, ua
+
+
+def _normalize_client_type(v: str | None) -> str:
+    """
+    core.sessions has CHECK constraint allowing only: web | ios | android.
+    Normalize any missing/unknown/internal values to 'ios' (safe default for service callers too).
+    """
+    s = (v or "").strip().lower()
+    if s not in _ALLOWED_CLIENT_TYPES:
+        return "ios"
+    return s
+
+
+def _normalize_device_id(v: str | None) -> str | None:
+    s = (v or "").strip()
+    return s if s else None
 
 
 async def _fetch_roles(conn, user_id: str) -> list[str]:
@@ -235,6 +253,10 @@ async def login(req: LoginRequest, request: Request):
         refresh = mint_refresh_token()
         refresh_hash = hash_refresh_token(refresh)
 
+        # ✅ Normalize for DB CHECK constraint (web|ios|android only)
+        device_id = _normalize_device_id(req.device_id)
+        client_type = _normalize_client_type(req.client_type)
+
         expires_at = int(time.time()) + REFRESH_TTL_SECONDS
         await conn.execute(
             """
@@ -243,8 +265,8 @@ async def login(req: LoginRequest, request: Request):
             """,
             user["id"],
             refresh_hash,
-            req.device_id,
-            req.client_type,
+            device_id,
+            client_type,
             expires_at,
             ua,
             ip,
@@ -259,7 +281,12 @@ async def login(req: LoginRequest, request: Request):
             request_id=request_id,
             ip=ip,
             user_agent=ua,
-            after={"email": user["email"], "tier": user["tier"], "client_type": req.client_type, "device_id": req.device_id},
+            after={
+                "email": user["email"],
+                "tier": user["tier"],
+                "client_type": client_type,
+                "device_id": device_id,
+            },
         )
 
         return TokenResponse(

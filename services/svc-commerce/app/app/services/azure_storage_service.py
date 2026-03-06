@@ -14,7 +14,14 @@ from azure.storage.blob import (
     generate_blob_sas,
 )
 
-from app.config import settings
+# Be robust if app/app/config.py is empty or settings lacks fields
+try:
+    from app.config import settings  # type: ignore
+except Exception:  # pragma: no cover
+    class _SettingsFallback:  # minimal fallback
+        AZURE_STORAGE_CONNECTION_STRING = ""
+        COMMERCE_OUTPUT_CONTAINER = ""
+    settings = _SettingsFallback()  # type: ignore
 
 
 def _strip_query(url: str) -> str:
@@ -58,6 +65,7 @@ def _try_parse_sas_expiry_utc_naive(url: str) -> Optional[datetime]:
             se = se[:-1] + "+00:00"
 
         dt = datetime.fromisoformat(se)
+        # normalize to naive UTC
         if dt.tzinfo is not None:
             dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
         return dt
@@ -73,6 +81,8 @@ def _guess_content_type(path: str) -> str:
         return "image/jpeg"
     if p.endswith(".webp"):
         return "image/webp"
+    if p.endswith(".blend"):
+        return "application/octet-stream"
     return "application/octet-stream"
 
 
@@ -101,10 +111,10 @@ class AzureStorageConfig:
         if not conn:
             raise RuntimeError(
                 "AzureStorageService: missing AZURE_STORAGE_CONNECTION_STRING "
-                "(set in app.config settings or env AZURE_STORAGE_CONNECTION_STRING)"
+                "(set in env AZURE_STORAGE_CONNECTION_STRING)"
             )
 
-        # container name (try commerce-first, then common fallbacks)
+        # container name (commerce-first)
         container = _first_nonempty(
             getattr(settings, "COMMERCE_OUTPUT_CONTAINER", None),
             getattr(settings, "COMMERCE_CONTAINER", None),
@@ -117,10 +127,9 @@ class AzureStorageConfig:
         if not container:
             raise RuntimeError(
                 "AzureStorageService: missing output container. "
-                "Set settings.COMMERCE_OUTPUT_CONTAINER or env COMMERCE_OUTPUT_CONTAINER (or DF_COMMERCE_OUTPUT_CONTAINER)."
+                "Set env COMMERCE_OUTPUT_CONTAINER (or DF_COMMERCE_OUTPUT_CONTAINER)."
             )
 
-        hours = 24
         try:
             hours = int(float(os.getenv("COMMERCE_SAS_HOURS") or "24"))
         except Exception:
@@ -133,9 +142,10 @@ class AzureStorageService:
     """
     svc-commerce Azure Blob helper.
 
-    IMPORTANT:
-      - Provides *sync* upload_file/upload_path methods because SareeDrapeProvider calls them synchronously.
-      - Also provides get_readonly_sas_url() for API responses if you store raw blob refs.
+    Key goals:
+      - Sync upload_file/upload_path/upload (SareeDrapeProvider calls sync)
+      - SAS URL generation + refresh helpers
+      - NEW: Sync get_blob_sas_url(container, blob_name, expires_in_s) for Option-B (az:// refs)
     """
 
     def __init__(self, *, config: Optional[AzureStorageConfig] = None):
@@ -144,8 +154,15 @@ class AzureStorageService:
         self.container = self.cfg.container
         self.blob_service = BlobServiceClient.from_connection_string(self.connection_string)
 
+        # parse account name/key once
+        conn_parts = dict(item.split("=", 1) for item in self.connection_string.split(";") if "=" in item)
+        self._account_name = conn_parts.get("AccountName")
+        self._account_key = conn_parts.get("AccountKey")
+        if not self._account_name or not self._account_key:
+            raise RuntimeError("AzureStorageService: could not parse AccountName/AccountKey from connection string")
+
     # -----------------------------
-    # Upload (sync) – used by providers
+    # Upload (sync)
     # -----------------------------
 
     def upload_file(
@@ -174,27 +191,10 @@ class AzureStorageService:
             container_name=container,
         )
 
-    # alias some codebases expect
+    # Common aliases expected by different code paths
     upload_path = upload_file
-
-    def upload_local_file(
-        self,
-        local_path: str,
-        blob_name: str,
-        *,
-        content_type: Optional[str] = None,
-        overwrite: bool = True,
-        sas_hours: Optional[int] = None,
-        container_name: Optional[str] = None,
-    ) -> str:
-        return self.upload_file(
-            local_path,
-            blob_name,
-            content_type=content_type,
-            overwrite=overwrite,
-            sas_hours=sas_hours,
-            container_name=container_name,
-        )
+    upload_local_file = upload_file
+    upload = upload_file  # IMPORTANT: some callers look for `upload(...)`
 
     def upload_bytes(
         self,
@@ -215,30 +215,100 @@ class AzureStorageService:
             overwrite=overwrite,
             content_settings=ContentSettings(content_type=content_type),
         )
-        return self._generate_sas_url(blob_name=blob, hours=sas_hours or self.cfg.default_sas_hours, container_name=container)
+        return self._generate_sas_url(
+            blob_name=blob,
+            hours=sas_hours or self.cfg.default_sas_hours,
+            container_name=container,
+        )
 
     # -----------------------------
-    # SAS helpers
+    # SAS helpers (hours-based, existing)
     # -----------------------------
 
     def _generate_sas_url(self, *, blob_name: str, hours: int = 24, container_name: Optional[str] = None) -> str:
         container = container_name or self.container
 
-        conn_parts = dict(item.split("=", 1) for item in self.connection_string.split(";") if "=" in item)
-        account_name = conn_parts.get("AccountName")
-        account_key = conn_parts.get("AccountKey")
-        if not account_name or not account_key:
-            raise RuntimeError("AzureStorageService: could not parse AccountName/AccountKey from connection string")
-
         sas_token = generate_blob_sas(
-            account_name=account_name,
+            account_name=self._account_name,
             container_name=container,
             blob_name=blob_name,
-            account_key=account_key,
+            account_key=self._account_key,
             permission=BlobSasPermissions(read=True),
             expiry=datetime.utcnow() + timedelta(hours=hours),
         )
-        return f"https://{account_name}.blob.core.windows.net/{container}/{blob_name}?{sas_token}"
+        return f"https://{self._account_name}.blob.core.windows.net/{container}/{blob_name}?{sas_token}"
+
+    # -----------------------------
+    # SAS helpers (seconds-based, NEW)
+    # -----------------------------
+
+    def _generate_sas_url_seconds(
+        self,
+        *,
+        container_name: str,
+        blob_name: str,
+        expires_in_s: int,
+        permission: str = "r",
+    ) -> str:
+        """
+        permission:
+          - "r"  read
+          - "w"  write (rarely needed)
+          - "rw" read+write
+        """
+        perm = (permission or "r").lower().strip()
+
+        perms = BlobSasPermissions(read=("r" in perm))
+        # only enable write if explicitly requested
+        if "w" in perm:
+            perms.write = True
+            perms.create = True
+            perms.add = True
+
+        expiry = datetime.utcnow() + timedelta(seconds=int(expires_in_s))
+        sas_token = generate_blob_sas(
+            account_name=self._account_name,
+            container_name=container_name,
+            blob_name=blob_name,
+            account_key=self._account_key,
+            permission=perms,
+            expiry=expiry,
+        )
+        return f"https://{self._account_name}.blob.core.windows.net/{container_name}/{blob_name}?{sas_token}"
+
+    def get_blob_sas_url(
+        self,
+        *,
+        container: str,
+        blob_name: str,
+        expires_in_s: int = 3600,
+        permission: str = "r",
+    ) -> str:
+        """
+        Sync: returns a SAS URL for any container/blob in the same storage account.
+
+        This is the method SareeDrapeProvider Option-B should call to sign:
+          DF_SAREE_TEMPLATE_NIVI_REF="az://commerce-training/drape_templates/.../nivi.blend"
+        """
+        c = (container or "").strip()
+        b = (blob_name or "").strip().lstrip("/")
+        if not c or not b:
+            raise ValueError(f"get_blob_sas_url requires container and blob_name (got container={container!r} blob={blob_name!r})")
+        return self._generate_sas_url_seconds(container_name=c, blob_name=b, expires_in_s=int(expires_in_s), permission=permission)
+
+    # Aliases (so callers don't have to match one exact name)
+    get_sas_url = get_blob_sas_url
+    create_sas_url = get_blob_sas_url
+    generate_sas_url = get_blob_sas_url
+    get_signed_url = get_blob_sas_url
+    sign_url = get_blob_sas_url
+    get_read_url = get_blob_sas_url
+    get_signed_read_url = get_blob_sas_url
+    refresh_sas_url = get_blob_sas_url
+
+    # -----------------------------
+    # Resolve helpers (existing)
+    # -----------------------------
 
     def _resolve_container_and_blob_name(
         self,
@@ -284,6 +354,16 @@ class AzureStorageService:
 
         raise ValueError("Empty storage_path_or_url and insufficient meta_json to resolve blob")
 
+    async def regenerate_sas_url(self, storage_path_or_url: str, *, hours: int = 24) -> str:
+        """
+        Accepts:
+          - blob_name ("commerce/vton/.../x.png")
+          - "container/blob"
+          - full URL with or without SAS
+        """
+        container, blob_name = self._resolve_container_and_blob_name(storage_path_or_url=storage_path_or_url)
+        return self._generate_sas_url(blob_name=blob_name, hours=hours, container_name=container)
+
     async def get_readonly_sas_url(
         self,
         *,
@@ -292,6 +372,10 @@ class AzureStorageService:
         hours: int = 24,
         refresh_if_within_minutes: int = 60,
     ) -> Optional[str]:
+        """
+        If storage_ref already has SAS and isn't expiring soon -> return it.
+        Else regenerate a SAS URL.
+        """
         if not storage_ref and not meta_json:
             return None
 
@@ -301,11 +385,17 @@ class AzureStorageService:
             exp = _try_parse_sas_expiry_utc_naive(storage_ref)
             if exp and exp > (now + timedelta(minutes=refresh_if_within_minutes)):
                 return storage_ref
-            container, blob_name = self._resolve_container_and_blob_name(storage_path_or_url=storage_ref, meta_json=meta_json)
+            container, blob_name = self._resolve_container_and_blob_name(
+                storage_path_or_url=storage_ref,
+                meta_json=meta_json,
+            )
             return self._generate_sas_url(blob_name=blob_name, hours=hours, container_name=container)
 
         if storage_ref:
-            container, blob_name = self._resolve_container_and_blob_name(storage_path_or_url=storage_ref, meta_json=meta_json)
+            container, blob_name = self._resolve_container_and_blob_name(
+                storage_path_or_url=storage_ref,
+                meta_json=meta_json,
+            )
             return self._generate_sas_url(blob_name=blob_name, hours=hours, container_name=container)
 
         container, blob_name = self._resolve_container_and_blob_name(storage_path_or_url="", meta_json=meta_json)

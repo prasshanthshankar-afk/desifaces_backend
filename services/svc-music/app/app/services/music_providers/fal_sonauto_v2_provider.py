@@ -38,60 +38,114 @@ class FalSonautoV2Provider:
             base_url=getattr(settings, "FAL_QUEUE_BASE_URL", None),
         )
 
-    @staticmethod
-    def _clean_tags(tags: Any) -> List[str]:
-        if tags is None:
-            return []
-        if isinstance(tags, str):
-            parts = [p.strip() for p in tags.split(",")]
-            return [p for p in parts if p]
-        if isinstance(tags, list):
-            out: List[str] = []
-            for x in tags:
-                v = str(x).strip()
-                if v:
-                    out.append(v)
-            return out
-        return []
-
+    # -----------------------------
+    # Normalizers (robust)
+    # -----------------------------
     @staticmethod
     def _safe_int(v: Any, default: int = 0) -> int:
         try:
-            return int(v)
+            return int(float(v))
         except Exception:
-            return default
+            return int(default)
 
     @staticmethod
     def _safe_float(v: Any, default: float) -> float:
         try:
             return float(v)
         except Exception:
-            return default
+            return float(default)
 
     @staticmethod
     def _normalize_output_format(v: Any) -> str:
         s = str(v or "").strip().lower() or "wav"
-        # Keep permissive; Sonauto supports: flac, mp3, wav, ogg, m4a
-        return s
+        # Sonauto supports (per docs/behavior): flac, mp3, wav, ogg, m4a
+        # Keep permissive but guard against empty/garbage.
+        allowed = {"flac", "mp3", "wav", "ogg", "m4a"}
+        return s if s in allowed else "wav"
 
     @staticmethod
     def _normalize_bpm(v: Any) -> Any:
+        """
+        Sonauto accepts bpm numeric or "auto".
+        """
         if v is None:
             return None
         if isinstance(v, (int, float)):
-            return int(v)
+            n = int(v)
+            return max(40, min(220, n))
         s = str(v).strip().lower()
-        return s if s else "auto"
+        if not s:
+            return "auto"
+        if s == "auto":
+            return "auto"
+        try:
+            n = int(float(s))
+            return max(40, min(220, n))
+        except Exception:
+            # keep custom strings if provider supports them; else "auto"
+            return s
 
     @staticmethod
     def _normalize_bit_rate(v: Any) -> Optional[int]:
         if v is None:
             return None
         try:
-            n = int(v)
+            n = int(float(v))
         except Exception:
             return None
         return n if n in (128, 192, 256, 320) else None
+
+    @staticmethod
+    def _clean_tags(tags: Any) -> List[str]:
+        """
+        Accept:
+          - list[str]
+          - "a,b,c"
+          - JSON list string: '["a","b"]'
+        Returns: deduped list[str], capped.
+        """
+        if tags is None:
+            return []
+
+        raw: List[Any] = []
+        if isinstance(tags, list):
+            raw = tags
+        elif isinstance(tags, str):
+            s = tags.strip()
+            if not s:
+                raw = []
+            elif s.startswith("["):
+                try:
+                    obj = __import__("json").loads(s)
+                    raw = obj if isinstance(obj, list) else [s]
+                except Exception:
+                    raw = [p.strip() for p in s.split(",")]
+            else:
+                raw = [p.strip() for p in s.split(",")]
+        else:
+            raw = [tags]
+
+        # sanitize + dedupe
+        out: List[str] = []
+        seen = set()
+        max_tags = int(getattr(settings, "MUSIC_SONAUTO_MAX_TAGS", 40) or 40)
+        max_len = int(getattr(settings, "MUSIC_SONAUTO_MAX_TAG_LEN", 64) or 64)
+
+        for x in raw:
+            t = str(x or "").strip()
+            if not t:
+                continue
+            if len(t) > max_len:
+                t = t[:max_len]
+            k = t.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(t)
+            if len(out) >= max_tags:
+                break
+
+        return out
 
     @staticmethod
     def _choose_inputs(
@@ -130,11 +184,11 @@ class FalSonautoV2Provider:
                 out["prompt"] = p
             out["lyrics_prompt"] = lp
 
-            # Guard: if instrumental and both prompt/tags missing, include a minimal prompt
+            # Guard: if instrumental and both prompt/tags missing, include minimal prompt
             if instrumental and ("prompt" not in out) and ("tags" not in out):
                 out["prompt"] = "An instrumental track."
 
-            # Guard: if user explicitly gave lyrics but provided nothing else, add a minimal prompt
+            # Guard: if user explicitly gave lyrics but provided nothing else, add minimal prompt
             if lyrics_is_user and (not t) and (p is None) and (not instrumental):
                 out["prompt"] = "Create a song with these lyrics."
             return out
@@ -176,7 +230,7 @@ class FalSonautoV2Provider:
                 file_size = fs
             elif isinstance(fs, str):
                 try:
-                    file_size = int(fs)
+                    file_size = int(float(fs))
                 except Exception:
                     file_size = None
 
@@ -190,6 +244,9 @@ class FalSonautoV2Provider:
             )
         return out
 
+    # -----------------------------
+    # Main API
+    # -----------------------------
     async def generate(
         self,
         *,
@@ -216,12 +273,14 @@ class FalSonautoV2Provider:
             instrumental=bool(instrumental),
         )
 
-        payload["prompt_strength"] = self._safe_float(prompt_strength, 2.0)
-        payload["balance_strength"] = self._safe_float(balance_strength, 0.7)
+        # Clamp tunables to sane ranges (avoid provider errors / weirdness)
+        ps = self._safe_float(prompt_strength, 2.0)
+        bs = self._safe_float(balance_strength, 0.7)
+        payload["prompt_strength"] = max(0.1, min(5.0, ps))
+        payload["balance_strength"] = max(0.0, min(1.0, bs))
 
         ns = self._safe_int(num_songs, 1)
-        if ns < 1:
-            ns = 1
+        ns = max(1, min(int(getattr(settings, "MUSIC_SONAUTO_MAX_NUM_SONGS", 4) or 4), ns))
         payload["num_songs"] = ns
 
         of = self._normalize_output_format(output_format)
@@ -246,8 +305,6 @@ class FalSonautoV2Provider:
             start_timeout_seconds=getattr(settings, "MUSIC_FAL_START_TIMEOUT_SECONDS", None),
         )
 
-        # With the updated FalQueueClient, this returns the final response JSON directly:
-        # e.g. {"seed":..., "tags":[...], "lyrics":"...", "audio":[{...}]}
         resp = await self.client.wait_for_completion(
             status_url=submit.status_url,
             response_url=submit.response_url,

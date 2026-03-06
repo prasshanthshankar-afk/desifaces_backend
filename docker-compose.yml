@@ -256,6 +256,39 @@ services:
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       PYTHONPATH: "/app"
 
+      # Blender / Saree drape
+      COMMERCE_SAREE_BLENDER_ENGINE: ${COMMERCE_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
+      DF_SAREE_BLENDER_ENGINE: ${DF_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
+
+      # Saree overlay provider (production defaults)
+      COMMERCE_SAREE_STRICT: ${COMMERCE_SAREE_STRICT:-1}
+      COMMERCE_ENABLE_SAREE_DRAPE_PROVIDER: ${COMMERCE_ENABLE_SAREE_DRAPE_PROVIDER:-1}
+      COMMERCE_SAREE_TEMPLATE_PATH: ${COMMERCE_SAREE_TEMPLATE_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/nivi.blend}
+
+      # ✅ STRICT requires this (mask must exist in Azure or local path)
+      COMMERCE_SAREE_ALPHA_MASK_PATH: ${COMMERCE_SAREE_ALPHA_MASK_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/alpha_mask_v1.png}
+
+      # ✅ Deterministic cache dir (shared volume)
+      COMMERCE_SAREE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
+      DF_SAREE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
+      DF_SAREE_TEMPLATE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
+
+      DF_SAREE_RUN_DIR_BASE: /var/cache/df_saree_drape_runs
+
+      DF_SAREE_VALIDATE_TEMPLATE: ${DF_SAREE_VALIDATE_TEMPLATE:-1}
+      DF_SAREE_REQUIRE_RENDER_META_OK: ${DF_SAREE_REQUIRE_RENDER_META_OK:-1}
+      DF_SAREE_QC_ENABLED: ${DF_SAREE_QC_ENABLED:-1}
+      DF_SAREE_RENDER_ENGINE_FALLBACK: ${DF_SAREE_RENDER_ENGINE_FALLBACK:-BLENDER_EEVEE_NEXT}
+
+      DF_SAREE_TEXTURE_TILE: ${DF_SAREE_TEXTURE_TILE:-1}
+      DF_SAREE_TEXTURE_TILE_SIZE: ${DF_SAREE_TEXTURE_TILE_SIZE:-1024}
+      DF_SAREE_TEXTURE_TILE_BG_THRESH: ${DF_SAREE_TEXTURE_TILE_BG_THRESH:-28}
+
+      COMMERCE_SAREE_ANCHOR_WARP: ${COMMERCE_SAREE_ANCHOR_WARP:-1}
+      DF_SAREE_ANCHOR_WARP: ${DF_SAREE_ANCHOR_WARP:-1}
+
+      COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE: ${COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE:-0}
+
       # JWT (match svc-core signing/claims)
       JWT_SECRET: ${JWT_SECRET}
       JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
@@ -273,31 +306,40 @@ services:
       COMMERCE_CREDITS_PER_CHANNEL_EXPORT: ${COMMERCE_CREDITS_PER_CHANNEL_EXPORT:-10}
       COMMERCE_CREDITS_MARKETPLACE_PACK: ${COMMERCE_CREDITS_MARKETPLACE_PACK:-25}
 
-      # Providers (optional now; wire later)
+      # Providers
       FAL_API_KEY: ${FAL_API_KEY:-}
       FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
 
-      # ✅ VTON (Fal CatVTON queue) — REQUIRED for real provider runs
-      # FalVTONClient reads FAL_KEY (or FAL_API_KEY) + COMMERCE_FAL_VTON_URL/ PATH.
+      # VTON (Fal)
       FAL_KEY: ${FAL_KEY:-}
       FAL_AUTH_MODE: ${FAL_AUTH_MODE:-key}
       COMMERCE_ENABLE_REAL_PROVIDERS: ${COMMERCE_ENABLE_REAL_PROVIDERS:-0}
       COMMERCE_VTON_PROVIDER: ${COMMERCE_VTON_PROVIDER:-fal}
       COMMERCE_MAX_PROVIDER_IMAGES: ${COMMERCE_MAX_PROVIDER_IMAGES:-1}
-      COMMERCE_FAL_VTON_URL: ${COMMERCE_FAL_VTON_URL:-https://queue.fal.run/fal-ai/cat-vton}
-      COMMERCE_FAL_VTON_PATH: ${COMMERCE_FAL_VTON_PATH:-}
-      COMMERCE_FAL_HTTP_TIMEOUT_SECS: ${COMMERCE_FAL_HTTP_TIMEOUT_SECS:-60}
-      COMMERCE_FAL_POLL_MAX_SECS: ${COMMERCE_FAL_POLL_MAX_SECS:-180}
-      COMMERCE_FAL_POLL_INTERVAL_SECS: ${COMMERCE_FAL_POLL_INTERVAL_SECS:-2}
 
+      COMMERCE_FAL_BASE_URL: ${COMMERCE_FAL_BASE_URL:-https://queue.fal.run}
+      COMMERCE_FAL_FASHN_ENDPOINT_ID: ${COMMERCE_FAL_FASHN_ENDPOINT_ID:-fal-ai/fashn/tryon/v1.5}
+      COMMERCE_FAL_ENDPOINT_ID: ${COMMERCE_FAL_ENDPOINT_ID:-fal-ai/leffa/virtual-tryon}
+
+      # These are the names vton_provider.py reads
+      COMMERCE_FAL_HTTP_TIMEOUT_S: ${COMMERCE_FAL_HTTP_TIMEOUT_S:-120}
+      COMMERCE_FAL_POLL_TIMEOUT_S: ${COMMERCE_FAL_POLL_TIMEOUT_S:-180}
+      COMMERCE_FAL_POLL_SECS: ${COMMERCE_FAL_POLL_SECS:-1.5}
+      COMMERCE_FAL_POLL_LOGS: ${COMMERCE_FAL_POLL_LOGS:-0}
+
+      # Demo mode
       COMMERCE_DEMO_MODE: ${COMMERCE_DEMO_MODE:-1}
       COMMERCE_DEMO_HUMAN_IMAGE_URL: ${COMMERCE_DEMO_HUMAN_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/man5.jpg}
       COMMERCE_DEMO_GARMENT_IMAGE_URL: ${COMMERCE_DEMO_GARMENT_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/tshirt.jpg}
       COMMERCE_FAL_CLOTH_TYPE: ${COMMERCE_FAL_CLOTH_TYPE:-upper}
 
-      # Optional service-to-service (future use)
-      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://df-svc-fusion:8002}
-      SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://df-svc-audio:8004}
+      # Optional service-to-service (Docker DNS names)
+      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://svc-fusion:8002}
+      SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://svc-audio:8004}
+
+    volumes:
+      - df_saree_templates_cache:/var/cache/df_saree_templates
+      - df_saree_drape_runs:/var/cache/df_saree_drape_runs
 
     command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8008}"]
     expose: ["8008"]
@@ -326,6 +368,43 @@ services:
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       PYTHONPATH: "/app"
 
+      # Blender / Saree drape
+      COMMERCE_SAREE_BLENDER_ENGINE: ${COMMERCE_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
+      DF_SAREE_BLENDER_ENGINE: ${DF_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
+
+      # Saree overlay provider (production defaults)
+      COMMERCE_SAREE_STRICT: ${COMMERCE_SAREE_STRICT:-1}
+      COMMERCE_ENABLE_SAREE_DRAPE_PROVIDER: ${COMMERCE_ENABLE_SAREE_DRAPE_PROVIDER:-1}
+      COMMERCE_SAREE_TEMPLATE_PATH: ${COMMERCE_SAREE_TEMPLATE_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/nivi.blend}
+
+      # ✅ STRICT requires this
+      COMMERCE_SAREE_ALPHA_MASK_PATH: ${COMMERCE_SAREE_ALPHA_MASK_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/alpha_mask_v1.png}
+
+      # ✅ Deterministic cache dir (shared volume)
+      COMMERCE_SAREE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
+      DF_SAREE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
+      DF_SAREE_TEMPLATE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
+
+      DF_SAREE_RUN_DIR_BASE: /var/cache/df_saree_drape_runs
+
+      DF_SAREE_VALIDATE_TEMPLATE: ${DF_SAREE_VALIDATE_TEMPLATE:-1}
+      DF_SAREE_REQUIRE_RENDER_META_OK: ${DF_SAREE_REQUIRE_RENDER_META_OK:-1}
+      DF_SAREE_QC_ENABLED: ${DF_SAREE_QC_ENABLED:-1}
+      DF_SAREE_QC_BLACK_THRESH: ${DF_SAREE_QC_BLACK_THRESH:-10}
+      DF_SAREE_QC_OVERLAY_ALPHA_MIN_MAX: ${DF_SAREE_QC_OVERLAY_ALPHA_MIN_MAX:-8}
+      DF_SAREE_RENDER_ENGINE_FALLBACK: ${DF_SAREE_RENDER_ENGINE_FALLBACK:-BLENDER_EEVEE_NEXT}
+
+      DF_SAREE_TEXTURE_TILE: ${DF_SAREE_TEXTURE_TILE:-1}
+      DF_SAREE_TEXTURE_TILE_SIZE: ${DF_SAREE_TEXTURE_TILE_SIZE:-1024}
+      DF_SAREE_TEXTURE_TILE_BG_THRESH: ${DF_SAREE_TEXTURE_TILE_BG_THRESH:-28}
+
+      COMMERCE_SAREE_ANCHOR_WARP: ${COMMERCE_SAREE_ANCHOR_WARP:-1}
+      DF_SAREE_ANCHOR_WARP: ${DF_SAREE_ANCHOR_WARP:-1}
+
+      DF_SAREE_KEEP_RUN_DIR: ${DF_SAREE_KEEP_RUN_DIR:-0}
+      DF_SAREE_UPLOAD_DEBUG_OVERLAY: ${DF_SAREE_UPLOAD_DEBUG_OVERLAY:-0}
+      DF_SAREE_UPLOAD_DEBUG_OVERLAY_WARPED: ${DF_SAREE_UPLOAD_DEBUG_OVERLAY_WARPED:-0}
+
       # JWT (match svc-core signing/claims)
       JWT_SECRET: ${JWT_SECRET}
       JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
@@ -343,22 +422,29 @@ services:
       COMMERCE_CREDITS_PER_CHANNEL_EXPORT: ${COMMERCE_CREDITS_PER_CHANNEL_EXPORT:-10}
       COMMERCE_CREDITS_MARKETPLACE_PACK: ${COMMERCE_CREDITS_MARKETPLACE_PACK:-25}
 
-      # Providers (optional now; wire later)
+      COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE: ${COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE:-0}
+
+      # Providers
       FAL_API_KEY: ${FAL_API_KEY:-}
       FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
 
-      # ✅ VTON (Fal CatVTON queue) — REQUIRED for real provider runs
+      # ✅ VTON (Fal)
       FAL_KEY: ${FAL_KEY:-}
       FAL_AUTH_MODE: ${FAL_AUTH_MODE:-key}
       COMMERCE_ENABLE_REAL_PROVIDERS: ${COMMERCE_ENABLE_REAL_PROVIDERS:-0}
       COMMERCE_VTON_PROVIDER: ${COMMERCE_VTON_PROVIDER:-fal}
       COMMERCE_MAX_PROVIDER_IMAGES: ${COMMERCE_MAX_PROVIDER_IMAGES:-1}
-      COMMERCE_FAL_VTON_URL: ${COMMERCE_FAL_VTON_URL:-https://queue.fal.run/fal-ai/cat-vton}
-      COMMERCE_FAL_VTON_PATH: ${COMMERCE_FAL_VTON_PATH:-}
-      COMMERCE_FAL_HTTP_TIMEOUT_SECS: ${COMMERCE_FAL_HTTP_TIMEOUT_SECS:-60}
-      COMMERCE_FAL_POLL_MAX_SECS: ${COMMERCE_FAL_POLL_MAX_SECS:-180}
-      COMMERCE_FAL_POLL_INTERVAL_SECS: ${COMMERCE_FAL_POLL_INTERVAL_SECS:-2}
 
+      COMMERCE_FAL_BASE_URL: ${COMMERCE_FAL_BASE_URL:-https://queue.fal.run}
+      COMMERCE_FAL_FASHN_ENDPOINT_ID: ${COMMERCE_FAL_FASHN_ENDPOINT_ID:-fal-ai/fashn/tryon/v1.5}
+      COMMERCE_FAL_ENDPOINT_ID: ${COMMERCE_FAL_ENDPOINT_ID:-fal-ai/leffa/virtual-tryon}
+
+      COMMERCE_FAL_HTTP_TIMEOUT_S: ${COMMERCE_FAL_HTTP_TIMEOUT_S:-120}
+      COMMERCE_FAL_POLL_TIMEOUT_S: ${COMMERCE_FAL_POLL_TIMEOUT_S:-180}
+      COMMERCE_FAL_POLL_SECS: ${COMMERCE_FAL_POLL_SECS:-1.5}
+      COMMERCE_FAL_POLL_LOGS: ${COMMERCE_FAL_POLL_LOGS:-0}
+
+      # Demo mode
       COMMERCE_DEMO_MODE: ${COMMERCE_DEMO_MODE:-1}
       COMMERCE_DEMO_HUMAN_IMAGE_URL: ${COMMERCE_DEMO_HUMAN_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/man5.jpg}
       COMMERCE_DEMO_GARMENT_IMAGE_URL: ${COMMERCE_DEMO_GARMENT_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/tshirt.jpg}
@@ -367,6 +453,11 @@ services:
       # Worker tuning (optional)
       WORKER_POLL_SECS: ${COMMERCE_WORKER_POLL_SECS:-1.5}
       WORKER_BATCH_SIZE: ${COMMERCE_WORKER_BATCH_SIZE:-1}
+
+    volumes:
+      - df_saree_templates_cache:/var/cache/df_saree_templates
+      - df_saree_drape_runs:/var/cache/df_saree_drape_runs
+      - ./tmp:/host_tmp:ro
 
     command: ["bash", "-lc", "python -m app.workers.commerce_worker"]
 
@@ -517,8 +608,8 @@ services:
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
 
-      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://df-svc-fusion:8002}
-      SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://df-svc-audio:8004}
+      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://svc-fusion:8002}
+      SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://svc-audio:8004}
       SVC_TO_SVC_BEARER: ${SVC_TO_SVC_BEARER}
 
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
@@ -563,8 +654,8 @@ services:
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
 
-      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://df-svc-fusion:8002}
-      SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://df-svc-audio:8004}
+      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://svc-fusion:8002}
+      SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://svc-audio:8004}
 
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       AZURE_FINAL_VIDEO_CONTAINER: ${AZURE_FINAL_VIDEO_CONTAINER:-video-output}
@@ -626,13 +717,10 @@ services:
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app"
 
-      # Standardize internal port across services
       PORT: "8000"
-
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
 
-      # JWT (MUST match svc-core signing/claims)
       JWT_SECRET: ${JWT_SECRET}
       JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
@@ -646,11 +734,9 @@ services:
       HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
       HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
 
-      # Cross-service (Docker network) — ALWAYS use :8000 internally
-      SVC_FACE_URL: ${SVC_FACE_URL:-http://svc-face:8000}
+      SVC_FACE_URL: ${SVC_FACE_URL:-http://svc-face:8003}
       SVC_FACE_BEARER_TOKEN: ${SVC_FACE_BEARER_TOKEN:-}
 
-      # Optional tuning knobs (safe defaults)
       SVC_FACE_TIMEOUT_SECS: ${SVC_FACE_TIMEOUT_SECS:-60}
       SVC_FACE_POLL_SECS: ${SVC_FACE_POLL_SECS:-2}
       SVC_FACE_WAIT_TIMEOUT_SECS: ${SVC_FACE_WAIT_TIMEOUT_SECS:-180}
@@ -660,10 +746,6 @@ services:
     command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT}"]
     expose: ["8000"]
     ports: ["8007:8000"]
-
-    init: true
-    restart: unless-stopped
-
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
       interval: 5s
@@ -703,8 +785,7 @@ services:
 
       WORKER_POLL_SECS: ${MUSIC_WORKER_POLL_SECS:-1.5}
 
-      # Cross-service (Docker network)
-      SVC_FACE_URL: ${SVC_FACE_URL:-http://svc-face:8000}
+      SVC_FACE_URL: ${SVC_FACE_URL:-http://svc-face:8003}
       SVC_FACE_TIMEOUT_SECS: ${SVC_FACE_TIMEOUT_SECS:-60}
       SVC_FACE_POLL_SECS: ${SVC_FACE_POLL_SECS:-2}
       SVC_FACE_WAIT_TIMEOUT_SECS: ${SVC_FACE_WAIT_TIMEOUT_SECS:-180}
@@ -712,10 +793,200 @@ services:
       DF_FUSION_BEARER_TOKEN: "${DF_FUSION_BEARER_TOKEN:-}"
       DF_X_USER_ID: "${DF_X_USER_ID:-}"
 
-    init: true
-    restart: unless-stopped
-
     command: ["bash", "-lc", "python -m app.workers.music_worker"]
+
+  # -------------------------
+  # Marketing API
+  # -------------------------
+  svc-marketing:
+    <<: *python_service
+    container_name: df-svc-marketing
+    build:
+      context: ./services/svc-marketing/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8010"
+
+      POSTGRES_DSN: ${DATABASE_URL}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+
+      AUTH_MODE: ${MARKETING_AUTH_MODE:-none}
+      CORE_URL: ${CORE_URL:-http://svc-core:8000}
+      CORE_INTROSPECT_PATH: ${CORE_INTROSPECT_PATH:-/api/auth/introspect}
+
+      ADMIN_MARKETING_USER_ID: ${ADMIN_MARKETING_USER_ID:-}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AZURE_OUTPUT_CONTAINER: ${MARKETING_OUTPUT_CONTAINER:-marketing-output}
+      AZURE_BLOB_PREFIX: ${MARKETING_BLOB_PREFIX:-marketing}
+      OUTPUT_DIR: ${MARKETING_OUTPUT_DIR:-/tmp/df_marketing_output}
+
+      SVC_FACE_URL: ${SVC_FACE_URL_MARKETING:-http://svc-face:8003}
+      SVC_FUSION_URL: ${SVC_FUSION_URL_MARKETING:-http://svc-fusion:8002}
+      SVC_MUSIC_URL: ${SVC_MUSIC_URL_MARKETING:-http://svc-music:8000}
+      SVC_COMMERCE_URL: ${SVC_COMMERCE_URL_MARKETING:-http://svc-commerce:8008}
+
+      FACE_CREATE_PATH: ${MARKETING_FACE_CREATE_PATH:-/api/face/creator/generate}
+      FACE_STATUS_PATH_TMPL: ${MARKETING_FACE_STATUS_TMPL:-/api/face/creator/jobs/{job_id}/status}
+
+      FUSION_CREATE_PATH: ${MARKETING_FUSION_CREATE_PATH:-/jobs}
+      FUSION_STATUS_PATH_TMPL: ${MARKETING_FUSION_STATUS_TMPL:-/jobs/{job_id}}
+
+      MUSIC_GENERATE_PATH: ${MARKETING_MUSIC_GENERATE_PATH:-/api/music/generate}
+      MUSIC_STATUS_PATH_TMPL: ${MARKETING_MUSIC_STATUS_TMPL:-/api/music/jobs/{job_id}/status}
+
+      COMMERCE_PROMO_PATH: ${MARKETING_COMMERCE_PROMO_PATH:-/api/commerce/promo/generate}
+      COMMERCE_STATUS_PATH_TMPL: ${MARKETING_COMMERCE_STATUS_TMPL:-/api/commerce/jobs/{job_id}/status}
+
+      ENABLE_PUBLISH_IG: ${ENABLE_PUBLISH_IG:-0}
+      ENABLE_PUBLISH_YT: ${ENABLE_PUBLISH_YT:-0}
+
+      IG_ACCESS_TOKEN: ${IG_ACCESS_TOKEN:-}
+      IG_BUSINESS_ACCOUNT_ID: ${IG_BUSINESS_ACCOUNT_ID:-}
+
+      YT_CLIENT_SECRET: ${YT_CLIENT_SECRET:-}
+      YT_REFRESH_TOKEN: ${YT_REFRESH_TOKEN:-}
+
+      LLM_MODE: ${MARKETING_LLM_MODE:-none}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${MARKETING_OPENAI_MODEL:-gpt-4.1-mini}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+
+      ENABLE_OPTIMIZER: ${MARKETING_ENABLE_OPTIMIZER:-1}
+      OPTIMIZER_INTERVAL_SECONDS: ${MARKETING_OPTIMIZER_INTERVAL_SECONDS:-21600}
+      OPTIMIZER_LOOKBACK_DAYS: ${MARKETING_OPTIMIZER_LOOKBACK_DAYS:-14}
+
+      PYTHONPATH: "/app"
+    volumes:
+      - df_marketing_output:/tmp/df_marketing_output
+    expose: ["8010"]
+    ports: ["8010:8010"]
+    command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8010}"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  # -------------------------
+  # Marketing Worker
+  # -------------------------
+  svc-marketing-worker:
+    <<: *python_service
+    container_name: df-svc-marketing-worker
+    build:
+      context: ./services/svc-marketing/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+
+      POSTGRES_DSN: ${DATABASE_URL}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+
+      AUTH_MODE: ${MARKETING_AUTH_MODE:-none}
+      CORE_URL: ${CORE_URL:-http://svc-core:8000}
+      CORE_INTROSPECT_PATH: ${CORE_INTROSPECT_PATH:-/api/auth/introspect}
+
+      ADMIN_MARKETING_USER_ID: ${ADMIN_MARKETING_USER_ID:-}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AZURE_OUTPUT_CONTAINER: ${MARKETING_OUTPUT_CONTAINER:-marketing-output}
+      AZURE_BLOB_PREFIX: ${MARKETING_BLOB_PREFIX:-marketing}
+      OUTPUT_DIR: ${MARKETING_OUTPUT_DIR:-/tmp/df_marketing_output}
+
+      SVC_FACE_URL: ${SVC_FACE_URL_MARKETING:-http://svc-face:8003}
+      SVC_FUSION_URL: ${SVC_FUSION_URL_MARKETING:-http://svc-fusion:8002}
+      SVC_MUSIC_URL: ${SVC_MUSIC_URL_MARKETING:-http://svc-music:8000}
+      SVC_COMMERCE_URL: ${SVC_COMMERCE_URL_MARKETING:-http://svc-commerce:8008}
+
+      FACE_STATUS_PATH_PREFIX: ${FACE_STATUS_PATH_PREFIX}
+      FACE_POLL_INTERVAL_S: ${FACE_POLL_INTERVAL_S}
+      FACE_POLL_TIMEOUT_S: ${FACE_POLL_TIMEOUT_S}
+
+      FACE_CREATE_PATH: ${MARKETING_FACE_CREATE_PATH:-/api/face/creator/generate}
+      FACE_STATUS_PATH_TMPL: ${MARKETING_FACE_STATUS_TMPL:-/api/face/creator/jobs/{job_id}/status}
+
+      FUSION_CREATE_PATH: ${MARKETING_FUSION_CREATE_PATH:-/jobs}
+      FUSION_STATUS_PATH_TMPL: ${MARKETING_FUSION_STATUS_TMPL:-/jobs/{job_id}}
+
+      MUSIC_GENERATE_PATH: ${MARKETING_MUSIC_GENERATE_PATH:-/api/music/generate}
+      MUSIC_STATUS_PATH_TMPL: ${MARKETING_MUSIC_STATUS_TMPL:-/api/music/jobs/{job_id}/status}
+
+      COMMERCE_PROMO_PATH: ${MARKETING_COMMERCE_PROMO_PATH:-/api/commerce/promo/generate}
+      COMMERCE_STATUS_PATH_TMPL: ${MARKETING_COMMERCE_STATUS_TMPL:-/api/commerce/jobs/{job_id}/status}
+
+      ENABLE_PUBLISH_IG: ${ENABLE_PUBLISH_IG:-0}
+      ENABLE_PUBLISH_YT: ${ENABLE_PUBLISH_YT:-0}
+
+      IG_ACCESS_TOKEN: ${IG_ACCESS_TOKEN:-}
+      IG_BUSINESS_ACCOUNT_ID: ${IG_BUSINESS_ACCOUNT_ID:-}
+
+      YT_CLIENT_SECRET: ${YT_CLIENT_SECRET:-}
+      YT_REFRESH_TOKEN: ${YT_REFRESH_TOKEN:-}
+
+      LLM_MODE: ${MARKETING_LLM_MODE:-none}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${MARKETING_OPENAI_MODEL:-gpt-4.1-mini}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+
+      WORKER_POLL_SECONDS: ${MARKETING_WORKER_POLL_SECONDS:-2}
+      PYTHONPATH: "/app"
+    volumes:
+      - df_marketing_output:/tmp/df_marketing_output
+    command: ["bash", "-lc", "python -m app.workers.marketing_worker"]
+
+  # -------------------------
+  # Marketing Scheduler
+  # -------------------------
+  svc-marketing-scheduler:
+    <<: *python_service
+    container_name: df-svc-marketing-scheduler
+    build:
+      context: ./services/svc-marketing/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+
+      POSTGRES_DSN: ${DATABASE_URL}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+
+      ADMIN_MARKETING_USER_ID: ${ADMIN_MARKETING_USER_ID:-}
+
+      PYTHONPATH: "/app"
+    command: ["bash", "-lc", "python -m app.workers.marketing_scheduler"]
+
+  # -------------------------
+  # Marketing Optimizer (optional; not started by default)
+  # -------------------------
+  svc-marketing-optimizer:
+    <<: *python_service
+    container_name: df-svc-marketing-optimizer
+    build:
+      context: ./services/svc-marketing/app
+      dockerfile: Dockerfile
+    profiles: ["marketing-optimizer"]
+    restart: "no"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+
+      POSTGRES_DSN: ${DATABASE_URL}
+      DATABASE_URL: ${DATABASE_URL}
+
+      ENABLE_OPTIMIZER: ${MARKETING_ENABLE_OPTIMIZER:-1}
+      OPTIMIZER_INTERVAL_SECONDS: ${MARKETING_OPTIMIZER_INTERVAL_SECONDS:-21600}
+      OPTIMIZER_LOOKBACK_DAYS: ${MARKETING_OPTIMIZER_LOOKBACK_DAYS:-14}
+
+      PYTHONPATH: "/app"
+    command: ["bash", "-lc", "python -m app.workers.marketing_optimizer"]
 
 networks:
   df-net:
@@ -725,3 +996,6 @@ networks:
 volumes:
   df_pgdata:
   df_redisdata:
+  df_saree_templates_cache:
+  df_saree_drape_runs:
+  df_marketing_output:

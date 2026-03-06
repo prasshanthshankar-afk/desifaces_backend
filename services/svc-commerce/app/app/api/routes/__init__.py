@@ -6,6 +6,7 @@ router = APIRouter()
 
 # Keep imports defensive so missing modules never crash the app
 for mod_path in [
+    "app.api.routes.commerce_assets",
     "app.api.routes.commerce_quotes",
     "app.api.routes.commerce_products",
     "app.api.routes.commerce_looksets",
@@ -19,5 +20,6 @@ for mod_path in [
         r = getattr(m, "router", None)
         if r is not None:
             router.include_router(r)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[routes] failed importing ---> {mod_path}: {e!r}")
+        raise

@@ -27,7 +27,6 @@ def _utc_now() -> dt.datetime:
 
 def _iso_utc_z(ts: Optional[dt.datetime] = None) -> str:
     x = ts or _utc_now()
-    # 2026-02-18T18:03:14.568460Z
     s = x.isoformat()
     return s.replace("+00:00", "Z")
 
@@ -138,6 +137,14 @@ def _decode_jwt_sub(token: str) -> Optional[str]:
         return str(sub) if sub else None
     except Exception:
         return None
+
+
+def _normalize_client_type(v: Optional[str]) -> str:
+    # MUST match DB constraint: web | ios | android
+    s = (v or "").strip().lower()
+    if s not in ("web", "ios", "android"):
+        return "ios"
+    return s
 
 
 # -----------------------------
@@ -330,6 +337,8 @@ class AuthState:
     out_dir: Path
     token: str
     user_id: str
+    device_id: str
+    client_type: str
     refresh_count: int = 0
 
     def headers(self) -> Dict[str, str]:
@@ -341,7 +350,15 @@ class AuthState:
 
     def refresh(self, *, reason: str) -> None:
         self.refresh_count += 1
-        token, user_id = _login(self.core_url, self.email, self.password, self.out_dir, log_name=f"auth_refresh_{self.refresh_count}.json")
+        token, user_id = _login(
+            self.core_url,
+            self.email,
+            self.password,
+            self.out_dir,
+            device_id=self.device_id,
+            client_type=self.client_type,
+            log_name=f"auth_refresh_{self.refresh_count}.json",
+        )
         self.token = token
         if user_id:
             self.user_id = user_id
@@ -404,12 +421,27 @@ def _upload_file_multipart_authed(
 # -----------------------------
 # Domain actions
 # -----------------------------
-def _login(core_url: str, email: str, password: str, out_dir: Path, *, log_name: str = "auth.json") -> Tuple[str, str]:
+def _login(
+    core_url: str,
+    email: str,
+    password: str,
+    out_dir: Path,
+    *,
+    device_id: str,
+    client_type: str,
+    log_name: str = "auth.json",
+) -> Tuple[str, str]:
     url = core_url.rstrip("/") + "/api/auth/login"
-    payload = {"email": email, "password": password}
+
+    payload = {
+        "email": email,
+        "password": password,
+        "device_id": (device_id or "svc-music-worker").strip() or "svc-music-worker",
+        "client_type": _normalize_client_type(client_type),
+    }
 
     st, obj, raw = _json_http("POST", url, payload=payload, timeout_s=60)
-    _write_json(out_dir / log_name, {"http_status": st, "response": obj, "raw_preview": _snip(raw, 400)})
+    _write_json(out_dir / log_name, {"http_status": st, "request": payload, "response": obj, "raw_preview": _snip(raw, 400)})
 
     if st != 200:
         raise RuntimeError(f"login_failed http_status={st} resp={_snip(raw, 300)}")
@@ -670,12 +702,10 @@ def _poll_status(
         prog = obj.get("progress")
         key = f"{status}|{stage}|{prog}"
 
-        # write rolling last status only on change / every N polls
         if obj and (key != last_written_key) and (n % write_every_n == 0 or status in ("succeeded", "failed")):
             _write_json(last_path, obj)
             last_written_key = key
 
-        # print progress on change (or every ~5 polls)
         if key != last_key and (n % 5 == 0 or status in ("succeeded", "failed")):
             elapsed = int(time.time() - t0)
             print(f"[{_iso_utc_z()}] {tag} job={job_id} status={status} stage={stage} elapsed_s={elapsed}")
@@ -784,6 +814,10 @@ def main() -> int:
         print("Missing DF_EMAIL / DF_PASSWORD env vars.", file=sys.stderr)
         return 2
 
+    # IMPORTANT: enforce DB-allowed client types only
+    device_id = _read_env("DF_DEVICE_ID", "svc-music-worker") or "svc-music-worker"
+    client_type = _normalize_client_type(_read_env("DF_CLIENT_TYPE", "ios") or "ios")
+
     voice_ref_path = _read_env("VOICE_REF_PATH")  # uploaded per project (autopilot/co_create)
     byo_audio_path = _read_env("BYO_AUDIO_PATH")
     byo_audio_url = _read_env("BYO_AUDIO_URL")
@@ -817,19 +851,36 @@ def main() -> int:
     provider_hints_json = _read_env("PROVIDER_HINTS_JSON")
     provider_hints = _as_dict(provider_hints_json) if provider_hints_json else {}
     if fast_preview:
-        # backend can ignore unknown hints; use once svc-music supports it
         provider_hints.setdefault("fast_preview", True)
         provider_hints.setdefault("skip_performer_videos", True)
 
     run_dir = Path("/tmp") / f"df_e2e_music_3modes_{_now_tag()}"
     _ensure_dir(run_dir)
     print(f"✅ E2E starting. Run dir: {run_dir}")
+    print(f"🔎 Auth params: device_id={device_id} client_type={client_type}")
 
     api = _discover_paths(music_url)
     _write_json(run_dir / "discovered_paths.json", api.__dict__)
 
-    token, user_id = _login(core_url, email, password, run_dir, log_name="auth.json")
-    auth = AuthState(core_url=core_url, email=email, password=password, out_dir=run_dir, token=token, user_id=user_id)
+    token, user_id = _login(
+        core_url,
+        email,
+        password,
+        run_dir,
+        device_id=device_id,
+        client_type=client_type,
+        log_name="auth.json",
+    )
+    auth = AuthState(
+        core_url=core_url,
+        email=email,
+        password=password,
+        out_dir=run_dir,
+        token=token,
+        user_id=user_id,
+        device_id=device_id,
+        client_type=client_type,
+    )
 
     summary: JsonDict = {"run_dir": str(run_dir), "core_url": core_url, "music_url": music_url, "modes": {}}
 
@@ -846,7 +897,6 @@ def main() -> int:
             tag=tag,
         )
 
-        # Voice reference is a dedicated endpoint per project (OpenAPI)
         if voice_ref_path and mode in ("autopilot", "co_create"):
             _upload_voice_reference_for_project(
                 music_url,
@@ -925,11 +975,9 @@ def main() -> int:
 
         summary["modes"][tag] = {"mode": mode, "project_id": pid, "job_id": jid, "final_url": final_url, "publish_status": pub.get("status")}
 
-    # autopilot + co_create always run
     run_mode("autopilot", "autopilot", "E2E Autopilot Music Video", None)
     run_mode("co_create", "co_create", "E2E Co-create Music Video", None)
 
-    # BYO optional (URL or PATH)
     if byo_audio_url:
         run_mode("byo", "byo", "E2E BYO Music Video", byo_audio_url.strip())
     elif byo_audio_path:

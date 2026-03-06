@@ -1,11 +1,13 @@
+# /Users/home/Desktop/products/desifaces-backend/desifaces_backend/services/svc-commerce/app/app/api/routes/commerce_quotes.py
 from __future__ import annotations
 
 import base64
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -13,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.api.deps import require_user
 from app.db import get_pool
 from app.domain.models import CommerceConfirmIn, CommerceConfirmOut, CommerceQuoteIn, CommerceQuoteOut
+from app.services.azure_storage_service import AzureStorageService
 from app.services.pricing_client import PricingClient
 
 logger = logging.getLogger(__name__)
@@ -67,6 +70,58 @@ def _is_http_url(v: Any) -> bool:
     return isinstance(v, str) and v.strip().lower().startswith(("http://", "https://"))
 
 
+def _normalize_urls(x: Any) -> List[str]:
+    """
+    Accept list[str] or single str. Strip/validate http(s).
+    """
+    urls: List[str] = []
+    if isinstance(x, str) and x.strip():
+        urls = [x.strip()]
+    elif isinstance(x, list):
+        urls = [u.strip() for u in x if isinstance(u, str) and u.strip()]
+    else:
+        urls = []
+    return [u for u in urls if u.lower().startswith(("http://", "https://"))]
+
+
+def _merge_computed(payload_computed: Dict[str, Any], computed_col: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    computed_json (column) wins over payload_json['computed'].
+    """
+    out = dict(payload_computed or {})
+    out.update(computed_col or {})
+    return out
+
+
+def _normalize_job_status_payload(out: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Product-grade contract:
+      - always include top-level urls (mirror computed.urls)
+      - ensure computed.urls exists and matches urls
+      - ensure preview_url and variant_count
+    """
+    out = out if isinstance(out, dict) else {}
+    computed = out.get("computed")
+    computed = computed if isinstance(computed, dict) else {}
+    urls = _normalize_urls(out.get("urls"))
+    if not urls:
+        urls = _normalize_urls(computed.get("urls"))
+    out["urls"] = urls
+    if "computed" not in out or not isinstance(out["computed"], dict):
+        out["computed"] = computed
+    out["computed"]["urls"] = urls
+    out["preview_url"] = urls[0] if urls else None
+
+    vc = out.get("variant_count")
+    if not isinstance(vc, int) or vc <= 0:
+        vc2 = computed.get("variant_count")
+        if isinstance(vc2, int) and vc2 > 0:
+            out["variant_count"] = vc2
+        else:
+            out["variant_count"] = len(urls)
+    return out
+
+
 def _b64url_encode_json(obj: Dict[str, Any]) -> str:
     raw = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
@@ -111,13 +166,6 @@ def _score_item(item: Dict[str, Any]) -> int:
 
 
 def _extract_wrapped_request(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Some clients send:
-      { "request": {...} }  or  { "quote_request": {...} }  or  { "input": {...} }
-
-    For /quote we treat inner dict as the "quote request" and merge into the outer body.
-    Outer keys are preserved unless overridden by inner.
-    """
     if not isinstance(raw, dict):
         return {}
     for k in ("quote_request", "request", "input"):
@@ -130,13 +178,6 @@ def _extract_wrapped_request(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _extract_confirm_patch(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    For /confirm we allow patching the stored request_json using either:
-      - nested: { quote_request: {...} } / { request: {...} } / { input: {...} }
-      - OR top-level fields: { product_assets: {...}, model_ref: {...}, resolution: ..., ... }
-
-    We never merge quote_id/idempotency_key into request_json.
-    """
     if not isinstance(raw, dict):
         return {}
 
@@ -157,6 +198,10 @@ def _extract_confirm_patch(raw: Dict[str, Any]) -> Dict[str, Any]:
         "product_assets",
         "model_ref",
         "drape_styles",
+        "outfit_kind",
+        "drape_style",
+        "product_ids",
+        "look_set_ids",
     }
     patch: Dict[str, Any] = {}
     for k in allowed:
@@ -166,9 +211,6 @@ def _extract_confirm_patch(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _deep_merge_request_json(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Merge patch over base with shallow-merge for known nested dicts.
-    """
     out = dict(base or {})
     patch = dict(patch or {})
 
@@ -182,14 +224,68 @@ def _deep_merge_request_json(base: Dict[str, Any], patch: Dict[str, Any]) -> Dic
     return out
 
 
-def _resolve_vton_inputs_from_request_json(request_json: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Resolves and normalizes:
-      - product_assets.garment_image_url (from items[] or legacy keys)
-      - product_assets.dominant_component_code (best guess)
-      - model_ref.human_image_url
-    Also sets lightweight garment-type hints for saree/dress cases (provider may use these).
-    """
+def _parse_az_ref(s: str) -> Optional[Tuple[str, str]]:
+    v = (s or "").strip()
+    if not v.startswith("az://"):
+        return None
+    rest = v[len("az://") :]
+    if "/" not in rest:
+        return None
+    c, b = rest.split("/", 1)
+    c = c.strip()
+    b = b.lstrip("/")
+    if not c or not b:
+        return None
+    return c, b
+
+
+def _default_platform_model_url(storage: AzureStorageService) -> Optional[str]:
+    u = (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_URL") or "").strip()
+    if _is_http_url(u):
+        return u
+
+    az = (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_AZ") or "").strip()
+    got = _parse_az_ref(az) if az else None
+    if got:
+        c, b = got
+        try:
+            return storage.get_blob_sas_url(container=c, blob_name=b, expires_in_s=3600, permission="r")
+        except Exception:
+            pass
+
+    fallback = "az://commerce-training/pools/20260222_165920_e8aa84d6/persons/000000_877386944.png"
+    got2 = _parse_az_ref(fallback)
+    if got2:
+        c, b = got2
+        try:
+            return storage.get_blob_sas_url(container=c, blob_name=b, expires_in_s=3600, permission="r")
+        except Exception:
+            return None
+    return None
+
+
+def _component_code_from_role(role: str) -> str:
+    r = (role or "").lower()
+    if "saree" in r:
+        return "saree"
+    if "blouse" in r:
+        return "blouse"
+    if "shirt" in r:
+        return "shirt"
+    if "pant" in r:
+        return "pants"
+    if "dress" in r:
+        return "dress"
+    if "jewelry" in r or "earring" in r or "necklace" in r:
+        return "jewelry"
+    if "shoe" in r:
+        return "shoes"
+    if "handbag" in r:
+        return "handbag"
+    return "other"
+
+
+def _resolve_vton_inputs_from_request_json(request_json: Dict[str, Any], *, storage: Optional[AzureStorageService] = None) -> Dict[str, Any]:
     pa = dict(_as_dict(request_json.get("product_assets")))
     mr = dict(_as_dict(request_json.get("model_ref")))
 
@@ -232,7 +328,15 @@ def _resolve_vton_inputs_from_request_json(request_json: Dict[str, Any]) -> Dict
                 human_url = str(v).strip()
                 break
 
-    # patch canonical keys
+    mode = str(request_json.get("mode") or "").strip() or "platform_models"
+    if mode == "platform_models" and not _is_http_url(human_url):
+        if storage is None:
+            storage = AzureStorageService()
+        auto = _default_platform_model_url(storage)
+        if _is_http_url(auto):
+            human_url = auto
+            mr["human_image_url"] = auto
+
     if garment_url:
         pa["garment_image_url"] = garment_url
     if dominant_code:
@@ -240,8 +344,6 @@ def _resolve_vton_inputs_from_request_json(request_json: Dict[str, Any]) -> Dict
     if _is_http_url(human_url):
         mr["human_image_url"] = str(human_url).strip()
 
-    # lightweight garment-type hints (helps providers pick "dresses" for saree/lehenga)
-    # Do not override user-provided values.
     if "garment_type" not in pa:
         url_l = (garment_url or "").lower()
         if pa.get("saree_image_url") or "saree" in url_l or "lehenga" in url_l or "anarkali" in url_l or "gown" in url_l or "dress" in url_l:
@@ -267,20 +369,185 @@ def _resolve_vton_inputs_from_request_json(request_json: Dict[str, Any]) -> Dict
     }
 
 
-def _require_vton_inputs_or_422(*, request_json: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Fail fast for FE + demo reliability.
-    Enforced in /confirm so worker does not fail later.
-    """
-    resolved = _resolve_vton_inputs_from_request_json(request_json)
+async def _signed_url_for_media_asset(
+    *,
+    con,
+    storage: AzureStorageService,
+    asset_id: UUID,
+    expected_user_id: UUID,
+    expires_in_s: int = 3600,
+) -> str:
+    row = await con.fetchrow(
+        "select id, user_id, storage_ref from public.media_assets where id=$1",
+        asset_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"media_asset_not_found: {asset_id}")
+    if UUID(str(row["user_id"])) != expected_user_id:
+        raise HTTPException(status_code=403, detail=f"media_asset_not_owned_by_user: {asset_id}")
+
+    storage_ref = str(row["storage_ref"] or "")
+    if storage_ref.startswith("az://"):
+        got = _parse_az_ref(storage_ref)
+        if not got:
+            raise HTTPException(status_code=422, detail=f"invalid_storage_ref_for_asset: {asset_id}")
+        c, b = got
+        return storage.get_blob_sas_url(container=c, blob_name=b, expires_in_s=expires_in_s, permission="r")
+
+    if "/" in storage_ref and not storage_ref.startswith("http"):
+        c, b = storage_ref.split("/", 1)
+        return storage.get_blob_sas_url(container=c, blob_name=b, expires_in_s=expires_in_s, permission="r")
+
+    if _is_http_url(storage_ref):
+        return storage_ref
+
+    raise HTTPException(status_code=422, detail=f"unsupported_storage_ref_for_asset: {asset_id}")
+
+
+async def _expand_product_ids_into_product_assets(
+    *,
+    con,
+    storage: AzureStorageService,
+    request_json: Dict[str, Any],
+    user_id: UUID,
+) -> None:
+    product_ids = request_json.get("product_ids")
+    if not isinstance(product_ids, list) or not product_ids:
+        return
+
+    pa = dict(_as_dict(request_json.get("product_assets")))
+    items = pa.get("items")
+    if not isinstance(items, list):
+        items = []
+    role_urls = dict(_as_dict(pa.get("meta", {})).get("role_urls") if isinstance(pa.get("meta"), dict) else {})
+
+    for pid in product_ids:
+        try:
+            pid_u = UUID(str(pid))
+        except Exception:
+            continue
+
+        owner = await con.fetchval("select user_id from public.commerce_products where id=$1", pid_u)
+        if owner is None:
+            raise HTTPException(status_code=404, detail=f"product_not_found: {pid_u}")
+        if UUID(str(owner)) != user_id:
+            raise HTTPException(status_code=403, detail=f"product_not_owned_by_user: {pid_u}")
+
+        rows = await con.fetch(
+            """
+            select asset_type, media_asset_id, meta_json
+            from public.commerce_product_assets
+            where product_id=$1
+            order by created_at asc
+            """,
+            pid_u,
+        )
+
+        for r in rows:
+            role = str(r["asset_type"] or "").strip()
+            if not role:
+                continue
+            ma_id = r["media_asset_id"]
+            if not ma_id:
+                continue
+
+            url = await _signed_url_for_media_asset(con=con, storage=storage, asset_id=UUID(str(ma_id)), expected_user_id=user_id)
+            role_urls[role] = url
+
+            already = False
+            for it in items:
+                if isinstance(it, dict):
+                    m = _as_dict(it.get("meta"))
+                    if str(m.get("asset_type") or "") == role and _is_http_url(it.get("image_url")):
+                        already = True
+                        break
+            if not already:
+                cc = _component_code_from_role(role)
+                kind = "garment" if cc in ("saree", "blouse", "shirt", "pants", "dress") else "other"
+                items.append(
+                    {
+                        "component_code": cc,
+                        "kind": kind,
+                        "image_url": url,
+                        "image_urls": [url],
+                        "is_primary": True if cc == "saree" and ("saree" in role.lower()) else False,
+                        "meta": {"asset_type": role, "media_asset_id": str(ma_id), "source": "product_ids_expand"},
+                    }
+                )
+
+    saree_url = role_urls.get("saree_full") or role_urls.get("saree")
+    blouse_url = role_urls.get("blouse_piece") or role_urls.get("blouse")
+    pallu_url = role_urls.get("pallu_full")
+    border_url = role_urls.get("border_closeup")
+
+    if saree_url and not _is_http_url(pa.get("saree_image_url")):
+        pa["saree_image_url"] = saree_url
+    if blouse_url and not _is_http_url(pa.get("blouse_image_url")):
+        pa["blouse_image_url"] = blouse_url
+
+    meta = dict(_as_dict(pa.get("meta")))
+    meta["role_urls"] = role_urls
+    if pallu_url:
+        meta.setdefault("pallu_url", pallu_url)
+    if border_url:
+        meta.setdefault("border_url", border_url)
+    pa["meta"] = meta
+    pa["items"] = items
+
+    request_json["product_assets"] = pa
+
+
+async def _resolve_model_asset_id_to_url(
+    *,
+    con,
+    storage: AzureStorageService,
+    request_json: Dict[str, Any],
+    user_id: UUID,
+) -> None:
+    mr = dict(_as_dict(request_json.get("model_ref")))
+    asset_id = mr.get("asset_id")
+    if not asset_id:
+        request_json["model_ref"] = mr
+        return
+    if _is_http_url(mr.get("human_image_url")):
+        request_json["model_ref"] = mr
+        return
+    try:
+        aid = UUID(str(asset_id))
+    except Exception:
+        raise HTTPException(status_code=422, detail="model_ref.asset_id is not a valid UUID")
+
+    url = await _signed_url_for_media_asset(con=con, storage=storage, asset_id=aid, expected_user_id=user_id)
+    mr["human_image_url"] = url
+    request_json["model_ref"] = mr
+
+
+async def _ensure_confirm_request_has_urls(
+    *,
+    con,
+    storage: AzureStorageService,
+    request_json: Dict[str, Any],
+    user_id: UUID,
+) -> Dict[str, Any]:
+    await _expand_product_ids_into_product_assets(con=con, storage=storage, request_json=request_json, user_id=user_id)
+    await _resolve_model_asset_id_to_url(con=con, storage=storage, request_json=request_json, user_id=user_id)
+
+    resolved = _resolve_vton_inputs_from_request_json(request_json, storage=storage)
+    request_json["product_assets"] = resolved.get("product_assets") or request_json.get("product_assets")
+    request_json["model_ref"] = resolved.get("model_ref") or request_json.get("model_ref")
+    return resolved
+
+
+def _require_vton_inputs_or_422(*, request_json: Dict[str, Any], storage: AzureStorageService) -> Dict[str, Any]:
+    resolved = _resolve_vton_inputs_from_request_json(request_json, storage=storage)
     garment_url = resolved.get("resolved_garment_image_url")
     human_url = resolved.get("resolved_human_image_url")
 
     missing: List[str] = []
     if not _is_http_url(garment_url):
-        missing.append("product_assets.items[].image_url OR product_assets.garment_image_url")
+        missing.append("product_assets.items[].image_url OR product_assets.garment_image_url OR product_assets.saree_image_url")
     if not _is_http_url(human_url):
-        missing.append("model_ref.human_image_url OR model_ref.image_url")
+        missing.append("model_ref.human_image_url OR model_ref.image_url OR (mode=platform_models uses default model)")
 
     if missing:
         raise HTTPException(
@@ -288,7 +555,9 @@ def _require_vton_inputs_or_422(*, request_json: Dict[str, Any]) -> Dict[str, An
             detail={
                 "error": "missing_vton_inputs",
                 "missing": missing,
-                "hint": "Send garment + human URLs in /quote or /confirm. Wrapper bodies {request:{...}} and {quote_request:{...}} are supported.",
+                "hint": "Vendor flow: set mode=platform_models and provide saree URL only; backend auto-picks default model. "
+                        "Customer flow: provide model_ref.human_image_url (or model_ref.asset_id). "
+                        "Wrapper bodies {request:{...}} and {quote_request:{...}} are supported.",
             },
         )
     return resolved
@@ -298,13 +567,8 @@ def _require_vton_inputs_or_422(*, request_json: Dict[str, Any]) -> Dict[str, An
 # API
 # ---------------------------
 
-@router.post("/quote", response_model=CommerceQuoteOut)
+@router.post("/quote", response_model=CommerceQuoteOut, operation_id="commerce_quote_create")
 async def quote(req: CommerceQuoteIn, request: Request, user_id: UUID = Depends(require_user)) -> CommerceQuoteOut:
-    """
-    Supports both canonical body and wrapper bodies:
-      - canonical: {mode, product_type, resolution, product_assets, model_ref, outputs...}
-      - wrappers:  {mode,..., request:{...}} OR {quote_request:{...}} OR {input:{...}}
-    """
     raw: Dict[str, Any] = {}
     try:
         raw_j = await request.json()
@@ -314,7 +578,6 @@ async def quote(req: CommerceQuoteIn, request: Request, user_id: UUID = Depends(
 
     normalized = _extract_wrapped_request(raw) if raw else req.model_dump(mode="json")
 
-    # Re-validate using normalized body so wrapper clients work reliably.
     try:
         req2 = CommerceQuoteIn.model_validate(normalized)
     except Exception as e:
@@ -327,8 +590,8 @@ async def quote(req: CommerceQuoteIn, request: Request, user_id: UUID = Depends(
     req_json = req2.model_dump(mode="json")
     out_json = out.model_dump(mode="json")
 
-    # Resolve best-effort (do NOT 422 here; quoting may happen before images are selected)
-    resolved = _resolve_vton_inputs_from_request_json(req_json)
+    storage = AzureStorageService()
+    resolved = _resolve_vton_inputs_from_request_json(req_json, storage=storage)
 
     total_usd = float(out.totals.get("usd", 0.0))
     total_inr = float(out.totals.get("inr", 0.0))
@@ -388,12 +651,11 @@ async def quote(req: CommerceQuoteIn, request: Request, user_id: UUID = Depends(
     return out
 
 
-@router.post("/confirm", response_model=CommerceConfirmOut)
+@router.post("/confirm", response_model=CommerceConfirmOut, operation_id="commerce_quote_confirm")
 async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depends(require_user)) -> CommerceConfirmOut:
     pool = await get_pool()
     now = datetime.now(timezone.utc)
 
-    # Accept wrapper bodies here too (so FE/E2E can pass images in confirm even if quote was earlier)
     raw: Dict[str, Any] = {}
     try:
         raw_j = await request.json()
@@ -404,6 +666,8 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
     idem_from_raw = raw.get("idempotency_key") if isinstance(raw, dict) else None
     idempotency_key = req.idempotency_key or (str(idem_from_raw).strip() if isinstance(idem_from_raw, str) and idem_from_raw.strip() else None)
 
+    storage = AzureStorageService()
+
     async with pool.acquire() as con:
         async with con.transaction():
             user_exists = await con.fetchval("select 1 from core.users where id = $1", user_id)
@@ -413,7 +677,6 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
                     detail="unknown_user_in_core_users (token sub not present in core.users; use a token issued by svc-core login/signup)",
                 )
 
-            # lock quote row during confirm for consistency
             q = await con.fetchrow(
                 """
                 select
@@ -429,30 +692,27 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
             )
 
             if not q:
-                raise HTTPException(status_code=404, detail="Quote not found")
+                raise HTTPException(status_code=404, detail="quote_not_found")
 
             if q["expires_at"] <= now:
-                raise HTTPException(status_code=422, detail="Quote expired")
+                raise HTTPException(status_code=422, detail="quote_expired")
 
             if q["status"] not in ("quoted", "confirmed"):
-                raise HTTPException(status_code=422, detail=f"Quote not confirmable: {q['status']}")
+                raise HTTPException(status_code=422, detail=f"quote_not_confirmable: {q['status']}")
 
             request_json: Dict[str, Any] = dict(q["request_json"] or {})
             request_json.setdefault("product_assets", {})
             request_json.setdefault("model_ref", {})
 
-            # Merge patch from client (nested or top-level) into stored quote request_json
             patch = _extract_confirm_patch(raw)
             if patch:
                 request_json = _deep_merge_request_json(request_json, patch)
 
-            # ensure mode/resolution present
             if not request_json.get("mode") and q.get("mode"):
                 request_json["mode"] = q["mode"]
             if not request_json.get("resolution") and q.get("resolution"):
                 request_json["resolution"] = q["resolution"]
 
-            # ensure resolved urls present from quote columns
             pa = _as_dict(request_json.get("product_assets"))
             mr = _as_dict(request_json.get("model_ref"))
             if q.get("resolved_garment_image_url") and not _is_http_url(pa.get("garment_image_url")):
@@ -464,8 +724,8 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
             request_json["product_assets"] = pa
             request_json["model_ref"] = mr
 
-            # HARD FAIL-FAST HERE (prevents worker failures + saves demo)
-            resolved = _require_vton_inputs_or_422(request_json=request_json)
+            resolved = await _ensure_confirm_request_has_urls(con=con, storage=storage, request_json=request_json, user_id=user_id)
+            resolved = _require_vton_inputs_or_422(request_json=request_json, storage=storage)
 
             request_json_for_job = dict(request_json)
             request_json_for_job["product_assets"] = resolved.get("product_assets") or request_json.get("product_assets")
@@ -475,7 +735,6 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
             product_type = str(request_json_for_job.get("product_type") or "mixed").strip() or "mixed"
             resolution = str(request_json_for_job.get("resolution") or (q.get("resolution") or "hd")).strip() or "hd"
 
-            # persist latest request_json + resolved to commerce_quotes
             await con.execute(
                 """
                 update public.commerce_quotes
@@ -500,7 +759,6 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
                 resolved.get("resolved_human_image_url") or q.get("resolved_human_image_url"),
             )
 
-            # campaign create or reuse
             existing_campaign = await con.fetchrow(
                 """
                 select id
@@ -541,7 +799,6 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
             payload = {
                 "quote_id": str(req.quote_id),
                 "campaign_id": str(campaign_id),
-                # include both keys so commerce_processor can find it regardless of extraction strategy
                 "quote_request": request_json_for_job,
                 "request": request_json_for_job,
                 "resolved": resolved.get("resolved_json") or {},
@@ -573,14 +830,12 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
             )
             studio_job_id = UUID(str(row["id"]))
 
-            # mark quote confirmed
             await con.execute(
                 "update public.commerce_quotes set status='confirmed', updated_at=now() where id=$1 and user_id=$2",
                 req.quote_id,
                 user_id,
             )
 
-            # help the worker + FE find the campaign/job quickly
             await con.execute(
                 """
                 update public.commerce_campaigns
@@ -590,20 +845,13 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
                 where id = $1
                 """,
                 campaign_id,
-                json.dumps(
-                    {
-                        "studio_job_id": str(studio_job_id),
-                        "quote_id": str(req.quote_id),
-                        "mode": mode,
-                        "resolution": resolution,
-                    }
-                ),
+                json.dumps({"studio_job_id": str(studio_job_id), "quote_id": str(req.quote_id), "mode": mode, "resolution": resolution}),
             )
 
             return CommerceConfirmOut(campaign_id=campaign_id, studio_job_id=studio_job_id, status="queued")
 
 
-@router.get("/jobs/{studio_job_id}/status")
+@router.get("/jobs/{studio_job_id}/status", operation_id="commerce_job_status_get")
 async def job_status(
     studio_job_id: UUID,
     user_id: UUID = Depends(require_user),
@@ -613,7 +861,10 @@ async def job_status(
     async with pool.acquire() as con:
         j = await con.fetchrow(
             """
-            select id, status, error_code, error_message, payload_json, meta_json, updated_at, created_at
+            select
+              id, status, error_code, error_message,
+              payload_json, meta_json, computed_json,
+              updated_at, created_at
             from public.studio_jobs
             where id = $1 and user_id = $2 and studio_type = 'commerce'
             """,
@@ -624,33 +875,47 @@ async def job_status(
         raise HTTPException(status_code=404, detail="job_not_found")
 
     payload = _as_dict(j["payload_json"])
-    computed = _as_dict(payload.get("computed"))
+    meta = _as_dict(j["meta_json"])
+
+    # ✅ IMPORTANT: worker writes computed_json; payload_json["computed"] is not reliable.
+    payload_computed = _as_dict(payload.get("computed"))
+    computed_col = _as_dict(j.get("computed_json"))
+
+    computed = dict(payload_computed)
+    computed.update(computed_col)  # computed_json wins
+
     stage = str(computed.get("stage") or j["status"] or "").strip() or str(j["status"])
 
+    # ✅ ALWAYS mirror computed.urls -> top-level urls (vendor/E2E contract)
     urls = computed.get("urls")
     if not isinstance(urls, list):
         urls = []
-    urls = [u for u in urls if isinstance(u, str) and u.strip()]
+    urls = [u.strip() for u in urls if isinstance(u, str) and u.strip()]
+    urls = [u for u in urls if u.lower().startswith(("http://", "https://"))]
+    computed["urls"] = urls
 
     out: Dict[str, Any] = {
         "studio_job_id": str(j["id"]),
         "studio_type": "commerce",
         "status": j["status"],
         "stage": stage,
-        "campaign_id": payload.get("campaign_id"),
-        "quote_id": payload.get("quote_id"),
+        "campaign_id": payload.get("campaign_id") or meta.get("campaign_id"),
+        "quote_id": payload.get("quote_id") or meta.get("quote_id"),
         "created_at": j["created_at"].isoformat() if j["created_at"] else None,
         "updated_at": j["updated_at"].isoformat() if j["updated_at"] else None,
         "error_code": j["error_code"],
         "error_message": j["error_message"],
         "computed": computed,
-        "urls": urls,
+        "urls": urls,  # <-- this fixes “succeeded but urls empty”
+        "variant_count": int(computed.get("variant_count")) if isinstance(computed.get("variant_count"), int) else len(urls),
         "preview_url": urls[0] if urls else None,
     }
 
     if include_payload:
-        out["payload_json"] = payload
-        out["meta_json"] = _as_dict(j["meta_json"])
+        payload2 = dict(payload)
+        payload2["computed"] = computed  # helpful for debugging
+        out["payload_json"] = payload2
+        out["meta_json"] = meta
 
     return out
 
@@ -659,7 +924,7 @@ async def job_status(
 # PRODUCTION SCALE DEMO ENDPOINTS
 # ---------------------------
 
-@router.get("/gallery")
+@router.get("/gallery", operation_id="commerce_gallery_list")
 async def gallery(
     user_id: UUID = Depends(require_user),
     limit: int = Query(24, ge=1, le=200),
@@ -667,12 +932,6 @@ async def gallery(
     before: Optional[str] = Query(None, description="(legacy) ISO timestamp; items strictly earlier than this"),
     only_succeeded: bool = Query(True),
 ) -> Dict[str, Any]:
-    """
-    Production-scale list endpoint for FE demo:
-      - Keyset pagination (created_at,id) via `cursor`
-      - Backward-compatible `before` timestamp pagination
-      - Returns compact items with urls + resolved inputs (if available)
-    """
     before_ts: Optional[datetime] = None
     before_id: Optional[str] = None
 
@@ -704,7 +963,7 @@ async def gallery(
                   updated_at,
                   payload_json->>'quote_id' as quote_id,
                   payload_json->>'campaign_id' as campaign_id,
-                  payload_json->'computed' as computed
+                  coalesce(computed_json, payload_json->'computed') as computed
                 from public.studio_jobs
                 where user_id = $1
                   and studio_type = 'commerce'
@@ -729,7 +988,7 @@ async def gallery(
                   updated_at,
                   payload_json->>'quote_id' as quote_id,
                   payload_json->>'campaign_id' as campaign_id,
-                  payload_json->'computed' as computed
+                  coalesce(computed_json, payload_json->'computed') as computed
                 from public.studio_jobs
                 where user_id = $1
                   and studio_type = 'commerce'
@@ -753,7 +1012,7 @@ async def gallery(
                   updated_at,
                   payload_json->>'quote_id' as quote_id,
                   payload_json->>'campaign_id' as campaign_id,
-                  payload_json->'computed' as computed
+                  coalesce(computed_json, payload_json->'computed') as computed
                 from public.studio_jobs
                 where user_id = $1
                   and studio_type = 'commerce'
@@ -772,8 +1031,7 @@ async def gallery(
 
     for r in rows or []:
         computed = _as_dict(r["computed"])
-        urls = computed.get("urls") if isinstance(computed.get("urls"), list) else []
-        urls = [u for u in urls if isinstance(u, str) and u.strip()]
+        urls = _normalize_urls(computed.get("urls"))
 
         provider_meta = _as_dict(computed.get("provider_meta"))
         resolved_inputs = _as_dict(provider_meta.get("resolved_inputs"))
@@ -788,7 +1046,7 @@ async def gallery(
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
                 "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
                 "provider": computed.get("provider"),
-                "variant_count": computed.get("variant_count"),
+                "variant_count": computed.get("variant_count") if isinstance(computed.get("variant_count"), int) else len(urls),
                 "urls": urls,
                 "preview_url": urls[0] if urls else None,
                 "resolved_inputs": resolved_inputs,
@@ -804,11 +1062,8 @@ async def gallery(
     return {"items": items, "next_cursor": next_cursor, "next_before": next_before, "count": len(items)}
 
 
-@router.get("/campaigns/{campaign_id}")
+@router.get("/campaigns/{campaign_id}", operation_id="commerce_campaign_detail_get")
 async def campaign_detail(campaign_id: UUID, user_id: UUID = Depends(require_user)) -> Dict[str, Any]:
-    """
-    Production endpoint: one campaign + latest job + urls for FE.
-    """
     pool = await get_pool()
     async with pool.acquire() as con:
         camp = await con.fetchrow(
@@ -825,7 +1080,7 @@ async def campaign_detail(campaign_id: UUID, user_id: UUID = Depends(require_use
 
         job = await con.fetchrow(
             """
-            select id, status, payload_json, created_at, updated_at, error_code, error_message
+            select id, status, payload_json, computed_json, created_at, updated_at, error_code, error_message
             from public.studio_jobs
             where user_id=$1
               and studio_type='commerce'
@@ -840,22 +1095,25 @@ async def campaign_detail(campaign_id: UUID, user_id: UUID = Depends(require_use
     job_out: Optional[Dict[str, Any]] = None
     if job:
         payload = _as_dict(job["payload_json"])
-        computed = _as_dict(payload.get("computed"))
-        urls = computed.get("urls") if isinstance(computed.get("urls"), list) else []
-        urls = [u for u in urls if isinstance(u, str) and u.strip()]
+        payload_computed = _as_dict(payload.get("computed"))
+        computed_col = _as_dict(job["computed_json"])
+        computed = _merge_computed(payload_computed, computed_col)
+        urls = _normalize_urls(computed.get("urls"))
 
-        job_out = {
-            "studio_job_id": str(job["id"]),
-            "status": job["status"],
-            "stage": str(computed.get("stage") or job["status"]),
-            "created_at": job["created_at"].isoformat() if job["created_at"] else None,
-            "updated_at": job["updated_at"].isoformat() if job["updated_at"] else None,
-            "error_code": job["error_code"],
-            "error_message": job["error_message"],
-            "computed": computed,
-            "urls": urls,
-            "preview_url": urls[0] if urls else None,
-        }
+        job_out = _normalize_job_status_payload(
+            {
+                "studio_job_id": str(job["id"]),
+                "status": job["status"],
+                "stage": str(computed.get("stage") or job["status"]),
+                "created_at": job["created_at"].isoformat() if job["created_at"] else None,
+                "updated_at": job["updated_at"].isoformat() if job["updated_at"] else None,
+                "error_code": job["error_code"],
+                "error_message": job["error_message"],
+                "computed": computed,
+                "urls": urls,
+                "variant_count": computed.get("variant_count") if isinstance(computed.get("variant_count"), int) else len(urls),
+            }
+        )
 
     return {
         "campaign": {

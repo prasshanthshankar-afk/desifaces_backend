@@ -1,10 +1,11 @@
+# services/svc-music/app/app/services/music_orchestrator.py
 from __future__ import annotations
 
 import asyncio
 import copy
 import inspect
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
 from app.db import get_pool
@@ -79,6 +80,59 @@ def _pick_first_str(*vals: Any) -> Optional[str]:
             if s:
                 return s
     return None
+
+
+# -----------------------------
+# DesiFaces quality gates
+# -----------------------------
+def _allow_fallback_audio_env() -> bool:
+    """
+    DesiFaces quality policy:
+      - Fallback audio is DEV-only and OFF by default.
+      - Only allow if explicitly enabled.
+    """
+    if (os.getenv("DF_ALLOW_FALLBACK_AUDIO") or "").strip():
+        return _truthy(os.getenv("DF_ALLOW_FALLBACK_AUDIO"))
+    # Back-compat only if explicitly set
+    if (os.getenv("MUSIC_ALLOW_NATIVE_FALLBACK") or "").strip():
+        return _truthy(os.getenv("MUSIC_ALLOW_NATIVE_FALLBACK"))
+    return False
+
+
+def _is_fallback_audio_url(url: str) -> bool:
+    u = (url or "").lower()
+    return ("fallback_full_mix" in u) or ("fallback_native" in u)
+
+
+def _extract_full_mix_url_from_state(state: MusicGraphState) -> str:
+    for t in getattr(state, "tracks", []) or []:
+        if str(getattr(t, "track_type", "")) == MusicTrackType.full_mix.value:
+            meta = getattr(t, "meta", None)
+            md = meta if isinstance(meta, dict) else {}
+            url = _pick_first_str(md.get("url"), md.get("audio_master_url"), md.get("sas_url"), md.get("storage_ref"))
+            return url or ""
+    return ""
+
+
+def _reject_fallback_audio_or_raise(*, input_json: Dict[str, Any], state: MusicGraphState, where: str) -> None:
+    """
+    If fallback audio is being used, fail fast unless DF_ALLOW_FALLBACK_AUDIO=1.
+    This prevents "successful" humming outputs.
+    """
+    if _allow_fallback_audio_env():
+        return
+
+    computed = _as_dict(input_json.get("computed"))
+
+    # Prefer explicit computed flags if present
+    if _truthy(computed.get("audio_is_fallback")):
+        reason = str(computed.get("audio_fallback_reason") or "fallback_audio_not_allowed")
+        raise RuntimeError(f"audio_fallback_rejected:{where}:{reason}")
+
+    # Otherwise detect from URLs
+    full_mix_url = _extract_full_mix_url_from_state(state) or str(computed.get("audio_master_url") or "")
+    if full_mix_url and _is_fallback_audio_url(full_mix_url):
+        raise RuntimeError(f"audio_fallback_rejected:{where}:full_mix_is_fallback")
 
 
 def _ensure_run_id(input_json: Dict[str, Any]) -> bool:
@@ -780,18 +834,39 @@ async def run_music_video_job(job_id: UUID) -> None:
         state = await run_video_pipeline(state, tools, jobs=jobs, steps=steps)
         progress_int = await _progress_bump(pool=pool, jobs=jobs, job_id=job_id, current=progress_int, target=82)
 
+        # DesiFaces quality gate: do NOT proceed with fallback audio
+        _reject_fallback_audio_or_raise(input_json=input_json, state=state, where="after_run_video_pipeline")
+
         computed = _as_dict(input_json.get("computed"))
         tool_computed = tools._computed()
 
         for k in (
+            # lyrics/plan
             "lyrics_text",
             "lyrics_source_effective",
             "music_plan",
             "plan_summary",
             "voice_ref_url",
+            # audio (CRITICAL)
             "audio_provider",
+            "audio_provider_requested",
             "provider_request_id",
             "autopilot_provider_error",
+            "audio_gen_error",
+            "audio_master_url",
+            "byo_audio_url",
+            "audio_master_duration_ms",
+            "audio_duration_ms",
+            "audio_content_type",
+            "audio_source",
+            "audio_is_fallback",
+            "audio_fallback_reason",
+            "audio_genre_family",
+            "audio_mood",
+            "audio_bpm",
+            "audio_instrumentation",
+            "audio_style_prompt",
+            # misc
             "exports",
             "performer_faces_skipped",
             "performer_faces_skip_reason",
@@ -809,18 +884,18 @@ async def run_music_video_job(job_id: UUID) -> None:
         for t in state.tracks:
             tt = str(getattr(t, "track_type", ""))
             meta = getattr(t, "meta", None)
+
             if tt == MusicTrackType.full_mix.value and isinstance(meta, dict):
-                am = meta.get("audio_master_url")
+                am = meta.get("audio_master_url") or meta.get("url") or meta.get("sas_url") or meta.get("storage_ref")
                 if am:
-                    computed["audio_master_url"] = am
-                    computed["byo_audio_url"] = am
-                demo = meta.get("demo_audio_url")
-                if demo:
-                    computed["demo_audio_url"] = demo
-                dur = meta.get("audio_duration_ms") or meta.get("byo_duration_ms")
+                    computed["audio_master_url"] = str(am)
+                    computed["byo_audio_url"] = str(am)
+
+                dur = meta.get("audio_duration_ms") or meta.get("byo_duration_ms") or meta.get("duration_ms")
                 if dur:
                     try:
                         computed["audio_master_duration_ms"] = int(dur)
+                        computed["audio_duration_ms"] = int(dur)
                     except Exception:
                         pass
 
@@ -911,60 +986,72 @@ async def run_music_video_job(job_id: UUID) -> None:
             await _persist_input_json_best_effort(jobs=jobs, job_id=job_id, input_json=input_json)
 
         if enable_perf_vid:
-            perf_fn = _get_performer_video_fn()
-            if callable(perf_fn):
-                try:
-                    input_json = await perf_fn(
-                        steps=steps,
-                        jobs=jobs,
-                        job_id=job_id,
-                        proj=proj,
-                        input_json=input_json,
-                    )
-                    # Ensure montage-friendly aliases exist
-                    if _sync_performer_video_aliases(input_json):
-                        pass
-                    await _persist_input_json_best_effort(jobs=jobs, job_id=job_id, input_json=input_json)
-                except Exception as e:
-                    computed = _as_dict(input_json.get("computed"))
-                    computed["performer_video_skipped"] = True
-                    computed["performer_video_skip_reason"] = f"perf_video_error:{_error_str(e)}"
-                    input_json["computed"] = computed
-                    await _persist_input_json_best_effort(jobs=jobs, job_id=job_id, input_json=input_json)
-
-                    if require_perf_vid:
-                        await jobs.set_video_job_failed(job_id=job_id, error=f"performer_video_failed:{_error_str(e)}")
-                        try:
-                            await update_studio_job_status_best_effort(
-                                pool=pool,
-                                job_id=job_id,
-                                status="failed",
-                                error_message=f"performer_video_failed:{_error_str(e)}",
-                                meta_patch={"music_project_id": str(proj_id), "svc": "svc-music"},
-                            )
-                        except Exception:
-                            pass
-                        return
+            # If we already have a performer video, skip regeneration
+            if _performer_video_present(input_json):
+                pass
             else:
-                computed = _as_dict(input_json.get("computed"))
-                computed["performer_video_skipped"] = True
-                computed["performer_video_skip_reason"] = "module_missing"
-                input_json["computed"] = computed
-                await _persist_input_json_best_effort(jobs=jobs, job_id=job_id, input_json=input_json)
-
-                if require_perf_vid:
-                    await jobs.set_video_job_failed(job_id=job_id, error="performer_video_module_missing")
+                perf_fn = _get_performer_video_fn()
+                if callable(perf_fn):
                     try:
-                        await update_studio_job_status_best_effort(
-                            pool=pool,
+                        input_json = await perf_fn(
+                            steps=steps,
+                            jobs=jobs,
                             job_id=job_id,
-                            status="failed",
-                            error_message="performer_video_module_missing",
-                            meta_patch={"music_project_id": str(proj_id), "svc": "svc-music"},
+                            proj=proj,
+                            input_json=input_json,
                         )
-                    except Exception:
-                        pass
-                    return
+                        if _sync_performer_video_aliases(input_json):
+                            pass
+                        await _persist_input_json_best_effort(jobs=jobs, job_id=job_id, input_json=input_json)
+                    except Exception as e:
+                        computed = _as_dict(input_json.get("computed"))
+                        computed["performer_video_skipped"] = True
+                        computed["performer_video_skip_reason"] = f"perf_video_error:{_error_str(e)}"
+                        input_json["computed"] = computed
+                        await _persist_input_json_best_effort(jobs=jobs, job_id=job_id, input_json=input_json)
+
+                        if require_perf_vid:
+                            await jobs.set_video_job_failed(job_id=job_id, error=f"performer_video_failed:{_error_str(e)}")
+                            try:
+                                await update_studio_job_status_best_effort(
+                                    pool=pool,
+                                    job_id=job_id,
+                                    status="failed",
+                                    error_message=f"performer_video_failed:{_error_str(e)}",
+                                    meta_patch={"music_project_id": str(proj_id), "svc": "svc-music"},
+                                )
+                            except Exception:
+                                pass
+                            return
+                else:
+                    # Fallback to tools implementation (keeps svc-music functional even if module missing)
+                    try:
+                        await tools.generate_performer_videos(state)  # type: ignore[attr-defined]
+                        # tools mutates shared input_json in-place; persist
+                        input_json["computed"] = _as_dict(input_json.get("computed"))
+                        if _sync_performer_video_aliases(input_json):
+                            pass
+                        await _persist_input_json_best_effort(jobs=jobs, job_id=job_id, input_json=input_json)
+                    except Exception as e:
+                        computed = _as_dict(input_json.get("computed"))
+                        computed["performer_video_skipped"] = True
+                        computed["performer_video_skip_reason"] = f"perf_video_error_tools:{_error_str(e)}"
+                        input_json["computed"] = computed
+                        await _persist_input_json_best_effort(jobs=jobs, job_id=job_id, input_json=input_json)
+
+                        if require_perf_vid:
+                            await jobs.set_video_job_failed(job_id=job_id, error=f"performer_video_failed:{_error_str(e)}")
+                            try:
+                                await update_studio_job_status_best_effort(
+                                    pool=pool,
+                                    job_id=job_id,
+                                    status="failed",
+                                    error_message=f"performer_video_failed:{_error_str(e)}",
+                                    meta_patch={"music_project_id": str(proj_id), "svc": "svc-music"},
+                                )
+                            except Exception:
+                                pass
+                            return
         else:
             computed = _as_dict(input_json.get("computed"))
             if computed.get("performer_video_skipped") is None:
@@ -986,6 +1073,9 @@ async def run_music_video_job(job_id: UUID) -> None:
             except Exception:
                 pass
             return
+
+        # DesiFaces quality gate (defense-in-depth): block fallback audio before montage/publish
+        _reject_fallback_audio_or_raise(input_json=input_json, state=state, where="before_montage")
 
         # Montage
         _, preview_asset_id, final_asset_id = await render_montage_and_upload(

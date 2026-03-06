@@ -16,11 +16,28 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json",
     )
 
+    # Existing router builder (keeps your current behavior)
     app.include_router(build_router())
+
+    # ✅ Hard-include commerce_assets router (prevents silent 404s)
+    try:
+        from app.api.routes.commerce_assets import router as commerce_assets_router
+
+        app.include_router(commerce_assets_router)
+        print("[svc-commerce] included commerce_assets_router")
+    except Exception as e:
+        # Keep service up, but print loud error (autoloader might also print)
+        print(f"[svc-commerce] FAILED to include commerce_assets_router: {e!r}")
 
     @app.on_event("startup")
     async def startup():
         await get_pool()
+
+        # ✅ Proof in logs that the route exists (or not)
+        has_assets = any(
+            getattr(r, "path", None) == "/api/commerce/assets/upload" for r in app.routes
+        )
+        print(f"[svc-commerce] assets_upload_route_registered={has_assets}")
 
     @app.on_event("shutdown")
     async def shutdown():

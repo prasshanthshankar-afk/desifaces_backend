@@ -758,6 +758,12 @@ class CreatorOrchestrator:
 
         request_dict: JsonDict = request.model_dump(mode="json")
 
+        # Backward-compatible alias: some callers send "prompt" instead of "user_prompt".
+        if not (request_dict.get("user_prompt") or "").strip():
+            p = str(request_dict.get("prompt") or "").strip()
+            if p:
+                request_dict["user_prompt"] = p
+
         mode = self._coerce_mode(request_dict.get("mode"))
 
         # ---- UPDATED (safe): prefer source_image_asset_id, fallback to source_image_url

@@ -1,3 +1,4 @@
+# services/creator_prompt_service.py
 from __future__ import annotations
 
 import hashlib
@@ -108,6 +109,38 @@ class CreatorPromptService:
             return obj.get("code") or obj.get("platform_code")
         return getattr(obj, "code", None) or getattr(obj, "platform_code", None)
 
+    @staticmethod
+    def _coerce_preferred_variations(x: Any) -> List[str]:
+        """
+        Accept:
+          - list[str]
+          - JSON string list like '["a","b"]'
+          - accidental scalar string (treated as single prompt)
+        """
+        if x is None:
+            return []
+        if isinstance(x, list):
+            out = []
+            for it in x:
+                s = it.strip() if isinstance(it, str) else str(it).strip()
+                if s:
+                    out.append(s)
+            return out
+        if isinstance(x, str):
+            s = x.strip()
+            if not s:
+                return []
+            # tolerate JSON list passed as string
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    j = json.loads(s)
+                    if isinstance(j, list):
+                        return [str(it).strip() for it in j if str(it).strip()]
+                except Exception:
+                    return []
+            return [s]
+        return []
+
     # ---------------------------------------------------------------------
     # Public: translate + validate
     # ---------------------------------------------------------------------
@@ -213,18 +246,28 @@ class CreatorPromptService:
         clothing = await self.config_repo.get_clothing_by_code(request_dict.get("clothing_style_code")) if request_dict.get("clothing_style_code") else None
         platform = await self.config_repo.get_platform_requirements_by_code(request_dict.get("platform_code")) if request_dict.get("platform_code") else None
 
-        # Seed
+        # Seed: respect explicit seed if present and job_seed not provided
         if job_seed is None:
-            job_seed = self._stable_seed_from(request_dict)
+            try:
+                if request_dict.get("seed") not in (None, "", 0):
+                    job_seed = int(request_dict.get("seed")) & 0x7FFFFFFF
+                else:
+                    job_seed = self._stable_seed_from(request_dict)
+            except Exception:
+                job_seed = self._stable_seed_from(request_dict)
         job_seed = int(job_seed) & 0x7FFFFFFF
 
-        # Prompt (translated prompt becomes the user instruction)
+        # Preferred per-variant prompts (authoritative if provided)
+        preferred_variations = self._coerce_preferred_variations(request_dict.get("preferred_variations"))
+
+        # Fallback prompt (single)
         translated_prompt = (
             request_dict.get("user_prompt_translated_en")
             or request_dict.get("translated_prompt")
             or request_dict.get("user_prompt")
             or ""
         )
+        translated_prompt = self._as_text(translated_prompt)
 
         # Gender policy
         gender = self._coerce_gender(request_dict.get("gender"))  # "" if not provided
@@ -241,12 +284,10 @@ class CreatorPromptService:
             return f"{g} person"
 
         # -------------------------
-        # Build demographic base
+        # Build demographic prefix (NO user prompt baked in)
         # -------------------------
         demographic_parts: List[str] = []
-
         if not is_i2i:
-            # T2I: include demographic descriptors ONLY if provided by UI
             if age_range:
                 demographic_parts.append(self._as_text(self._get(age_range, "prompt_descriptor")))
 
@@ -269,20 +310,9 @@ class CreatorPromptService:
             if skin_tone:
                 demographic_parts.append(self._as_text(self._get(skin_tone, "prompt_descriptor")))
 
-            # keep this for T2I quality and cultural consistency
             demographic_parts.append("authentic Indian features, natural appearance, culturally accurate")
 
-            # add user prompt
-            if translated_prompt:
-                demographic_parts.append(translated_prompt)
-
-        else:
-            # I2I: do NOT inject demographic defaults.
-            # Keep this minimal; identity is handled by the image itself + negative prompts.
-            # Ensure the edit instruction dominates by placing it LAST later in the final prompt.
-            pass
-
-        demographic_base = self._join(demographic_parts)
+        demographic_prefix = self._join(demographic_parts)
 
         # -------------------------
         # Variations from DB
@@ -318,7 +348,12 @@ class CreatorPromptService:
         height = int(self._get(image_format, "height") or 512)
         aspect_ratio = self._as_text(self._get(image_format, "aspect_ratio"))
 
+        # num_variants: cap to preferred_variations length if present
         num_variants = int(request_dict.get("num_variants") or 4)
+        num_variants = max(1, num_variants)
+        if preferred_variations:
+            num_variants = min(num_variants, len(preferred_variations))
+
         variants: List[Dict[str, Any]] = []
 
         # I2I: default OFF (to avoid fighting edit instruction)
@@ -348,19 +383,14 @@ class CreatorPromptService:
             creative_parts: List[str] = []
 
             # Use-case base:
-            # - T2I: always include (helps)
-            # - I2I: include ONLY if you want it (often fights edit); default omit.
             if not is_i2i:
                 uc_base = self._as_text(self._get(use_case, "prompt_base"))
                 if uc_base:
                     creative_parts.append(uc_base)
 
-            # style (probably None)
             if style and (not is_i2i):
                 creative_parts.append(self._as_text(self._get(style, "prompt_base")))
 
-            # context + clothing are explicit UI controls -> include for both,
-            # but background prompts can fight I2I; include bg only for T2I.
             if context:
                 ctx_base = self._get(context, "prompt_base") or self._get(context, "prompt_modifiers")
                 if ctx_base:
@@ -375,14 +405,12 @@ class CreatorPromptService:
                 if cloth_base:
                     creative_parts.append(self._as_text(cloth_base))
 
-            # variation modifiers
             if chosen:
                 for _, vrow in chosen.items():
                     pm = vrow.get("prompt_modifier")
                     if pm:
                         creative_parts.append(self._as_text(pm))
 
-            # platform guidance (safe to include for both)
             if platform:
                 guidelines = platform.get("content_guidelines") or {}
                 if isinstance(guidelines, dict):
@@ -391,18 +419,22 @@ class CreatorPromptService:
                     if guidelines.get("authenticity") == "high":
                         creative_parts.append("authentic, documentary realism, not stock-photo")
 
+            # Per-variant instruction: preferred_variations[i] wins, else translated_prompt
+            prompt_instruction = ""
+            if preferred_variations and i < len(preferred_variations):
+                prompt_instruction = self._as_text(preferred_variations[i])
+            else:
+                prompt_instruction = translated_prompt
+
             # -------------------------
             # Assemble prompt
             # -------------------------
             if not is_i2i:
-                # T2I: demographic_base already includes user prompt
-                full_prompt = self._join([demographic_base, self._join(creative_parts)])
+                full_prompt = self._join([demographic_prefix, prompt_instruction, self._join(creative_parts)])
             else:
-                # I2I: Keep prompt clean and ensure user edit dominates (place it LAST)
                 i2i_base = "EDIT THE INPUT PHOTO: keep the SAME person/identity"
                 i2i_parts = [i2i_base]
 
-                # If user explicitly provided demographics via UI, include them lightly (optional)
                 demo_light: List[str] = []
                 if age_range:
                     demo_light.append(self._as_text(self._get(age_range, "prompt_descriptor")))
@@ -422,13 +454,12 @@ class CreatorPromptService:
                 if demo_light:
                     i2i_parts.append(self._join(demo_light))
 
-                # Minimal creative parts (context/clothing/platform) ok
                 if creative_parts:
                     i2i_parts.append(self._join(creative_parts))
 
                 # USER edit instruction LAST
-                if translated_prompt:
-                    i2i_parts.append(translated_prompt)
+                if prompt_instruction:
+                    i2i_parts.append(prompt_instruction)
 
                 full_prompt = self._join(i2i_parts)
 
@@ -473,7 +504,9 @@ class CreatorPromptService:
                     for vt, vrow in chosen.items()
                 },
                 "prompt_used": full_prompt,
-                "demographic_base": demographic_base,
+                "demographic_base": demographic_prefix,  # keep key name stable for your existing logs/tools
+                "prompt_instruction": prompt_instruction,
+                "prompt_source": "preferred_variations" if preferred_variations else "translated_prompt",
             })
 
         resolved = {
@@ -489,5 +522,7 @@ class CreatorPromptService:
             "platform": platform,
             "job_seed": job_seed,
             "enable_i2i_variations": enable_i2i_variations,
+            "preferred_variations_used": bool(preferred_variations),
+            "preferred_variations_n": len(preferred_variations),
         }
         return variants, resolved

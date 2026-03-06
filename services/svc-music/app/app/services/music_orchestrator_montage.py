@@ -63,16 +63,18 @@ def _get_str(name: str, default: str) -> str:
 # -----------------------------
 # Blob naming helpers
 # -----------------------------
-def _montage_blob_filename(*, job_id: UUID, run_id: str, filename: str) -> str:
+def _montage_blob_filename(*, job_id: UUID, run_id: str, render_id: str, filename: str) -> str:
     """
-    Ensure every montage output is unique per job+run to avoid stale/older-run URLs.
-    We keep everything under: montage/{job_id}/{run_id}/...
+    Ensure every montage output is unique per job+run+render to avoid stale URLs.
+    Path: montage/{job_id}/{run_id}/{render_id}/...
     """
     fn = (filename or "").lstrip("/")
     if fn.startswith("montage/"):
         fn = fn[len("montage/") :]
     fn = fn or "output.mp4"
-    return f"montage/{job_id}/{run_id}/{fn}"
+    safe_run = (run_id or "").strip() or "run"
+    safe_render = (render_id or "").strip() or "render"
+    return f"montage/{job_id}/{safe_run}/{safe_render}/{fn}"
 
 
 # -----------------------------
@@ -265,24 +267,19 @@ async def _render_image_segment_async(
     Render an image as a short video segment with dynamic motion.
     Uses zoompan + gentle drift; motion parameters vary deterministically per clip.
     """
-    # Base knobs (global)
     z_step_base = float(_get_int("MUSIC_MONTAGE_ZOOMPAN_STEP_X1E6", 500) / 1_000_000.0)
     z_max_base = float(_get_int("MUSIC_MONTAGE_ZOOMPAN_MAX_X100", 104) / 100.0)
 
-    # Per-segment variation (deterministic)
-    z_step = z_step_base * (0.65 + 0.90 * float(motion_seed))          # ~0.65x..1.55x
-    z_max = z_max_base + (float(motion_seed) - 0.5) * 0.06             # +/- 0.03
+    z_step = z_step_base * (0.65 + 0.90 * float(motion_seed))
+    z_max = z_max_base + (float(motion_seed) - 0.5) * 0.06
 
-    # Drift amplitude & speed
-    amp = 0.22 + 0.18 * float(motion_seed)  # 0.22..0.40
-    sx = 18.0 + 20.0 * float(motion_seed)   # 18..38
-    sy = 22.0 + 18.0 * float(motion_seed)   # 22..40
+    amp = 0.22 + 0.18 * float(motion_seed)
+    sx = 18.0 + 20.0 * float(motion_seed)
+    sy = 22.0 + 18.0 * float(motion_seed)
 
-    # Phase offsets (avoid identical motion between clips)
     phx = 3.14159 * (0.30 + 1.40 * float(motion_seed))
     phy = 3.14159 * (0.20 + 1.60 * float(motion_seed))
 
-    # We drift around center; clamp to [0,1] before multiplying by (iw-iw/zoom).
     x_expr = f"(iw-iw/zoom)*max(0,min(1,0.5+{amp:.3f}*sin(on/{sx:.3f}+{phx:.3f})))"
     y_expr = f"(ih-ih/zoom)*max(0,min(1,0.5+{amp:.3f}*cos(on/{sy:.3f}+{phy:.3f})))"
 
@@ -399,11 +396,44 @@ async def _transcode_async(cmd: List[str]) -> None:
     await asyncio.to_thread(_ffmpeg_run, cmd)
 
 
+def _normalize_broll_url(v: Any) -> Optional[str]:
+    """
+    broll.by_clip can be:
+      - "https://..."
+      - {"url": "..."} / {"image_url": "..."} / {"sas_url": "..."}
+    """
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s.startswith("http") else None
+    if isinstance(v, dict):
+        for k in ("url", "image_url", "sas_url", "preview_url"):
+            s = str(v.get(k) or "").strip()
+            if s.startswith("http"):
+                return s
+    return None
+
+
+def _pick_performer_url(computed: JsonDict) -> Optional[str]:
+    """
+    Montage should accept whichever performer key exists.
+    """
+    for k in (
+        "performer_video_url",
+        "performer_a_video_url",
+        "performer_url",
+        "performer_a_url",
+    ):
+        s = str(computed.get(k) or "").strip()
+        if s.startswith("http"):
+            return s
+    return None
+
+
 async def _render_montage_local_parallel(
     *,
     job_id: UUID,
     manifest: JsonDict,
-    broll_by_clip: Dict[str, str],
+    broll_by_clip: Dict[str, Any],
     audio_url: str,
     out_dir: Path,
     performer_url: Optional[str],
@@ -423,12 +453,12 @@ async def _render_montage_local_parallel(
     x264_preset = _get_str("MUSIC_MONTAGE_X264_PRESET", "veryfast")
     crf = _clamp_int(_get_int("MUSIC_MONTAGE_CRF", 23), 16, 35)
 
-    # performer intercut knobs (default TRUE if performer_url exists; can disable via env)
+    # performer intercut knobs
     enable_performer_intercut = _get_bool("MUSIC_MONTAGE_ENABLE_PERFORMER_INTERCUT", True)
     performer_every_n = _clamp_int(_get_int("MUSIC_MONTAGE_PERFORMER_EVERY_N", 3), 1, 50)
     performer_offset = _clamp_int(_get_int("MUSIC_MONTAGE_PERFORMER_OFFSET", 1), 0, 20)
-    performer_max_ratio = float(_get_int("MUSIC_MONTAGE_PERFORMER_MAX_RATIO_X100", 40)) / 100.0  # default 0.40
-    performer_min_sec = float(_get_int("MUSIC_MONTAGE_PERFORMER_MIN_SEC_X10", 12)) / 10.0        # default 1.2
+    performer_max_ratio = float(_get_int("MUSIC_MONTAGE_PERFORMER_MAX_RATIO_X100", 40)) / 100.0
+    performer_min_sec = float(_get_int("MUSIC_MONTAGE_PERFORMER_MIN_SEC_X10", 12)) / 10.0
 
     performer_enabled = bool(enable_performer_intercut and performer_url and not scene_no_face)
 
@@ -441,11 +471,11 @@ async def _render_montage_local_parallel(
         fps = 30
     fps = _clamp_int(fps, 24, 60)
 
-    # 1) Download audio
-    audio_path = out_dir / f"audio{_guess_ext_from_url(audio_url)}"
+    # Download audio
+    audio_path = out_dir / f"audio{_guess_ext_from_url(audio_url) or '.mp3'}"
     await _download_to_file_async(audio_url, audio_path, timeout_s=60, max_bytes=250 * 1024 * 1024)
 
-    # 1b) Download performer (optional)
+    # Download performer (optional)
     performer_path: Optional[Path] = None
     performer_dur_s: Optional[float] = None
     if performer_enabled and performer_url:
@@ -453,7 +483,7 @@ async def _render_montage_local_parallel(
         await _download_to_file_async(str(performer_url), performer_path, timeout_s=90, max_bytes=600 * 1024 * 1024)
         performer_dur_s = _ffprobe_duration_s(performer_path)
 
-    # 2) Build render plan (clip order preserved)
+    # Build render plan
     plan: List[Dict[str, Any]] = []
     for i, clip in enumerate(clips):
         if not isinstance(clip, dict):
@@ -462,7 +492,7 @@ async def _render_montage_local_parallel(
         if not clip_id:
             continue
 
-        img_url = broll_by_clip.get(clip_id)
+        img_url = _normalize_broll_url(broll_by_clip.get(clip_id))
         if not img_url:
             continue
 
@@ -472,16 +502,13 @@ async def _render_montage_local_parallel(
         )
         dur = max(0.6, min(10.0, float(dur)))
 
-        # decide performer usage for this clip
         use_perf = False
-        if performer_enabled and performer_path is not None:
-            if dur >= performer_min_sec:
-                use_perf = (((i + performer_offset) % performer_every_n) == 0)
+        if performer_enabled and performer_path is not None and dur >= performer_min_sec:
+            use_perf = (((i + performer_offset) % performer_every_n) == 0)
 
         frames = int(round(dur * fps))
         frames = max(1, int(frames))
 
-        start_sec = 0.0
         try:
             start_sec = float(clip.get("start_sec") or 0.0)
         except Exception:
@@ -505,7 +532,7 @@ async def _render_montage_local_parallel(
     if not plan:
         raise RuntimeError("montage_no_segments_rendered_plan_empty")
 
-    # Cap performer ratio (so we still have b-roll)
+    # Cap performer ratio
     if performer_enabled:
         desired = [p for p in plan if p.get("use_performer")]
         max_perf = int(max(1, int(round(len(plan) * max(0.05, min(0.9, performer_max_ratio))))))
@@ -519,7 +546,7 @@ async def _render_montage_local_parallel(
                 if p.get("use_performer") and int(p["i"]) not in keep:
                     p["use_performer"] = False
 
-    # 3) Download all images concurrently (bounded)
+    # Download images concurrently
     dl_sem = asyncio.Semaphore(download_parallel)
 
     async def _dl_one(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -546,7 +573,7 @@ async def _render_montage_local_parallel(
 
     ok_plan.sort(key=lambda x: int(x["i"]))
 
-    # 4) Render segments concurrently (bounded)
+    # Render segments concurrently
     r_sem = asyncio.Semaphore(render_parallel)
 
     async def _render_one(item: Dict[str, Any]) -> Path:
@@ -613,7 +640,7 @@ async def _render_montage_local_parallel(
     if not seg_paths:
         raise RuntimeError(f"montage_no_segments_rendered errors={errors[:3]}")
 
-    # 5) Concat video (-c copy)
+    # Concat (-c copy)
     concat_list = out_dir / "concat_list.txt"
     concat_list.write_text("".join([f"file '{p.as_posix()}'\n" for p in seg_paths]), encoding="utf-8")
 
@@ -640,7 +667,7 @@ async def _render_montage_local_parallel(
         ],
     )
 
-    # 6) Mux audio
+    # Mux audio
     final_1080p = out_dir / "final_16x9_1080p.mp4"
     await asyncio.to_thread(
         _ffmpeg_run,
@@ -667,7 +694,7 @@ async def _render_montage_local_parallel(
         ],
     )
 
-    # 7) Preview + exports
+    # Preview + exports
     enc2 = _video_encoder_args(
         enable_nvenc=enable_nvenc,
         x264_preset=_get_str("MUSIC_MONTAGE_X264_PRESET_2", "veryfast"),
@@ -888,15 +915,16 @@ async def render_montage_and_upload(
     computed = _as_dict(input_json.get("computed"))
     manifest = _as_dict(computed.get("clip_manifest"))
     broll = _as_dict(computed.get("broll"))
-    by_clip = broll.get("by_clip")
-    if not isinstance(by_clip, dict) or not by_clip:
+
+    by_clip_raw = broll.get("by_clip")
+    if not isinstance(by_clip_raw, dict) or not by_clip_raw:
         raise RuntimeError("montage_missing_broll_by_clip")
 
     audio_url = pick_audio_url_for_probe(input_json)
     if not audio_url:
         raise RuntimeError("montage_missing_audio_url")
 
-    performer_url = str(computed.get("performer_video_url") or "").strip() or None
+    performer_url = _pick_performer_url(computed)
     scene_no_face = bool(computed.get("scene_no_face"))
 
     download_parallel = _clamp_int(_get_int("MUSIC_MONTAGE_DOWNLOAD_PARALLEL", 8), 1, 32)
@@ -907,12 +935,13 @@ async def render_montage_and_upload(
     nvenc_usable = _ffmpeg_nvenc_usable()
     nvenc_used = bool(enable_nvenc and nvenc_usable)
 
-    # IMPORTANT: unique run id per montage render to avoid stale/older-run URLs
-    run_id = uuid4().hex[:12]
+    # Use computed.run_id for "run uniqueness"; add montage_render_id for retry uniqueness.
+    run_id = str(computed.get("run_id") or "").strip() or uuid4().hex[:12]
+    render_id = uuid4().hex[:10]
     computed["montage_run_id"] = run_id
+    computed["montage_render_id"] = render_id
     input_json["computed"] = computed
 
-    # Persist run_id early (best-effort) for debuggability.
     try:
         await jobs.set_video_job_input_json(job_id=job_id, input_json=input_json)
         await persist_studio_payload_best_effort(job_id=job_id, payload_json=input_json)
@@ -926,6 +955,7 @@ async def render_montage_and_upload(
             status="running",
             meta_json={
                 "run_id": run_id,
+                "render_id": render_id,
                 "audio_url": True,
                 "download_parallel": download_parallel,
                 "render_parallel": render_parallel,
@@ -949,14 +979,13 @@ async def render_montage_and_upload(
         paths, perf = await _render_montage_local_parallel(
             job_id=job_id,
             manifest=manifest,
-            broll_by_clip=by_clip,
+            broll_by_clip=by_clip_raw,
             audio_url=str(audio_url),
             out_dir=out_dir,
             performer_url=performer_url,
             scene_no_face=scene_no_face,
         )
 
-        # upload tasks keyed by name (avoid list-order bugs)
         upload_tasks: Dict[str, asyncio.Task] = {
             "preview": asyncio.create_task(
                 _upload_music_output_video(
@@ -965,7 +994,7 @@ async def render_montage_and_upload(
                     project_id=project_id,
                     job_id=job_id,
                     local_path=str(paths["preview"]),
-                    blob_filename=_montage_blob_filename(job_id=job_id, run_id=run_id, filename="preview_720p.mp4"),
+                    blob_filename=_montage_blob_filename(job_id=job_id, run_id=run_id, render_id=render_id, filename="preview_720p.mp4"),
                 )
             ),
             "final": asyncio.create_task(
@@ -975,7 +1004,7 @@ async def render_montage_and_upload(
                     project_id=project_id,
                     job_id=job_id,
                     local_path=str(paths["final"]),
-                    blob_filename=_montage_blob_filename(job_id=job_id, run_id=run_id, filename="final_16x9_1080p.mp4"),
+                    blob_filename=_montage_blob_filename(job_id=job_id, run_id=run_id, render_id=render_id, filename="final_16x9_1080p.mp4"),
                 )
             ),
         }
@@ -988,7 +1017,7 @@ async def render_montage_and_upload(
                     project_id=project_id,
                     job_id=job_id,
                     local_path=str(paths["export_9x16"]),
-                    blob_filename=_montage_blob_filename(job_id=job_id, run_id=run_id, filename="export_9x16_1080x1920.mp4"),
+                    blob_filename=_montage_blob_filename(job_id=job_id, run_id=run_id, render_id=render_id, filename="export_9x16_1080x1920.mp4"),
                 )
             )
 
@@ -1000,15 +1029,13 @@ async def render_montage_and_upload(
                     project_id=project_id,
                     job_id=job_id,
                     local_path=str(paths["export_1x1"]),
-                    blob_filename=_montage_blob_filename(job_id=job_id, run_id=run_id, filename="export_1x1_1080x1080.mp4"),
+                    blob_filename=_montage_blob_filename(job_id=job_id, run_id=run_id, render_id=render_id, filename="export_1x1_1080x1080.mp4"),
                 )
             )
 
-        results = await asyncio.gather(*upload_tasks.values(), return_exceptions=True)
-
-        by_name: Dict[str, Any] = {}
-        for name, res in zip(upload_tasks.keys(), results):
-            by_name[name] = res
+        keys = list(upload_tasks.keys())
+        results = await asyncio.gather(*[upload_tasks[k] for k in keys], return_exceptions=True)
+        by_name: Dict[str, Any] = {k: r for k, r in zip(keys, results)}
 
         up_preview = by_name.get("preview")
         up_final = by_name.get("final")
@@ -1018,8 +1045,8 @@ async def render_montage_and_upload(
         if not isinstance(up_preview, dict) or not isinstance(up_final, dict):
             raise RuntimeError("montage_upload_failed_preview_or_final")
 
-    preview_url = str(up_preview["sas_url"])
-    final_url = str(up_final["sas_url"])
+        preview_url = str(up_preview["sas_url"])
+        final_url = str(up_final["sas_url"])
 
     exports_list: List[JsonDict] = [
         {
@@ -1056,6 +1083,7 @@ async def render_montage_and_upload(
 
     out = {
         "run_id": run_id,
+        "render_id": render_id,
         "preview_url": preview_url,
         "final_url": final_url,
         "exports": exports_list,
@@ -1073,8 +1101,6 @@ async def render_montage_and_upload(
     computed["preview_video_url"] = preview_url
     computed["final_video_url"] = final_url
     computed["montage_performer_used"] = bool(_as_dict(out.get("perf")).get("performer_used"))
-
-    # UI-facing canonical fields (avoid clients accidentally showing old performer_url)
     computed["display_video_url"] = final_url
     computed["display_video_source"] = "montage"
 
@@ -1101,6 +1127,7 @@ async def render_montage_and_upload(
             "kind": "music_video_preview",
             "job_id": str(job_id),
             "montage_run_id": run_id,
+            "montage_render_id": render_id,
             "container": up_preview["container"],
             "storage_path": up_preview["storage_path"],
         },
@@ -1115,10 +1142,24 @@ async def render_montage_and_upload(
             "kind": "music_video_final",
             "job_id": str(job_id),
             "montage_run_id": run_id,
+            "montage_render_id": render_id,
             "container": up_final["container"],
             "storage_path": up_final["storage_path"],
         },
     )
+
+    # Store asset ids into computed.video_outputs for convenience
+    computed = _as_dict(input_json.get("computed"))
+    vo = _as_dict(computed.get("video_outputs"))
+    vo["preview_asset_id"] = str(preview_asset_id) if preview_asset_id else None
+    vo["final_asset_id"] = str(final_asset_id) if final_asset_id else None
+    computed["video_outputs"] = vo
+    input_json["computed"] = computed
+    try:
+        await jobs.set_video_job_input_json(job_id=job_id, input_json=input_json)
+        await persist_studio_payload_best_effort(job_id=job_id, payload_json=input_json)
+    except Exception:
+        pass
 
     try:
         await steps.upsert_step(
@@ -1127,6 +1168,7 @@ async def render_montage_and_upload(
             status="succeeded",
             meta_json={
                 "run_id": run_id,
+                "render_id": render_id,
                 "has_preview": bool(preview_url),
                 "has_final": bool(final_url),
                 "exports": len(exports_list),
