@@ -1,0 +1,2 @@
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pricing_credit_reservations_user_idempotency
+ON pricing_credit_reservations (user_id, idempotency_key);

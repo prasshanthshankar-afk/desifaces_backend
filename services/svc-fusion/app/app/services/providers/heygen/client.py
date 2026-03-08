@@ -38,7 +38,7 @@ def _safe_json(resp: httpx.Response) -> Dict[str, Any]:
     try:
         obj = resp.json()
     except json.JSONDecodeError as e:
-        raise HeyGenApiError(f"INVALID_JSON: {str(e)} body={text[:200]}") from e
+        raise HeyGenApiError(f"INVALID_JSON: {str(e)} body={text[:400]}") from e
     if not isinstance(obj, dict):
         raise HeyGenApiError(f"UNEXPECTED_JSON_TYPE: {type(obj)}")
     return obj
@@ -69,6 +69,7 @@ def _extract_error_message(obj: Dict[str, Any]) -> Optional[str]:
     return (
         obj.get("error_message")
         or obj.get("error")
+        or obj.get("message")
         or (obj.get("data") or {}).get("error_message")
         or (obj.get("data") or {}).get("error")
         or (obj.get("result") or {}).get("error_message")
@@ -77,6 +78,10 @@ def _extract_error_message(obj: Dict[str, Any]) -> Optional[str]:
 
 
 class HeyGenAV4Client:
+    """
+    Kept as HeyGenAV4Client for compatibility with the rest of Fusion,
+    but now uses the supported V2 create-video endpoint.
+    """
     provider_name = "heygen_av4"
 
     def __init__(self) -> None:
@@ -90,7 +95,7 @@ class HeyGenAV4Client:
         retry=retry_if_exception_type((httpx.TimeoutException, httpx.TransportError, HeyGenApiError)),
     )
     async def submit(self, payload: Dict[str, Any], idempotency_key: str) -> ProviderSubmitResult:
-        url = f"{self.base}/v2/video/av4/generate"
+        url = f"{self.base}/v2/video/generate"
         headers = _headers()
         headers["Idempotency-Key"] = idempotency_key
 
@@ -147,7 +152,10 @@ class HeyGenAV4Client:
             core = core["data"]
 
         if not isinstance(core, dict):
-            return ProviderPollResult(status="processing", raw_response={"note": "unexpected status shape", "response": data})
+            return ProviderPollResult(
+                status="processing",
+                raw_response={"note": "unexpected status shape", "response": data},
+            )
 
         raw_status = core.get("status") or core.get("state") or core.get("video_status")
         status = _normalize_status(raw_status)
@@ -185,7 +193,10 @@ class HeyGenAV4Client:
             videos = data.get("videos") or data.get("list") or data.get("items")
 
         if not isinstance(videos, list):
-            return ProviderPollResult(status="processing", raw_response={"note": "unexpected video.list shape", "response": data})
+            return ProviderPollResult(
+                status="processing",
+                raw_response={"note": "unexpected video.list shape", "response": data},
+            )
 
         item = None
         for v in videos:
@@ -196,7 +207,10 @@ class HeyGenAV4Client:
                     break
 
         if item is None:
-            return ProviderPollResult(status="processing", raw_response={"note": "video_id not found in list", "video_id": provider_job_id})
+            return ProviderPollResult(
+                status="processing",
+                raw_response={"note": "video_id not found in list", "video_id": provider_job_id},
+            )
 
         status = _normalize_status(item.get("status") or item.get("state"))
         video_url = _extract_video_url(item)

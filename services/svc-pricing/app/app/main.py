@@ -12,7 +12,7 @@ from app.db import close_db_pool, ensure_db_pool
 from app.api.routes.health import router as health_router
 from app.api.routes.pricing import router as pricing_router
 from app.api.routes.credits import router as credits_router
-
+from app.api.routes.reservations import router as reservations_router
 
 def _configure_logging() -> None:
     level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
@@ -44,6 +44,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(pricing_router)
     app.include_router(credits_router)
+    app.include_router(reservations_router)
 
     return app
 

@@ -16,34 +16,42 @@ def build_av4_payload(
     audio_url_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Build HeyGen AV4 payload.
+    Build the current HeyGen V2 create-video payload.
 
-    We support two modes:
+    Current supported shape:
+      {
+        "video_inputs": [
+          {
+            "character": {
+              "type": "talking_photo",
+              "talking_photo_id": "..."
+            },
+            "voice": {
+              "type": "audio" | "text",
+              ...
+            }
+          }
+        ],
+        "dimension": {...},
+        "use_avatar_iv_model": true
+      }
 
-    1) voice_mode=audio (recommended)
-       - Requires: talking_photo_id + audio_url
-       - Does NOT require voice_id/script
-
-    2) voice_mode=tts
-       - Requires: talking_photo_id + voice_id + script
-       - Does NOT require audio_url
+    Note:
+    - `video_title` is kept in the function signature for compatibility with existing callers,
+      but the new V2 payload does not use it.
     """
+
     if not talking_photo_id or not talking_photo_id.strip():
         raise ValueError("talking_photo_id is required")
 
     dim = resolve_dimension(req.video)
 
-    payload: Dict[str, Any] = {
-        "test": False,
-        "video_title": video_title,
-        "image_key": talking_photo_id,
+    character: Dict[str, Any] = {
+        "type": "talking_photo",
+        "talking_photo_id": str(talking_photo_id).strip(),
     }
 
-    # -------------------------
-    # Voice selection
-    # -------------------------
     if req.voice_mode == VoiceMode.audio:
-        # Prefer override (caller can pass Azure SAS directly or other URL)
         audio_url = audio_url_override
         if not audio_url:
             if not req.voice_audio:
@@ -52,18 +60,31 @@ def build_av4_payload(
                 raise ValueError("voice_mode=audio requires voice_audio.audio_url (or audio_url_override)")
             audio_url = str(req.voice_audio.audio_url)
 
-        payload["audio_url"] = str(audio_url)
+        voice: Dict[str, Any] = {
+            "type": "audio",
+            "audio_url": str(audio_url),
+        }
 
     else:
-        # voice_mode == tts
         if not req.voice_tts or not req.voice_tts.voice_id or not req.voice_tts.script:
             raise ValueError("voice_mode=tts requires voice_tts.voice_id and voice_tts.script")
-        payload["voice_id"] = req.voice_tts.voice_id
-        payload["script"] = req.voice_tts.script
 
-    # -------------------------
-    # Sizing
-    # -------------------------
+        voice = {
+            "type": "text",
+            "input_text": req.voice_tts.script,
+            "voice_id": req.voice_tts.voice_id,
+        }
+
+    payload: Dict[str, Any] = {
+        "video_inputs": [
+            {
+                "character": character,
+                "voice": voice,
+            }
+        ],
+        "use_avatar_iv_model": True,
+    }
+
     if dim:
         payload["dimension"] = {"width": dim.width, "height": dim.height}
     else:

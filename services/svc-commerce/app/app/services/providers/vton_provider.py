@@ -110,6 +110,21 @@ def _first_http_str(x: Any) -> Optional[str]:
     return None
 
 
+def _norm_text(x: Any) -> str:
+    return str(x or "").strip().lower()
+
+
+def _uniq_norm(xs: Any) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for x in _as_list(xs):
+        s = _norm_text(x)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 _IMAGEAPPS_ALLOWED_RATIOS = {"1:1", "16:9", "9:16", "4:3", "3:4"}
 
 
@@ -933,7 +948,6 @@ class NonSareeQC:
             main_change = full
 
         # Score: reward garment change, penalize face drift; blank gets a hard penalty
-        # (kept simple + deterministic)
         score = float(main_change) - 0.6 * float(face)
         if blankish:
             score -= 1.0
@@ -974,12 +988,8 @@ class NonSareeQC:
 
 
 # -----------------------------------------------------------------------------
-# Non-saree garment resolution (unchanged logic + minor outerwear priority)
+# Non-saree garment resolution
 # -----------------------------------------------------------------------------
-
-
-def _norm_text(x: Any) -> str:
-    return str(x or "").strip().lower()
 
 
 def _infer_component_role(code: str, name: str, category: str) -> str:
@@ -1059,7 +1069,6 @@ def _resolve_non_saree_garments(*, product_assets: Dict[str, Any], comps: Dict[s
 
     # If outerwear exists and primary isn't explicit, prefer outerwear for blazer/coat flows
     if outer_url and (not primary or _looks_outerwear_url(primary) or _looks_outerwear_url(outer_url)):
-        # Only override if it doesn't contradict a dominant_component_code
         if not dominant or dominant in ("outer", "blazer", "jacket", "coat"):
             primary = outer_url
 
@@ -1074,6 +1083,156 @@ def _resolve_non_saree_garments(*, product_assets: Dict[str, Any], comps: Dict[s
         "items_norm": items_norm,
         "dominant_component_code": dominant,
     }
+
+
+def _non_saree_platform_mode_requested(*, product_assets: Dict[str, Any], model_ref: Dict[str, Any]) -> bool:
+    pa_meta = _as_dict(product_assets.get("meta"))
+    mr_meta = _as_dict(model_ref.get("meta"))
+
+    mode_blob = " ".join(
+        [
+            _norm_text(product_assets.get("mode")),
+            _norm_text(pa_meta.get("mode")),
+            _norm_text(model_ref.get("mode")),
+            _norm_text(mr_meta.get("mode")),
+            _norm_text(model_ref.get("source")),
+            _norm_text(mr_meta.get("source")),
+        ]
+    )
+
+    if "platform_models" in mode_blob:
+        return True
+
+    if _truthy(model_ref.get("use_platform_models")) or _truthy(mr_meta.get("use_platform_models")):
+        return True
+
+    if _truthy(model_ref.get("platform_model_required")) or _truthy(mr_meta.get("platform_model_required")):
+        return True
+
+    return False
+
+
+def _resolve_platform_preferred_tags(*, product_assets: Dict[str, Any], model_ref: Dict[str, Any]) -> List[str]:
+    pa_meta = _as_dict(product_assets.get("meta"))
+    mr_meta = _as_dict(model_ref.get("meta"))
+    tags: List[str] = []
+    for src in (
+        product_assets.get("style_tags"),
+        pa_meta.get("style_tags"),
+        model_ref.get("style_tags"),
+        mr_meta.get("style_tags"),
+        product_assets.get("preferred_tags"),
+        pa_meta.get("preferred_tags"),
+        model_ref.get("preferred_tags"),
+        mr_meta.get("preferred_tags"),
+    ):
+        for t in _as_list(src):
+            tt = _norm_text(t)
+            if tt:
+                tags.append(tt)
+    return _uniq_norm(tags)
+
+
+def _resolve_recent_platform_model_codes(*, product_assets: Dict[str, Any], model_ref: Dict[str, Any]) -> List[str]:
+    pa_meta = _as_dict(product_assets.get("meta"))
+    mr_meta = _as_dict(model_ref.get("meta"))
+    codes: List[str] = []
+    for src in (
+        product_assets.get("recent_model_codes"),
+        pa_meta.get("recent_model_codes"),
+        model_ref.get("recent_model_codes"),
+        mr_meta.get("recent_model_codes"),
+    ):
+        for c in _as_list(src):
+            cc = _norm_text(c)
+            if cc:
+                codes.append(cc)
+    return _uniq_norm(codes)
+
+
+def _infer_non_saree_platform_garment_kind(
+    *,
+    product_assets: Dict[str, Any],
+    ns: Dict[str, Any],
+    garment_type: str,
+    primary_url: Optional[str],
+) -> Optional[str]:
+    """
+    Resolve to:
+      - Indian Phase-1 families when we can
+      - else generic families for western / mixed catalog:
+          upper_body, lower_body, dresses
+    """
+    blob_parts: List[str] = [
+        _norm_text(product_assets.get("garment_kind")),
+        _norm_text(product_assets.get("outfit_kind")),
+        _norm_text(product_assets.get("dominant_component_code")),
+        _norm_text(ns.get("dominant_component_code")),
+        _norm_text(product_assets.get("title")),
+        _norm_text(product_assets.get("name")),
+        _norm_text(product_assets.get("category")),
+        _norm_text(primary_url),
+    ]
+
+    for it in _as_list(product_assets.get("items")):
+        d = _as_dict(it)
+        blob_parts.extend(
+            [
+                _norm_text(d.get("component_code")),
+                _norm_text(d.get("kind")),
+                _norm_text(d.get("name")),
+                _norm_text(d.get("category")),
+                _norm_text(d.get("image_url")),
+            ]
+        )
+
+    blob = " | ".join([p for p in blob_parts if p])
+
+    item_codes = []
+    for it in _as_list(ns.get("items_norm")):
+        d = _as_dict(it)
+        item_codes.append(_norm_text(d.get("component_code") or d.get("kind")))
+        item_codes.append(_norm_text(d.get("name")))
+    joined = " | ".join([x for x in item_codes if x])
+
+    # Indian explicit families first
+    if any(t in blob for t in ("dhoti_kurta", "dhoti kurta")):
+        return "dhoti_kurta"
+    if "sherwani" in blob:
+        return "sherwani"
+    if any(t in blob for t in ("salwar_suit", "salwar suit", "shalwar", "kameez", "salwar kameez")):
+        return "salwar_suit"
+    if any(t in blob for t in ("lehenga_set", "lehenga set", "lehenga choli", "lehenga")):
+        return "lehenga_set"
+    if any(t in blob for t in ("kurta_pyjama", "kurta pyjama", "kurta pajama", "pyjama set", "pajama set")):
+        return "kurta_pyjama"
+
+    if "dhoti" in joined and "kurta" in joined:
+        return "dhoti_kurta"
+    if "lehenga" in joined:
+        return "lehenga_set"
+    if "salwar" in joined or "kameez" in joined:
+        return "salwar_suit"
+    if "kurta" in joined and any(t in joined for t in ("pyjama", "pajama")):
+        return "kurta_pyjama"
+    if "sherwani" in joined:
+        return "sherwani"
+
+    # Generic western / mixed fallback
+    if any(t in blob for t in ("hoodie", "blazer", "jacket", "coat", "overcoat", "sweater", "cardigan", "shirt", "tshirt", "t-shirt", "top", "kurta", "blouse", "choli")):
+        return "upper_body"
+
+    if any(t in blob for t in ("jeans", "pant", "pants", "trouser", "trousers", "skirt", "shorts", "pyjama", "pajama", "dhoti", "lungi")):
+        return "lower_body"
+
+    if any(t in blob for t in ("dress", "gown", "jumpsuit", "anarkali", "salwar", "lehenga", "suit", "kurta_set", "onepiece", "one-piece")):
+        return "dresses"
+
+    gt = _norm_text(garment_type)
+    if gt in {"upper_body", "lower_body", "dresses"}:
+        return gt
+
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -1307,6 +1466,7 @@ class VTONProvider:
 
     Production hardening for NON-SAREE:
       - run providers in configured order
+      - optionally resolve a platform-model human from the approved manifest
       - compute QC score per provider candidate
       - choose best strict-pass candidate; if none, optionally choose best hard-pass candidate
         (COMMERCE_VTON_QC_FAIL_OPEN=1 by default)
@@ -1349,6 +1509,13 @@ class VTONProvider:
         ]
         self.two_piece_sequential = _env_bool("COMMERCE_VTON_TWO_PIECE_SEQUENTIAL", default=False)
 
+        # Platform-model selector for non-saree
+        self.enable_platform_model_selector = _env_bool("COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR", default=True)
+        self.platform_model_force_when_missing_human = _env_bool("COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN", default=True)
+        self.platform_model_top_k = _clamp_int(_env_str("COMMERCE_PLATFORM_MODELS_TOP_K", "10"), default=10, lo=1, hi=50)
+        self._platform_selector: Optional[Any] = None
+        self._platform_asset_url_cache: Dict[str, str] = {}
+
         # Dependencies
         self.fal = FalQueueClient()
         self.saree_lora = SareeLoRAProvider(fal=self.fal)
@@ -1376,6 +1543,82 @@ class VTONProvider:
 
     def _fal_key(self) -> str:
         return (_env_str("FAL_KEY", "") or _env_str("FAL_API_KEY", "") or _env_str("COMMERCE_FAL_KEY", "")).strip()
+
+    def _resolve_platform_model_asset_url(self, url: str) -> str:
+        if _is_http_url(url):
+            return str(url)
+
+        cached = self._platform_asset_url_cache.get(str(url))
+        if cached:
+            return cached
+
+        az_ref = _parse_az_ref(str(url))
+        if not az_ref:
+            return str(url)
+
+        storage = _get_storage_service_best_effort()
+        container, blob_name = az_ref
+        sas_url = _call_any_sas_method(
+            storage,
+            container=container,
+            blob_name=blob_name,
+            expires_in_s=int(self.sas_expires_in_s),
+            permission="r",
+        )
+        self._platform_asset_url_cache[str(url)] = sas_url
+        return sas_url
+
+    def _get_platform_selector(self) -> Any:
+        if self._platform_selector is not None:
+            return self._platform_selector
+
+        from app.services.catalog.platform_model_selector import PlatformModelSelector
+
+        self._platform_selector = PlatformModelSelector(
+            asset_url_resolver=self._resolve_platform_model_asset_url,
+        )
+        return self._platform_selector
+
+    async def _select_platform_model_for_non_saree(
+        self,
+        *,
+        req: VTONGenerateRequest,
+        product_assets: Dict[str, Any],
+        model_ref: Dict[str, Any],
+        garment_kind: str,
+    ) -> Dict[str, Any]:
+        selector = self._get_platform_selector()
+
+        pa_meta = _as_dict(product_assets.get("meta"))
+        mr_meta = _as_dict(model_ref.get("meta"))
+
+        tenantish = str(
+            product_assets.get("tenant_id")
+            or pa_meta.get("tenant_id")
+            or model_ref.get("tenant_id")
+            or mr_meta.get("tenant_id")
+            or req.user_id
+        )
+
+        product_id = (
+            product_assets.get("product_id")
+            or pa_meta.get("product_id")
+            or model_ref.get("product_id")
+            or mr_meta.get("product_id")
+        )
+
+        preferred_tags = _resolve_platform_preferred_tags(product_assets=product_assets, model_ref=model_ref)
+        recent_model_codes = _resolve_recent_platform_model_codes(product_assets=product_assets, model_ref=model_ref)
+
+        return selector.select_platform_model(
+            garment_kind=garment_kind,
+            tenant_id=str(tenantish),
+            quote_id=str(req.quote_id),
+            product_id=str(product_id) if product_id else None,
+            preferred_tags=preferred_tags,
+            recent_model_codes=recent_model_codes,
+            top_k=int(self.platform_model_top_k),
+        )
 
     async def _build_saree_garment_proxy_url(
         self,
@@ -1496,17 +1739,22 @@ class VTONProvider:
         garment_url = comps.get("primary_garment_url")
         saree_url = comps.get("saree_url") or garment_url
 
-        if not human_url or not saree_url:
+        if not saree_url:
             raise RuntimeError(
-                "VTONProvider: missing human_image_url or garment_image_url. "
-                "Provide model_ref.url/human_image_url and product_assets.garment_image_url "
-                "(or items[] with dominant_component_code)."
+                "VTONProvider: missing garment_image_url. "
+                "Provide product_assets.garment_image_url or items[] with dominant_component_code."
             )
 
         saree_like = _is_saree_like(product_assets=product_assets, garment_url=saree_url)
         garment_type = _infer_garment_type(product_assets=product_assets, garment_url=saree_url)
         default_drape_style = str(product_assets.get("drape_style") or "").strip().lower() or "nivi"
         full_body_flag = _compute_full_body_flag(req=req, model_ref=model_ref)
+
+        if saree_like and not human_url:
+            raise RuntimeError(
+                "VTONProvider: missing human_image_url for saree flow. "
+                "Provide model_ref.url / model_ref.human_image_url."
+            )
 
         urls_placeholders = [
             self._placeholder_url(product_type=product_type, pose=v.pose, bg=v.background, idx=i) for i, v in enumerate(req.variants)
@@ -1677,10 +1925,49 @@ class VTONProvider:
         lower_url = ns.get("lower_url")
         outer_url = ns.get("outer_url")
 
+        resolved_platform_garment_kind = _infer_non_saree_platform_garment_kind(
+            product_assets=product_assets,
+            ns=ns,
+            garment_type=garment_type,
+            primary_url=primary_url,
+        )
+
+        platform_model_selection: Optional[Dict[str, Any]] = None
+        platform_mode_requested = _non_saree_platform_mode_requested(product_assets=product_assets, model_ref=model_ref)
+
+        if self.enable_platform_model_selector and resolved_platform_garment_kind and (
+            platform_mode_requested or (self.platform_model_force_when_missing_human and not human_url)
+        ):
+            try:
+                platform_model_selection = await self._select_platform_model_for_non_saree(
+                    req=req,
+                    product_assets=product_assets,
+                    model_ref=model_ref,
+                    garment_kind=str(resolved_platform_garment_kind),
+                )
+                human_url = str(platform_model_selection.get("primary_asset_url") or "").strip() or human_url
+            except Exception as e:
+                if platform_mode_requested or not human_url:
+                    raise RuntimeError(
+                        f"PLATFORM_MODEL_SELECTION_FAILED garment_kind={resolved_platform_garment_kind} err={type(e).__name__}: {e}"
+                    ) from e
+                logger.exception("Platform model selection failed; falling back to provided human_url")
+
         if not _is_http_url(primary_url):
             raise RuntimeError("VTONProvider: non-saree missing primary garment URL (garment_image_url / items[])")
 
-        is_outerwear = bool(_is_http_url(outer_url) or _looks_outerwear_url(primary_url) or _looks_outerwear_url(product_assets.get("title")) or _looks_outerwear_url(product_assets.get("name")))
+        if not human_url:
+            raise RuntimeError(
+                "VTONProvider: non-saree missing human_image_url and no platform model was selected. "
+                "Provide model_ref.url/human_image_url or enable platform-model selection with a valid manifest."
+            )
+
+        is_outerwear = bool(
+            _is_http_url(outer_url)
+            or _looks_outerwear_url(primary_url)
+            or _looks_outerwear_url(product_assets.get("title"))
+            or _looks_outerwear_url(product_assets.get("name"))
+        )
 
         # Sequential upper+lower is disabled for outerwear by design (outerwear is not a 2-piece outfit)
         use_sequential = bool((not is_outerwear) and self.two_piece_sequential and _is_http_url(upper_url) and _is_http_url(lower_url))
@@ -1906,7 +2193,14 @@ class VTONProvider:
                         "errors": provider_errors[:5],
                         "storage": mat_dbg,
                         "two_piece_sequential": bool(use_sequential),
-                        "resolved": {"primary_url": primary_url, "upper_url": upper_url, "lower_url": lower_url, "outer_url": outer_url},
+                        "resolved": {
+                            "primary_url": primary_url,
+                            "upper_url": upper_url,
+                            "lower_url": lower_url,
+                            "outer_url": outer_url,
+                            "resolved_platform_garment_kind": resolved_platform_garment_kind,
+                        },
+                        "platform_model_selection": platform_model_selection,
                     },
                 )
             raise RuntimeError(f"NON_SAREE_ALL_PROVIDERS_FAILED errors={provider_errors[:5]}")
@@ -1949,7 +2243,14 @@ class VTONProvider:
                         "candidates": [{"provider": c.get("provider"), "qc": c.get("qc")} for c in candidates[:5]],
                         "storage": mat_dbg,
                         "two_piece_sequential": bool(use_sequential),
-                        "resolved": {"primary_url": primary_url, "upper_url": upper_url, "lower_url": lower_url, "outer_url": outer_url},
+                        "resolved": {
+                            "primary_url": primary_url,
+                            "upper_url": upper_url,
+                            "lower_url": lower_url,
+                            "outer_url": outer_url,
+                            "resolved_platform_garment_kind": resolved_platform_garment_kind,
+                        },
+                        "platform_model_selection": platform_model_selection,
                     },
                 )
             raise RuntimeError(
@@ -1981,8 +2282,15 @@ class VTONProvider:
                 "selection_reason": selection_reason,
                 "candidates": [{"provider": c.get("provider"), "qc": c.get("qc"), "route": c.get("route")} for c in candidates[:5]],
                 "errors": provider_errors[:5],
-                "resolved": {"primary_url": primary_url, "upper_url": upper_url, "lower_url": lower_url, "outer_url": outer_url},
+                "resolved": {
+                    "primary_url": primary_url,
+                    "upper_url": upper_url,
+                    "lower_url": lower_url,
+                    "outer_url": outer_url,
+                    "resolved_platform_garment_kind": resolved_platform_garment_kind,
+                },
                 "provider_meta": selected_meta,
+                "platform_model_selection": platform_model_selection,
                 "storage": mat_dbg,
             },
         )

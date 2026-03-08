@@ -1,82 +1,72 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional
-from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 import logging
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from typing import Any, List, Optional
+from urllib.parse import quote
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from pydantic import BaseModel
 
+try:
+    from desifaces_shared.pricing.client import PricingClientError
+except Exception:
+    class PricingClientError(Exception):
+        """Fallback so svc-face can still boot if shared pricing package
+        is missing from the container image."""
+        pass
+
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.storage.blob import BlobSasPermissions, generate_blob_sas
+
 from app.api.deps import get_current_user_id
+from app.config import settings
 from app.db import get_pool
-
-
-
 from app.domain.models import (
-    # Legacy models
+    ContextConfigView,
+    CreatorPlatformRequest,
     FaceGenerateRequest,
     FaceJobView,
     FaceProfileView,
-    RegionConfigView,
-    ContextConfigView,
-    # Creator platform models
-    CreatorPlatformRequest,
     JobCreatedResponse,
     JobStatusResponse,
+    RegionConfigView,
 )
-
-from app.services.creator_orchestrator import CreatorOrchestrator
-
+from app.repos.creator_config_repo import CreatorPlatformConfigRepo
 from app.repos.face_jobs_repo import FaceJobsRepo
 from app.repos.face_profiles_repo import FaceProfilesRepo
-from app.repos.creator_config_repo import CreatorPlatformConfigRepo
 from app.repos.media_assets_repo import MediaAssetsRepo
-
-from app.config import settings
-
-# Azure blob (used for upload endpoint)
-from azure.storage.blob import BlobServiceClient, ContentSettings
-from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+from app.services.creator_orchestrator import CreatorOrchestrator
 
 router = APIRouter()
-
 logger = logging.getLogger("api.face_jobs")
-
-
 
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
 
-# ------------------------------------------------------------------------------
-# Friendly error mapping (prompt safety)
-# ------------------------------------------------------------------------------
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB
+UPLOAD_CONTAINER = getattr(settings, "FACE_OUTPUT_CONTAINER", "face-output")
+UPLOAD_PREFIX = "face-input"
+
 
 def _parse_unsafe_prompt_reason(err: Exception) -> Optional[str]:
     """
-    Extracts a human-readable reason from exceptions thrown by prompt validation,
-    e.g. ValueError("unsafe_prompt: Blocked keyword detected: naked")
+    Extract a human-readable reason from exceptions thrown by prompt validation.
+    Example:
+      ValueError("unsafe_prompt: Blocked keyword detected: naked")
     """
     msg = str(err or "").strip()
     if not msg:
         return None
-
-    # Current convention in CreatorPromptService:
-    # raise ValueError(f"unsafe_prompt: {reason}")
     if msg.startswith("unsafe_prompt:"):
         return msg.split("unsafe_prompt:", 1)[1].strip() or "unsafe_prompt"
-
     return None
 
 
 def _raise_friendly_unsafe_prompt(user_id: str, reason: str) -> None:
-    """
-    Raise a clean 400 error payload the client can show nicely.
-    We keep the reason (for debugging) but provide a friendly message.
-    """
     logger.info("Blocked unsafe prompt user_id=%s reason=%s", user_id, reason)
-
-    # Friendly message shown to end user (safe wording)
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail={
@@ -91,6 +81,7 @@ def _raise_friendly_unsafe_prompt(user_id: str, reason: str) -> None:
         },
     )
 
+
 def _get(obj: Any, key: str, default: Any = None) -> Any:
     """Safe getter for dicts, pydantic models, and asyncpg Records."""
     if obj is None:
@@ -104,18 +95,20 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     except Exception:
         return default
 
+
 def _assert_owner(job: Any, user_id: str) -> None:
     job_user_id = str(_get(job, "user_id", ""))
     if job_user_id != str(user_id):
         raise HTTPException(status_code=403, detail="forbidden")
 
-# ------------------------------------------------------------------------------
-# Upload (NEW) — for image-to-image identity lock
-# ------------------------------------------------------------------------------
 
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB (tune later)
-UPLOAD_CONTAINER = getattr(settings, "FACE_OUTPUT_CONTAINER", "face-output")  # reuse for now
-UPLOAD_PREFIX = "face-input"  # logical folder within container
+def _localized_text(value: Any, language: str, fallback: str) -> str:
+    if isinstance(value, dict):
+        return value.get(language) or value.get("en") or fallback
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return fallback
+
 
 class UploadImageResponse(BaseModel):
     asset_id: str
@@ -124,28 +117,55 @@ class UploadImageResponse(BaseModel):
     size_bytes: int
     storage_path: str
 
-def _azure_clients() -> tuple[BlobServiceClient, str, str]:
+
+def _azure_clients() -> tuple[BlobServiceClient, str, str, str]:
     """
-    Returns (bsc, account_name, account_key) from AZURE_STORAGE_CONNECTION_STRING.
-    This enables both upload and SAS generation.
+    Returns:
+      (blob_service_client, account_name, account_key, endpoint_suffix)
+    from AZURE_STORAGE_CONNECTION_STRING.
     """
     conn = settings.AZURE_STORAGE_CONNECTION_STRING
+    if not conn:
+        raise RuntimeError("azure_storage_connection_string_missing")
+
     bsc = BlobServiceClient.from_connection_string(conn)
 
-    # Parse conn string for AccountName/AccountKey (needed for SAS generation)
-    # Example: "AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net"
-    parts = {}
+    parts: dict[str, str] = {}
     for chunk in conn.split(";"):
         if "=" in chunk:
             k, v = chunk.split("=", 1)
             parts[k.strip()] = v.strip()
+
     account_name = parts.get("AccountName") or ""
     account_key = parts.get("AccountKey") or ""
+    endpoint_suffix = parts.get("EndpointSuffix") or "core.windows.net"
+
     if not account_name or not account_key:
         raise RuntimeError("azure_conn_string_missing_account_name_or_key")
-    return bsc, account_name, account_key
 
-def _make_read_sas_url(account_name: str, account_key: str, *, container: str, blob_name: str, hours: int = 24) -> str:
+    return bsc, account_name, account_key, endpoint_suffix
+
+
+def _make_blob_url(
+    account_name: str,
+    endpoint_suffix: str,
+    *,
+    container: str,
+    blob_name: str,
+) -> str:
+    quoted_blob = quote(blob_name, safe="/")
+    return f"https://{account_name}.blob.{endpoint_suffix}/{container}/{quoted_blob}"
+
+
+def _make_read_sas_url(
+    account_name: str,
+    account_key: str,
+    endpoint_suffix: str,
+    *,
+    container: str,
+    blob_name: str,
+    hours: int = 24,
+) -> str:
     sas = generate_blob_sas(
         account_name=account_name,
         container_name=container,
@@ -154,7 +174,18 @@ def _make_read_sas_url(account_name: str, account_key: str, *, container: str, b
         permission=BlobSasPermissions(read=True),
         expiry=datetime.now(timezone.utc) + timedelta(hours=hours),
     )
-    return f"https://{account_name}.blob.core.windows.net/{container}/{blob_name}?{sas}"
+    base_url = _make_blob_url(
+        account_name,
+        endpoint_suffix,
+        container=container,
+        blob_name=blob_name,
+    )
+    return f"{base_url}?{sas}"
+
+
+# ------------------------------------------------------------------------------
+# Upload (NEW) — for image-to-image identity lock
+# ------------------------------------------------------------------------------
 
 @router.post("/assets/upload", response_model=UploadImageResponse)
 async def upload_source_image(
@@ -162,40 +193,49 @@ async def upload_source_image(
     user_id: str = Depends(get_current_user_id),
 ) -> UploadImageResponse:
     """
-    Upload a source image (phone/desktop) and create a media_assets row.
+    Upload a source image and create a media_assets row.
 
     Client usage:
       1) POST /api/face/assets/upload (multipart)
       2) Use returned asset_id in CreatorPlatformRequest:
-         { mode: "image-to-image", source_image_asset_id: "<asset_id>", preservation_strength: 0.22, ... }
+         {
+           "mode": "image-to-image",
+           "source_image_asset_id": "<asset_id>",
+           "preservation_strength": 0.22
+         }
     """
     if not file:
         raise HTTPException(status_code=400, detail="missing_file")
 
     content_type = (file.content_type or "").strip().lower()
     if not content_type.startswith("image/"):
-        raise HTTPException(status_code=415, detail=f"unsupported_content_type:{content_type or 'unknown'}")
+        raise HTTPException(
+            status_code=415,
+            detail=f"unsupported_content_type:{content_type or 'unknown'}",
+        )
 
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty_file")
 
     if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"file_too_large:max={MAX_UPLOAD_BYTES}")
+        raise HTTPException(
+            status_code=413,
+            detail=f"file_too_large:max={MAX_UPLOAD_BYTES}",
+        )
 
-    # Create blob path
     ext = ""
     if file.filename and "." in file.filename:
         ext = "." + file.filename.rsplit(".", 1)[-1].lower()
         if len(ext) > 8:
             ext = ""
+
     blob_name = f"{UPLOAD_PREFIX}/{user_id}/{uuid4().hex}{ext}"
-    storage_path = f"{UPLOAD_CONTAINER}/{blob_name}"
+    storage_path = f"az://{UPLOAD_CONTAINER}/{blob_name}"
 
     try:
-        bsc, account_name, account_key = _azure_clients()
+        bsc, account_name, account_key, endpoint_suffix = _azure_clients()
         container_client = bsc.get_container_client(UPLOAD_CONTAINER)
-        # Container should already exist in your infra; if not, this will throw.
         blob_client = container_client.get_blob_client(blob_name)
 
         blob_client.upload_blob(
@@ -204,22 +244,45 @@ async def upload_source_image(
             content_settings=ContentSettings(content_type=content_type),
         )
 
-        # Return a read SAS URL (24h)
-        image_url = _make_read_sas_url(account_name, account_key, container=UPLOAD_CONTAINER, blob_name=blob_name, hours=24)
+        stable_blob_url = _make_blob_url(
+            account_name,
+            endpoint_suffix,
+            container=UPLOAD_CONTAINER,
+            blob_name=blob_name,
+        )
+        image_url = _make_read_sas_url(
+            account_name,
+            account_key,
+            endpoint_suffix,
+            container=UPLOAD_CONTAINER,
+            blob_name=blob_name,
+            hours=24,
+        )
 
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"azure_upload_failed:{e}") from e
+    except Exception:
+        logger.exception(
+            "upload_source_image azure upload failed user_id=%s filename=%s",
+            user_id,
+            getattr(file, "filename", None),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "azure_upload_failed",
+                "code": "DF_AZURE_UPLOAD_FAILED",
+                "message": "Failed to upload source image.",
+            },
+        )
 
-    # Persist as media asset
     pool = await get_pool()
     assets_repo = MediaAssetsRepo(pool)
 
     asset_id = await assets_repo.create_asset(
         user_id=str(user_id),
         kind="source_image",
-        storage_ref=image_url,
+        storage_ref=stable_blob_url,
         content_type=content_type,
         size_bytes=int(len(data)),
         meta={
@@ -228,16 +291,19 @@ async def upload_source_image(
             "storage_container": UPLOAD_CONTAINER,
             "blob_name": blob_name,
             "storage_path": storage_path,
+            "stable_blob_url": stable_blob_url,
+            "uploaded_via": "api.face.assets.upload",
         },
     )
 
     return UploadImageResponse(
-        asset_id=asset_id,
+        asset_id=str(asset_id),
         image_url=image_url,
         content_type=content_type,
         size_bytes=int(len(data)),
         storage_path=storage_path,
     )
+
 
 # ------------------------------------------------------------------------------
 # LEGACY FACE GENERATION (backward compatible)
@@ -254,7 +320,6 @@ async def generate_faces(
     """
     pool = await get_pool()
 
-    # Import lazily so service startup doesn’t fail if legacy orchestrator is removed.
     try:
         from app.services.face_orchestrator import FaceOrchestrator  # type: ignore
     except Exception:
@@ -265,10 +330,11 @@ async def generate_faces(
 
     return FaceJobView(job_id=job_id, status="queued", faces=[])
 
+
 @router.get("/jobs/{job_id}", response_model=FaceJobView)
 async def get_legacy_job_status(
     job_id: str,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id),
 ) -> FaceJobView:
     """
     Legacy: Get face generation job status and results.
@@ -291,7 +357,7 @@ async def get_legacy_job_status(
             image_url=str(f["image_url"]) if f.get("image_url") else "",
             thumbnail_url=None,
             variant=(f.get("attributes_json") or {}).get("variant", 0),
-            generation_params=f.get("meta_json") or {}
+            generation_params=f.get("meta_json") or {},
         )
         for f in face_records
     ]
@@ -301,13 +367,14 @@ async def get_legacy_job_status(
         status=str(job["status"]),
         faces=faces,
         error_code=job.get("error_code"),
-        error_message=job.get("error_message")
+        error_message=job.get("error_message"),
     )
+
 
 @router.get("/jobs", response_model=List[FaceJobView])
 async def list_legacy_user_jobs(
     user_id: str = Depends(get_current_user_id),
-    limit: int = 20
+    limit: int = 20,
 ) -> List[FaceJobView]:
     """
     Legacy: List user's face generation jobs.
@@ -322,8 +389,9 @@ async def list_legacy_user_jobs(
         for j in jobs
     ]
 
+
 # ------------------------------------------------------------------------------
-# CREATOR PLATFORM (NEW) - wired to CreatorOrchestrator
+# CREATOR PLATFORM (LIVE) - wired to CreatorOrchestrator
 # ------------------------------------------------------------------------------
 
 @router.post("/creator/generate", response_model=JobCreatedResponse)
@@ -337,28 +405,55 @@ async def creator_generate_faces(
 
     For image-to-image identity lock:
       - req.mode must be "image-to-image"
-      - req.source_image_url must be provided
-      - req.preservation_strength ~ 0.15 - 0.35 (DesiFaces semantics)
+      - req.source_image_url or req.source_image_asset_id must be provided
+      - req.preservation_strength ~ 0.15 - 0.35
     """
     pool = await get_pool()
     orch = CreatorOrchestrator(pool)
 
     try:
         return await orch.create_job(user_id=user_id, request=req)
+
+    except PricingClientError as e:
+        logger.warning(
+            "creator_generate_faces pricing reservation failed user_id=%s err=%s",
+            user_id,
+            str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "error": "pricing_reservation_failed",
+                "code": "DF_PRICING_RESERVATION_FAILED",
+                "message": str(e),
+            },
+        )
+
     except ValueError as e:
         reason = _parse_unsafe_prompt_reason(e)
         if reason:
             _raise_friendly_unsafe_prompt(user_id=str(user_id), reason=reason)
-        # Not an unsafe prompt; treat as a normal validation error
+
         logger.warning("creator_generate_faces ValueError user_id=%s err=%s", user_id, str(e))
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"error": "bad_request", "message": str(e)},
         )
+
     except HTTPException:
-        # Preserve explicit HTTP errors
         raise
-    
+
+    except Exception:
+        logger.exception("creator_generate_faces failed user_id=%s", user_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "internal_error",
+                "code": "DF_FACE_CREATE_FAILED",
+                "message": "Failed to create face job.",
+            },
+        )
+
 
 @router.get("/creator/jobs/{job_id}/status", response_model=JobStatusResponse)
 async def creator_get_job_status(
@@ -381,6 +476,7 @@ async def creator_get_job_status(
     orch = CreatorOrchestrator(pool)
     return await orch.get_job_status(job_id)
 
+
 @router.get("/creator/jobs", response_model=List[JobStatusResponse])
 async def creator_list_jobs(
     user_id: str = Depends(get_current_user_id),
@@ -398,19 +494,18 @@ async def creator_list_jobs(
 
     creator_job_ids: List[str] = []
     for j in jobs:
-        # meta = j.get("meta_json") or {}
-        if isinstance(j, dict):
-            meta = j.get("meta_json") or {}
-        else:
-            meta = getattr(j, "meta_json", None) or {}
+        meta = _get(j, "meta_json", {}) or {}
+        if isinstance(meta, str):
+            meta = {}
         if meta.get("request_type") == "creator_platform":
-            creator_job_ids.append(str(j["id"]))
+            creator_job_ids.append(str(_get(j, "id")))
 
     results: List[JobStatusResponse] = []
     for jid in creator_job_ids:
         results.append(await orch.get_job_status(jid))
 
     return results
+
 
 # ------------------------------------------------------------------------------
 # Shared endpoints (profiles + config)
@@ -419,7 +514,7 @@ async def creator_list_jobs(
 @router.get("/profiles", response_model=List[FaceProfileView])
 async def list_user_profiles(
     user_id: str = Depends(get_current_user_id),
-    limit: int = 50
+    limit: int = 50,
 ) -> List[FaceProfileView]:
     """
     List user's saved face profiles.
@@ -435,10 +530,11 @@ async def list_user_profiles(
             image_url=str(p["image_url"]) if p.get("image_url") else "",
             thumbnail_url=None,
             variant=(p.get("attributes_json") or {}).get("variant", 0),
-            generation_params=p.get("meta_json") or {}
+            generation_params=p.get("meta_json") or {},
         )
         for p in profiles
     ]
+
 
 @router.get("/config/regions", response_model=List[RegionConfigView])
 async def get_available_regions(language: str = "en") -> List[RegionConfigView]:
@@ -454,9 +550,11 @@ async def get_available_regions(language: str = "en") -> List[RegionConfigView]:
         return [
             RegionConfigView(
                 code=r["code"],
-                display_name=(r.get("display_name") or {}).get(language)
-                or (r.get("display_name") or {}).get("en")
-                or r["code"],
+                display_name=_localized_text(
+                    r.get("display_name"),
+                    language,
+                    r["code"],
+                ),
                 sub_region=r.get("sub_region"),
                 is_active=bool(r.get("is_active", True)),
             )
@@ -475,14 +573,17 @@ async def get_available_regions(language: str = "en") -> List[RegionConfigView]:
     return [
         RegionConfigView(
             code=r["code"],
-            display_name=(r.get("display_name") or {}).get(language)
-            or (r.get("display_name") or {}).get("en")
-            or r["code"],
+            display_name=_localized_text(
+                r.get("display_name"),
+                language,
+                r["code"],
+            ),
             sub_region=r.get("sub_region"),
             is_active=bool(r.get("is_active", True)),
         )
         for r in rows
     ]
+
 
 @router.get("/config/contexts", response_model=List[ContextConfigView])
 async def get_available_contexts() -> List[ContextConfigView]:
@@ -494,7 +595,7 @@ async def get_available_contexts() -> List[ContextConfigView]:
     config_repo = CreatorPlatformConfigRepo(pool)
 
     q = """
-    SELECT code, display_name, prompt_base, is_active
+    SELECT code, display_name, prompt_base, is_active, meta_json
     FROM public.face_generation_contexts
     WHERE is_active = TRUE
     ORDER BY sort_order NULLS LAST, code
@@ -504,11 +605,11 @@ async def get_available_contexts() -> List[ContextConfigView]:
 
     result: List[ContextConfigView] = []
     for r in rows:
-        dn = r.get("display_name")
-        if isinstance(dn, dict):
-            display_name = dn.get("en") or r["code"].replace("_", " ").title()
-        else:
-            display_name = dn or r["code"].replace("_", " ").title()
+        display_name = _localized_text(
+            r.get("display_name"),
+            "en",
+            r["code"].replace("_", " ").title(),
+        )
 
         result.append(
             ContextConfigView(

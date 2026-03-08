@@ -171,8 +171,8 @@ services:
     <<: *python_service
     container_name: df-svc-face
     build:
-      context: ./services/svc-face/app
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/svc-face/app/Dockerfile
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
@@ -197,6 +197,13 @@ services:
 
       AZURE_CONTENT_MODERATOR_ENDPOINT: ${AZURE_CONTENT_MODERATOR_ENDPOINT}
       AZURE_CONTENT_MODERATOR_KEY: ${AZURE_CONTENT_MODERATOR_KEY}
+
+      # svc-pricing wiring
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
     expose: ["8003"]
     ports: ["8003:8003"]
     healthcheck:
@@ -213,8 +220,8 @@ services:
     <<: *python_service
     container_name: df-svc-face-worker
     build:
-      context: ./services/svc-face/app
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/svc-face/app/Dockerfile
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
@@ -236,7 +243,50 @@ services:
 
       AZURE_CONTENT_MODERATOR_ENDPOINT: ${AZURE_CONTENT_MODERATOR_ENDPOINT}
       AZURE_CONTENT_MODERATOR_KEY: ${AZURE_CONTENT_MODERATOR_KEY}
+
+      # svc-pricing wiring
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
     command: ["bash", "-lc", "python -m app.workers.face_worker"]
+
+  # -------------------------
+  # Pricing API
+  # -------------------------
+  svc-pricing:
+    <<: *python_service
+    container_name: df-svc-pricing
+    build:
+      context: ./services/svc-pricing/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8009"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      # internal service-to-service auth for pricing reservations
+      DF_PRICING_INTERNAL_BEARER: ${DF_PRICING_INTERNAL_BEARER}
+      DF_PRICING_ALLOWED_SERVICES: ${DF_PRICING_ALLOWED_SERVICES:-svc-face,svc-commerce,svc-music,svc-marketing}
+    expose: ["8009"]
+    ports: ["8009:8009"]
+    command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8009}"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
 
   # -------------------------
   # Commerce API

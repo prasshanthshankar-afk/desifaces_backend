@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     # RBAC (core.roles.role_key whitelist for admin routes)
     PRICING_ADMIN_ROLE_KEYS: str = Field(default="admin,ops,pricing_admin")
 
+    MAX_CREDITS_PER_RESERVATION: int = Field(default=250000) 
+
     # Pricing / reservations
     DEFAULT_RESERVATION_TTL_S: int = Field(default=900)   # 15 min
     MAX_RESERVATION_TTL_S: int = Field(default=3600)      # 60 min

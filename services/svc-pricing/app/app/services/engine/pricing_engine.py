@@ -14,6 +14,10 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
+# -------------------------
+# models
+# -------------------------
+
 @dataclass(frozen=True)
 class PriceLine:
     sku_code: str
@@ -40,16 +44,55 @@ class QuoteResult:
     total_money: Decimal
     rounding_mode: str
     lines: List[PriceLine]
+
+    # “Would-have-cost” (useful for free/shadow UX)
+    shadow_total_credits: Optional[int] = None
+    shadow_total_money: Optional[Decimal] = None
+
+    # Optional alternate currency preview
     alt_currency: Optional[str] = None
     alt_total_money: Optional[Decimal] = None
 
 
+# -------------------------
+# helpers
+# -------------------------
+
+def _norm_currency(x: Optional[str]) -> Optional[str]:
+    if not x:
+        return None
+    v = x.strip().upper()
+    return v or None
+
+
+def _norm_country(x: str) -> str:
+    return (x or "").strip().upper()
+
+
+def _norm_channel(x: str) -> str:
+    v = (x or "web").strip().lower()
+    return v if v in {"web", "mobile", "api"} else "web"
+
+
 def _d(x: Any) -> Decimal:
+    # for internal known-numeric DB values
     if x is None:
         return Decimal("0")
     if isinstance(x, Decimal):
         return x
     return Decimal(str(x))
+
+
+def _d_param(x: Any, key: str) -> Decimal:
+    # for user-provided params: fail closed on invalid values
+    if x is None:
+        return Decimal("0")
+    if isinstance(x, Decimal):
+        return x
+    try:
+        return Decimal(str(x))
+    except Exception:
+        raise ValueError(f"PRICING_BAD_PARAM:{key}")
 
 
 def _ceil_int(x: Decimal) -> int:
@@ -59,24 +102,47 @@ def _ceil_int(x: Decimal) -> int:
 
 
 def _round_money(amount: Decimal, mode: str) -> Decimal:
-    q = Decimal("1").scaleb(-settings.MONEY_DECIMALS)  # 0.01
+    q = Decimal("1").scaleb(-settings.MONEY_DECIMALS)  # e.g. 0.01 for 2 dp
     mode = (mode or "ceil").lower()
     if mode == "floor":
         return amount.quantize(q, rounding=ROUND_FLOOR)
     if mode == "round":
         return amount.quantize(q, rounding=ROUND_HALF_UP)
-    # default ceil
     return amount.quantize(q, rounding=ROUND_CEILING)
 
 
+def _primary_currency(country_code: str, requested_currency: Optional[str]) -> str:
+    rc = _norm_currency(requested_currency)
+    if rc:
+        return rc
+    return "INR" if _norm_country(country_code) == "IN" else "USD"
+
+
+def _norm_billing_mode(x: str) -> str:
+    v = (x or "bill").strip().lower()
+    if v in {"bill", "shadow", "free", "disabled"}:
+        return v
+    return "bill"
+
+
 async def _resolve_tier_code(conn: asyncpg.Connection, user_id: UUID) -> str:
+    # 1) pricing_user_entitlements wins (supports future tiers like developer/api_enterprise)
     r = await conn.fetchrow(
         "select tier_code from pricing_user_entitlements where user_id = $1",
         user_id,
     )
-    if not r:
-        return "free"
-    return str(r["tier_code"] or "free")
+    if r and r.get("tier_code"):
+        return str(r["tier_code"])
+
+    # 2) fallback to core.users.tier (free|pro|enterprise)
+    u = await conn.fetchrow(
+        "select tier from core.users where id = $1",
+        user_id,
+    )
+    if u and u.get("tier"):
+        return str(u["tier"])
+
+    return "free"
 
 
 async def _get_credit_value(conn: asyncpg.Connection, currency: str) -> Tuple[Decimal, str]:
@@ -93,8 +159,8 @@ async def _get_credit_value(conn: asyncpg.Connection, currency: str) -> Tuple[De
         currency,
     )
     if not r:
-        # safe fallback
-        return Decimal("0.01"), "ceil"
+        # FAIL CLOSED: missing credit value means we'd produce wrong money numbers
+        raise ValueError(f"PRICING_MISSING_CREDIT_VALUE:{currency}")
     return _d(r["money_per_credit"]), str(r["rounding_mode"] or "ceil")
 
 
@@ -108,13 +174,17 @@ async def _select_pricebook(
 ) -> dict:
     """
     Deterministic selection:
-      - must be active, within effective window
+      - active, within effective window
       - match currency + channel
-      - prefer exact country match, else null country_code (global)
-      - prefer exact tier match, else null tier_code (all tiers)
-      - latest effective_from
+      - allow country_code null/global or exact match
+      - allow tier_code null/all tiers or exact match
+      - prefer exact match, then newest effective_from
     """
-    rows = await conn.fetch(
+    cc = _norm_country(country_code)
+    tc = (tier_code or "").strip().lower() or "free"
+    ch = _norm_channel(channel)
+
+    row = await conn.fetchrow(
         """
         select *
         from pricing_pricebooks
@@ -123,36 +193,23 @@ async def _select_pricebook(
           and channel = $2
           and effective_from <= now()
           and (effective_to is null or effective_to > now())
-          and (country_code is null or country_code = $3)
+          and (country_code is null or country_code = $3 or $3 = '')
           and (tier_code is null or tier_code = $4)
         order by
-          (country_code = $3) desc,
-          (tier_code = $4) desc,
+          case when $3 <> '' and country_code = $3 then 1 else 0 end desc,
+          case when tier_code = $4 then 1 else 0 end desc,
           effective_from desc,
           created_at desc
         limit 1
         """,
-        currency, channel, (country_code or None), (tier_code or None),
+        currency,
+        ch,
+        cc,
+        tc,
     )
-    if not rows:
-        # fallback: allow global tier/country
-        rows = await conn.fetch(
-            """
-            select *
-            from pricing_pricebooks
-            where is_active = true
-              and currency = $1
-              and channel = $2
-              and effective_from <= now()
-              and (effective_to is null or effective_to > now())
-            order by effective_from desc, created_at desc
-            limit 1
-            """,
-            currency, channel,
-        )
-    if not rows:
+    if not row:
         raise ValueError("PRICING_NO_ACTIVE_PRICEBOOK")
-    return dict(rows[0])
+    return dict(row)
 
 
 async def _get_variant(conn: asyncpg.Connection, variant_code: str) -> dict:
@@ -174,6 +231,7 @@ async def _get_variant_lines(conn: asyncpg.Connection, variant_code: str) -> lis
         select variant_code, sku_code, qty_mode, qty_value, qty_param, metadata_json
         from pricing_variant_lines
         where variant_code = $1
+        order by sku_code asc
         """,
         variant_code,
     )
@@ -203,49 +261,31 @@ async def _get_sku_override(conn: asyncpg.Connection, pricebook_id: UUID, sku_co
         from pricing_sku_prices
         where pricebook_id = $1 and sku_code = $2
         """,
-        pricebook_id, sku_code,
+        pricebook_id,
+        sku_code,
     )
     return dict(r) if r else {}
 
 
 def _qty_from_params(line: dict, params: Dict[str, Any]) -> Decimal:
-    mode = str(line.get("qty_mode") or "fixed")
+    mode = str(line.get("qty_mode") or "fixed").lower()
+
     if mode == "fixed":
         return _d(line.get("qty_value") or 0)
+
     if mode == "param":
         key = str(line.get("qty_param") or "").strip()
         if not key:
             return Decimal("0")
-        return _d(params.get(key, 0))
-    # metered lines are 0 at quote time unless caller supplies actuals later
+        return _d_param(params.get(key, 0), key)
+
+    # metered lines: 0 at quote time (actuals used at finalize later)
     return Decimal("0")
 
 
-def _primary_currency(country_code: str, requested_currency: Optional[str]) -> str:
-    if requested_currency:
-        return requested_currency.upper()
-    return "INR" if (country_code or "").upper() == "IN" else "USD"
-
-
-async def _resolve_tier_code(conn: asyncpg.Connection, user_id: UUID) -> str:
-    # 1) pricing_user_entitlements wins (supports future tiers like "developer")
-    r = await conn.fetchrow(
-        "select tier_code from pricing_user_entitlements where user_id = $1",
-        user_id,
-    )
-    if r and r.get("tier_code"):
-        return str(r["tier_code"])
-
-    # 2) fallback to core.users.tier (free|pro|enterprise)
-    u = await conn.fetchrow(
-        "select tier from core.users where id = $1",
-        user_id,
-    )
-    if u and u.get("tier"):
-        return str(u["tier"])
-
-    return "free"
-
+# -------------------------
+# main entry
+# -------------------------
 
 async def quote_variant(
     conn: asyncpg.Connection,
@@ -253,23 +293,19 @@ async def quote_variant(
     user_id: UUID,
     variant_code: str,
     params: Dict[str, Any],
-    channel: str,                     # web|mobile|api
+    channel: str,          # web|mobile|api
     country_code: str,
     currency: Optional[str],
-    billing_mode: str,                # from module_gate
+    billing_mode: str,     # from module_gate
 ) -> QuoteResult:
-    """
-    Computes quote using:
-      - variant BOM expansion (pricing_variant_lines)
-      - SKU base credits (pricing_skus.default_unit_credits)
-      - pricebook selection + overrides + multiplier
-      - credit->money conversion via pricing_credit_value
-    """
     var = await _get_variant(conn, variant_code)
     tier_code = await _resolve_tier_code(conn, user_id)
 
-    cur = _primary_currency(country_code, currency)
-    pb = await _select_pricebook(conn, currency=cur, channel=channel, country_code=country_code, tier_code=tier_code)
+    cc = _norm_country(country_code)
+    ch = _norm_channel(channel)
+    cur = _primary_currency(cc, currency)
+
+    pb = await _select_pricebook(conn, currency=cur, channel=ch, country_code=cc, tier_code=tier_code)
     pb_id = UUID(str(pb["id"]))
     pb_mult = _d(pb.get("multiplier") or 1)
 
@@ -280,7 +316,8 @@ async def quote_variant(
         raise ValueError("PRICING_VARIANT_HAS_NO_LINES")
 
     lines: List[PriceLine] = []
-    total_credits = 0
+    bill_total_credits = 0
+    bill_total_money = Decimal("0")
 
     for ld in lines_def:
         sku_code = str(ld["sku_code"])
@@ -291,14 +328,25 @@ async def quote_variant(
         if qty <= 0:
             continue
 
-        unit_credits = int(ov.get("unit_credits_override") or sku["default_unit_credits"])
+        # Sanity: unit credits cannot be negative
+        unit_credits = int(ov.get("unit_credits_override") or sku["default_unit_credits"] or 0)
+        unit_credits = max(0, unit_credits)
+
+        # Credits (multiplied)
         raw_credits = qty * _d(unit_credits) * pb_mult
         line_credits = _ceil_int(raw_credits)
 
-        # If billing_mode is shadow/free, we still compute "would-have-cost" in metadata,
-        # but we return total_credits=0 and total_money=0 to enforce no-charge behavior.
-        # For UX: frontend can still display the "shadow_estimate" from line metadata if desired.
+        # Money policy:
+        # - If unit_money_override exists AND qty bounds allow, use it
+        # - Else derive from credits * money_per_credit
         unit_money_override = ov.get("unit_money_override")
+        min_qty = ov.get("min_qty")
+        max_qty = ov.get("max_qty")
+
+        if unit_money_override is not None:
+            if (min_qty is not None and qty < _d(min_qty)) or (max_qty is not None and qty > _d(max_qty)):
+                unit_money_override = None
+
         if unit_money_override is not None:
             unit_money = _d(unit_money_override)
             line_money = _round_money(unit_money * qty, rounding_mode)
@@ -320,20 +368,30 @@ async def quote_variant(
                 line_money=line_money,
             )
         )
-        total_credits += line_credits
 
-    total_money = _round_money(_d(total_credits) * money_per_credit, rounding_mode)
-    # If any overrides set unit_money, our per-line money already accounts; so sum line_money.
-    if any(l.unit_money is not None for l in lines):
-        total_money = _round_money(sum((l.line_money for l in lines), Decimal("0")), rounding_mode)
+        bill_total_credits += line_credits
+        bill_total_money += line_money
 
-    # Apply no-charge modes
-    if billing_mode in {"shadow", "free"}:
+    if not lines:
+        raise ValueError("PRICING_VARIANT_ZERO_QTY_LINES")
+
+    # Total money is sum(line_money) so breakdown always matches total.
+    bill_total_money = _round_money(bill_total_money, rounding_mode)
+
+    bm = _norm_billing_mode(billing_mode)
+    shadow_total_credits = bill_total_credits
+    shadow_total_money = bill_total_money
+
+    if bm in {"shadow", "free", "disabled"}:
         total_credits = 0
         total_money = _round_money(Decimal("0"), rounding_mode)
+    else:
+        total_credits = bill_total_credits
+        total_money = bill_total_money
 
-    # Alt-currency preview (optional)
+    # Alt currency preview of the *charged* amount (based on total_credits)
     alt_currency = "USD" if cur == "INR" else "INR"
+    alt_total = None
     try:
         alt_mpc, alt_round = await _get_credit_value(conn, alt_currency)
         alt_total = _round_money(_d(total_credits) * alt_mpc, alt_round)
@@ -346,11 +404,13 @@ async def quote_variant(
         currency=cur,
         pricebook_id=pb_id,
         pricebook_name=str(pb["name"]),
-        billing_mode=billing_mode,
+        billing_mode=bm,
         total_credits=int(total_credits),
         total_money=total_money,
         rounding_mode=rounding_mode,
         lines=lines,
+        shadow_total_credits=int(shadow_total_credits),
+        shadow_total_money=shadow_total_money,
         alt_currency=alt_currency if alt_total is not None else None,
         alt_total_money=alt_total,
     )

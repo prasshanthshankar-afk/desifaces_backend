@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -9,66 +10,62 @@ class HeyGenDimension(BaseModel):
     height: int = Field(ge=64, le=4096)
 
 
-class HeyGenAV4Request(BaseModel):
-    """
-    AV4 supports two mutually exclusive voice modes:
+class HeyGenTalkingPhotoCharacter(BaseModel):
+    type: Literal["talking_photo"] = "talking_photo"
+    talking_photo_id: str = Field(min_length=1)
 
-    - Audio mode: talking_photo_id + audio_url
-    - TTS mode:   talking_photo_id + voice_id + script
 
-    Also requires either dimension or aspect_ratio.
-    """
-    test: bool = False
+class HeyGenAvatarCharacter(BaseModel):
+    type: Literal["avatar"] = "avatar"
+    avatar_id: str = Field(min_length=1)
+    avatar_style: Optional[str] = "normal"
 
-    image_key: str = Field(min_length=1)
-    video_title: str = Field(min_length=1)
 
-    dimension: Optional[HeyGenDimension] = None
-    aspect_ratio: Optional[str] = None
+HeyGenCharacter = Union[HeyGenTalkingPhotoCharacter, HeyGenAvatarCharacter]
 
-    # Audio mode
+
+class HeyGenAudioVoice(BaseModel):
+    type: Literal["audio"] = "audio"
     audio_url: Optional[str] = None
-
-    # Back-compat field (we accept it in payload struct, but DO NOT recommend using it)
-    # If you truly want to support it, convert asset_id -> url outside, then pass audio_url.
     audio_asset_id: Optional[str] = None
-
-    # TTS mode
-    voice_id: Optional[str] = None
-    script: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_rules(self):
-        # size rule
+        if not self.audio_url and not self.audio_asset_id:
+            raise ValueError("voice.type=audio requires audio_url or audio_asset_id.")
+        return self
+
+
+class HeyGenTextVoice(BaseModel):
+    type: Literal["text"] = "text"
+    input_text: str = Field(min_length=1)
+    voice_id: str = Field(min_length=1)
+
+
+HeyGenVoice = Union[HeyGenAudioVoice, HeyGenTextVoice]
+
+
+class HeyGenVideoInput(BaseModel):
+    character: HeyGenCharacter
+    voice: HeyGenVoice
+    background: Optional[Dict[str, Any]] = None
+
+
+class HeyGenV2GenerateRequest(BaseModel):
+    video_inputs: List[HeyGenVideoInput] = Field(min_length=1)
+    dimension: Optional[HeyGenDimension] = None
+    aspect_ratio: Optional[str] = None
+
+    # Kept top-level because this matched the successful manual request.
+    use_avatar_iv_model: bool = True
+
+    @model_validator(mode="after")
+    def validate_rules(self):
         if not self.dimension and not self.aspect_ratio:
             raise ValueError("Either dimension or aspect_ratio must be provided.")
-
-        has_audio = bool(self.audio_url) or bool(self.audio_asset_id)
-        has_tts = bool(self.voice_id) or bool(self.script)
-
-        # Must choose exactly one mode
-        if has_audio and has_tts:
-            raise ValueError("Provide either (audio_url/audio_asset_id) OR (voice_id+script), not both.")
-        if not has_audio and not has_tts:
-            raise ValueError("Provide either audio_url (audio mode) OR voice_id+script (tts mode).")
-
-        # Audio mode rules
-        if has_audio:
-            # strongly prefer audio_url; if asset_id provided alone, we allow validation but orchestration should resolve it
-            if not self.audio_url and self.audio_asset_id:
-                # allow pass-through for now, but warn in logs at call site if you want
-                return self
-            if not self.audio_url:
-                raise ValueError("Audio mode requires audio_url.")
-            return self
-
-        # TTS mode rules
-        if not self.voice_id:
-            raise ValueError("TTS mode requires voice_id.")
-        if not self.script:
-            raise ValueError("TTS mode requires script.")
         return self
 
 
 def validate_av4_payload(payload: Dict[str, Any]) -> None:
-    HeyGenAV4Request.model_validate(payload)
+    # Kept function name for compatibility with the rest of Fusion.
+    HeyGenV2GenerateRequest.model_validate(payload)
