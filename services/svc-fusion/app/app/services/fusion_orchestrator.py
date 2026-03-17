@@ -1,27 +1,112 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import asyncpg
+
+PRICING_IMPORT_ERROR: Optional[str] = None
+
+try:
+    from desifaces_shared.pricing.client import PricingClientError, SvcPricingClient
+    from desifaces_shared.pricing.models import (
+        PricingCommitRequest,
+        PricingReleaseRequest,
+        PricingReserveRequest,
+    )
+except Exception as pricing_import_error:
+    PRICING_IMPORT_ERROR = str(pricing_import_error)
+    logging.getLogger("fusion_orchestrator").exception(
+        "svc_fusion_pricing_import_failed",
+        extra={"error": PRICING_IMPORT_ERROR},
+    )
+
+    class PricingClientError(Exception):
+        pass
+
+    @dataclass
+    class PricingReserveRequest:
+        user_id: str
+        service_name: str
+        service_action: str
+        sku_code: str
+        units: str
+        external_ref_type: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+
+    @dataclass
+    class PricingCommitRequest:
+        user_id: str
+        reservation_id: str
+        actual_units: str
+        external_ref_type: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+
+    @dataclass
+    class PricingReleaseRequest:
+        user_id: str
+        reservation_id: str
+        reason: str
+        external_ref_type: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+
+    class SvcPricingClient:
+        enabled = False
+
+        @classmethod
+        def from_env(cls, service_name: str) -> "SvcPricingClient":
+            return cls()
+
+        async def reserve(self, req: PricingReserveRequest):
+            raise PricingClientError("pricing client unavailable")
+
+        async def commit(self, req: PricingCommitRequest):
+            raise PricingClientError("pricing client unavailable")
+
+        async def release(self, req: PricingReleaseRequest):
+            raise PricingClientError("pricing client unavailable")
+
 
 from app.config import settings
 from app.domain.enums import StepCode
 from app.domain.models import FusionJobCreate
-from app.services.idempotency_service import request_hash, provider_idempotency_key
-from app.services.providers.heygen.av4_payload import build_av4_payload
-from app.services.providers.heygen.client import HeyGenAV4Client, HeyGenApiError
-from app.services.artifact_service import ArtifactService
+from app.repos.artifacts_repo import ArtifactsRepo
+from app.repos.digital_performances_repo import DigitalPerformancesRepo
 from app.repos.fusion_jobs_repo import FusionJobsRepo
 from app.repos.provider_runs_repo import ProviderRunsRepo
 from app.repos.steps_repo import StepsRepo
-from app.repos.artifacts_repo import ArtifactsRepo
-from app.repos.digital_performances_repo import DigitalPerformancesRepo
+from app.services.artifact_service import ArtifactService
+from app.services.idempotency_service import provider_idempotency_key, request_hash
 from app.services.providers.heygen.assets import HeyGenAssetsClient
+from app.services.providers.heygen.av4_payload import build_av4_payload
+from app.services.providers.heygen.client import HeyGenAV4Client, HeyGenApiError
 
 logger = logging.getLogger("fusion_orchestrator")
+
+
+class _DisabledPricingClient:
+    enabled = False
+
+    async def reserve(self, req: PricingReserveRequest):
+        raise PricingClientError("pricing client unavailable")
+
+    async def commit(self, req: PricingCommitRequest):
+        raise PricingClientError("pricing client unavailable")
+
+    async def release(self, req: PricingReleaseRequest):
+        raise PricingClientError("pricing client unavailable")
 
 
 def _classify_error(e: Exception) -> str:
@@ -38,6 +123,8 @@ def _classify_error(e: Exception) -> str:
         return "HEYGEN_API_ERROR"
     if "requires" in msg and ("face" in msg or "audio" in msg):
         return "INVALID_REQUEST"
+    if "pricing" in msg:
+        return "PRICING_ERROR"
     return "FUSION_FAILED"
 
 
@@ -60,6 +147,21 @@ def _url_base(u: Optional[str]) -> Optional[str]:
         return s.split("?", 1)[0]
 
 
+def _extract_pricing_error_code(e: Exception) -> str:
+    msg = str(e or "")
+    for code in (
+        "PRICING_INSUFFICIENT_CREDITS",
+        "PRICING_UNKNOWN_OR_INACTIVE_VARIANT",
+        "PRICING_VARIANT_ZERO_QTY_LINES",
+        "PRICING_CLIENT_DISABLED",
+    ):
+        if code in msg:
+            return code
+    if "pricing client unavailable" in msg.lower():
+        return "PRICING_CLIENT_DISABLED"
+    return "PRICING_RESERVATION_FAILED"
+
+
 def _extract_talking_photo_id(obj: Dict[str, Any]) -> Optional[str]:
     """
     Best-effort extractor for newer HeyGen photo-avatar style responses.
@@ -75,7 +177,6 @@ def _extract_talking_photo_id(obj: Dict[str, Any]) -> Optional[str]:
         data.get("avatar_id"),
         obj.get("avatar_id"),
     ]
-    # Sometimes APIs return a generic id. Only trust it if there is no image_key.
     if data.get("id") and not data.get("image_key"):
         candidates.append(data.get("id"))
     if obj.get("id") and not obj.get("image_key"):
@@ -87,15 +188,79 @@ def _extract_talking_photo_id(obj: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _provider_poll_timeout_seconds() -> int:
+    try:
+        return max(
+            60,
+            int(
+                os.getenv(
+                    "DF_FUSION_PROVIDER_TIMEOUT_SECONDS",
+                    str(getattr(settings, "JOB_POLL_MAX_SECONDS", 360)),
+                )
+            ),
+        )
+    except Exception:
+        return 360
+
+
+def _provider_poll_interval_seconds() -> int:
+    try:
+        return max(
+            2,
+            int(
+                os.getenv(
+                    "DF_FUSION_PROVIDER_POLL_SECONDS",
+                    str(getattr(settings, "JOB_POLL_INTERVAL_SECONDS", 5)),
+                )
+            ),
+        )
+    except Exception:
+        return 5
+
+
+def _normalize_provider_status(raw_status: Optional[str]) -> str:
+    s = str(raw_status or "").strip().lower()
+
+    if s in {"completed", "complete", "success", "succeeded", "ready"}:
+        return "succeeded"
+
+    if s in {"failed", "error"}:
+        return "failed"
+
+    if s in {"canceled", "cancelled"}:
+        return "canceled"
+
+    if s in {
+        "processing",
+        "pending",
+        "queued",
+        "waiting",
+        "running",
+        "in_progress",
+        "submitted",
+    }:
+        return "processing"
+
+    return "unknown"
+
+
 class FusionOrchestrator:
     """
-    Deterministic HeyGen V2 orchestration.
+    HeyGen AV4 orchestration.
 
     Key behavior:
       - UI should pass artifact IDs (face_artifact_id, audio_artifact_id)
       - Fusion mints fresh SAS at run time to avoid expired SAS URLs
       - Still supports legacy URLs (face_image_url and voice_audio.audio_url)
-      - Supported create-video path now requires talking_photo_id for Photo Avatars
+      - AV4/create-video path requires a real talking_photo_id for talking-photo flow
+      - Provider idempotency is job-scoped to avoid cross-job run reuse
+      - Pricing can be enforced with DF_PRICING_REQUIRED=1 to fail fast when disabled
+
+    Pricing note:
+      - svc-pricing reserve currently expects request.sku_code to carry the
+        pricing_variants.code, not the leaf pricing_skus.code.
+      - For Fusion this means reserve must use FUSION_TALKING_VIDEO, while the
+        leaf SKU remains FUSION_TALK_MIN through pricing_variant_lines.
     """
 
     def __init__(self, pool: asyncpg.Pool):
@@ -110,6 +275,56 @@ class FusionOrchestrator:
         self.assets = HeyGenAssetsClient()
         self.artifact_service = ArtifactService()
 
+        try:
+            self.pricing_client = SvcPricingClient.from_env(service_name="svc-fusion")
+        except Exception as e:
+            logger.exception(
+                "svc_fusion_pricing_client_init_failed",
+                extra={"error": str(e)},
+            )
+            self.pricing_client = _DisabledPricingClient()
+
+    # -------------------------------------------------------------------------
+    # Generic helpers
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _coerce_dict(v: Any) -> Dict[str, Any]:
+        if v is None:
+            return {}
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            try:
+                vv = json.loads(v)
+                return vv if isinstance(vv, dict) else {}
+            except Exception:
+                return {}
+        try:
+            if hasattr(v, "keys"):
+                return {k: v[k] for k in v.keys()}
+        except Exception:
+            pass
+        try:
+            vv = dict(v)
+            return vv if isinstance(vv, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _pricing_resp_get(resp: Any, key: str, default: Any = None) -> Any:
+        if resp is None:
+            return default
+        if isinstance(resp, dict):
+            value = resp.get(key, default)
+        else:
+            value = getattr(resp, key, default)
+        if hasattr(value, "value"):
+            try:
+                return value.value
+            except Exception:
+                return default if value is None else value
+        return value
+
     def _sas_ttl_hours(self) -> int:
         ttl = getattr(settings, "AZURE_SAS_EXPIRY_HOURS", None)
         try:
@@ -119,6 +334,528 @@ class FusionOrchestrator:
             pass
         return 4
 
+    def _pricing_required(self) -> bool:
+        v = str(os.getenv("DF_PRICING_REQUIRED", "0")).strip().lower()
+        return v in {"1", "true", "yes", "y"}
+
+    def _pricing_enabled(self) -> bool:
+        try:
+            return bool(getattr(self.pricing_client, "enabled", False))
+        except Exception:
+            return False
+
+    def _pricing_disabled_reason(self) -> str:
+        if PRICING_IMPORT_ERROR:
+            return f"pricing_import_failed: {PRICING_IMPORT_ERROR}"
+        return "svc-fusion pricing client is disabled or not configured"
+
+    def _fusion_pricing_variant_code(self) -> str:
+        """
+        Reserve must send pricing_variants.code, not the leaf pricing_skus.code.
+        """
+        candidate = str(os.getenv("DF_PRICING_VARIANT_FUSION_VIDEO", "") or "").strip()
+        if candidate:
+            return candidate
+
+        legacy = str(os.getenv("DF_PRICING_SKU_FUSION_VIDEO", "") or "").strip()
+        if legacy:
+            # Map previously-used/wrong values to the correct active variant.
+            if legacy in {"fusion.video.generate", "FUSION_TALK_MIN"}:
+                return "FUSION_TALKING_VIDEO"
+            return legacy
+
+        return "FUSION_TALKING_VIDEO"
+
+    def _fusion_pricing_leaf_sku_code(self) -> str:
+        candidate = str(os.getenv("DF_PRICING_LEAF_SKU_FUSION_VIDEO", "") or "").strip()
+        if candidate:
+            if candidate == "FUSION_TALKING_VIDEO":
+                return "FUSION_TALK_MIN"
+            return candidate
+        return "FUSION_TALK_MIN"
+
+    # -------------------------------------------------------------------------
+    # Pricing helpers
+    # -------------------------------------------------------------------------
+    def _build_initial_pricing_block(self, req: FusionJobCreate) -> Dict[str, Any]:
+        variant_code = self._fusion_pricing_variant_code()
+        leaf_sku_code = self._fusion_pricing_leaf_sku_code()
+        pricing_enabled = self._pricing_enabled()
+        state = "pending_reservation" if pricing_enabled else "disabled"
+        disabled_reason = None if pricing_enabled else self._pricing_disabled_reason()
+
+        # Current Fusion pricing is per-minute and reserve needs qty_param=minutes.
+        # Until we wire exact predicted duration, reserve a minimum of 1 minute.
+        estimated_units = "1"
+        estimated_minutes = "1"
+
+        return {
+            "enabled": pricing_enabled,
+            "state": state,
+            "service_name": "svc-fusion",
+            "service_action": "fusion.video.generate",
+            "variant_code": variant_code,
+            "sku_code": variant_code,
+            "leaf_sku_code": leaf_sku_code,
+            "estimated_units": estimated_units,
+            "unit_type": "minute",
+            "reservation_id": None,
+            "reservation_status": None,
+            "quote_id": None,
+            "reserved_units": None,
+            "actual_units": None,
+            "billed_units": None,
+            "released_units": None,
+            "amount": None,
+            "currency": None,
+            "ledger_entry_id": None,
+            "billing_mode": None,
+            "billing_account_id": None,
+            "settlement_mode": None,
+            "pricing_mode": None,
+            "entitlement_source": None,
+            "entitlement_reason": None,
+            "tier_code": None,
+            "disabled_reason": disabled_reason,
+            "meta": {
+                "provider": req.provider,
+                "voice_mode": req.voice_mode.value,
+                "video": req.video.model_dump(),
+                "variant_code": variant_code,
+                "leaf_sku_code": leaf_sku_code,
+                "minutes": estimated_minutes,
+                "requested_units": estimated_units,
+                "has_face_artifact_id": bool(getattr(req, "face_artifact_id", None)),
+                "has_audio_artifact_id": bool(
+                    getattr(getattr(req, "voice_audio", None), "audio_artifact_id", None)
+                ),
+                "has_talking_photo_id": bool(getattr(req, "heygen_talking_photo_id", None)),
+            },
+        }
+
+    @staticmethod
+    def _merge_pricing_block(current: Optional[Dict[str, Any]], **updates: Any) -> Dict[str, Any]:
+        out = dict(current or {})
+        for key, value in updates.items():
+            if value is not None:
+                out[key] = value
+        return out
+
+    def _pricing_from_payload_meta(
+        self,
+        payload_json: Optional[Dict[str, Any]],
+        meta_json: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        payload = self._coerce_dict(payload_json)
+        meta = self._coerce_dict(meta_json)
+
+        pricing = self._coerce_dict(payload.get("pricing"))
+        if pricing:
+            return pricing
+
+        pricing = self._coerce_dict(meta.get("pricing"))
+        if pricing:
+            return pricing
+
+        return {}
+
+    async def _persist_pricing_block(self, job_id: str, pricing: Dict[str, Any]) -> None:
+        q = """
+        UPDATE public.studio_jobs
+        SET
+          payload_json = COALESCE(payload_json, '{}'::jsonb) || jsonb_build_object('pricing', $2::jsonb),
+          meta_json = COALESCE(meta_json, '{}'::jsonb)
+                      || jsonb_build_object(
+                           'pricing', $2::jsonb,
+                           'pricing_state', COALESCE($3::text, ''),
+                           'pricing_enabled', $4::bool,
+                           'pricing_billing_mode', NULLIF($5::text, ''),
+                           'pricing_settlement_mode', NULLIF($6::text, ''),
+                           'pricing_billing_account_id', NULLIF($7::text, '')
+                         ),
+          updated_at = now()
+        WHERE id = $1::uuid
+          AND studio_type = 'fusion'
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    q,
+                    job_id,
+                    json.dumps(pricing or {}),
+                    str(pricing.get("state") or ""),
+                    bool(pricing.get("enabled", False)),
+                    str(pricing.get("billing_mode") or ""),
+                    str(pricing.get("settlement_mode") or ""),
+                    str(pricing.get("billing_account_id") or ""),
+                )
+        except Exception:
+            logger.exception("fusion_pricing_persist_failed", extra={"job_id": job_id})
+
+    async def _load_latest_pricing(self, job_id: str) -> Dict[str, Any]:
+        q = """
+        SELECT payload_json, meta_json
+        FROM public.studio_jobs
+        WHERE id = $1::uuid
+          AND studio_type = 'fusion'
+        LIMIT 1
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(q, job_id)
+            if not row:
+                return {}
+            payload_json = self._coerce_dict(row["payload_json"])
+            meta_json = self._coerce_dict(row["meta_json"])
+            return self._pricing_from_payload_meta(payload_json, meta_json)
+        except Exception:
+            logger.exception("fusion_pricing_load_failed", extra={"job_id": job_id})
+            return {}
+
+    async def _await_reserved_pricing(
+        self,
+        job_id: str,
+        *,
+        max_wait_s: float = 8.0,
+        poll_s: float = 0.25,
+    ) -> Dict[str, Any]:
+        if not self._pricing_enabled():
+            return {}
+
+        deadline = asyncio.get_running_loop().time() + max_wait_s
+        last_pricing: Dict[str, Any] = {}
+
+        while True:
+            pricing = await self._load_latest_pricing(job_id)
+            last_pricing = pricing or {}
+
+            if not last_pricing.get("enabled"):
+                return last_pricing
+
+            state = str(last_pricing.get("state") or "").strip().lower()
+            reservation_id = str(last_pricing.get("reservation_id") or "").strip()
+
+            if state in {"reserved", "committed", "released", "reservation_failed", "commit_failed", "release_failed"}:
+                return last_pricing
+
+            if reservation_id and state in {"pending_reservation", ""}:
+                out = dict(last_pricing)
+                out["state"] = "reserved"
+                out["reservation_status"] = out.get("reservation_status") or "reserved"
+                return out
+
+            if asyncio.get_running_loop().time() >= deadline:
+                return last_pricing
+
+            await asyncio.sleep(poll_s)
+
+    async def _reserve_pricing_for_job(
+        self,
+        *,
+        job_id: str,
+        user_id: str,
+        pricing: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not self._pricing_enabled():
+            return pricing
+
+        variant_code = str(
+            pricing.get("variant_code")
+            or pricing.get("sku_code")
+            or self._fusion_pricing_variant_code()
+        ).strip() or self._fusion_pricing_variant_code()
+        leaf_sku_code = str(
+            pricing.get("leaf_sku_code") or self._fusion_pricing_leaf_sku_code()
+        ).strip() or self._fusion_pricing_leaf_sku_code()
+
+        requested_units = str(pricing.get("estimated_units") or "1").strip() or "1"
+
+        meta = self._coerce_dict(pricing.get("meta"))
+        minutes = str(meta.get("minutes") or requested_units).strip() or requested_units
+
+        meta = {
+            **meta,
+            "variant_code": variant_code,
+            "leaf_sku_code": leaf_sku_code,
+            "minutes": minutes,
+            "requested_units": requested_units,
+            "service_action": str(pricing.get("service_action") or "fusion.video.generate"),
+        }
+
+        req = PricingReserveRequest(
+            user_id=str(user_id),
+            service_name="svc-fusion",
+            service_action=str(pricing.get("service_action") or "fusion.video.generate"),
+            sku_code=variant_code,
+            units=requested_units,
+            external_ref_type="studio_job",
+            external_ref_id=str(job_id),
+            idempotency_key=f"svc-fusion:job:{job_id}:reserve",
+            meta=meta,
+        )
+
+        try:
+            logger.info(
+                "fusion_pricing_reserve_request",
+                extra={
+                    "user_id": req.user_id,
+                    "service_name": req.service_name,
+                    "service_action": req.service_action,
+                    "variant_code": variant_code,
+                    "leaf_sku_code": leaf_sku_code,
+                    "sku_code": req.sku_code,
+                    "units": req.units,
+                    "external_ref_type": req.external_ref_type,
+                    "external_ref_id": req.external_ref_id,
+                    "idempotency_key": req.idempotency_key,
+                    "meta": req.meta,
+                },
+            )
+            resp = await self.pricing_client.reserve(req)
+            reserve_status = str(self._pricing_resp_get(resp, "status", "reserved") or "reserved")
+
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="reserved",
+                variant_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
+                sku_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
+                leaf_sku_code=self._pricing_resp_get(resp, "sku_code") or leaf_sku_code,
+                reservation_id=self._pricing_resp_get(resp, "reservation_id"),
+                quote_id=self._pricing_resp_get(resp, "quote_id"),
+                reserved_units=self._pricing_resp_get(resp, "reserved_units") or pricing.get("estimated_units"),
+                reservation_status=reserve_status,
+                amount=self._pricing_resp_get(resp, "amount"),
+                currency=self._pricing_resp_get(resp, "currency"),
+                billing_mode=self._pricing_resp_get(resp, "billing_mode"),
+                billing_account_id=self._pricing_resp_get(resp, "billing_account_id"),
+                settlement_mode=self._pricing_resp_get(resp, "settlement_mode"),
+                pricing_mode=self._pricing_resp_get(resp, "pricing_mode"),
+                entitlement_source=self._pricing_resp_get(resp, "entitlement_source"),
+                entitlement_reason=self._pricing_resp_get(resp, "entitlement_reason"),
+                tier_code=self._pricing_resp_get(resp, "tier_code"),
+                meta=meta,
+                disabled_reason=None,
+            )
+            await self._persist_pricing_block(job_id, pricing)
+            return pricing
+        except Exception as e:
+            logger.exception(
+                "fusion_pricing_reserve_failed",
+                extra={
+                    "job_id": job_id,
+                    "user_id": user_id,
+                    "variant_code": variant_code,
+                    "leaf_sku_code": leaf_sku_code,
+                },
+            )
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="reservation_failed",
+                variant_code=variant_code,
+                sku_code=variant_code,
+                leaf_sku_code=leaf_sku_code,
+                meta=meta,
+                error=str(e),
+            )
+            await self._persist_pricing_block(job_id, pricing)
+            if isinstance(e, PricingClientError):
+                raise
+            raise PricingClientError(str(e)) from e
+
+    async def _commit_pricing_for_job(
+        self,
+        *,
+        job_id: str,
+        user_id: str,
+        pricing: Dict[str, Any],
+        actual_units: int,
+    ) -> Dict[str, Any]:
+        if not self._pricing_enabled():
+            return pricing
+
+        latest_pricing = await self._load_latest_pricing(job_id)
+        if latest_pricing:
+            pricing = latest_pricing
+
+        reservation_id = str(pricing.get("reservation_id") or "").strip()
+        state = str(pricing.get("state") or "").strip().lower()
+
+        if (not reservation_id) or (state not in {"reserved", "commit_failed"}):
+            awaited = await self._await_reserved_pricing(job_id)
+            if awaited:
+                pricing = awaited
+                reservation_id = str(pricing.get("reservation_id") or "").strip()
+                state = str(pricing.get("state") or "").strip().lower()
+
+        if not reservation_id:
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="commit_failed",
+                actual_units=str(max(1, int(actual_units))),
+                error="missing_reservation_id_at_commit",
+            )
+            await self._persist_pricing_block(job_id, pricing)
+            return pricing
+
+        if state not in {"reserved", "commit_failed"}:
+            return pricing
+
+        variant_code = str(
+            pricing.get("variant_code")
+            or pricing.get("sku_code")
+            or self._fusion_pricing_variant_code()
+        ).strip() or self._fusion_pricing_variant_code()
+        leaf_sku_code = str(
+            pricing.get("leaf_sku_code") or self._fusion_pricing_leaf_sku_code()
+        ).strip() or self._fusion_pricing_leaf_sku_code()
+
+        try:
+            resp = await self.pricing_client.commit(
+                PricingCommitRequest(
+                    user_id=str(user_id),
+                    reservation_id=reservation_id,
+                    actual_units=str(max(1, int(actual_units))),
+                    external_ref_type="studio_job",
+                    external_ref_id=str(job_id),
+                    idempotency_key=f"svc-fusion:job:{job_id}:commit",
+                    meta={
+                        "variant_code": variant_code,
+                        "sku_code": variant_code,
+                        "leaf_sku_code": leaf_sku_code,
+                        "minutes": str(max(1, int(actual_units))),
+                        "service_action": pricing.get("service_action"),
+                        "requested_units": pricing.get("estimated_units"),
+                    },
+                )
+            )
+            commit_status = str(self._pricing_resp_get(resp, "status", "committed") or "committed")
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="committed",
+                variant_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
+                sku_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
+                leaf_sku_code=self._pricing_resp_get(resp, "sku_code") or leaf_sku_code,
+                actual_units=str(max(1, int(actual_units))),
+                commit_status=commit_status,
+                reservation_status=commit_status,
+                ledger_entry_id=self._pricing_resp_get(resp, "ledger_entry_id"),
+                billed_units=self._pricing_resp_get(resp, "billed_units") or str(max(1, int(actual_units))),
+                amount=self._pricing_resp_get(resp, "amount"),
+                currency=self._pricing_resp_get(resp, "currency"),
+                billing_mode=self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
+                billing_account_id=self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
+                settlement_mode=self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
+                entitlement_source=self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
+                disabled_reason=None,
+            )
+            await self._persist_pricing_block(job_id, pricing)
+            return pricing
+        except Exception as e:
+            logger.exception(
+                "fusion_pricing_commit_failed",
+                extra={"job_id": job_id, "reservation_id": reservation_id, "user_id": user_id},
+            )
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="commit_failed",
+                actual_units=str(max(1, int(actual_units))),
+                error=str(e),
+            )
+            await self._persist_pricing_block(job_id, pricing)
+            return pricing
+
+    async def _release_pricing_for_job(
+        self,
+        *,
+        job_id: str,
+        user_id: str,
+        pricing: Dict[str, Any],
+        reason: str,
+    ) -> Dict[str, Any]:
+        if not self._pricing_enabled():
+            return pricing
+
+        latest_pricing = await self._load_latest_pricing(job_id)
+        if latest_pricing:
+            pricing = latest_pricing
+
+        reservation_id = str(pricing.get("reservation_id") or "").strip()
+        state = str(pricing.get("state") or "").strip().lower()
+
+        if (not reservation_id) or (state not in {"reserved", "release_failed"}):
+            awaited = await self._await_reserved_pricing(job_id)
+            if awaited:
+                pricing = awaited
+                reservation_id = str(pricing.get("reservation_id") or "").strip()
+                state = str(pricing.get("state") or "").strip().lower()
+
+        if not reservation_id:
+            return pricing
+
+        if state not in {"reserved", "release_failed"}:
+            return pricing
+
+        variant_code = str(
+            pricing.get("variant_code")
+            or pricing.get("sku_code")
+            or self._fusion_pricing_variant_code()
+        ).strip() or self._fusion_pricing_variant_code()
+        leaf_sku_code = str(
+            pricing.get("leaf_sku_code") or self._fusion_pricing_leaf_sku_code()
+        ).strip() or self._fusion_pricing_leaf_sku_code()
+
+        try:
+            resp = await self.pricing_client.release(
+                PricingReleaseRequest(
+                    user_id=str(user_id),
+                    reservation_id=reservation_id,
+                    reason=reason,
+                    external_ref_type="studio_job",
+                    external_ref_id=str(job_id),
+                    idempotency_key=f"svc-fusion:job:{job_id}:release",
+                    meta={
+                        "variant_code": variant_code,
+                        "sku_code": variant_code,
+                        "leaf_sku_code": leaf_sku_code,
+                        "minutes": str(pricing.get("estimated_units") or "1"),
+                        "service_action": pricing.get("service_action"),
+                    },
+                )
+            )
+            release_status = str(self._pricing_resp_get(resp, "status", "released") or "released")
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="released",
+                variant_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
+                sku_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
+                leaf_sku_code=self._pricing_resp_get(resp, "sku_code") or leaf_sku_code,
+                release_status=release_status,
+                reservation_status=release_status,
+                released_units=self._pricing_resp_get(resp, "released_units"),
+                billing_mode=self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
+                billing_account_id=self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
+                settlement_mode=self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
+                entitlement_source=self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
+                disabled_reason=None,
+            )
+            await self._persist_pricing_block(job_id, pricing)
+            return pricing
+        except Exception as e:
+            logger.exception(
+                "fusion_pricing_release_failed",
+                extra={"job_id": job_id, "user_id": user_id, "reason": reason},
+            )
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="release_failed",
+                error=str(e),
+            )
+            await self._persist_pricing_block(job_id, pricing)
+            return pricing
+
+    # -------------------------------------------------------------------------
+    # Job create + input resolution
+    # -------------------------------------------------------------------------
     async def create_job(self, user_id: str, req: FusionJobCreate) -> str:
         """
         Create a new fusion job.
@@ -126,6 +863,8 @@ class FusionOrchestrator:
         IMPORTANT:
         - Prefer stable IDs (artifact IDs / heygen_talking_photo_id / image_key) for hashing.
         - If a URL is provided (SAS), strip query string for stability.
+        - Pricing-enabled jobs start as pricing_pending and only become queued after reserve succeeds.
+        - Insufficient credits is a soft product block: return a blocked job with job_id.
         """
         face_artifact_id = getattr(req, "face_artifact_id", None)
 
@@ -135,40 +874,102 @@ class FusionOrchestrator:
         stable_spec: Dict[str, Any] = {
             "provider": req.provider,
             "voice_mode": req.voice_mode.value,
-
             "face_artifact_id": str(face_artifact_id) if face_artifact_id else None,
             "heygen_talking_photo_id": (
                 req.heygen_talking_photo_id.strip() if req.heygen_talking_photo_id else None
             ),
-            # kept for back-compat request hashing only
             "image_key": (req.image_key.strip() if req.image_key else None),
-
             "audio_artifact_id": str(audio_artifact_id) if audio_artifact_id else None,
-
             "face_image_url_base": (
                 _url_base(str(req.face_image_url)) if getattr(req, "face_image_url", None) else None
             ),
             "voice_audio_url_base": (
                 _url_base(str(voice_audio.audio_url)) if (voice_audio and voice_audio.audio_url) else None
             ),
-
             "voice_id": req.voice_tts.voice_id if req.voice_tts else None,
             "script": req.voice_tts.script if req.voice_tts else None,
-
             "video": req.video.model_dump(),
             "payload_version": f"{settings.HEYGEN_AV4_PAYLOAD_VERSION}.v2",
         }
 
-        stable_spec = {k: v for k, v in stable_spec.items() if v is not None}
+        disable_create_dedupe = str(os.getenv("DF_FUSION_DISABLE_CREATE_DEDUPE", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+        }
+        if disable_create_dedupe:
+            stable_spec["request_nonce"] = uuid4().hex
 
+        stable_spec = {k: v for k, v in stable_spec.items() if v is not None}
         req_hash = request_hash(stable_spec)
+
+        pricing_enabled = self._pricing_enabled()
+        initial_status = "pricing_pending" if pricing_enabled else "queued"
 
         job_id = await self.jobs.insert_job(
             user_id=user_id,
             request_hash=req_hash,
             payload=req.model_dump(),
+            initial_status=initial_status,
         )
+
+        pricing = self._build_initial_pricing_block(req)
+        await self._persist_pricing_block(job_id, pricing)
+
+        if self._pricing_required() and not pricing_enabled:
+            reason = self._pricing_disabled_reason()
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="disabled",
+                error=reason,
+                disabled_reason=reason,
+            )
+            await self._persist_pricing_block(job_id, pricing)
+            try:
+                await self.jobs.set_status(
+                    job_id,
+                    "failed",
+                    error_code="PRICING_CLIENT_DISABLED",
+                    error_message=reason,
+                )
+            except Exception:
+                logger.exception("fusion_set_failed_status_pricing_disabled", extra={"job_id": job_id})
+            raise PricingClientError(reason)
+
+        if pricing_enabled:
+            try:
+                await self._reserve_pricing_for_job(
+                    job_id=job_id,
+                    user_id=str(user_id),
+                    pricing=pricing,
+                )
+                await self.jobs.set_status(job_id, "queued")
+            except PricingClientError as e:
+                error_code = _extract_pricing_error_code(e)
+                blocked = error_code == "PRICING_INSUFFICIENT_CREDITS"
+
+                try:
+                    await self.jobs.set_status(
+                        job_id,
+                        "blocked" if blocked else "failed",
+                        error_code=error_code,
+                        error_message=str(e),
+                    )
+                except Exception:
+                    logger.exception(
+                        "fusion_set_failed_status_after_reservation_error",
+                        extra={"job_id": job_id},
+                    )
+
+                if blocked:
+                    return job_id
+
+                raise
+
         return job_id
+
+
 
     async def _resolve_face_url(self, job_id: str, req: FusionJobCreate) -> str:
         """
@@ -269,7 +1070,6 @@ class FusionOrchestrator:
             )
             return talking_photo_id
 
-        # Back-compat alias only. Some installs may already persist the look id here.
         if getattr(req, "image_key", None):
             talking_photo_id = str(req.image_key).strip()
             if talking_photo_id:
@@ -283,9 +1083,7 @@ class FusionOrchestrator:
                 return talking_photo_id
 
         face_url = await self._resolve_face_url(job_id, req)
-
-        # Keep the old asset client call as best-effort only.
-        img_upload = await self.assets.upload_image_asset_from_url(face_url)
+        img_upload = await self.assets.create_talking_photo_from_url(face_url)
 
         talking_photo_id = _extract_talking_photo_id(img_upload)
         if talking_photo_id:
@@ -309,11 +1107,14 @@ class FusionOrchestrator:
             )
 
         raise ValueError(
-            "heygen_talking_photo_id is required for /v2/video/generate photo-avatar flow. "
+            "heygen_talking_photo_id is required for AV4/talking-photo flow. "
             "Provide req.heygen_talking_photo_id (avatar look id), or upgrade HeyGenAssetsClient "
             "to create/return a Photo Avatar talking_photo_id instead of only image_key."
         )
 
+    # -------------------------------------------------------------------------
+    # Job runner
+    # -------------------------------------------------------------------------
     async def run_job(self, job_id: str) -> None:
         job = await self.jobs.get_job(job_id)
         if not job:
@@ -327,8 +1128,7 @@ class FusionOrchestrator:
 
         payload_json = job["payload_json"]
         if isinstance(payload_json, str):
-            import json as _json
-            payload_json = _json.loads(payload_json)
+            payload_json = json.loads(payload_json)
         if not isinstance(payload_json, dict):
             raise ValueError(f"Unexpected payload_json type: {type(payload_json)}")
 
@@ -341,6 +1141,7 @@ class FusionOrchestrator:
             f"{settings.HEYGEN_AV4_PAYLOAD_VERSION}.v2",
             req_hash,
         )
+        provider_idem = f"{idem}:{job_id}"
 
         run_id: Optional[str] = None
         provider_job_id: Optional[str] = None
@@ -348,20 +1149,52 @@ class FusionOrchestrator:
         audio_url_to_use: Optional[str] = None
         last_poll = None
         performance_id: Optional[str] = None
+        pricing: Dict[str, Any] = {}
 
         user_id = str(job.get("user_id") or "").strip()
 
         try:
+            if self._pricing_required() and not self._pricing_enabled():
+                reason = self._pricing_disabled_reason()
+                await self.jobs.set_status(
+                    job_id,
+                    "failed",
+                    error_code="PRICING_CLIENT_DISABLED",
+                    error_message=reason,
+                )
+                return
+
+            pricing = await self._load_latest_pricing(job_id)
+            if self._pricing_enabled():
+                latest_pricing = await self._await_reserved_pricing(job_id)
+                if latest_pricing:
+                    pricing = latest_pricing
+
+                pricing_state = str(pricing.get("state") or "").strip().lower()
+                reservation_id = str(pricing.get("reservation_id") or "").strip()
+
+                if pricing.get("enabled") and pricing_state == "reservation_failed":
+                    await self.jobs.set_status(
+                        job_id,
+                        "failed",
+                        error_code="PRICING_RESERVATION_FAILED",
+                        error_message=str(pricing.get("error") or "Pricing reservation failed"),
+                    )
+                    return
+
+                if pricing.get("enabled") and not reservation_id:
+                    await self.jobs.set_status(
+                        job_id,
+                        "failed",
+                        error_code="PRICING_NOT_RESERVED",
+                        error_message="Pricing reservation did not complete before job execution",
+                    )
+                    return
+
             await self.steps.upsert_step(job_id, StepCode.provider_submit.value, "running", attempt=0)
 
-            # -------------------------
-            # FACE: resolve talking_photo_id
-            # -------------------------
             talking_photo_id = await self._resolve_talking_photo_id(job_id, req)
 
-            # -------------------------
-            # AUDIO: resolve runtime audio URL if voice_mode=audio
-            # -------------------------
             if req.voice_mode.value == "audio":
                 audio_url_to_use = await self._resolve_audio_url(job_id, req)
 
@@ -373,7 +1206,6 @@ class FusionOrchestrator:
                     meta_json={"provider": "azure_blob"},
                 )
 
-                # keep legacy kind for easier debugging in old dashboards
                 await self.artifacts.add_artifact(
                     job_id,
                     "heygen_audio_url",
@@ -382,9 +1214,6 @@ class FusionOrchestrator:
                     meta_json={"provider": "azure_blob"},
                 )
 
-            # -------------------------
-            # Build + Submit V2
-            # -------------------------
             video_title = f"desifaces_fusion_{job_id}"
             av4_payload = build_av4_payload(
                 req,
@@ -402,29 +1231,33 @@ class FusionOrchestrator:
                     meta_json={
                         "talking_photo_id": talking_photo_id,
                         "audio_url_present": bool(audio_url_to_use),
-                        "idempotency_key": idem,
+                        "idempotency_key": provider_idem,
                     },
                 )
             except Exception:
                 pass
 
-            existing = await self.runs.get_by_idempotency_key(idem)
-            if existing and existing.get("provider_job_id"):
-                provider_job_id = str(existing["provider_job_id"])
-                run_id = str(existing["id"])
+            existing = self._coerce_dict(await self.runs.get_by_idempotency_key(provider_idem))
+            existing_provider_job_id = str(existing.get("provider_job_id") or "").strip()
+
+            if existing_provider_job_id:
+                provider_job_id = existing_provider_job_id
+                run_id = str(existing.get("id") or "")
                 logger.info(
-                    "reuse_provider_job",
-                    extra={"job_id": job_id, "provider_job_id": provider_job_id, "idempotency_key": idem},
+                    "reuse_provider_job_same_job_only",
+                    extra={"job_id": job_id, "provider_job_id": provider_job_id, "idempotency_key": provider_idem},
                 )
             else:
                 run_id = await self.runs.create_run(
                     job_id=job_id,
                     provider=provider_name,
-                    idempotency_key=idem,
+                    idempotency_key=provider_idem,
                     request_json=av4_payload,
                 )
-                submit_res = await self.provider.submit(av4_payload, idem)
+                submit_res = await self.provider.submit(av4_payload, provider_idem)
                 provider_job_id = submit_res.provider_job_id
+                if not provider_job_id:
+                    raise HeyGenApiError("provider_job_id missing after submit")
                 await self.runs.mark_submitted(run_id, provider_job_id, submit_res.raw_response)
 
             if not provider_job_id:
@@ -437,7 +1270,7 @@ class FusionOrchestrator:
                 attempt=0,
                 meta_json={
                     "provider_job_id": provider_job_id,
-                    "idempotency_key": idem,
+                    "idempotency_key": provider_idem,
                     "talking_photo_id": talking_photo_id,
                 },
             )
@@ -451,7 +1284,7 @@ class FusionOrchestrator:
                 meta_json={
                     "job_id": job_id,
                     "request_hash": req_hash,
-                    "idempotency_key": idem,
+                    "idempotency_key": provider_idem,
                     "talking_photo_id": talking_photo_id,
                     "voice_mode": req.voice_mode.value,
                     "payload_version": f"{settings.HEYGEN_AV4_PAYLOAD_VERSION}.v2",
@@ -469,21 +1302,43 @@ class FusionOrchestrator:
 
             started = asyncio.get_running_loop().time()
             last_status: Optional[str] = None
+            poll_errors = 0
+            provider_timeout_s = _provider_poll_timeout_seconds()
+            poll_interval_s = _provider_poll_interval_seconds()
 
             while True:
-                if (asyncio.get_running_loop().time() - started) > settings.JOB_POLL_MAX_SECONDS:
-                    raise HeyGenApiError("Provider polling timed out")
+                elapsed = asyncio.get_running_loop().time() - started
+                if elapsed > provider_timeout_s:
+                    raise HeyGenApiError(f"Provider polling timed out after {int(elapsed)}s")
 
-                poll = await self.provider.poll(provider_job_id)
+                try:
+                    poll = await self.provider.poll(provider_job_id)
+                    poll_errors = 0
+                except Exception as exc:
+                    poll_errors += 1
+                    if poll_errors >= 5:
+                        raise HeyGenApiError(f"Provider poll failed repeatedly: {exc}") from exc
+                    await asyncio.sleep(poll_interval_s)
+                    continue
+
                 last_poll = poll
 
-                if run_id and poll.status != last_status:
-                    last_status = poll.status
+                raw_status = str(getattr(poll, "status", None) or "").strip()
+                normalized_status = _normalize_provider_status(raw_status)
+                video_url = str(getattr(poll, "video_url", None) or "").strip()
+
+                if run_id and raw_status != last_status:
+                    last_status = raw_status
                     try:
                         await self.runs.update_status(
                             run_id,
-                            poll.status,
-                            meta_json={"raw": poll.raw_response, "provider_job_id": provider_job_id},
+                            normalized_status if normalized_status != "unknown" else (raw_status or "processing"),
+                            meta_json={
+                                "raw": poll.raw_response,
+                                "provider_job_id": provider_job_id,
+                                "raw_status": raw_status,
+                                "normalized_status": normalized_status,
+                            },
                         )
                     except Exception:
                         logger.warning(
@@ -491,37 +1346,71 @@ class FusionOrchestrator:
                             extra={"job_id": job_id, "run_id": run_id},
                         )
 
-                if poll.status == "processing":
-                    await asyncio.sleep(settings.JOB_POLL_INTERVAL_SECONDS)
+                if video_url:
+                    if run_id:
+                        await self.runs.update_status(
+                            run_id,
+                            "succeeded",
+                            meta_json={
+                                "raw": poll.raw_response,
+                                "provider_job_id": provider_job_id,
+                                "raw_status": raw_status,
+                                "normalized_status": normalized_status,
+                            },
+                        )
+                    await self.steps.upsert_step(job_id, StepCode.provider_poll.value, "succeeded", attempt=0)
+                    break
+
+                if normalized_status == "processing":
+                    await asyncio.sleep(poll_interval_s)
                     continue
 
-                if poll.status == "failed":
+                if normalized_status == "failed":
                     if run_id:
                         await self.runs.update_status(
                             run_id,
                             "failed",
-                            meta_json={"error": poll.error_message, "raw": poll.raw_response},
+                            meta_json={
+                                "error": poll.error_message or "Provider failed",
+                                "raw": poll.raw_response,
+                                "provider_job_id": provider_job_id,
+                                "raw_status": raw_status,
+                                "normalized_status": normalized_status,
+                            },
                         )
-                    raise HeyGenApiError(poll.error_message or "Provider failed")
+                    raise HeyGenApiError(poll.error_message or f"Provider failed with status={raw_status!r}")
 
-                if not poll.video_url:
+                if normalized_status == "canceled":
                     if run_id:
                         await self.runs.update_status(
                             run_id,
                             "failed",
-                            meta_json={"error": "Provider success but missing video_url", "raw": poll.raw_response},
+                            meta_json={
+                                "error": "Provider canceled",
+                                "raw": poll.raw_response,
+                                "provider_job_id": provider_job_id,
+                                "raw_status": raw_status,
+                                "normalized_status": normalized_status,
+                            },
+                        )
+                    raise HeyGenApiError(f"Provider canceled with status={raw_status!r}")
+
+                if normalized_status == "succeeded":
+                    if run_id:
+                        await self.runs.update_status(
+                            run_id,
+                            "failed",
+                            meta_json={
+                                "error": "Provider success but missing video_url",
+                                "raw": poll.raw_response,
+                                "provider_job_id": provider_job_id,
+                                "raw_status": raw_status,
+                                "normalized_status": normalized_status,
+                            },
                         )
                     raise HeyGenApiError("Provider returned succeeded but video_url is missing")
 
-                if run_id:
-                    await self.runs.update_status(
-                        run_id,
-                        "succeeded",
-                        meta_json={"raw": poll.raw_response, "provider_job_id": provider_job_id},
-                    )
-
-                await self.steps.upsert_step(job_id, StepCode.provider_poll.value, "succeeded", attempt=0)
-                break
+                await asyncio.sleep(poll_interval_s)
 
             await self.steps.upsert_step(job_id, StepCode.finalize.value, "running", attempt=0)
 
@@ -588,6 +1477,13 @@ class FusionOrchestrator:
                         extra={"job_id": job_id, "performance_id": performance_id},
                     )
 
+            pricing = await self._commit_pricing_for_job(
+                job_id=job_id,
+                user_id=user_id,
+                pricing=pricing,
+                actual_units=1,
+            )
+
             await self.steps.upsert_step(job_id, StepCode.finalize.value, "succeeded", attempt=0)
             await self.jobs.set_status(job_id, "succeeded")
             return
@@ -607,6 +1503,16 @@ class FusionOrchestrator:
                     "performance_id": performance_id,
                 },
             )
+
+            try:
+                pricing = await self._release_pricing_for_job(
+                    job_id=job_id,
+                    user_id=user_id,
+                    pricing=pricing,
+                    reason=code.lower(),
+                )
+            except Exception:
+                logger.exception("fusion_pricing_release_in_except_failed", extra={"job_id": job_id})
 
             try:
                 if run_id:
@@ -636,7 +1542,7 @@ class FusionOrchestrator:
                         meta_json={
                             "job_id": job_id,
                             "request_hash": req_hash,
-                            "idempotency_key": idem,
+                            "idempotency_key": provider_idem,
                             "user_id": str(job["user_id"]),
                         },
                     )

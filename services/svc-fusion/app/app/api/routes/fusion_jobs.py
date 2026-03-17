@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from urllib.parse import urlparse
 
@@ -7,9 +8,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.deps import RequireFusionEnabled, get_current_user_id
 from app.db import get_pool
-from app.domain.models import FusionJobCreate, FusionJobView, StepView, ArtifactView
+from app.domain.models import ArtifactView, FusionJobCreate, FusionJobView, StepView
 from app.domain.validators import validate_fusion_request
-from app.services.fusion_orchestrator import FusionOrchestrator
+from app.services.fusion_orchestrator import FusionOrchestrator, PricingClientError
 from app.services.artifact_service import ArtifactService
 from app.repos.fusion_jobs_repo import FusionJobsRepo
 from app.repos.steps_repo import StepsRepo
@@ -32,13 +33,77 @@ def _is_azure_blob_url(url: str) -> bool:
         return False
 
 
-# Optional: only mint SAS for these kinds (tune as you like)
+def _coerce_dict(v):
+    if v is None:
+        return {}
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            vv = json.loads(v)
+            return vv if isinstance(vv, dict) else {}
+        except Exception:
+            return {}
+    try:
+        if hasattr(v, "keys"):
+            return {k: v[k] for k in v.keys()}
+    except Exception:
+        pass
+    try:
+        vv = dict(v)
+        return vv if isinstance(vv, dict) else {}
+    except Exception:
+        return {}
+
+
+def _extract_pricing_view(job) -> dict | None:
+    payload = _coerce_dict(job.get("payload_json"))
+    meta = _coerce_dict(job.get("meta_json"))
+
+    pricing = _coerce_dict(payload.get("pricing"))
+    if pricing:
+        return pricing
+
+    pricing = _coerce_dict(meta.get("pricing"))
+    if pricing:
+        return pricing
+
+    return None
+
+
+def _raise_http_for_pricing_error(exc: Exception) -> None:
+    msg = str(exc or "")
+
+    if "PRICING_CLIENT_DISABLED" in msg or "pricing client unavailable" in msg.lower():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="PRICING_CLIENT_DISABLED",
+        )
+
+    if "PRICING_UNKNOWN_OR_INACTIVE_VARIANT" in msg:
+        raise HTTPException(
+            status_code=status.HTTP_424_FAILED_DEPENDENCY,
+            detail="PRICING_UNKNOWN_OR_INACTIVE_VARIANT",
+        )
+
+    if "PRICING_VARIANT_ZERO_QTY_LINES" in msg:
+        raise HTTPException(
+            status_code=status.HTTP_424_FAILED_DEPENDENCY,
+            detail="PRICING_VARIANT_ZERO_QTY_LINES",
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_424_FAILED_DEPENDENCY,
+        detail="PRICING_RESERVATION_FAILED",
+    )
+
+
 _SAS_KINDS = {
     "audio",
     "image",
     "face",
     "face_image",
-    "video",  # if you later persist videos into azure blob
+    "video",
     "resolved_face_sas_url",
     "resolved_audio_sas_url",
 }
@@ -47,26 +112,34 @@ _SAS_KINDS = {
 @router.post("/jobs", dependencies=[RequireFusionEnabled], response_model=FusionJobView)
 async def create_job(
     req: FusionJobCreate,
-    user_id: str = Depends(get_current_user_id),  # UUID string
+    user_id: str = Depends(get_current_user_id),
 ) -> FusionJobView:
     validate_fusion_request(req)
 
     pool = await get_pool()
     orch = FusionOrchestrator(pool)
+    jobs = FusionJobsRepo(pool)
 
-    job_id = await orch.create_job(user_id=user_id, req=req)
-    return FusionJobView(job_id=job_id, status="queued")
+    try:
+        job_id = await orch.create_job(user_id=user_id, req=req)
+    except PricingClientError as e:
+        _raise_http_for_pricing_error(e)
+
+    job = await jobs.get_job(job_id)
+    if not job:
+        return FusionJobView(job_id=job_id, status="queued")
+
+    return FusionJobView(
+        job_id=str(job["id"]),
+        status=str(job["status"]),
+        error_code=job.get("error_code"),
+        error_message=job.get("error_message"),
+        pricing=_extract_pricing_view(job),
+    )
 
 
 @router.get("/jobs/{job_id}", dependencies=[RequireFusionEnabled], response_model=FusionJobView)
 async def get_job(job_id: str) -> FusionJobView:
-    """
-    Get job status, steps, and artifacts.
-
-    UX behavior:
-      - For Azure Blob artifacts, mint a fresh read SAS before returning,
-        so UI playback/download doesn't rely on stale SAS URLs.
-    """
     pool = await get_pool()
     jobs = FusionJobsRepo(pool)
     steps = StepsRepo(pool)
@@ -80,7 +153,6 @@ async def get_job(job_id: str) -> FusionJobView:
     step_rows = await steps.list_steps(job_id)
     artifact_rows = await artifacts.list_artifacts(job_id)
 
-    # 1) Best-effort provider_job_id discovery (prefer provider_runs)
     provider_job_id = None
     try:
         async with pool.acquire() as conn:
@@ -98,7 +170,6 @@ async def get_job(job_id: str) -> FusionJobView:
     except Exception as e:
         logger.debug("provider_job_id_lookup_failed job_id=%s err=%s", job_id, str(e))
 
-    # fallback: scan steps meta_json
     if not provider_job_id:
         for step in step_rows:
             meta = step.get("meta_json")
@@ -107,7 +178,6 @@ async def get_job(job_id: str) -> FusionJobView:
                 if provider_job_id:
                     break
 
-    # 2) Mint fresh SAS for Azure Blob artifacts
     resolved_artifacts: list[ArtifactView] = []
     for a in artifact_rows:
         kind = str(a.get("kind") or "")
@@ -116,10 +186,8 @@ async def get_job(job_id: str) -> FusionJobView:
 
         try:
             if kind in _SAS_KINDS and _is_azure_blob_url(url):
-                # IMPORTANT: mint_read_sas_for_artifact must be robust to bad storage_path.
                 url = await artifact_svc.mint_read_sas_for_artifact(dict(a), ttl_hours=2)
         except Exception as e:
-            # Don't fail the whole response
             logger.debug(
                 "sas_mint_failed job_id=%s kind=%s url=%s err=%s",
                 job_id,
@@ -136,6 +204,7 @@ async def get_job(job_id: str) -> FusionJobView:
         provider_job_id=provider_job_id,
         error_code=job.get("error_code"),
         error_message=job.get("error_message"),
+        pricing=_extract_pricing_view(job),
         steps=[
             StepView(
                 step_code=str(r["step_code"]),

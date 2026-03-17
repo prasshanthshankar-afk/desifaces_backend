@@ -1,0 +1,421 @@
+{
+  "budget": {
+    "budget_usd_cap": 100.0,
+    "estimated_cost_per_generated_image_usd": 0.04,
+    "estimated_images_generated": 86,
+    "estimated_total_cost_usd": 3.44
+  },
+  "counts": {
+    "budget_exhausted": 0,
+    "failed_jobs": 23,
+    "generated_images_est": 86,
+    "jobs_started": 43,
+    "rejected": 20,
+    "review": 0,
+    "skipped_pairs": 25,
+    "test": 0,
+    "total": 0,
+    "train": 0,
+    "val": 0
+  },
+  "created_at": "2026-03-14T14:44:43.621172+00:00",
+  "dataset_id": "e51065ab-72ec-4cd9-bce0-acd687c6c912",
+  "dataset_name": "non_saree_vton_bootstrap_20260314_135716",
+  "dataset_prefix": "training/non_saree_vton/20260314_135717/e51065ab-72ec-4cd9-bce0-acd687c6c912",
+  "examples": [],
+  "rejected": [
+    {
+      "component_code": "hoodie",
+      "expected_family": "hoodie",
+      "garment_kind": "upper_body",
+      "model_code": "female_west_bengal_fullbody_002",
+      "original_output_url": "https://desifacesstore.blob.core.windows.net/commerce-output/commerce/vton/fashn/dccb05ca-abb9-4f08-a01b-ae7836d9ebf8/2e4719f4-e6ea-47a5-b1da-92e85f9ee12e-0/9b804c0a2ba77472e5e1cc18627ef7fea45b5e56425866f70629b8c5c3d3e32d/tryon_fashn_0da81f1ae86f762a49f66d2399594b30.png?se=2026-03-15T13%3A59%3A07Z&sp=r&sv=2026-02-06&sr=b&sig=bpvZ9RWds%2BOIGle8%2BIYnwTMbT6/YScDFqkXnrXp6H8I%3D",
+      "outfit_kind": "upper_body",
+      "pair_slug": "hoodie_0_Minimalist_back_view_of_a_person_wearing_a_white_hoodie_ideal_for_mockup_purposes_female_west_bengal_fullbody_0",
+      "qc": {
+        "accepted": false,
+        "clip": {
+          "all_product_scores": {
+            "blazer": 4.832171543966979e-05,
+            "dress": 1.2617981155926827e-05,
+            "generic_product": 0.013896330259740353,
+            "hoodie": 0.9776945114135742,
+            "jeans": 0.0001303025201195851,
+            "kurta": 0.0008465441060252488,
+            "lehenga": 5.071002306067385e-05,
+            "salwar_suit": 0.0003419831919018179,
+            "sherwani": 4.793460902874358e-05
+          },
+          "all_wearing_scores": {
+            "blazer": 2.5549804831825895e-06,
+            "dress": 4.278385006273311e-07,
+            "generic_person": 0.0002919719263445586,
+            "hoodie": 0.006429468747228384,
+            "jeans": 2.246371514047496e-05,
+            "kurta": 1.1038077900593635e-05,
+            "lehenga": 5.296373274177313e-05,
+            "salwar_suit": 0.00011679149611154571,
+            "sherwani": 3.081283466599416e-06
+          },
+          "available": true,
+          "expected_product_score": 0.9776945114135742,
+          "expected_wearing_score": 0.006429468747228384,
+          "human_vs_product_margin": -0.013604358333395794,
+          "margin_over_other_family": 0.006312677251116838,
+          "margin_over_product": -0.9712650426663458,
+          "other_family": "salwar_suit",
+          "other_family_score": 0.00011679149611154571,
+          "predicted_family": "hoodie",
+          "predicted_family_score": 0.006429468747228384
+        },
+        "context": {
+          "component_code": "hoodie",
+          "dataset_id": "e51065ab-72ec-4cd9-bce0-acd687c6c912",
+          "dataset_prefix": "training/non_saree_vton/20260314_135717/e51065ab-72ec-4cd9-bce0-acd687c6c912",
+          "garment_kind": "upper_body",
+          "model_code": "female_west_bengal_fullbody_002",
+          "outfit_kind": "upper_body",
+          "pair_slug": "hoodie_0_Minimalist_back_view_of_a_person_wearing_a_white_hoodie_ideal_for_mockup_purposes_female_west_bengal_fullbody_0",
+          "quote_id": "9ee2fcd9-a786-4e22-b879-76461bb2450c",
+          "seed_name": "hoodie",
+          "studio_job_id": "2e4719f4-e6ea-47a5-b1da-92e85f9ee12e"
+        },
+        "expected_family": "hoodie",
+        "metrics": {
+          "garment_hash_distance": 97,
+          "garment_hist_similarity": 0.1817252898862556,
+          "model_hash_distance": 86,
+          "model_hist_similarity": 0.804626060525602,
+          "source_garment": {
+            "avg_hash": 3366740866468300962792280053130592567619069654112540514414535639040,
+            "brightness_mean": 207.63392068139473,
+            "brightness_stddev": 32.90527680124858,
+            "entropy": 5.806613055641033,
+            "height": 1300,
+            "width": 867
+          },
+          "source_model": {
+            "avg_hash": 8140036087403764563704931417997444515122937147880430902777966847904175783932,
+            "brightness_mean": 171.2554842631022,
+            "brightness_stddev": 37.47180656832366,
+            "entropy": 6.0287488028553495,
+            "height": 768,
+            "width": 1024
+          },
+          "target": {
+            "avg_hash": 112200086108128020337514041489851710786846576634956087577494513649912066605112,
+            "brightness_mean": 180.05565643310547,
+            "brightness_stddev": 47.03756789606006,
+            "entropy": 5.98505250989331,
+            "height": 768,
+            "width": 1024
+          }
+        },
+        "predicted_family": "hoodie",
+        "reasons": [
+          "expected_family_wearing_score_too_low",
+          "expected_family_not_stronger_than_product_only",
+          "expected_family_not_stronger_than_other_family",
+          "target_looks_like_product_only"
+        ],
+        "status": "rejected"
+      },
+      "quote_id": "9ee2fcd9-a786-4e22-b879-76461bb2450c",
+      "rejected_az": "az://commerce-training/training/non_saree_vton/20260314_135717/e51065ab-72ec-4cd9-bce0-acd687c6c912/rejected/upper_body/hoodie_0_Minimalist_back_view_of_a_person_wearing_a_white_hoodie_ideal_for_mockup_purposes_female_west_bengal_fullbody_0_r0.png",
+      "seed_name": "hoodie",
+      "studio_job_id": "2e4719f4-e6ea-47a5-b1da-92e85f9ee12e"
+    },
+    {
+      "component_code": "hoodie",
+      "expected_family": "hoodie",
+      "garment_kind": "upper_body",
+      "model_code": "male_assam_fullbody_001",
+      "original_output_url": "https://desifacesstore.blob.core.windows.net/commerce-output/commerce/vton/fashn/dccb05ca-abb9-4f08-a01b-ae7836d9ebf8/98be875e-f920-4ae8-a868-76c4082b625d-0/22448bea436a32544029de5ced8e627df48f958fc61a5a8d152b63cbda5db6e5/tryon_fashn_60e2c84a8fdbeb44737bdbc8c7ae710d.png?se=2026-03-15T14%3A00%3A58Z&sp=r&sv=2026-02-06&sr=b&sig=gQkDefDZeMzKv8EVJJPMy32PEcNKYWsFx5fLfmnui9M%3D",
+      "outfit_kind": "upper_body",
+      "pair_slug": "hoodie_0_Minimalist_back_view_of_a_person_wearing_a_white_hoodie_ideal_for_mockup_purposes_male_assam_fullbody_001",
+      "qc": {
+        "accepted": false,
+        "clip": {
+          "all_product_scores": {
+            "blazer": 0.00014049770834390074,
+            "dress": 0.002044047461822629,
+            "generic_product": 0.023378031328320503,
+            "hoodie": 0.06344223022460938,
+            "jeans": 0.00047016452299430966,
+            "kurta": 0.8472931385040283,
+            "lehenga": 0.0002496838860679418,
+            "salwar_suit": 0.05566631630063057,
+            "sherwani": 0.003606893355026841
+          },
+          "all_wearing_scores": {
+            "blazer": 1.447477302463085e-06,
+            "dress": 4.434297352418071e-06,
+            "generic_person": 0.0008911252953112125,
+            "hoodie": 0.00025012006517499685,
+            "jeans": 1.5506559066125192e-05,
+            "kurta": 0.0010376011487096548,
+            "lehenga": 3.6948265915270895e-05,
+            "salwar_suit": 0.0014486451400443912,
+            "sherwani": 2.3194737877929583e-05
+          },
+          "available": true,
+          "expected_product_score": 0.06344223022460938,
+          "expected_wearing_score": 0.00025012006517499685,
+          "human_vs_product_margin": -0.02248690603300929,
+          "margin_over_other_family": -0.0011985250748693943,
+          "margin_over_product": -0.06319211015943438,
+          "other_family": "salwar_suit",
+          "other_family_score": 0.0014486451400443912,
+          "predicted_family": "salwar_suit",
+          "predicted_family_score": 0.0014486451400443912
+        },
+        "context": {
+          "component_code": "hoodie",
+          "dataset_id": "e51065ab-72ec-4cd9-bce0-acd687c6c912",
+          "dataset_prefix": "training/non_saree_vton/20260314_135717/e51065ab-72ec-4cd9-bce0-acd687c6c912",
+          "garment_kind": "upper_body",
+          "model_code": "male_assam_fullbody_001",
+          "outfit_kind": "upper_body",
+          "pair_slug": "hoodie_0_Minimalist_back_view_of_a_person_wearing_a_white_hoodie_ideal_for_mockup_purposes_male_assam_fullbody_001",
+          "quote_id": "1d384163-d62b-4410-a0a3-998f30b0810d",
+          "seed_name": "hoodie",
+          "studio_job_id": "98be875e-f920-4ae8-a868-76c4082b625d"
+        },
+        "expected_family": "hoodie",
+        "metrics": {
+          "garment_hash_distance": 103,
+          "garment_hist_similarity": 0.14598449129481517,
+          "model_hash_distance": 92,
+          "model_hist_similarity": 0.6672872884685013,
+          "source_garment": {
+            "avg_hash": 3366740866468300962792280053130592567619069654112540514414535639040,
+            "brightness_mean": 207.63392068139473,
+            "brightness_stddev": 32.90527680124858,
+            "entropy": 5.806613055641033,
+            "height": 1300,
+            "width": 867
+          },
+          "source_model": {
+            "avg_hash": 56130026423445177304244078535546672231023432831973038889364218420108625182816,
+            "brightness_mean": 167.991091410319,
+            "brightness_stddev": 30.155274256313064,
+            "entropy": 6.394455617969037,
+            "height": 768,
+            "width": 1024
+          },
+          "target": {
+            "avg_hash": 25329906348347548988171657325719307928034574419569886394221210978286504509440,
+            "brightness_mean": 184.9116465250651,
+            "brightness_stddev": 27.9321800781498,
+            "entropy": 5.744652047713432,
+            "height": 768,
+            "width": 1024
+          }
+        },
+        "predicted_family": "salwar_suit",
+        "reasons": [
+          "predicted_family_mismatch:salwar_suit",
+          "expected_family_wearing_score_too_low",
+          "expected_family_not_stronger_than_product_only",
+          "expected_family_not_stronger_than_other_family",
+          "target_looks_like_product_only"
+        ],
+        "status": "rejected"
+      },
+      "quote_id": "1d384163-d62b-4410-a0a3-998f30b0810d",
+      "rejected_az": "az://commerce-training/training/non_saree_vton/20260314_135717/e51065ab-72ec-4cd9-bce0-acd687c6c912/rejected/upper_body/hoodie_0_Minimalist_back_view_of_a_person_wearing_a_white_hoodie_ideal_for_mockup_purposes_male_assam_fullbody_001_r0.png",
+      "seed_name": "hoodie",
+      "studio_job_id": "98be875e-f920-4ae8-a868-76c4082b625d"
+    },
+    {
+      "component_code": "hoodie",
+      "expected_family": "hoodie",
+      "garment_kind": "upper_body",
+      "model_code": "male_delhi_fullbody_002",
+      "original_output_url": "https://desifacesstore.blob.core.windows.net/commerce-output/commerce/vton/fashn/dccb05ca-abb9-4f08-a01b-ae7836d9ebf8/78df1a0c-da03-4c05-8f79-ebb36e8b962d-0/2390212529715eae5652d5fed2bcbc13abcae88b709b8b0371913f5ad6b52f75/tryon_fashn_1523693c8030ee87debf804b6c5157bd.png?se=2026-03-15T14%3A03%3A19Z&sp=r&sv=2026-02-06&sr=b&sig=44zlkQMA8YlZuqZ0IP7V/OsK0ItVyD5mHvUINd4jY8o%3D",
+      "outfit_kind": "upper_body",
+      "pair_slug": "hoodie_1_Man_in_casual_white_hoodie_standing_against_a_neutral_background_suitable_for_lifestyle_ima_male_delhi_fullbody",
+      "qc": {
+        "accepted": false,
+        "clip": {
+          "all_product_scores": {
+            "blazer": 0.00012387410970404744,
+            "dress": 0.00034789295750670135,
+            "generic_product": 0.0444154255092144,
+            "hoodie": 0.9376406073570251,
+            "jeans": 2.7409789254306816e-05,
+            "kurta": 0.007657420355826616,
+            "lehenga": 1.1715169421222527e-05,
+            "salwar_suit": 0.0022096317261457443,
+            "sherwani": 0.00166820059530437
+          },
+          "all_wearing_scores": {
+            "blazer": 6.703551775899541e-07,
+            "dress": 7.889860853538266e-07,
+            "generic_person": 0.00047804228961467743,
+            "hoodie": 0.0052888048812747,
+            "jeans": 3.8787413814134197e-07,
+            "kurta": 1.8485858163330704e-05,
+            "lehenga": 2.517489292586106e-06,
+            "salwar_suit": 0.00010014024883275852,
+            "sherwani": 7.954945431265514e-06
+          },
+          "available": true,
+          "expected_product_score": 0.9376406073570251,
+          "expected_wearing_score": 0.0052888048812747,
+          "human_vs_product_margin": -0.043937383219599724,
+          "margin_over_other_family": 0.005188664632441942,
+          "margin_over_product": -0.9323518024757504,
+          "other_family": "salwar_suit",
+          "other_family_score": 0.00010014024883275852,
+          "predicted_family": "hoodie",
+          "predicted_family_score": 0.0052888048812747
+        },
+        "context": {
+          "component_code": "hoodie",
+          "dataset_id": "e51065ab-72ec-4cd9-bce0-acd687c6c912",
+          "dataset_prefix": "training/non_saree_vton/20260314_135717/e51065ab-72ec-4cd9-bce0-acd687c6c912",
+          "garment_kind": "upper_body",
+          "model_code": "male_delhi_fullbody_002",
+          "outfit_kind": "upper_body",
+          "pair_slug": "hoodie_1_Man_in_casual_white_hoodie_standing_against_a_neutral_background_suitable_for_lifestyle_ima_male_delhi_fullbody",
+          "quote_id": "92ac1cf2-3287-4a8a-ae12-c4aaa3f0caf1",
+          "seed_name": "hoodie",
+          "studio_job_id": "78df1a0c-da03-4c05-8f79-ebb36e8b962d"
+        },
+        "expected_family": "hoodie",
+        "metrics": {
+          "garment_hash_distance": 102,
+          "garment_hist_similarity": 0.2881464227912212,
+          "model_hash_distance": 108,
+          "model_hist_similarity": 0.6263808997583186,
+          "source_garment": {
+            "avg_hash": 56542126422864140020430047912575757592538930509520317008363951052362891248,
+            "brightness_mean": 199.96159048071863,
+            "brightness_stddev": 28.945782926276472,
+            "entropy": 5.805437621297284,
+            "height": 1253,
+            "width": 1880
+          },
+          "source_model": {
+            "avg_hash": 224390413076954233468034002054664221540913672289548776397957567674666975232,
+            "brightness_mean": 167.93984985351562,
+            "brightness_stddev": 27.043232030266292,
+            "entropy": 6.308309972651533,
+            "height": 768,
+            "width": 1024
+          },
+          "target": {
+            "avg_hash": 10855894870520739042571275555318017971597704419921324313610066370270387503104,
+            "brightness_mean": 186.06377792358398,
+            "brightness_stddev": 28.474412911719043,
+            "entropy": 5.718972228999353,
+            "height": 768,
+            "width": 1024
+          }
+        },
+        "predicted_family": "hoodie",
+        "reasons": [
+          "expected_family_wearing_score_too_low",
+          "expected_family_not_stronger_than_product_only",
+          "expected_family_not_stronger_than_other_family",
+          "target_looks_like_product_only"
+        ],
+        "status": "rejected"
+      },
+      "quote_id": "92ac1cf2-3287-4a8a-ae12-c4aaa3f0caf1",
+      "rejected_az": "az://commerce-training/training/non_saree_vton/20260314_135717/e51065ab-72ec-4cd9-bce0-acd687c6c912/rejected/upper_body/hoodie_1_Man_in_casual_white_hoodie_standing_against_a_neutral_background_suitable_for_lifestyle_ima_male_delhi_fullbody_r0.png",
+      "seed_name": "hoodie",
+      "studio_job_id": "78df1a0c-da03-4c05-8f79-ebb36e8b962d"
+    },
+    {
+      "component_code": "hoodie",
+      "expected_family": "hoodie",
+      "garment_kind": "upper_body",
+      "model_code": "male_jammu_kashmir_fullbody_001",
+      "original_output_url": "https://desifacesstore.blob.core.windows.net/commerce-output/commerce/vton/fashn/dccb05ca-abb9-4f08-a01b-ae7836d9ebf8/d066f267-2b14-4de7-b23b-65845c27dfb8-0/b3c352708323cc854889367c65ea83e3c4ef5e60399c1cc440739303540993f0/tryon_fashn_9d7ab75fe2ac4599a5962c5636d12ca2.png?se=2026-03-15T14%3A05%3A03Z&sp=r&sv=2026-02-06&sr=b&sig=DvlsVJJN8yXHDHRg2eW6cpFkJ/9P0iPsCDGRgosPtP0%3D",
+      "outfit_kind": "upper_body",
+      "pair_slug": "hoodie_1_Man_in_casual_white_hoodie_standing_against_a_neutral_background_suitable_for_lifestyle_ima_male_jammu_kashmir_",
+      "qc": {
+        "accepted": false,
+        "clip": {
+          "all_product_scores": {
+            "blazer": 0.000862191547639668,
+            "dress": 0.03654744476079941,
+            "generic_product": 0.02672308124601841,
+            "hoodie": 0.005689758807420731,
+            "jeans": 0.0003484392655082047,
+            "kurta": 0.8390182852745056,
+            "lehenga": 9.935766138369218e-05,
+            "salwar_suit": 0.07978510111570358,
+            "sherwani": 0.00262142950668931
+          },
+          "all_wearing_scores": {
+            "blazer": 7.744253707642201e-06,
+            "dress": 0.000127123057609424,
+            "generic_person": 0.0011852341704070568,
+            "hoodie": 3.957915396313183e-05,
+            "jeans": 2.064882210106589e-05,
+            "kurta": 0.0024412469938397408,
+            "lehenga": 6.425641913665459e-05,
+            "salwar_suit": 0.0043929158709943295,
+            "sherwani": 2.612840944493655e-05
+          },
+          "available": true,
+          "expected_product_score": 0.005689758807420731,
+          "expected_wearing_score": 3.957915396313183e-05,
+          "human_vs_product_margin": -0.025537847075611353,
+          "margin_over_other_family": -0.004353336717031198,
+          "margin_over_product": -0.005650179653457599,
+          "other_family": "salwar_suit",
+          "other_family_score": 0.0043929158709943295,
+          "predicted_family": "salwar_suit",
+          "predicted_family_score": 0.0043929158709943295
+        },
+        "context": {
+          "component_code": "hoodie",
+          "dataset_id": "e51065ab-72ec-4cd9-bce0-acd687c6c912",
+          "dataset_prefix": "training/non_saree_vton/20260314_135717/e51065ab-72ec-4cd9-bce0-acd687c6c912",
+          "garment_kind": "upper_body",
+          "model_code": "male_jammu_kashmir_fullbody_001",
+          "outfit_kind": "upper_body",
+          "pair_slug": "hoodie_1_Man_in_casual_white_hoodie_standing_against_a_neutral_background_suitable_for_lifestyle_ima_male_jammu_kashmir_",
+          "quote_id": "bd95069f-2725-4576-9e8f-a75d0ea31d4a",
+          "seed_name": "hoodie",
+          "studio_job_id": "d066f267-2b14-4de7-b23b-65845c27dfb8"
+        },
+        "expected_family": "hoodie",
+        "metrics": {
+          "garment_hash_distance": 102,
+          "garment_hist_similarity": 0.3582474812574613,
+          "model_hash_distance": 81,
+          "model_hist_similarity": 0.19336985521696518,
+          "source_garment": {
+            "avg_hash": 56542126422864140020430047912575757592538930509520317008363951052362891248,
+            "brightness_mean": 199.96159048071863,
+            "brightness_stddev": 28.945782926276472,
+            "entropy": 5.805437621297284,
+            "height": 1253,
+            "width": 1880
+          },
+          "source_model": {
+            "avg_hash": 162552410483690029336819729261952905224253681870590803209127174391361177152,
+            "brightness_mean": 157.91377385457358,
+            "brightness_stddev": 30.104136013602695,
+            "entropy": 6.422672224694436,
+            "height": 768,
+            "width": 1024
+          },
+          "target": {
+            "avg_hash": 7233582258908560373298231672107341198715109256063528903160181898427548827648,
+            "brightness_mean": 183.74731572469076,
+            "brightness_stddev": 38.324651301631334,
+            "entropy": 5.968419811590693,
+            "height": 768,
+            "width": 1024
+          }
+        },
+        "predicted_family": "salwar_suit",
+        "reasons": [
+          "predicted_family_mismatch:salwar_suit",
+          "expected_f

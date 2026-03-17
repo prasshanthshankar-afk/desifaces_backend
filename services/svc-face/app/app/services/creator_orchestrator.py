@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -70,6 +71,7 @@ except Exception:
 
         async def release(self, req: PricingReleaseRequest):
             raise PricingClientError("pricing client unavailable")
+
 
 from ..domain.models import (
     CreatorPlatformRequest,
@@ -276,7 +278,8 @@ class CreatorOrchestrator:
             return v
         if isinstance(v, str):
             try:
-                return json.loads(v)
+                vv = json.loads(v)
+                return vv if isinstance(vv, dict) else {}
             except Exception:
                 return {}
         return {}
@@ -318,14 +321,30 @@ class CreatorOrchestrator:
         except Exception:
             return default
 
+    @staticmethod
+    def _string_or_none(v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    @staticmethod
+    def _pricing_resp_get(resp: Any, key: str, default: Any = None) -> Any:
+        if resp is None:
+            return default
+        if isinstance(resp, dict):
+            value = resp.get(key, default)
+        else:
+            value = getattr(resp, key, default)
+        if hasattr(value, "value"):
+            try:
+                return value.value
+            except Exception:
+                return default if value is None else value
+        return value
+
     @classmethod
     def _stable_source_url_for_hash(cls, url: str) -> str:
-        """
-        Keep existing behavior for normal URLs, but if it *looks like* an Azure SAS URL,
-        strip the query to avoid "same blob, different SAS" changing request_hash.
-
-        This is intentionally conservative: only strips when query contains SAS-ish keys.
-        """
         u = (url or "").strip()
         if not u:
             return ""
@@ -341,10 +360,6 @@ class CreatorOrchestrator:
         return u
 
     async def _get_media_asset_row(self, asset_id: str) -> Optional[Dict[str, Any]]:
-        """
-        DB fallback to resolve asset_id -> storage_ref/meta_json if MediaAssetsRepo lacks get_asset().
-        Best-effort: returns None on any failure.
-        """
         try:
             q = """
             SELECT id::text as id, storage_ref, meta_json
@@ -365,9 +380,6 @@ class CreatorOrchestrator:
             return None
 
     async def _refresh_read_sas_best_effort(self, storage_ref: str, meta_json: Dict[str, Any]) -> str:
-        """
-        If storage_service supports SAS refresh, do it. Never fails.
-        """
         try:
             fn = getattr(self.storage_service, "get_readonly_sas_url", None)
             if callable(fn):
@@ -383,7 +395,7 @@ class CreatorOrchestrator:
             pass
         return storage_ref
 
-    def _validate_http_url(self, url: str) -> None:
+    def _validate_remote_http_url(self, url: str) -> None:
         u = (url or "").strip()
         p = urlparse(u)
         if p.scheme not in ("http", "https"):
@@ -430,7 +442,6 @@ class CreatorOrchestrator:
         if p.scheme == "file":
             return raw
 
-        # UUID asset id path
         if self._UUID_RE.match(raw):
             storage_ref = None
             meta_json: Dict[str, Any] = {}
@@ -528,6 +539,23 @@ class CreatorOrchestrator:
             "estimated_units": str(requested_variants),
             "unit_type": "image",
             "mode": mode,
+            "reservation_id": None,
+            "reservation_status": None,
+            "quote_id": None,
+            "reserved_units": None,
+            "actual_units": None,
+            "billed_units": None,
+            "released_units": None,
+            "amount": None,
+            "currency": None,
+            "ledger_entry_id": None,
+            "billing_mode": None,
+            "billing_account_id": None,
+            "settlement_mode": None,
+            "pricing_mode": None,
+            "entitlement_source": None,
+            "entitlement_reason": None,
+            "tier_code": None,
             "meta": {
                 "requested_variants": requested_variants,
                 "mode": mode,
@@ -538,8 +566,20 @@ class CreatorOrchestrator:
             },
         }
 
+    @staticmethod
+    def _merge_pricing_block(current: Optional[Dict[str, Any]], **updates: Any) -> Dict[str, Any]:
+        out = dict(current or {})
+        for key, value in updates.items():
+            if value is not None:
+                out[key] = value
+        return out
+
     def _pricing_from_job(self, job: Any, payload_json: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        payload = payload_json if isinstance(payload_json, dict) else self._coerce_dict(self._row_get(job, "payload_json", None))
+        payload = (
+            payload_json
+            if isinstance(payload_json, dict)
+            else self._coerce_dict(self._row_get(job, "payload_json", None))
+        )
         meta = self._coerce_dict(self._row_get(job, "meta_json", None))
 
         pricing = self._coerce_dict(payload.get("pricing"))
@@ -561,7 +601,10 @@ class CreatorOrchestrator:
                       || jsonb_build_object(
                            'pricing', $2::jsonb,
                            'pricing_state', COALESCE($3::text, ''),
-                           'pricing_enabled', $4::bool
+                           'pricing_enabled', $4::bool,
+                           'pricing_billing_mode', NULLIF($5::text, ''),
+                           'pricing_settlement_mode', NULLIF($6::text, ''),
+                           'pricing_billing_account_id', NULLIF($7::text, '')
                          ),
           updated_at = now()
         WHERE id = $1::uuid
@@ -573,9 +616,60 @@ class CreatorOrchestrator:
                 self.jobs_repo.prepare_jsonb_param(pricing or {}),
                 str(pricing.get("state") or ""),
                 bool(pricing.get("enabled", False)),
+                str(pricing.get("billing_mode") or ""),
+                str(pricing.get("settlement_mode") or ""),
+                str(pricing.get("billing_account_id") or ""),
             )
         except Exception:
             logger.exception("Failed to persist pricing block", extra={"job_id": job_id})
+
+    async def _load_latest_job_and_pricing(
+        self,
+        job_id: str,
+    ) -> Tuple[Optional[Any], Dict[str, Any], Dict[str, Any]]:
+        latest_job = await self.jobs_repo.get_job(job_id)
+        if not latest_job:
+            return None, {}, {}
+        latest_payload = self._coerce_dict(self._row_get(latest_job, "payload_json", None))
+        latest_pricing = self._pricing_from_job(latest_job, latest_payload)
+        return latest_job, latest_payload, latest_pricing
+
+    async def _await_reserved_pricing(
+        self,
+        job_id: str,
+        *,
+        max_wait_s: float = 8.0,
+        poll_s: float = 0.25,
+    ) -> Dict[str, Any]:
+        if not self.pricing_client.enabled:
+            return {}
+
+        deadline = asyncio.get_running_loop().time() + max_wait_s
+        last_pricing: Dict[str, Any] = {}
+
+        while True:
+            _, _, pricing = await self._load_latest_job_and_pricing(job_id)
+            last_pricing = pricing or {}
+
+            if not last_pricing.get("enabled"):
+                return last_pricing
+
+            state = str(last_pricing.get("state") or "").strip().lower()
+            reservation_id = str(last_pricing.get("reservation_id") or "").strip()
+
+            if state in {"reserved", "committed", "released", "reservation_failed", "commit_failed", "release_failed"}:
+                return last_pricing
+
+            if reservation_id and state in {"pending_reservation", ""}:
+                out = dict(last_pricing)
+                out["state"] = "reserved"
+                out["reservation_status"] = out.get("reservation_status") or "reserved"
+                return out
+
+            if asyncio.get_running_loop().time() >= deadline:
+                return last_pricing
+
+            await asyncio.sleep(poll_s)
 
     async def _reserve_pricing_for_job(
         self,
@@ -601,25 +695,36 @@ class CreatorOrchestrator:
 
         try:
             resp = await self.pricing_client.reserve(req)
-            pricing = dict(pricing)
-            pricing.update(
-                {
-                    "state": "reserved",
-                    "reservation_id": resp.reservation_id,
-                    "quote_id": resp.quote_id,
-                    "reserved_units": resp.reserved_units or pricing.get("estimated_units"),
-                    "reservation_status": resp.status,
-                }
+            reserve_status = str(self._pricing_resp_get(resp, "status", "reserved") or "reserved")
+
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="reserved",
+                reservation_id=self._pricing_resp_get(resp, "reservation_id"),
+                quote_id=self._pricing_resp_get(resp, "quote_id"),
+                reserved_units=self._pricing_resp_get(resp, "reserved_units") or pricing.get("estimated_units"),
+                reservation_status=reserve_status,
+                amount=self._pricing_resp_get(resp, "amount"),
+                currency=self._pricing_resp_get(resp, "currency"),
+                billing_mode=self._pricing_resp_get(resp, "billing_mode"),
+                billing_account_id=self._pricing_resp_get(resp, "billing_account_id"),
+                settlement_mode=self._pricing_resp_get(resp, "settlement_mode"),
+                pricing_mode=self._pricing_resp_get(resp, "pricing_mode"),
+                entitlement_source=self._pricing_resp_get(resp, "entitlement_source"),
+                entitlement_reason=self._pricing_resp_get(resp, "entitlement_reason"),
+                tier_code=self._pricing_resp_get(resp, "tier_code"),
             )
             await self._persist_pricing_block(job_id, pricing)
             return pricing
         except Exception as e:
-            pricing = dict(pricing)
-            pricing.update(
-                {
-                    "state": "reservation_failed",
-                    "error": str(e),
-                }
+            logger.exception(
+                "Pricing reserve failed",
+                extra={"job_id": job_id, "user_id": user_id},
+            )
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="reservation_failed",
+                error=str(e),
             )
             await self._persist_pricing_block(job_id, pricing)
             if isinstance(e, PricingClientError):
@@ -637,11 +742,30 @@ class CreatorOrchestrator:
         if not pricing.get("enabled"):
             return pricing
 
+        _, _, latest_pricing = await self._load_latest_job_and_pricing(job_id)
+        if latest_pricing:
+            pricing = latest_pricing
+
         reservation_id = str(pricing.get("reservation_id") or "").strip()
+        state = str(pricing.get("state") or "").strip().lower()
+
+        if (not reservation_id) or (state not in {"reserved", "commit_failed"}):
+            awaited = await self._await_reserved_pricing(job_id)
+            if awaited:
+                pricing = awaited
+                reservation_id = str(pricing.get("reservation_id") or "").strip()
+                state = str(pricing.get("state") or "").strip().lower()
+
         if not reservation_id:
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="commit_failed",
+                actual_units=str(max(1, int(actual_units))),
+                error="missing_reservation_id_at_commit",
+            )
+            await self._persist_pricing_block(job_id, pricing)
             return pricing
 
-        state = str(pricing.get("state") or "").strip().lower()
         if state not in {"reserved", "commit_failed"}:
             return pricing
 
@@ -661,28 +785,34 @@ class CreatorOrchestrator:
                     },
                 )
             )
-            pricing = dict(pricing)
-            pricing.update(
-                {
-                    "state": "committed",
-                    "actual_units": str(max(1, int(actual_units))),
-                    "commit_status": resp.status,
-                    "ledger_entry_id": resp.ledger_entry_id,
-                    "billed_units": resp.billed_units or str(max(1, int(actual_units))),
-                    "amount": resp.amount,
-                    "currency": resp.currency,
-                }
+            commit_status = str(self._pricing_resp_get(resp, "status", "committed") or "committed")
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="committed",
+                actual_units=str(max(1, int(actual_units))),
+                commit_status=commit_status,
+                reservation_status=commit_status,
+                ledger_entry_id=self._pricing_resp_get(resp, "ledger_entry_id"),
+                billed_units=self._pricing_resp_get(resp, "billed_units") or str(max(1, int(actual_units))),
+                amount=self._pricing_resp_get(resp, "amount"),
+                currency=self._pricing_resp_get(resp, "currency"),
+                billing_mode=self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
+                billing_account_id=self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
+                settlement_mode=self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
+                entitlement_source=self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
             )
             await self._persist_pricing_block(job_id, pricing)
             return pricing
         except Exception as e:
-            pricing = dict(pricing)
-            pricing.update(
-                {
-                    "state": "commit_failed",
-                    "actual_units": str(max(1, int(actual_units))),
-                    "error": str(e),
-                }
+            logger.exception(
+                "Pricing commit failed",
+                extra={"job_id": job_id, "reservation_id": reservation_id, "user_id": user_id},
+            )
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="commit_failed",
+                actual_units=str(max(1, int(actual_units))),
+                error=str(e),
             )
             await self._persist_pricing_block(job_id, pricing)
             return pricing
@@ -698,11 +828,23 @@ class CreatorOrchestrator:
         if not pricing.get("enabled"):
             return pricing
 
+        _, _, latest_pricing = await self._load_latest_job_and_pricing(job_id)
+        if latest_pricing:
+            pricing = latest_pricing
+
         reservation_id = str(pricing.get("reservation_id") or "").strip()
+        state = str(pricing.get("state") or "").strip().lower()
+
+        if (not reservation_id) or (state not in {"reserved", "release_failed"}):
+            awaited = await self._await_reserved_pricing(job_id)
+            if awaited:
+                pricing = awaited
+                reservation_id = str(pricing.get("reservation_id") or "").strip()
+                state = str(pricing.get("state") or "").strip().lower()
+
         if not reservation_id:
             return pricing
 
-        state = str(pricing.get("state") or "").strip().lower()
         if state not in {"reserved", "release_failed"}:
             return pricing
 
@@ -721,23 +863,29 @@ class CreatorOrchestrator:
                     },
                 )
             )
-            pricing = dict(pricing)
-            pricing.update(
-                {
-                    "state": "released",
-                    "release_status": resp.status,
-                    "released_units": resp.released_units,
-                }
+            release_status = str(self._pricing_resp_get(resp, "status", "released") or "released")
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="released",
+                release_status=release_status,
+                reservation_status=release_status,
+                released_units=self._pricing_resp_get(resp, "released_units"),
+                billing_mode=self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
+                billing_account_id=self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
+                settlement_mode=self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
+                entitlement_source=self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
             )
             await self._persist_pricing_block(job_id, pricing)
             return pricing
         except Exception as e:
-            pricing = dict(pricing)
-            pricing.update(
-                {
-                    "state": "release_failed",
-                    "error": str(e),
-                }
+            logger.exception(
+                "Pricing release failed",
+                extra={"job_id": job_id, "user_id": user_id, "reason": reason},
+            )
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="release_failed",
+                error=str(e),
             )
             await self._persist_pricing_block(job_id, pricing)
             return pricing
@@ -768,7 +916,7 @@ class CreatorOrchestrator:
             )
 
     # -------------------------
-    # MINIMAL FIX: ensure required codes exist
+    # Config normalization
     # -------------------------
     async def _ensure_required_config_codes(self, request_dict: Dict[str, Any]) -> Dict[str, Any]:
         rd = request_dict
@@ -780,7 +928,11 @@ class CreatorOrchestrator:
             if use_case_code:
                 try:
                     uc = await self.creator_config_repo.get_use_case_by_code(use_case_code)
-                    rec = uc.get("recommended_formats") if isinstance(uc, dict) else getattr(uc, "recommended_formats", None)
+                    rec = (
+                        uc.get("recommended_formats")
+                        if isinstance(uc, dict)
+                        else getattr(uc, "recommended_formats", None)
+                    )
                     if isinstance(rec, list) and rec:
                         picked = str(rec[0])
                 except Exception:
@@ -831,7 +983,7 @@ class CreatorOrchestrator:
         return rd
 
     # -------------------------
-    # Provider runs (dashboard) - minimal, best-effort, never breaks pipeline
+    # Provider runs
     # -------------------------
     def _prune_provider_meta(self, meta: Any) -> Dict[str, Any]:
         m = self._coerce_dict(meta)
@@ -861,25 +1013,36 @@ class CreatorOrchestrator:
     ) -> None:
         q = """
         INSERT INTO public.provider_runs (
-          job_id, provider, idempotency_key, provider_status,
-          request_json, response_json, meta_json,
-          created_at, updated_at
+          job_id,
+          provider,
+          idempotency_key,
+          provider_status,
+          request_json,
+          response_json,
+          meta_json,
+          created_at,
+          updated_at
         )
         VALUES (
-          $1::uuid, $2::text, $3::text, $4::text,
-          $5::jsonb, $6::jsonb, $7::jsonb,
-          now(), now()
+          $1::uuid,
+          $2::text,
+          $3::text,
+          $4::text,
+          $5::jsonb,
+          $6::jsonb,
+          $7::jsonb,
+          now(),
+          now()
         )
         ON CONFLICT (idempotency_key)
         DO UPDATE SET
-          job_id          = EXCLUDED.job_id,
-          provider        = EXCLUDED.provider,
+          job_id = EXCLUDED.job_id,
+          provider = EXCLUDED.provider,
           provider_status = EXCLUDED.provider_status,
-          request_json    = EXCLUDED.request_json,
-          response_json   = EXCLUDED.response_json,
-          meta_json       = EXCLUDED.meta_json,
-          updated_at      = now()
-        )
+          request_json = EXCLUDED.request_json,
+          response_json = EXCLUDED.response_json,
+          meta_json = EXCLUDED.meta_json,
+          updated_at = now()
         """
         try:
             await self.jobs_repo.execute_command(
@@ -893,6 +1056,15 @@ class CreatorOrchestrator:
                 self.jobs_repo.prepare_jsonb_param(meta_json or {}),
             )
         except Exception:
+            logger.exception(
+                "provider_runs upsert failed",
+                extra={
+                    "job_id": job_id,
+                    "provider": provider,
+                    "idempotency_key": idempotency_key,
+                    "provider_status": provider_status,
+                },
+            )
             return
 
     # -------------------------
@@ -930,29 +1102,6 @@ class CreatorOrchestrator:
     @classmethod
     def _new_random_job_seed(cls, bits: int = 63) -> int:
         return secrets.randbits(bits)
-
-    def _derive_variant_seed_hmac(
-        self,
-        *,
-        job_seed: int,
-        variant_number: int,
-        purpose: str = "face:gen",
-        request_hash: str = "",
-    ) -> int:
-        idx = max(0, int(variant_number) - 1)
-        secret = self._get_seed_secret()
-
-        if secret:
-            msg = f"{self.SEED_CONTEXT}|{purpose}|job_seed={int(job_seed)}|v={idx}"
-            if request_hash:
-                msg += f"|rh={request_hash}"
-            digest = hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).digest()
-            n = int.from_bytes(digest[:8], "big")
-            return int(n % self.SEED_MODULUS)
-
-        msg = f"{self.SEED_CONTEXT}|{purpose}|job_seed={int(job_seed)}|v={idx}|rh={request_hash}"
-        hh = hashlib.sha256(msg.encode("utf-8")).hexdigest()
-        return int(int(hh[:8], 16) % self.SEED_MODULUS)
 
     def _pre_resolve_seed_mode(self, request_dict: Dict[str, Any]) -> str:
         sent_seed_mode = "seed_mode" in request_dict
@@ -1003,6 +1152,29 @@ class CreatorOrchestrator:
 
         return "random", int(self._new_random_job_seed())
 
+    def _derive_variant_seed_hmac(
+        self,
+        *,
+        job_seed: int,
+        variant_number: int,
+        purpose: str = "face:gen",
+        request_hash: str = "",
+    ) -> int:
+        idx = max(0, int(variant_number) - 1)
+        secret = self._get_seed_secret()
+
+        if secret:
+            msg = f"{self.SEED_CONTEXT}|{purpose}|job_seed={int(job_seed)}|v={idx}"
+            if request_hash:
+                msg += f"|rh={request_hash}"
+            digest = hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).digest()
+            n = int.from_bytes(digest[:8], "big")
+            return int(n % self.SEED_MODULUS)
+
+        msg = f"{self.SEED_CONTEXT}|{purpose}|job_seed={int(job_seed)}|v={idx}|rh={request_hash}"
+        hh = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+        return int(int(hh[:8], 16) % self.SEED_MODULUS)
+
     # -------------------------
     # Identity (T2I) helpers
     # -------------------------
@@ -1023,16 +1195,28 @@ class CreatorOrchestrator:
         n = int.from_bytes(d[:4], "big") % 100
         return n < max(0, min(100, int(true_pct)))
 
-    def _build_identity_profile(self, *, job_seed: int, request_hash: str, request_dict: Dict[str, Any]) -> Dict[str, str]:
-        signature = hashlib.sha256(f"{self.ID_CONTEXT}|{job_seed}|{request_hash}".encode("utf-8")).hexdigest()[:12]
+    def _build_identity_profile(
+        self,
+        *,
+        job_seed: int,
+        request_hash: str,
+        request_dict: Dict[str, Any],
+    ) -> Dict[str, str]:
+        signature = hashlib.sha256(
+            f"{self.ID_CONTEXT}|{job_seed}|{request_hash}".encode("utf-8")
+        ).hexdigest()[:12]
 
         face = self._id_pick(job_seed=job_seed, request_hash=request_hash, key="face_shape", options=self.ID_FACE_SHAPES)
         jaw = self._id_pick(job_seed=job_seed, request_hash=request_hash, key="jawline", options=self.ID_JAWLINES)
         nose = self._id_pick(job_seed=job_seed, request_hash=request_hash, key="nose", options=self.ID_NOSES)
         eyes = self._id_pick(job_seed=job_seed, request_hash=request_hash, key="eyes", options=self.ID_EYES)
-
         spacing = self._id_pick(job_seed=job_seed, request_hash=request_hash, key="eye_spacing", options=self.ID_EYE_SPACING)
-        proportions = self._id_pick(job_seed=job_seed, request_hash=request_hash, key="proportions", options=self.ID_FACE_PROPORTIONS)
+        proportions = self._id_pick(
+            job_seed=job_seed,
+            request_hash=request_hash,
+            key="proportions",
+            options=self.ID_FACE_PROPORTIONS,
+        )
 
         cheek = (
             self._id_pick(job_seed=job_seed, request_hash=request_hash, key="cheekbones", options=self.ID_CHEEKBONES)
@@ -1090,7 +1274,12 @@ class CreatorOrchestrator:
         neg = self.ID_NEG_DEFAULT
         if "smile" in user_prompt:
             neg = neg
-        return {"signature": signature, "tokens": tokens, "negative_tokens": neg}
+
+        return {
+            "signature": signature,
+            "tokens": tokens,
+            "negative_tokens": neg,
+        }
 
     # -------------------------
     # Public API
@@ -1108,7 +1297,6 @@ class CreatorOrchestrator:
 
         request_dict: JsonDict = request.model_dump(mode="json")
 
-        # Backward-compatible alias: some callers send "prompt" instead of "user_prompt".
         if not (request_dict.get("user_prompt") or "").strip():
             p = str(request_dict.get("prompt") or "").strip()
             if p:
@@ -1116,7 +1304,6 @@ class CreatorOrchestrator:
 
         mode = self._coerce_mode(request_dict.get("mode"))
 
-        # Prefer source_image_asset_id, fallback to source_image_url
         if mode == "image-to-image":
             asset_ref = (request_dict.get("source_image_asset_id") or "").strip()
             url_ref = (request_dict.get("source_image_url") or "").strip()
@@ -1152,7 +1339,6 @@ class CreatorOrchestrator:
             request_dict["translated_prompt"] = (
                 translation_meta.get("user_prompt_translated_en") or request_dict.get("user_prompt")
             )
-            request_dict["translated_prompt"] = request_dict.get("translated_prompt")
             request_dict.update(translation_meta)
 
         request_dict = await self._ensure_required_config_codes(request_dict)
@@ -1195,14 +1381,12 @@ class CreatorOrchestrator:
 
         if mode == "image-to-image":
             request_hash_payload["mode"] = "image-to-image"
-
             if (request_dict.get("source_image_asset_id") or "").strip():
                 request_hash_payload["source_image_asset_id"] = request_dict.get("source_image_asset_id")
             else:
                 request_hash_payload["source_image_url"] = self._stable_source_url_for_hash(
                     str(request_dict.get("source_image_url") or "")
                 )
-
             request_hash_payload["preservation_strength"] = request_dict.get("preservation_strength")
 
         request_hash = self._generate_request_hash(request_hash_payload)
@@ -1242,6 +1426,9 @@ class CreatorOrchestrator:
                 "pricing": pricing,
                 "pricing_state": pricing.get("state"),
                 "pricing_enabled": bool(pricing.get("enabled")),
+                "pricing_billing_mode": pricing.get("billing_mode"),
+                "pricing_settlement_mode": pricing.get("settlement_mode"),
+                "pricing_billing_account_id": pricing.get("billing_account_id"),
             },
         )
 
@@ -1254,12 +1441,12 @@ class CreatorOrchestrator:
                     user_id=str(user_id),
                     pricing=pricing,
                 )
-            except PricingClientError:
+            except PricingClientError as e:
                 await self.jobs_repo.update_status(
                     job_id,
                     "failed",
                     error_code="PRICING_RESERVATION_FAILED",
-                    error_message="Pricing reservation failed",
+                    error_message=str(e),
                 )
                 raise
 
@@ -1320,6 +1507,32 @@ class CreatorOrchestrator:
 
             user_id = str(self._row_get(job, "user_id", "") or "")
             pricing = self._pricing_from_job(job, payload_json)
+
+            if self.pricing_client.enabled:
+                latest_pricing = await self._await_reserved_pricing(job_id)
+                if latest_pricing:
+                    pricing = latest_pricing
+
+                pricing_state = str(pricing.get("state") or "").strip().lower()
+                reservation_id = str(pricing.get("reservation_id") or "").strip()
+
+                if pricing.get("enabled") and pricing_state == "reservation_failed":
+                    await self.jobs_repo.update_status(
+                        job_id,
+                        "failed",
+                        error_code="PRICING_RESERVATION_FAILED",
+                        error_message=str(pricing.get("error") or "Pricing reservation failed"),
+                    )
+                    return
+
+                if pricing.get("enabled") and not reservation_id:
+                    await self.jobs_repo.update_status(
+                        job_id,
+                        "failed",
+                        error_code="PRICING_NOT_RESERVED",
+                        error_message="Pricing reservation did not complete before job execution",
+                    )
+                    return
 
             job_seed: Optional[int] = None
             seed_mode: Optional[str] = None
@@ -1431,7 +1644,7 @@ class CreatorOrchestrator:
                     continue
 
             if generated:
-                await self._commit_pricing_for_job(
+                pricing = await self._commit_pricing_for_job(
                     job_id=job_id,
                     user_id=user_id,
                     pricing=pricing,
@@ -1481,9 +1694,7 @@ class CreatorOrchestrator:
         mode: str,
     ) -> GeneratedVariant:
         import httpx
-        import os
         import uuid
-        from urllib.parse import urlparse
 
         from app.services.providers.image_provider import ImageProviderRouter
 
@@ -1562,7 +1773,11 @@ class CreatorOrchestrator:
                 if not source_image_url:
                     raise RuntimeError(f"unresolvable_source_image_ref:{source_image_ref}")
 
-                self._validate_http_url(source_image_url)
+                parsed = urlparse(source_image_url)
+                if parsed.scheme in ("http", "https"):
+                    self._validate_remote_http_url(source_image_url)
+                elif parsed.scheme != "file":
+                    raise ValueError(f"unsupported_source_image_scheme:{parsed.scheme or 'missing'}")
 
                 strength = self._clamp_strength(payload_json.get("preservation_strength"), 0.25)
 
@@ -1589,7 +1804,6 @@ class CreatorOrchestrator:
 
                 tmp_src_path = f"/tmp/df_i2i_src_{uuid.uuid4().hex}.png"
 
-                parsed = urlparse(source_image_url)
                 if parsed.scheme == "file":
                     local_path = parsed.path
                     if not local_path or not os.path.exists(local_path):
@@ -2007,6 +2221,10 @@ class CreatorOrchestrator:
         pricing_state = str(pricing.get("state") or "").strip()
         if progress is not None and pricing_state:
             progress["pricing_state"] = pricing_state
+            if pricing.get("billing_mode"):
+                progress["pricing_billing_mode"] = pricing.get("billing_mode")
+            if pricing.get("settlement_mode"):
+                progress["pricing_settlement_mode"] = pricing.get("settlement_mode")
 
         return JobStatusResponse(
             job_id=job_id,
@@ -2022,7 +2240,7 @@ class CreatorOrchestrator:
     def _get_status_message(self, status: JobStatus) -> str:
         messages = {
             JobStatus.QUEUED: "Job queued for processing",
-            JobStatus.RUNNING: "Generating diverse face variants",
+            JobStatus.RUNNING: "Generating creator platform variants",
             JobStatus.SUCCEEDED: "Face generation completed successfully",
             JobStatus.FAILED: "Face generation failed",
             JobStatus.CANCELLED: "Job was cancelled",
@@ -2046,7 +2264,10 @@ class CreatorOrchestrator:
             return base
 
         if status == JobStatus.SUCCEEDED:
-            base = {"message": f"Generated {variants_count} variants successfully", "variants_completed": variants_count}
+            base = {
+                "message": f"Generated {variants_count} variants successfully",
+                "variants_completed": variants_count,
+            }
             if requested is not None:
                 base["variants_requested"] = requested
             return base

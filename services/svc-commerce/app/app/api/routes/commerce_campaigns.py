@@ -82,7 +82,6 @@ def _pick_str(d: Dict[str, Any], key: str) -> Optional[str]:
 
 
 def _extract_stage(payload: Dict[str, Any]) -> Optional[str]:
-    # support both patterns
     if "stage" in payload and payload.get("stage") is not None:
         return str(payload.get("stage"))
     comp = _as_dict(payload.get("computed"))
@@ -107,7 +106,6 @@ async def get_current_user_id(authorization: str | None = Header(default=None)) 
 
     last_err: Exception | None = None
 
-    # 1) Verify signature using configured secrets (preferred)
     if secrets:
         for secret in secrets:
             try:
@@ -129,7 +127,6 @@ async def get_current_user_id(authorization: str | None = Header(default=None)) 
             except Exception as e:  # noqa: BLE001
                 last_err = e
 
-    # 2) DEV fallback: decode without signature verification (explicit opt-in only)
     if _allow_unverified_jwt():
         try:
             payload = jwt.decode(  # type: ignore[misc]
@@ -148,15 +145,17 @@ async def get_current_user_id(authorization: str | None = Header(default=None)) 
 async def confirm(req: CommerceConfirmIn, user_id: UUID = Depends(get_current_user_id)) -> CommerceConfirmOut:
     pool = await get_pool()
 
-    q = await pool.fetchrow(
-        """
-        select id, request_json, response_json, total_credits, total_usd, total_inr, status, expires_at
-        from public.commerce_quotes
-        where id=$1 and user_id=$2
-        """,
-        req.quote_id,
-        user_id,
-    )
+    async with pool.acquire() as con:
+        q = await con.fetchrow(
+            """
+            select id, request_json, response_json, total_credits, total_usd, total_inr, status, expires_at
+            from public.commerce_quotes
+            where id=$1 and user_id=$2
+            """,
+            req.quote_id,
+            user_id,
+        )
+
     if not q:
         raise HTTPException(status_code=404, detail="Quote not found")
 
@@ -187,81 +186,92 @@ async def confirm(req: CommerceConfirmIn, user_id: UUID = Depends(get_current_us
         }
     )
 
-    # Idempotency: reuse existing campaign for same quote + request_hash
-    existing = await pool.fetchrow(
-        """
-        select id, meta_json
-        from public.commerce_campaigns
-        where user_id=$1 and quote_id=$2 and (meta_json->>'request_hash')=$3
-        order by created_at desc
-        limit 1
-        """,
-        user_id,
-        req.quote_id,
-        request_hash,
-    )
-    if existing:
-        mj = _as_dict(existing["meta_json"])
-        sj = mj.get("studio_job_id")
-        if not sj:
-            sj = await pool.fetchval(
-                """
-                select id
-                from public.studio_jobs
-                where user_id=$1 and studio_type='commerce' and request_hash=$2
-                order by created_at desc
-                limit 1
-                """,
-                user_id,
-                request_hash,
-            )
-        if not sj:
-            raise HTTPException(status_code=500, detail="Campaign exists but missing studio_job_id")
-
-        # ✅ return actual job status
-        job_status = await pool.fetchval(
+    async with pool.acquire() as con:
+        existing = await con.fetchrow(
             """
-            select status
-            from public.studio_jobs
-            where id=$1 and user_id=$2 and studio_type='commerce'
+            select id, meta_json
+            from public.commerce_campaigns
+            where user_id=$1 and quote_id=$2 and (meta_json->>'request_hash')=$3
+            order by created_at desc
+            limit 1
             """,
-            UUID(str(sj)),
             user_id,
+            req.quote_id,
+            request_hash,
         )
 
-        return CommerceConfirmOut(
-            campaign_id=UUID(str(existing["id"])),
-            studio_job_id=UUID(str(sj)),
-            status=str(job_status or "queued"),
-        )
+        if existing:
+            mj = _as_dict(existing["meta_json"])
+            sj = mj.get("studio_job_id")
+            if not sj:
+                sj = await con.fetchval(
+                    """
+                    select id
+                    from public.studio_jobs
+                    where user_id=$1 and studio_type='commerce' and request_hash=$2
+                    order by created_at desc
+                    limit 1
+                    """,
+                    user_id,
+                    request_hash,
+                )
+            if not sj:
+                raise HTTPException(status_code=500, detail="Campaign exists but missing studio_job_id")
 
-    payload = {
-        "input": {"quote_id": str(req.quote_id), "idempotency_key": idem or None},
-        "quote": quote_resp,
-        "quote_request": quote_req,
-        "computed": {"stage": "queued", "request_hash": request_hash},
-    }
+            job_status = await con.fetchval(
+                """
+                select status
+                from public.studio_jobs
+                where id=$1 and user_id=$2 and studio_type='commerce'
+                """,
+                UUID(str(sj)),
+                user_id,
+            )
 
-    meta = {
-        "request_hash": request_hash,
-        "request_type": "commerce_confirm",
-        "quote_id": str(req.quote_id),
-        "idempotency_key": idem or None,
-        "totals": {"usd": float(q["total_usd"]), "inr": float(q["total_inr"])},
-        "total_credits": int(q["total_credits"]),
-        "expires_at": q["expires_at"].isoformat(),
-        "mode": str(mode),
-        "product_type": str(product_type),
-    }
+            return CommerceConfirmOut(
+                campaign_id=UUID(str(existing["id"])),
+                studio_job_id=UUID(str(sj)),
+                status=str(job_status or "queued"),
+            )
 
     async with pool.acquire() as con:
         async with con.transaction():
+            payload = {
+                "quote_id": str(req.quote_id),
+                "input": {
+                    "quote_id": str(req.quote_id),
+                    "idempotency_key": idem or None,
+                },
+                "quote": quote_resp,
+                "quote_request": quote_req,
+                "computed": {
+                    "stage": "queued",
+                    "request_hash": request_hash,
+                    "quote_id": str(req.quote_id),
+                },
+            }
+
+            meta = {
+                "request_hash": request_hash,
+                "request_type": "commerce_confirm",
+                "quote_id": str(req.quote_id),
+                "idempotency_key": idem or None,
+                "totals": {"usd": float(q["total_usd"]), "inr": float(q["total_inr"])},
+                "total_credits": int(q["total_credits"]),
+                "expires_at": q["expires_at"].isoformat(),
+                "mode": str(mode),
+                "product_type": str(product_type),
+            }
+
             studio_job_id = await con.fetchval(
                 """
                 insert into public.studio_jobs(studio_type, status, request_hash, payload_json, meta_json, user_id)
                 values('commerce', 'queued', $1, $2::jsonb, $3::jsonb, $4)
                 on conflict (user_id, studio_type, request_hash)
-                do update set updated_at=now()
+                do update set
+                    updated_at = now(),
+                    payload_json = excluded.payload_json,
+                    meta_json = excluded.meta_json
                 returning id
                 """,
                 request_hash,
@@ -283,37 +293,84 @@ async def confirm(req: CommerceConfirmIn, user_id: UUID = Depends(get_current_us
                 str(product_type),
                 req.quote_id,
                 json.dumps(
-                    {"quote_id": str(req.quote_id), "idempotency_key": idem or None, "request_hash": request_hash}
+                    {
+                        "quote_id": str(req.quote_id),
+                        "idempotency_key": idem or None,
+                        "request_hash": request_hash,
+                    }
                 ),
-                json.dumps({**meta, "studio_job_id": str(studio_job_id)}),
+                json.dumps(
+                    {
+                        **meta,
+                        "studio_job_id": str(studio_job_id),
+                    }
+                ),
             )
 
-            # ✅ Link campaign_id into studio_job payload/meta (E2E-critical)
+            await con.execute(
+                """
+                update public.commerce_campaigns
+                set meta_json =
+                    (
+                        case
+                            when meta_json is null or jsonb_typeof(meta_json) <> 'object'
+                                then '{}'::jsonb
+                            else meta_json
+                        end
+                    ) || jsonb_build_object(
+                        'studio_job_id', $2::text,
+                        'campaign_id', $1::text,
+                        'quote_id', $3::text,
+                        'mode', $4::text,
+                        'product_type', $5::text
+                    ),
+                    updated_at = now()
+                where id = $1::uuid
+                """,
+                campaign_id,
+                str(studio_job_id),
+                str(req.quote_id),
+                str(mode),
+                str(product_type),
+            )
+
             await con.execute(
                 """
                 update public.studio_jobs
                 set
-                  payload_json = jsonb_set(
-                    coalesce(payload_json,'{}'::jsonb),
-                    '{commerce_campaign_id}',
-                    to_jsonb($2::text),
-                    true
-                  ),
-                  meta_json = jsonb_set(
-                    coalesce(meta_json,'{}'::jsonb),
-                    '{commerce_campaign_id}',
-                    to_jsonb($2::text),
-                    true
-                  ),
+                  payload_json =
+                    (
+                        case
+                            when payload_json is null or jsonb_typeof(payload_json) <> 'object'
+                                then '{}'::jsonb
+                            else payload_json
+                        end
+                    ) || jsonb_build_object(
+                        'quote_id', $2::text,
+                        'commerce_campaign_id', $3::text,
+                        'campaign_id', $3::text
+                    ),
+                  meta_json =
+                    (
+                        case
+                            when meta_json is null or jsonb_typeof(meta_json) <> 'object'
+                                then '{}'::jsonb
+                            else meta_json
+                        end
+                    ) || jsonb_build_object(
+                        'quote_id', $2::text,
+                        'commerce_campaign_id', $3::text,
+                        'campaign_id', $3::text
+                    ),
                   updated_at = now()
-                where id=$1 and user_id=$3 and studio_type='commerce'
+                where id=$1 and user_id=$4 and studio_type='commerce'
                 """,
                 UUID(str(studio_job_id)),
+                str(req.quote_id),
                 str(campaign_id),
                 user_id,
             )
 
-            # mark quote confirmed
             await con.execute(
                 """
                 update public.commerce_quotes
@@ -334,15 +391,16 @@ async def confirm(req: CommerceConfirmIn, user_id: UUID = Depends(get_current_us
 @router.get("/jobs/{studio_job_id}/status")
 async def job_status(studio_job_id: UUID, user_id: UUID = Depends(get_current_user_id)) -> Dict[str, Any]:
     pool = await get_pool()
-    row = await pool.fetchrow(
-        """
-        select id, studio_type, status, payload_json, meta_json, error_code, error_message, updated_at
-        from public.studio_jobs
-        where id=$1 and user_id=$2 and studio_type='commerce'
-        """,
-        studio_job_id,
-        user_id,
-    )
+    async with pool.acquire() as con:
+        row = await con.fetchrow(
+            """
+            select id, studio_type, status, payload_json, meta_json, error_code, error_message, updated_at
+            from public.studio_jobs
+            where id=$1 and user_id=$2 and studio_type='commerce'
+            """,
+            studio_job_id,
+            user_id,
+        )
     if not row:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -356,6 +414,8 @@ async def job_status(studio_job_id: UUID, user_id: UUID = Depends(get_current_us
         "studio_type": row["studio_type"],
         "status": row["status"],
         "stage": stage,
+        "quote_id": payload.get("quote_id") or _as_dict(payload.get("input")).get("quote_id") or meta.get("quote_id"),
+        "campaign_id": payload.get("campaign_id") or payload.get("commerce_campaign_id") or meta.get("campaign_id"),
         "computed": computed,
         "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
         "error_code": row["error_code"],

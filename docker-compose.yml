@@ -21,6 +21,17 @@ x-common-python-service: &python_service
       max-size: "10m"
       max-file: "3"
 
+x-python-http-healthcheck: &python_http_healthcheck
+  test:
+    - CMD-SHELL
+    - >-
+      python -c "import os, urllib.request;
+      urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"PORT\"]}/api/health', timeout=3);
+      print('ok')"
+  interval: 5s
+  timeout: 3s
+  retries: 30
+
 services:
   # -------------------------
   # Database
@@ -47,7 +58,9 @@ services:
     restart: unless-stopped
     logging:
       driver: "json-file"
-      options: { max-size: "10m", max-file: "3" }
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # -------------------------
   # Redis
@@ -64,7 +77,9 @@ services:
     restart: unless-stopped
     logging:
       driver: "json-file"
-      options: { max-size: "10m", max-file: "3" }
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # -------------------------
   # Core API
@@ -91,10 +106,7 @@ services:
     expose: ["8000"]
     ports: ["8000:8000"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
+      <<: *python_http_healthcheck
       start_period: 15s
 
   # -------------------------
@@ -103,9 +115,16 @@ services:
   svc-fusion:
     <<: *python_service
     container_name: df-svc-fusion
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
     build:
-      context: ./services/svc-fusion/app
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/svc-fusion/app/Dockerfile
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
@@ -120,18 +139,30 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
       JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      REFRESH_TOKEN_HMAC_SECRET: ${REFRESH_TOKEN_HMAC_SECRET}
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
 
       HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
       HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
+      HEYGEN_ENABLE_VIDEO_LIST_FALLBACK: ${HEYGEN_ENABLE_VIDEO_LIST_FALLBACK:-1}
+      HEYGEN_SUBMIT_PATH: ${HEYGEN_SUBMIT_PATH:-}
+
+      DF_FUSION_DISABLE_CREATE_DEDUPE: ${DF_FUSION_DISABLE_CREATE_DEDUPE:-1}
+      DF_FUSION_PROVIDER_TIMEOUT_SECONDS: ${DF_FUSION_PROVIDER_TIMEOUT_SECONDS:-360}
+      DF_FUSION_PROVIDER_POLL_SECONDS: ${DF_FUSION_PROVIDER_POLL_SECONDS:-5}
+      FUSION_JOB_TIMEOUT_SECONDS: ${FUSION_JOB_TIMEOUT_SECONDS:-420}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
     expose: ["8002"]
     ports: ["8002:8002"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
+      <<: *python_http_healthcheck
       start_period: 20s
 
   # -------------------------
@@ -140,9 +171,16 @@ services:
   svc-fusion-worker:
     <<: *python_service
     container_name: df-svc-fusion-worker
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
     build:
-      context: ./services/svc-fusion/app
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/svc-fusion/app/Dockerfile
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
@@ -153,6 +191,8 @@ services:
 
       HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
       HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
+      HEYGEN_ENABLE_VIDEO_LIST_FALLBACK: ${HEYGEN_ENABLE_VIDEO_LIST_FALLBACK:-1}
+      HEYGEN_SUBMIT_PATH: ${HEYGEN_SUBMIT_PATH:-}
 
       DF_FUSION_STUDIO_ENABLED: ${DF_FUSION_STUDIO_ENABLED:-true}
 
@@ -162,6 +202,17 @@ services:
       REFRESH_TOKEN_HMAC_SECRET: ${REFRESH_TOKEN_HMAC_SECRET}
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      DF_FUSION_PROVIDER_TIMEOUT_SECONDS: ${DF_FUSION_PROVIDER_TIMEOUT_SECONDS:-360}
+      DF_FUSION_PROVIDER_POLL_SECONDS: ${DF_FUSION_PROVIDER_POLL_SECONDS:-5}
+      FUSION_JOB_TIMEOUT_SECONDS: ${FUSION_JOB_TIMEOUT_SECONDS:-420}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
     command: ["bash", "-lc", "python -m app.workers.fusion_worker"]
 
   # -------------------------
@@ -198,7 +249,6 @@ services:
       AZURE_CONTENT_MODERATOR_ENDPOINT: ${AZURE_CONTENT_MODERATOR_ENDPOINT}
       AZURE_CONTENT_MODERATOR_KEY: ${AZURE_CONTENT_MODERATOR_KEY}
 
-      # svc-pricing wiring
       DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
       DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
       DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
@@ -207,10 +257,7 @@ services:
     expose: ["8003"]
     ports: ["8003:8003"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
+      <<: *python_http_healthcheck
       start_period: 20s
 
   # -------------------------
@@ -244,7 +291,6 @@ services:
       AZURE_CONTENT_MODERATOR_ENDPOINT: ${AZURE_CONTENT_MODERATOR_ENDPOINT}
       AZURE_CONTENT_MODERATOR_KEY: ${AZURE_CONTENT_MODERATOR_KEY}
 
-      # svc-pricing wiring
       DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
       DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
       DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
@@ -275,18 +321,14 @@ services:
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
 
-      # internal service-to-service auth for pricing reservations
       DF_PRICING_INTERNAL_BEARER: ${DF_PRICING_INTERNAL_BEARER}
-      DF_PRICING_ALLOWED_SERVICES: ${DF_PRICING_ALLOWED_SERVICES:-svc-face,svc-commerce,svc-music,svc-marketing}
+      DF_PRICING_ALLOWED_SERVICES: ${DF_PRICING_ALLOWED_SERVICES:-svc-face,svc-fusion,svc-audio,svc-commerce,svc-music,svc-marketing}
     expose: ["8009"]
     ports: ["8009:8009"]
     command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8009}"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-      start_period: 20s
+      <<: *python_http_healthcheck
+      start_period: 30s
 
   # -------------------------
   # Commerce API
@@ -306,23 +348,21 @@ services:
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       PYTHONPATH: "/app"
 
-      # Blender / Saree drape
       COMMERCE_SAREE_BLENDER_ENGINE: ${COMMERCE_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
       DF_SAREE_BLENDER_ENGINE: ${DF_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
 
-      # Saree overlay provider (production defaults)
       COMMERCE_SAREE_STRICT: ${COMMERCE_SAREE_STRICT:-1}
       COMMERCE_ENABLE_SAREE_DRAPE_PROVIDER: ${COMMERCE_ENABLE_SAREE_DRAPE_PROVIDER:-1}
+      COMMERCE_ENABLE_SAREE_PLATFORM_MODEL_AUTO_PICK: ${COMMERCE_ENABLE_SAREE_PLATFORM_MODEL_AUTO_PICK:-1}
+
+      # Azure-only platform model refs. Do not point these to outside URLs.
       COMMERCE_SAREE_TEMPLATE_PATH: ${COMMERCE_SAREE_TEMPLATE_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/nivi.blend}
+      COMMERCE_SAREE_ALPHA_MASK_PATH: ${COMMERCE_SAREE_ALPHA_MASK_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/masks/saree_alpha.png}
+      COMMERCE_SAREE_PALLU_MASK_PATH: ${COMMERCE_SAREE_PALLU_MASK_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/masks/pallu_alpha.png}
 
-      # ✅ STRICT requires this (mask must exist in Azure or local path)
-      COMMERCE_SAREE_ALPHA_MASK_PATH: ${COMMERCE_SAREE_ALPHA_MASK_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/alpha_mask_v1.png}
-
-      # ✅ Deterministic cache dir (shared volume)
       COMMERCE_SAREE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
       DF_SAREE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
       DF_SAREE_TEMPLATE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
-
       DF_SAREE_RUN_DIR_BASE: /var/cache/df_saree_drape_runs
 
       DF_SAREE_VALIDATE_TEMPLATE: ${DF_SAREE_VALIDATE_TEMPLATE:-1}
@@ -339,14 +379,12 @@ services:
 
       COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE: ${COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE:-0}
 
-      # JWT (match svc-core signing/claims)
       JWT_SECRET: ${JWT_SECRET}
       JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
 
-      # Pricing stub knobs (svc-pricing later)
       PRICING_SERVICE_URL: ${PRICING_SERVICE_URL:-}
       COMMERCE_QUOTE_TTL_SECONDS: ${COMMERCE_QUOTE_TTL_SECONDS:-900}
       COMMERCE_CREDIT_USD_RATE: ${COMMERCE_CREDIT_USD_RATE:-0.03}
@@ -356,34 +394,42 @@ services:
       COMMERCE_CREDITS_PER_CHANNEL_EXPORT: ${COMMERCE_CREDITS_PER_CHANNEL_EXPORT:-10}
       COMMERCE_CREDITS_MARKETPLACE_PACK: ${COMMERCE_CREDITS_MARKETPLACE_PACK:-25}
 
-      # Providers
       FAL_API_KEY: ${FAL_API_KEY:-}
       FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
-
-      # VTON (Fal)
       FAL_KEY: ${FAL_KEY:-}
       FAL_AUTH_MODE: ${FAL_AUTH_MODE:-key}
-      COMMERCE_ENABLE_REAL_PROVIDERS: ${COMMERCE_ENABLE_REAL_PROVIDERS:-0}
+
+      COMMERCE_ENABLE_REAL_PROVIDERS: ${COMMERCE_ENABLE_REAL_PROVIDERS:-1}
       COMMERCE_VTON_PROVIDER: ${COMMERCE_VTON_PROVIDER:-fal}
       COMMERCE_MAX_PROVIDER_IMAGES: ${COMMERCE_MAX_PROVIDER_IMAGES:-1}
+      COMMERCE_DEMO_MODE: ${COMMERCE_DEMO_MODE:-0}
 
       COMMERCE_FAL_BASE_URL: ${COMMERCE_FAL_BASE_URL:-https://queue.fal.run}
-      COMMERCE_FAL_FASHN_ENDPOINT_ID: ${COMMERCE_FAL_FASHN_ENDPOINT_ID:-fal-ai/fashn/tryon/v1.5}
+      COMMERCE_FAL_FASHN_ENDPOINT_ID: ${COMMERCE_FAL_FASHN_ENDPOINT_ID:-fal-ai/fashn/tryon/v1.6}
       COMMERCE_FAL_ENDPOINT_ID: ${COMMERCE_FAL_ENDPOINT_ID:-fal-ai/leffa/virtual-tryon}
 
-      # These are the names vton_provider.py reads
-      COMMERCE_FAL_HTTP_TIMEOUT_S: ${COMMERCE_FAL_HTTP_TIMEOUT_S:-120}
-      COMMERCE_FAL_POLL_TIMEOUT_S: ${COMMERCE_FAL_POLL_TIMEOUT_S:-180}
+      COMMERCE_FAL_HTTP_TIMEOUT_S: ${COMMERCE_FAL_HTTP_TIMEOUT_S:-180}
+      COMMERCE_FAL_POLL_TIMEOUT_S: ${COMMERCE_FAL_POLL_TIMEOUT_S:-900}
       COMMERCE_FAL_POLL_SECS: ${COMMERCE_FAL_POLL_SECS:-1.5}
       COMMERCE_FAL_POLL_LOGS: ${COMMERCE_FAL_POLL_LOGS:-0}
 
-      # Demo mode
-      COMMERCE_DEMO_MODE: ${COMMERCE_DEMO_MODE:-1}
-      COMMERCE_DEMO_HUMAN_IMAGE_URL: ${COMMERCE_DEMO_HUMAN_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/man5.jpg}
+      COMMERCE_NON_SAREE_PROVIDER_ORDER: ${COMMERCE_NON_SAREE_PROVIDER_ORDER:-imageapps_v2,fashn,catvton}
+      COMMERCE_ENABLE_IMAGEAPPS_V2_VTON: ${COMMERCE_ENABLE_IMAGEAPPS_V2_VTON:-1}
+      COMMERCE_ENABLE_CATVTON: ${COMMERCE_ENABLE_CATVTON:-1}
+      COMMERCE_VTON_QC_ENABLE: ${COMMERCE_VTON_QC_ENABLE:-1}
+      COMMERCE_VTON_QC_FAIL_OPEN: ${COMMERCE_VTON_QC_FAIL_OPEN:-1}
+      COMMERCE_INDIAN_NON_SAREE_STRICT: ${COMMERCE_INDIAN_NON_SAREE_STRICT:-0}
+      COMMERCE_ENABLE_INDIAN_NON_SAREE_GENERIC_FALLBACK: ${COMMERCE_ENABLE_INDIAN_NON_SAREE_GENERIC_FALLBACK:-1}
+
+      COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR: ${COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR:-1}
+      COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN: ${COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN:-1}
+      COMMERCE_PLATFORM_MODELS_TOP_K: ${COMMERCE_PLATFORM_MODELS_TOP_K:-10}
+
+      # Human demo fallback intentionally blank. Human platform models must come from DesiFaces Azure only.
+      COMMERCE_DEMO_HUMAN_IMAGE_URL: ${COMMERCE_DEMO_HUMAN_IMAGE_URL:-}
       COMMERCE_DEMO_GARMENT_IMAGE_URL: ${COMMERCE_DEMO_GARMENT_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/tshirt.jpg}
       COMMERCE_FAL_CLOTH_TYPE: ${COMMERCE_FAL_CLOTH_TYPE:-upper}
 
-      # Optional service-to-service (Docker DNS names)
       SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://svc-fusion:8002}
       SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://svc-audio:8004}
 
@@ -395,10 +441,7 @@ services:
     expose: ["8008"]
     ports: ["8008:8008"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
+      <<: *python_http_healthcheck
       start_period: 20s
 
   # -------------------------
@@ -418,23 +461,25 @@ services:
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       PYTHONPATH: "/app"
 
-      # Blender / Saree drape
+      HF_HOME: /var/cache/huggingface
+      HF_HUB_CACHE: /var/cache/huggingface/hub
+      HF_TOKEN: ${HF_TOKEN:-}
+
       COMMERCE_SAREE_BLENDER_ENGINE: ${COMMERCE_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
       DF_SAREE_BLENDER_ENGINE: ${DF_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
 
-      # Saree overlay provider (production defaults)
       COMMERCE_SAREE_STRICT: ${COMMERCE_SAREE_STRICT:-1}
       COMMERCE_ENABLE_SAREE_DRAPE_PROVIDER: ${COMMERCE_ENABLE_SAREE_DRAPE_PROVIDER:-1}
+      COMMERCE_ENABLE_SAREE_PLATFORM_MODEL_AUTO_PICK: ${COMMERCE_ENABLE_SAREE_PLATFORM_MODEL_AUTO_PICK:-1}
+
+      # Azure-only platform model refs. Do not point these to outside URLs.
       COMMERCE_SAREE_TEMPLATE_PATH: ${COMMERCE_SAREE_TEMPLATE_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/nivi.blend}
+      COMMERCE_SAREE_ALPHA_MASK_PATH: ${COMMERCE_SAREE_ALPHA_MASK_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/masks/saree_alpha.png}
+      COMMERCE_SAREE_PALLU_MASK_PATH: ${COMMERCE_SAREE_PALLU_MASK_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/masks/pallu_alpha.png}
 
-      # ✅ STRICT requires this
-      COMMERCE_SAREE_ALPHA_MASK_PATH: ${COMMERCE_SAREE_ALPHA_MASK_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/alpha_mask_v1.png}
-
-      # ✅ Deterministic cache dir (shared volume)
       COMMERCE_SAREE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
       DF_SAREE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
       DF_SAREE_TEMPLATE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
-
       DF_SAREE_RUN_DIR_BASE: /var/cache/df_saree_drape_runs
 
       DF_SAREE_VALIDATE_TEMPLATE: ${DF_SAREE_VALIDATE_TEMPLATE:-1}
@@ -455,14 +500,14 @@ services:
       DF_SAREE_UPLOAD_DEBUG_OVERLAY: ${DF_SAREE_UPLOAD_DEBUG_OVERLAY:-0}
       DF_SAREE_UPLOAD_DEBUG_OVERLAY_WARPED: ${DF_SAREE_UPLOAD_DEBUG_OVERLAY_WARPED:-0}
 
-      # JWT (match svc-core signing/claims)
+      COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE: ${COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE:-0}
+
       JWT_SECRET: ${JWT_SECRET}
       JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
 
-      # Pricing stub knobs (svc-pricing later)
       PRICING_SERVICE_URL: ${PRICING_SERVICE_URL:-}
       COMMERCE_QUOTE_TTL_SECONDS: ${COMMERCE_QUOTE_TTL_SECONDS:-900}
       COMMERCE_CREDIT_USD_RATE: ${COMMERCE_CREDIT_USD_RATE:-0.03}
@@ -472,41 +517,49 @@ services:
       COMMERCE_CREDITS_PER_CHANNEL_EXPORT: ${COMMERCE_CREDITS_PER_CHANNEL_EXPORT:-10}
       COMMERCE_CREDITS_MARKETPLACE_PACK: ${COMMERCE_CREDITS_MARKETPLACE_PACK:-25}
 
-      COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE: ${COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE:-0}
-
-      # Providers
       FAL_API_KEY: ${FAL_API_KEY:-}
       FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
-
-      # ✅ VTON (Fal)
       FAL_KEY: ${FAL_KEY:-}
       FAL_AUTH_MODE: ${FAL_AUTH_MODE:-key}
-      COMMERCE_ENABLE_REAL_PROVIDERS: ${COMMERCE_ENABLE_REAL_PROVIDERS:-0}
+
+      COMMERCE_ENABLE_REAL_PROVIDERS: ${COMMERCE_ENABLE_REAL_PROVIDERS:-1}
       COMMERCE_VTON_PROVIDER: ${COMMERCE_VTON_PROVIDER:-fal}
       COMMERCE_MAX_PROVIDER_IMAGES: ${COMMERCE_MAX_PROVIDER_IMAGES:-1}
+      COMMERCE_DEMO_MODE: ${COMMERCE_DEMO_MODE:-0}
 
       COMMERCE_FAL_BASE_URL: ${COMMERCE_FAL_BASE_URL:-https://queue.fal.run}
-      COMMERCE_FAL_FASHN_ENDPOINT_ID: ${COMMERCE_FAL_FASHN_ENDPOINT_ID:-fal-ai/fashn/tryon/v1.5}
+      COMMERCE_FAL_FASHN_ENDPOINT_ID: ${COMMERCE_FAL_FASHN_ENDPOINT_ID:-fal-ai/fashn/tryon/v1.6}
       COMMERCE_FAL_ENDPOINT_ID: ${COMMERCE_FAL_ENDPOINT_ID:-fal-ai/leffa/virtual-tryon}
 
-      COMMERCE_FAL_HTTP_TIMEOUT_S: ${COMMERCE_FAL_HTTP_TIMEOUT_S:-120}
-      COMMERCE_FAL_POLL_TIMEOUT_S: ${COMMERCE_FAL_POLL_TIMEOUT_S:-180}
+      COMMERCE_FAL_HTTP_TIMEOUT_S: ${COMMERCE_FAL_HTTP_TIMEOUT_S:-180}
+      COMMERCE_FAL_POLL_TIMEOUT_S: ${COMMERCE_FAL_POLL_TIMEOUT_S:-900}
       COMMERCE_FAL_POLL_SECS: ${COMMERCE_FAL_POLL_SECS:-1.5}
       COMMERCE_FAL_POLL_LOGS: ${COMMERCE_FAL_POLL_LOGS:-0}
 
-      # Demo mode
-      COMMERCE_DEMO_MODE: ${COMMERCE_DEMO_MODE:-1}
-      COMMERCE_DEMO_HUMAN_IMAGE_URL: ${COMMERCE_DEMO_HUMAN_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/man5.jpg}
+      COMMERCE_NON_SAREE_PROVIDER_ORDER: ${COMMERCE_NON_SAREE_PROVIDER_ORDER:-imageapps_v2,fashn,catvton}
+      COMMERCE_ENABLE_IMAGEAPPS_V2_VTON: ${COMMERCE_ENABLE_IMAGEAPPS_V2_VTON:-1}
+      COMMERCE_ENABLE_CATVTON: ${COMMERCE_ENABLE_CATVTON:-1}
+      COMMERCE_VTON_QC_ENABLE: ${COMMERCE_VTON_QC_ENABLE:-1}
+      COMMERCE_VTON_QC_FAIL_OPEN: ${COMMERCE_VTON_QC_FAIL_OPEN:-1}
+      COMMERCE_INDIAN_NON_SAREE_STRICT: ${COMMERCE_INDIAN_NON_SAREE_STRICT:-0}
+      COMMERCE_ENABLE_INDIAN_NON_SAREE_GENERIC_FALLBACK: ${COMMERCE_ENABLE_INDIAN_NON_SAREE_GENERIC_FALLBACK:-1}
+
+      COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR: ${COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR:-1}
+      COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN: ${COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN:-1}
+      COMMERCE_PLATFORM_MODELS_TOP_K: ${COMMERCE_PLATFORM_MODELS_TOP_K:-10}
+
+      # Human demo fallback intentionally blank. Human platform models must come from DesiFaces Azure only.
+      COMMERCE_DEMO_HUMAN_IMAGE_URL: ${COMMERCE_DEMO_HUMAN_IMAGE_URL:-}
       COMMERCE_DEMO_GARMENT_IMAGE_URL: ${COMMERCE_DEMO_GARMENT_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/tshirt.jpg}
       COMMERCE_FAL_CLOTH_TYPE: ${COMMERCE_FAL_CLOTH_TYPE:-upper}
 
-      # Worker tuning (optional)
       WORKER_POLL_SECS: ${COMMERCE_WORKER_POLL_SECS:-1.5}
       WORKER_BATCH_SIZE: ${COMMERCE_WORKER_BATCH_SIZE:-1}
 
     volumes:
       - df_saree_templates_cache:/var/cache/df_saree_templates
       - df_saree_drape_runs:/var/cache/df_saree_drape_runs
+      - df_hf_cache:/var/cache/huggingface
       - ./tmp:/host_tmp:ro
 
     command: ["bash", "-lc", "python -m app.workers.commerce_worker"]
@@ -517,9 +570,16 @@ services:
   svc-audio:
     <<: *python_service
     container_name: df-svc-audio
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
     build:
-      context: ./services/svc-audio/app
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/svc-audio/app/Dockerfile
     image: desifaces-svc-audio
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -543,13 +603,17 @@ services:
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       AUDIO_OUTPUT_CONTAINER: ${AUDIO_OUTPUT_CONTAINER:-audio-output}
       AUDIO_SAS_HOURS: ${AUDIO_SAS_HOURS:-24}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
     expose: ["8004"]
     ports: ["8004:8004"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
+      <<: *python_http_healthcheck
       start_period: 20s
 
   # -------------------------
@@ -558,10 +622,17 @@ services:
   svc-audio-worker:
     <<: *python_service
     container_name: df-svc-audio-worker
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
     build:
-      context: ./services/svc-audio/app
-      dockerfile: Dockerfile
-    image: desifaces-svc-audio
+      context: .
+      dockerfile: services/svc-audio/app/Dockerfile
+    image: desifaces-svc-audio-worker
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
@@ -587,6 +658,13 @@ services:
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       AUDIO_OUTPUT_CONTAINER: ${AUDIO_OUTPUT_CONTAINER:-audio-output}
       AUDIO_SAS_HOURS: ${AUDIO_SAS_HOURS:-24}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
     command: ["bash", "-lc", "python -m app.workers.audio_worker"]
 
   # -------------------------
@@ -612,10 +690,7 @@ services:
     expose: ["8005"]
     ports: ["8005:8005"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
+      <<: *python_http_healthcheck
       start_period: 20s
 
   svc-dashboard-worker:
@@ -678,10 +753,7 @@ services:
     expose: ["8006"]
     ports: ["8006:8006"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
+      <<: *python_http_healthcheck
       start_period: 20s
 
   svc-fusion-extension-worker:
@@ -797,10 +869,7 @@ services:
     expose: ["8000"]
     ports: ["8007:8000"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
+      <<: *python_http_healthcheck
       start_period: 25s
 
   # -------------------------
@@ -916,10 +985,7 @@ services:
     ports: ["8010:8010"]
     command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8010}"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT}/api/health >/dev/null"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
+      <<: *python_http_healthcheck
       start_period: 20s
 
   # -------------------------
@@ -1014,7 +1080,7 @@ services:
     command: ["bash", "-lc", "python -m app.workers.marketing_scheduler"]
 
   # -------------------------
-  # Marketing Optimizer (optional; not started by default)
+  # Marketing Optimizer
   # -------------------------
   svc-marketing-optimizer:
     <<: *python_service
@@ -1048,4 +1114,5 @@ volumes:
   df_redisdata:
   df_saree_templates_cache:
   df_saree_drape_runs:
+  df_hf_cache:
   df_marketing_output:

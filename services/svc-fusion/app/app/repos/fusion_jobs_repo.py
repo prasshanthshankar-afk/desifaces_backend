@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-
 from typing import Any, Dict, List, Optional
+
 import asyncpg
 
 
@@ -10,24 +10,40 @@ class FusionJobsRepo:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
 
-    async def insert_job(self, user_id: int, request_hash: str, payload: Dict[str, Any]) -> str:
+    async def insert_job(
+        self,
+        user_id: str,
+        request_hash: str,
+        payload: Dict[str, Any],
+        initial_status: str = "queued",
+    ) -> str:
         """
         Recommended DB constraint for repeatable submit:
-          UNIQUE (user_id, request_hash)
+          UNIQUE (user_id, studio_type, request_hash)
 
-        With that in place, this becomes true idempotency:
-          same request_hash => same job id returned.
+        Important:
+          - Create pricing-enabled jobs as pricing_pending first.
+          - Only move to queued after reserve succeeds.
+          - Worker claims queued only, so pricing_pending jobs can never run.
         """
         sql = """
-        INSERT INTO studio_jobs (studio_type, status, user_id, request_hash, payload_json, created_at, updated_at)
-        VALUES ('fusion', 'queued', $1, $2, $3::jsonb, now(), now())
+        INSERT INTO studio_jobs (
+            studio_type,
+            status,
+            user_id,
+            request_hash,
+            payload_json,
+            created_at,
+            updated_at
+        )
+        VALUES ('fusion', $4, $1, $2, $3::jsonb, now(), now())
         ON CONFLICT (user_id, studio_type, request_hash)
         DO UPDATE SET updated_at = now()
         RETURNING id::text
         """
         async with self.pool.acquire() as conn:
             payload_json = json.dumps(payload, default=str)
-            return await conn.fetchval(sql, user_id, request_hash, payload_json)
+            return await conn.fetchval(sql, user_id, request_hash, payload_json, initial_status)
 
     async def claim_next_jobs(self, studio_type: str, limit: int = 1) -> List[str]:
         sql = """
@@ -41,7 +57,8 @@ class FusionJobsRepo:
             LIMIT $2
         )
         UPDATE studio_jobs j
-        SET status='running', updated_at=now()
+        SET status = 'running',
+            updated_at = now()
         FROM cte
         WHERE j.id = cte.id
         RETURNING j.id::text;

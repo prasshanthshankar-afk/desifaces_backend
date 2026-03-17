@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+
 from fastapi import APIRouter
 
 from app.api.health import router as health_router
@@ -21,6 +22,7 @@ def build_router() -> APIRouter:
         "app.api.routes.commerce_templates",
         "app.api.routes.commerce_exports",
         "app.api.routes.commerce_quotes",
+        "app.api.routes.training",
     ]:
         try:
             m = importlib.import_module(mod_path)

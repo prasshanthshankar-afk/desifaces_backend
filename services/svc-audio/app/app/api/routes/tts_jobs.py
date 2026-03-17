@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from typing import Any, Dict, List, Optional
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from app.db import get_pool
 from app.api.deps import get_current_user_id
+from app.db import get_pool
+from app.services.tts_orchestrator import PricingClientError
+from app.services.tts_orchestrator import TTSOrchestrator
 
 router = APIRouter(prefix="/api/audio", tags=["audio-tts"])
 
@@ -37,6 +38,48 @@ def _jsonb_to_dict(val: Any) -> Dict[str, Any]:
         return {}
 
 
+def _extract_pricing_view(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    payload = _jsonb_to_dict(job.get("payload_json"))
+    meta = _jsonb_to_dict(job.get("meta_json"))
+
+    pricing = _jsonb_to_dict(payload.get("pricing"))
+    if pricing:
+        return pricing
+
+    pricing = _jsonb_to_dict(meta.get("pricing"))
+    if pricing:
+        return pricing
+
+    return None
+
+
+def _raise_http_for_pricing_error(exc: Exception) -> None:
+    msg = str(exc or "")
+
+    if "PRICING_CLIENT_DISABLED" in msg or "pricing client unavailable" in msg.lower():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="PRICING_CLIENT_DISABLED",
+        )
+
+    if "PRICING_UNKNOWN_OR_INACTIVE_VARIANT" in msg:
+        raise HTTPException(
+            status_code=status.HTTP_424_FAILED_DEPENDENCY,
+            detail="PRICING_UNKNOWN_OR_INACTIVE_VARIANT",
+        )
+
+    if "PRICING_VARIANT_ZERO_QTY_LINES" in msg:
+        raise HTTPException(
+            status_code=status.HTTP_424_FAILED_DEPENDENCY,
+            detail="PRICING_VARIANT_ZERO_QTY_LINES",
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_424_FAILED_DEPENDENCY,
+        detail="PRICING_RESERVATION_FAILED",
+    )
+
+
 class TTSCreateRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=4000)
     target_locale: str = Field(..., min_length=2, max_length=20)
@@ -57,6 +100,9 @@ class TTSCreateRequest(BaseModel):
 class JobCreatedResponse(BaseModel):
     job_id: str
     status: str
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    pricing: Optional[Dict[str, Any]] = None
 
 
 class VariantAudio(BaseModel):
@@ -73,15 +119,7 @@ class JobStatusResponse(BaseModel):
     error_message: Optional[str] = None
     variants: List[VariantAudio] = Field(default_factory=list)
     payload: Dict[str, Any] = Field(default_factory=dict)
-
-
-def _stable_hash(user_id: str, payload: Dict[str, Any]) -> str:
-    s = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    h = hashlib.sha256()
-    h.update(user_id.encode("utf-8"))
-    h.update(b"|")
-    h.update(s.encode("utf-8"))
-    return h.hexdigest()
+    pricing: Optional[Dict[str, Any]] = None
 
 
 @router.post("/tts", response_model=JobCreatedResponse)
@@ -93,12 +131,9 @@ async def create_tts_job(
     payload: Dict[str, Any] = {
         "text": req.text,
         "target_locale": req.target_locale,
-
         "source_language": req.source_language,
         "input_language": (req.source_language or "en"),
-
         "translate": req.translate,
-
         "voice": req.voice,
         "style": req.style,
         "style_degree": req.style_degree,
@@ -106,32 +141,40 @@ async def create_tts_job(
         "pitch": req.pitch,
         "volume": req.volume,
         "context": req.context,
-
         "output_format": req.output_format,
     }
 
-    request_hash = _stable_hash(user_id, payload)
+    orch = TTSOrchestrator(pool)
+
+    try:
+        job_id = await orch.create_job(user_id=user_id, payload=payload)
+    except PricingClientError as e:
+        _raise_http_for_pricing_error(e)
 
     async with pool.acquire() as conn:
-        try:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO public.studio_jobs (studio_type, status, request_hash, payload_json, meta_json, user_id)
-                VALUES ($1, 'queued', $2, $3::jsonb, $4::jsonb, $5::uuid)
-                ON CONFLICT (user_id, studio_type, request_hash)
-                DO UPDATE SET updated_at = now()
-                RETURNING id::text, status
-                """,
-                AUDIO_STUDIO_TYPE,
-                request_hash,
-                json.dumps(payload),
-                json.dumps({"request_type": "audio_tts"}),
-                user_id,
-            )
-        except asyncpg.PostgresError as e:
-            raise HTTPException(status_code=400, detail=f"db_error: {str(e)}")
+        job = await conn.fetchrow(
+            """
+            SELECT id::text, status, error_code, error_message, payload_json, meta_json
+            FROM public.studio_jobs
+            WHERE id = $1::uuid
+              AND user_id = $2::uuid
+            """,
+            job_id,
+            user_id,
+        )
 
-    return JobCreatedResponse(job_id=row["id"], status=row["status"])
+    if not job:
+        return JobCreatedResponse(job_id=job_id, status="queued")
+
+    job_dict = dict(job)
+
+    return JobCreatedResponse(
+        job_id=job_dict["id"],
+        status=job_dict["status"],
+        error_code=job_dict.get("error_code"),
+        error_message=job_dict.get("error_message"),
+        pricing=_extract_pricing_view(job_dict),
+    )
 
 
 @router.get("/jobs/{job_id}/status", response_model=JobStatusResponse)
@@ -143,7 +186,7 @@ async def get_job_status(
     async with pool.acquire() as conn:
         job = await conn.fetchrow(
             """
-            SELECT id::text, status, error_code, error_message, payload_json
+            SELECT id::text, status, error_code, error_message, payload_json, meta_json
             FROM public.studio_jobs
             WHERE id = $1::uuid
               AND user_id = $2::uuid
@@ -176,11 +219,14 @@ async def get_job_status(
         if a.get("url")
     ]
 
+    job_dict = dict(job)
+
     return JobStatusResponse(
-        job_id=job["id"],
-        status=job["status"],
-        error_code=job["error_code"],
-        error_message=job["error_message"],
+        job_id=job_dict["id"],
+        status=job_dict["status"],
+        error_code=job_dict.get("error_code"),
+        error_message=job_dict.get("error_message"),
         variants=variants,
-        payload=_jsonb_to_dict(job["payload_json"]),
+        payload=_jsonb_to_dict(job_dict["payload_json"]),
+        pricing=_extract_pricing_view(job_dict),
     )

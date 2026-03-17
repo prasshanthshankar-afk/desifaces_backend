@@ -34,6 +34,18 @@ class PricingReserveResponse(_PricingBaseModel):
     amount: Optional[str] = None
     currency: Optional[str] = None
     ledger_entry_id: Optional[str] = None
+
+    # Entitlement result
+    billing_mode: Optional[str] = None
+    pricing_mode: Optional[str] = None
+    entitlement_source: Optional[str] = None
+    entitlement_reason: Optional[str] = None
+    tier_code: Optional[str] = None
+
+    # Billing ownership / settlement
+    billing_account_id: Optional[str] = None
+    settlement_mode: Optional[str] = None
+
     message: Optional[str] = None
 
 
@@ -54,6 +66,15 @@ class PricingCommitResponse(_PricingBaseModel):
     amount: Optional[str] = None
     currency: Optional[str] = None
     ledger_entry_id: Optional[str] = None
+
+    # Entitlement result
+    billing_mode: Optional[str] = None
+    entitlement_source: Optional[str] = None
+
+    # Billing ownership / settlement
+    billing_account_id: Optional[str] = None
+    settlement_mode: Optional[str] = None
+
     message: Optional[str] = None
 
 
@@ -71,4 +92,13 @@ class PricingReleaseResponse(_PricingBaseModel):
     status: str = "released"
     reservation_id: Optional[str] = None
     released_units: Optional[str] = None
+
+    # Entitlement result
+    billing_mode: Optional[str] = None
+    entitlement_source: Optional[str] = None
+
+    # Billing ownership / settlement
+    billing_account_id: Optional[str] = None
+    settlement_mode: Optional[str] = None
+
     message: Optional[str] = None

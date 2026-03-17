@@ -9,8 +9,11 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from uuid import UUID
+
+from azure.storage.blob import BlobServiceClient
 
 from app.db import get_pool
 from app.services.azure_storage_service import AzureStorageConfig, AzureStorageService
@@ -96,6 +99,13 @@ def _sha256_json(obj: Any) -> str:
 def _stable_seed(*, request_hash: str, idx: int) -> int:
     h = hashlib.sha256(f"{request_hash}:{idx}".encode("utf-8")).hexdigest()
     return int(h[:8], 16) & 0x7FFFFFFF
+
+
+def _stable_pick_index(*, seed_material: str, n: int) -> int:
+    if n <= 0:
+        raise RuntimeError("commerce_processor: no platform-model candidates available")
+    h = hashlib.sha256(seed_material.encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % n
 
 
 def _coerce_int(x: Any, default: int) -> int:
@@ -226,13 +236,18 @@ def _validate_variant_urls_or_raise(
         if unique == 1:
             logger.warning(
                 "commerce_processor: variant urls identical (non-strict). job_id=%s expected=%s url=%s",
-                job_id, expected_count, urls[0],
+                job_id,
+                expected_count,
+                urls[0],
             )
         missing = [i for i in range(expected_count) if not any(f"{job_id}-{i}" in u for u in urls)]
         if missing:
             logger.warning(
                 "commerce_processor: variant url tags missing (non-strict). job_id=%s expected=%s missing=%s sample=%s",
-                job_id, expected_count, missing, urls[0],
+                job_id,
+                expected_count,
+                missing,
+                urls[0],
             )
         return
 
@@ -358,6 +373,399 @@ def _resolve_platform_model_asset_url(
     )
 
 
+def _platform_model_container_name() -> str:
+    return (os.getenv("COMMERCE_PLATFORM_MODEL_CONTAINER") or "commerce-catalog").strip() or "commerce-catalog"
+
+
+def _platform_model_prefix() -> str:
+    return (os.getenv("COMMERCE_PLATFORM_MODEL_PREFIX") or "platform_models").strip().strip("/") or "platform_models"
+
+
+def _platform_model_source_file() -> str:
+    return (os.getenv("COMMERCE_PLATFORM_MODEL_SOURCE_FILE") or "source.jpg").strip() or "source.jpg"
+
+
+def _platform_model_max_candidates() -> int:
+    return max(1, _coerce_int(os.getenv("COMMERCE_PLATFORM_MODEL_MAX_CANDIDATES"), 500) or 500)
+
+
+def _is_desifaces_platform_model_az_ref(v: Any) -> bool:
+    az = _parse_az_ref(str(v or ""))
+    if not az:
+        return False
+    c, b = az
+    prefix = _platform_model_prefix() + "/"
+    return c == _platform_model_container_name() and b.startswith(prefix)
+
+
+def _is_desifaces_platform_model_http_url(v: Any) -> bool:
+    s = str(v or "").strip()
+    if not _is_http_url(s):
+        return False
+    parsed = urlparse(s)
+    path = parsed.path.lstrip("/")
+    expected_prefix = f"{_platform_model_container_name()}/{_platform_model_prefix()}/"
+    return path.startswith(expected_prefix)
+
+
+def _is_desifaces_platform_model_ref(v: Any) -> bool:
+    return _is_desifaces_platform_model_az_ref(v) or _is_desifaces_platform_model_http_url(v)
+
+
+def _assert_desifaces_platform_model_ref(*, value: Any, label: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        raise RuntimeError(f"{label}: missing platform model ref")
+    if not _is_desifaces_platform_model_ref(s):
+        raise RuntimeError(
+            f"{label}: external human model refs are forbidden; "
+            f"must be under az://{_platform_model_container_name()}/{_platform_model_prefix()}/... "
+            f"or corresponding DesiFaces Azure Blob URL. got={s}"
+        )
+    return s
+
+
+def _blob_name_is_full_body(blob_name: str) -> bool:
+    low = (blob_name or "").lower()
+    return any(t in low for t in ("fullbody", "full_body", "full-body"))
+
+
+def _infer_gender_from_platform_model_blob_name(blob_name: str) -> str:
+    low = (blob_name or "").lower()
+    if "female" in low or "woman" in low or "women" in low or "girl" in low:
+        return "female"
+    if "male" in low or "/men/" in low or "/man/" in low or "boy" in low:
+        return "male"
+    return "any"
+
+
+def _extract_model_code_from_platform_blob(blob_name: str) -> str:
+    prefix = _platform_model_prefix().rstrip("/") + "/"
+    name = str(blob_name or "").strip().lstrip("/")
+    if not name.startswith(prefix):
+        return ""
+    rest = name[len(prefix) :]
+    return rest.split("/", 1)[0].strip()
+
+
+def _configured_default_platform_model_ref(
+    *,
+    bucket_gender: str,
+    saree_like: bool,
+) -> Tuple[str, str]:
+    """
+    Azure-only configured fallback refs.
+    Primary behavior should come from Azure catalog random selection.
+    These are safety-net fallbacks only.
+    """
+    bucket = _normalize_gender(bucket_gender)
+
+    if saree_like:
+        ref = (
+            (os.getenv("COMMERCE_SAREE_DEFAULT_PLATFORM_MODEL_AZ") or "").strip()
+            or (os.getenv("COMMERCE_SAREE_DEFAULT_PLATFORM_MODEL_URL") or "").strip()
+            or (os.getenv("COMMERCE_FEMALE_DEFAULT_PLATFORM_MODEL_AZ") or "").strip()
+            or (os.getenv("COMMERCE_FEMALE_DEFAULT_PLATFORM_MODEL_URL") or "").strip()
+            or (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_AZ") or "").strip()
+            or (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_URL") or "").strip()
+        )
+        code = (
+            (os.getenv("COMMERCE_SAREE_DEFAULT_PLATFORM_MODEL_CODE") or "").strip()
+            or (os.getenv("COMMERCE_FEMALE_DEFAULT_PLATFORM_MODEL_CODE") or "").strip()
+            or (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_CODE") or "").strip()
+            or "default_saree_platform_model"
+        )
+        return ref, code
+
+    if bucket == "female":
+        ref = (
+            (os.getenv("COMMERCE_FEMALE_DEFAULT_PLATFORM_MODEL_AZ") or "").strip()
+            or (os.getenv("COMMERCE_FEMALE_DEFAULT_PLATFORM_MODEL_URL") or "").strip()
+            or (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_AZ") or "").strip()
+            or (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_URL") or "").strip()
+        )
+        code = (
+            (os.getenv("COMMERCE_FEMALE_DEFAULT_PLATFORM_MODEL_CODE") or "").strip()
+            or (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_CODE") or "").strip()
+            or "default_female_platform_model"
+        )
+        return ref, code
+
+    if bucket == "male":
+        ref = (
+            (os.getenv("COMMERCE_MALE_DEFAULT_PLATFORM_MODEL_AZ") or "").strip()
+            or (os.getenv("COMMERCE_MALE_DEFAULT_PLATFORM_MODEL_URL") or "").strip()
+            or (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_AZ") or "").strip()
+            or (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_URL") or "").strip()
+        )
+        code = (
+            (os.getenv("COMMERCE_MALE_DEFAULT_PLATFORM_MODEL_CODE") or "").strip()
+            or (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_CODE") or "").strip()
+            or "default_male_platform_model"
+        )
+        return ref, code
+
+    ref = (
+        (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_AZ") or "").strip()
+        or (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_URL") or "").strip()
+    )
+    code = (
+        (os.getenv("COMMERCE_DEFAULT_PLATFORM_MODEL_CODE") or "").strip()
+        or "default_platform_model"
+    )
+    return ref, code
+
+
+async def _list_azure_catalog_platform_models_best_effort(
+    *,
+    bucket_gender: str,
+    require_full_body: bool,
+) -> List[Dict[str, Any]]:
+    """
+    Enumerate only DesiFaces Azure catalog platform models:
+      az://commerce-catalog/platform_models/<model_code>/source.jpg
+    """
+    conn = (
+        (os.getenv("AZURE_STORAGE_CONNECTION_STRING") or "").strip()
+        or (os.getenv("COMMERCE_AZURE_STORAGE_CONNECTION_STRING") or "").strip()
+        or (os.getenv("DF_AZURE_STORAGE_CONNECTION_STRING") or "").strip()
+    )
+    if not conn:
+        logger.warning("commerce_processor: missing Azure connection string for platform-model catalog scan")
+        return []
+
+    container = _platform_model_container_name()
+    prefix = _platform_model_prefix()
+    source_file = _platform_model_source_file().lower()
+    max_candidates = _platform_model_max_candidates()
+    bucket = _normalize_gender(bucket_gender)
+
+    def _scan() -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        bsc = BlobServiceClient.from_connection_string(conn)
+        cc = bsc.get_container_client(container)
+        starts_with = prefix.rstrip("/") + "/"
+
+        for blob in cc.list_blobs(name_starts_with=starts_with):
+            name = str(blob.name or "").strip()
+            low = name.lower()
+
+            if not (low.endswith("/" + source_file) or low == source_file):
+                continue
+
+            if require_full_body and not _blob_name_is_full_body(low):
+                continue
+
+            gender = _infer_gender_from_platform_model_blob_name(low)
+            if bucket in ("female", "male") and gender != bucket:
+                continue
+
+            model_code = _extract_model_code_from_platform_blob(name)
+            if not model_code:
+                continue
+
+            out.append(
+                {
+                    "az_ref": f"az://{container}/{name}",
+                    "blob_name": name,
+                    "model_code": model_code,
+                    "gender": gender,
+                    "container": container,
+                    "source_file": source_file,
+                }
+            )
+            if len(out) >= max_candidates:
+                break
+
+        uniq = {str(x["az_ref"]): x for x in out}
+        return sorted(uniq.values(), key=lambda x: str(x["az_ref"]))
+
+    try:
+        return await asyncio.to_thread(_scan)
+    except Exception as e:
+        logger.warning("commerce_processor: Azure catalog platform-model scan failed err=%s", e)
+        return []
+
+
+async def _pick_random_platform_model_from_azure_catalog(
+    *,
+    request_hash: str,
+    quote_id: UUID,
+    user_id: UUID,
+    bucket_gender: str,
+    saree_like: bool,
+    require_full_body: bool,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Deterministic-random selection from DesiFaces Azure platform-model catalog.
+    Falls back to configured Azure-only env refs if the catalog has zero eligible candidates.
+    """
+    bucket = _normalize_gender(bucket_gender)
+    dbg: Dict[str, Any] = {
+        "source": "azure_catalog_random",
+        "selection_mode": "deterministic_random",
+        "bucket_gender": bucket,
+        "saree_like": bool(saree_like),
+        "require_full_body": bool(require_full_body),
+        "candidate_count": 0,
+    }
+
+    candidates = await _list_azure_catalog_platform_models_best_effort(
+        bucket_gender=bucket,
+        require_full_body=require_full_body,
+    )
+    dbg["candidate_count"] = len(candidates)
+
+    storage = _get_storage_service_best_effort()
+    sas_expires_in_s = _coerce_int(os.getenv("COMMERCE_VTON_SAS_EXPIRES_S"), 86400) or 86400
+
+    if candidates:
+        ordered = sorted(candidates, key=lambda x: str(x["az_ref"]))
+        seed_material = f"{request_hash}:{quote_id}:{user_id}:{bucket}:{'saree' if saree_like else 'non_saree'}"
+        idx = _stable_pick_index(seed_material=seed_material, n=len(ordered))
+        chosen = ordered[idx]
+
+        resolved_url = _resolve_platform_model_asset_url(
+            storage=storage,
+            url=str(chosen["az_ref"]),
+            sas_expires_in_s=sas_expires_in_s,
+        )
+        if not _is_http_url(resolved_url):
+            raise RuntimeError(
+                f"commerce_processor: resolved Azure catalog platform model is not http(s): {resolved_url}"
+            )
+
+        selection = {
+            "source": "azure_catalog_random",
+            "selection_mode": "deterministic_random",
+            "bucket_gender": bucket,
+            "saree_like": bool(saree_like),
+            "require_full_body": bool(require_full_body),
+            "model_code": chosen.get("model_code"),
+            "gender": chosen.get("gender") if bucket in ("female", "male") else chosen.get("gender"),
+            "asset_az_ref": chosen.get("az_ref"),
+            "primary_asset_url": resolved_url,
+            "candidate_count": len(ordered),
+            "candidate_index": idx,
+            "quote_id": str(quote_id),
+            "user_id": str(user_id),
+            "request_hash": request_hash[:16],
+        }
+        dbg["selected"] = {
+            "model_code": chosen.get("model_code"),
+            "asset_az_ref": chosen.get("az_ref"),
+            "primary_asset_url": resolved_url,
+            "candidate_index": idx,
+        }
+        dbg["reason"] = "selected_from_catalog"
+        return selection, dbg
+
+    configured_ref, configured_code = _configured_default_platform_model_ref(
+        bucket_gender=bucket,
+        saree_like=saree_like,
+    )
+    if configured_ref:
+        _assert_desifaces_platform_model_ref(
+            value=configured_ref,
+            label="commerce_processor.configured_default_platform_model",
+        )
+
+        resolved_url = _resolve_platform_model_asset_url(
+            storage=storage,
+            url=configured_ref,
+            sas_expires_in_s=sas_expires_in_s,
+        )
+        if not _is_http_url(resolved_url):
+            raise RuntimeError(
+                f"commerce_processor: resolved configured default platform model is not http(s): {resolved_url}"
+            )
+
+        selection = {
+            "source": "configured_default_platform_model",
+            "selection_mode": "configured_default",
+            "bucket_gender": bucket,
+            "saree_like": bool(saree_like),
+            "require_full_body": bool(require_full_body),
+            "model_code": configured_code,
+            "gender": bucket if bucket in ("female", "male") else None,
+            "asset_az_ref": configured_ref if str(configured_ref).startswith("az://") else None,
+            "primary_asset_url": resolved_url,
+            "candidate_count": 1,
+            "candidate_index": 0,
+            "configured_ref": configured_ref,
+            "quote_id": str(quote_id),
+            "user_id": str(user_id),
+            "request_hash": request_hash[:16],
+        }
+        dbg["selected"] = {
+            "model_code": configured_code,
+            "configured_ref": configured_ref,
+            "primary_asset_url": resolved_url,
+        }
+        dbg["reason"] = "selected_from_configured_default"
+        return selection, dbg
+
+    dbg["reason"] = "no_catalog_candidates_and_no_configured_default"
+    return None, dbg
+
+
+def _apply_platform_model_selection_to_model_ref(
+    *,
+    model_ref: Dict[str, Any],
+    selection: Dict[str, Any],
+) -> Dict[str, Any]:
+    mr = dict(model_ref or {})
+    primary_asset_url = str(selection.get("primary_asset_url") or "").strip()
+    if not _is_http_url(primary_asset_url):
+        raise RuntimeError("commerce_processor: platform-model selection primary_asset_url is not http(s)")
+
+    mr["human_image_url"] = primary_asset_url
+    mr["url"] = primary_asset_url
+
+    if selection.get("gender") and not mr.get("gender"):
+        mr["gender"] = str(selection.get("gender"))
+
+    meta2 = _as_dict(mr.get("meta"))
+    meta2["platform_model_selection"] = selection
+    meta2["platform_model_code"] = selection.get("model_code")
+
+    if selection.get("gender") and not meta2.get("gender"):
+        meta2["gender"] = selection.get("gender")
+
+    views = _as_dict(meta2.get("views"))
+    views["full_body"] = True
+    meta2["views"] = views
+    meta2["full_body"] = True
+    meta2["is_full_body"] = True
+
+    mr["meta"] = meta2
+    mr["full_body"] = True
+    mr["is_full_body"] = True
+    return mr
+
+
+def _resolve_existing_platform_model_ref_to_http(
+    *,
+    value: str,
+) -> str:
+    _assert_desifaces_platform_model_ref(
+        value=value,
+        label="commerce_processor.request_supplied_platform_model_ref",
+    )
+    storage = _get_storage_service_best_effort()
+    sas_expires_in_s = _coerce_int(os.getenv("COMMERCE_VTON_SAS_EXPIRES_S"), 86400) or 86400
+    resolved = _resolve_platform_model_asset_url(
+        storage=storage,
+        url=value,
+        sas_expires_in_s=sas_expires_in_s,
+    )
+    if not _is_http_url(resolved):
+        raise RuntimeError(
+            f"commerce_processor: request-supplied platform model could not be resolved to http(s): {resolved}"
+        )
+    return resolved
+
+
 # -----------------------------
 # Costume gender policy + garment type inference (non-saree)
 # -----------------------------
@@ -426,20 +834,21 @@ _DRESS_CODES = {
     "anarkali",
     "kurta_pyjama",  # treat as set = "dresses" category for provider
     "kurta_set",
-    "sherwani",      # treat as set-like for provider too
+    "sherwani",  # treat as set-like for provider too
 }
 
 
 def _infer_target_gender(*, quote_request: Dict[str, Any], product_assets: Dict[str, Any]) -> str:
-    # explicit request wins
     qr = _as_dict(quote_request)
     pa = _as_dict(product_assets)
+
+    if _looks_saree_like_for_platform_selector(product_assets=pa):
+        return "female"
 
     g = qr.get("gender") or qr.get("target_gender") or _as_dict(qr.get("model_ref")).get("gender")
     if g:
         return _normalize_gender(g)
 
-    # infer from dominant component code / items
     dom = str(pa.get("dominant_component_code") or "").strip().lower()
     if dom in _MALE_ONLY_CODES:
         return "male"
@@ -628,7 +1037,6 @@ def _infer_non_saree_platform_garment_kind(*, product_assets: Dict[str, Any]) ->
     blob = " | ".join([p for p in blob_parts if p])
     joined = " | ".join([x for x in item_codes if x])
 
-    # Indian explicit families first
     if any(t in blob for t in ("dhoti_kurta", "dhoti kurta")):
         return "dhoti_kurta"
     if "sherwani" in blob:
@@ -651,8 +1059,25 @@ def _infer_non_saree_platform_garment_kind(*, product_assets: Dict[str, Any]) ->
     if "sherwani" in joined:
         return "sherwani"
 
-    # Generic western / mixed fallback
-    if any(t in blob for t in ("hoodie", "blazer", "jacket", "coat", "overcoat", "sweater", "cardigan", "shirt", "tshirt", "t-shirt", "top", "kurta", "blouse", "choli")):
+    if any(
+        t in blob
+        for t in (
+            "hoodie",
+            "blazer",
+            "jacket",
+            "coat",
+            "overcoat",
+            "sweater",
+            "cardigan",
+            "shirt",
+            "tshirt",
+            "t-shirt",
+            "top",
+            "kurta",
+            "blouse",
+            "choli",
+        )
+    ):
         return "upper_body"
 
     if any(t in blob for t in ("jeans", "pant", "pants", "trouser", "trousers", "skirt", "shorts", "pyjama", "pajama", "dhoti", "lungi")):
@@ -701,6 +1126,134 @@ def _resolve_recent_platform_model_codes(*, quote_request: Dict[str, Any], produ
     return _uniq_norm(codes)
 
 
+async def _inject_platform_model_for_saree_best_effort(
+    *,
+    quote_request: Dict[str, Any],
+    product_assets: Dict[str, Any],
+    model_ref: Dict[str, Any],
+    request_hash: str,
+    quote_id: UUID,
+    user_id: UUID,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Saree vendor-only flow:
+    if no explicit human image is present, inject a deterministic-random female full-body
+    platform model from DesiFaces Azure catalog. Uses configured Azure-only env refs
+    only as fallback when the catalog has zero eligible candidates.
+    """
+    mr = dict(model_ref or {})
+    dbg: Dict[str, Any] = {
+        "requested": False,
+        "enabled": (
+            os.getenv("COMMERCE_ENABLE_SAREE_PLATFORM_MODEL_AUTO_PICK") or "1"
+        ).strip().lower() not in ("0", "false", "no"),
+        "saree_like": False,
+    }
+
+    if not dbg["enabled"]:
+        dbg["reason"] = "saree_auto_pick_disabled"
+        return mr, dbg
+
+    saree_like = _looks_saree_like_for_platform_selector(product_assets=product_assets)
+    dbg["saree_like"] = bool(saree_like)
+    if not saree_like:
+        dbg["reason"] = "not_saree_like"
+        return mr, dbg
+
+    requested = _platform_mode_requested(
+        quote_request=quote_request,
+        product_assets=product_assets,
+        model_ref=model_ref,
+    )
+    dbg["requested"] = bool(requested)
+
+    force_when_missing_human = (
+        os.getenv("COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN") or "1"
+    ).strip().lower() not in ("0", "false", "no")
+    dbg["force_when_missing_human"] = bool(force_when_missing_human)
+
+    mr = _ensure_human_image_url(mr)
+    existing = str(
+        mr.get("human_image_url")
+        or mr.get("url")
+        or mr.get("image_url")
+        or ""
+    ).strip()
+
+    if existing:
+        existing_resolved = _resolve_existing_platform_model_ref_to_http(value=existing)
+        mr["human_image_url"] = existing_resolved
+        mr["url"] = existing_resolved
+
+        meta2 = _as_dict(mr.get("meta"))
+        meta2.setdefault(
+            "platform_model_selection",
+            {
+                "source": "request_supplied_model_ref",
+                "selection_mode": "request_supplied",
+                "primary_asset_url": existing_resolved,
+                "requested": bool(requested),
+                "saree_like": True,
+                "bucket_gender": "female",
+                "quote_id": str(quote_id),
+                "user_id": str(user_id),
+                "request_hash": request_hash[:16],
+            },
+        )
+        meta2["full_body"] = True
+        meta2["is_full_body"] = True
+        views = _as_dict(meta2.get("views"))
+        views["full_body"] = True
+        meta2["views"] = views
+        mr["meta"] = meta2
+        mr["full_body"] = True
+        mr["is_full_body"] = True
+
+        dbg["selection"] = {
+            "source": "request_supplied_model_ref",
+            "primary_asset_url": existing_resolved,
+        }
+        dbg["reason"] = "human_present"
+        return mr, dbg
+
+    if not requested and not force_when_missing_human:
+        dbg["reason"] = "not_requested_and_missing_human"
+        return mr, dbg
+
+    selection, pick_dbg = await _pick_random_platform_model_from_azure_catalog(
+        request_hash=request_hash,
+        quote_id=quote_id,
+        user_id=user_id,
+        bucket_gender="female",
+        saree_like=True,
+        require_full_body=True,
+    )
+    dbg["candidate_count"] = pick_dbg.get("candidate_count")
+    dbg["catalog_pick"] = pick_dbg
+
+    if not selection:
+        dbg["reason"] = "missing_default_platform_model_env_and_no_catalog_candidates"
+        raise RuntimeError(
+            "commerce_processor: saree vendor flow requires an eligible female full-body platform model "
+            "from DesiFaces Azure catalog under az://commerce-catalog/platform_models/.../source.jpg, "
+            "or an Azure-only fallback via COMMERCE_SAREE_DEFAULT_PLATFORM_MODEL_AZ / "
+            "COMMERCE_SAREE_DEFAULT_PLATFORM_MODEL_URL "
+            "(fallback: COMMERCE_FEMALE_DEFAULT_PLATFORM_MODEL_AZ / COMMERCE_DEFAULT_PLATFORM_MODEL_AZ)"
+        )
+
+    mr = _apply_platform_model_selection_to_model_ref(model_ref=mr, selection=selection)
+    dbg["selection"] = {
+        "model_code": selection.get("model_code"),
+        "primary_asset_url": selection.get("primary_asset_url"),
+        "asset_az_ref": selection.get("asset_az_ref"),
+        "candidate_count": selection.get("candidate_count"),
+        "candidate_index": selection.get("candidate_index"),
+        "selection_mode": selection.get("selection_mode"),
+    }
+    dbg["reason"] = "selected"
+    return mr, dbg
+
+
 async def _preselect_platform_model_for_non_saree(
     *,
     quote_request: Dict[str, Any],
@@ -711,13 +1264,14 @@ async def _preselect_platform_model_for_non_saree(
     user_id: UUID,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Production-grade platform model selection.
+    Non-saree platform-model resolution.
 
-    Uses the approved manifest via services/svc-commerce/app/app/services/catalog/platform_model_selector.py
-    and resolves az:// assets to SAS/public URLs for provider consumption.
+    Primary:
+      deterministic-random selection from DesiFaces Azure platform-model catalog
+      using the resolved target-gender bucket (female / male / any).
 
-    Returns:
-      (patched_model_ref, debug_meta)
+    Fallback:
+      existing approved selector path, but still enforce Azure-only platform-model assets.
     """
     mr = dict(model_ref or {})
     dbg: Dict[str, Any] = {
@@ -743,14 +1297,53 @@ async def _preselect_platform_model_for_non_saree(
     force_when_missing_human = (os.getenv("COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN") or "1").strip().lower() not in ("0", "false", "no")
     human_url_existing = str(mr.get("human_image_url") or mr.get("image_url") or mr.get("url") or "").strip()
 
+    if human_url_existing:
+        resolved_existing = _resolve_existing_platform_model_ref_to_http(value=human_url_existing)
+        mr["human_image_url"] = resolved_existing
+        mr["url"] = resolved_existing
+        dbg["reason"] = "human_present"
+        dbg["selection"] = {
+            "source": "request_supplied_model_ref",
+            "primary_asset_url": resolved_existing,
+        }
+        return mr, dbg
+
     if not requested and not (force_when_missing_human and not human_url_existing):
-        dbg["reason"] = "not_requested_and_human_present"
+        dbg["reason"] = "not_requested_no_force_or_human_present"
         return mr, dbg
 
     garment_kind = _infer_non_saree_platform_garment_kind(product_assets=product_assets)
     dbg["resolved_garment_kind"] = garment_kind
     if not garment_kind:
         dbg["reason"] = "garment_kind_unresolved"
+        return mr, dbg
+
+    target_gender = _infer_target_gender(quote_request=quote_request, product_assets=product_assets)
+    bucket_gender = target_gender if target_gender in ("female", "male") else "any"
+    dbg["bucket_gender"] = bucket_gender
+
+    random_selection, random_dbg = await _pick_random_platform_model_from_azure_catalog(
+        request_hash=request_hash,
+        quote_id=quote_id,
+        user_id=user_id,
+        bucket_gender=bucket_gender,
+        saree_like=False,
+        require_full_body=True,
+    )
+    dbg["catalog_pick"] = random_dbg
+
+    if random_selection:
+        mr = _apply_platform_model_selection_to_model_ref(model_ref=mr, selection=random_selection)
+        dbg["selection"] = {
+            "model_code": random_selection.get("model_code"),
+            "gender": random_selection.get("gender"),
+            "primary_asset_url": random_selection.get("primary_asset_url"),
+            "asset_az_ref": random_selection.get("asset_az_ref"),
+            "candidate_count": random_selection.get("candidate_count"),
+            "candidate_index": random_selection.get("candidate_index"),
+            "selection_mode": random_selection.get("selection_mode"),
+        }
+        dbg["reason"] = "selected_from_random_catalog"
         return mr, dbg
 
     storage = _get_storage_service_best_effort()
@@ -815,6 +1408,10 @@ async def _preselect_platform_model_for_non_saree(
         return mr, dbg
 
     selected_url = str(selection.get("primary_asset_url") or "").strip()
+    _assert_desifaces_platform_model_ref(
+        value=selected_url,
+        label="commerce_processor.non_saree_selector.primary_asset_url",
+    )
     if not _is_http_url(selected_url):
         dbg["reason"] = "selector_returned_non_http"
         if requested or not human_url_existing:
@@ -845,7 +1442,7 @@ async def _preselect_platform_model_for_non_saree(
         "eligible_count": selection.get("eligible_count"),
         "top_k_count": selection.get("top_k_count"),
     }
-    dbg["reason"] = "selected"
+    dbg["reason"] = "selected_from_selector_fallback"
     dbg["request_hash"] = request_hash[:16]
     return mr, dbg
 
@@ -1077,7 +1674,7 @@ async def _apply_items_resolver_best_effort(con, *, product_assets: Dict[str, An
     catalog = await _fetch_catalog_ranks_best_effort(con, codes)
 
     best: Optional[Dict[str, Any]] = None
-    best_score = -10**9
+    best_score = -(10**9)
     best_code: Optional[str] = None
 
     for it in norm_items:
@@ -1184,7 +1781,6 @@ def _extract_vton_request_parts(
     product_assets = _as_dict(qr.get("product_assets") or p.get("product_assets") or inp.get("product_assets"))
     model_ref = _as_dict(qr.get("model_ref") or p.get("model_ref") or inp.get("model_ref"))
 
-    # normalize legacy keys into dicts
     for k in (
         "garment_image_url",
         "saree_image_url",
@@ -1303,17 +1899,14 @@ class NonSareeQC:
         self.timeout_s = _coerce_int(os.getenv("COMMERCE_VTON_QC_TIMEOUT_S"), 25) or 25
         self.image_size = _coerce_int(os.getenv("COMMERCE_VTON_QC_IMAGE_SIZE"), 256) or 256
 
-        # minimum diffs (presence)
         self.min_upper = float(os.getenv("COMMERCE_VTON_QC_MIN_UPPER_DIFF") or "0.04")
         self.min_lower = float(os.getenv("COMMERCE_VTON_QC_MIN_LOWER_DIFF") or "0.04")
         self.min_both_upper = float(os.getenv("COMMERCE_VTON_QC_MIN_DRESS_UPPER_DIFF") or "0.03")
         self.min_both_lower = float(os.getenv("COMMERCE_VTON_QC_MIN_DRESS_LOWER_DIFF") or "0.05")
 
-        # maximum diffs (preserve)
         self.max_face = float(os.getenv("COMMERCE_VTON_QC_MAX_FACE_DIFF") or "0.14")
         self.max_corners = float(os.getenv("COMMERCE_VTON_QC_MAX_CORNER_DIFF") or "0.15")
 
-        # outfit completeness: non-target should not be wildly altered
         self.max_non_target = float(os.getenv("COMMERCE_VTON_QC_MAX_NON_TARGET_DIFF") or "0.20")
 
     async def score(
@@ -1326,8 +1919,9 @@ class NonSareeQC:
         if not self.enabled:
             return {"qc_enabled": False, "ok": True, "score": 0.0}
 
-        from PIL import Image, ImageChops, ImageStat
         import io
+
+        from PIL import Image, ImageChops, ImageStat
 
         size = int(self.image_size)
         timeout_s = int(self.timeout_s)
@@ -1354,9 +1948,8 @@ class NonSareeQC:
         human = await asyncio.to_thread(_fetch, human_url)
         out = await asyncio.to_thread(_fetch, out_url)
 
-        # Regions
-        upper = _roi_diff(human, out, 0.10, 0.90, 0.18, 0.60)  # torso-ish
-        lower = _roi_diff(human, out, 0.08, 0.92, 0.60, 0.98)  # legs/skirt area
+        upper = _roi_diff(human, out, 0.10, 0.90, 0.18, 0.60)
+        lower = _roi_diff(human, out, 0.08, 0.92, 0.60, 0.98)
 
         face = _roi_diff(human, out, 0.30, 0.70, 0.00, 0.28)
 
@@ -1370,21 +1963,16 @@ class NonSareeQC:
         ok_presence = True
         ok_preserve = True
 
-        # Presence constraints
         if gt == "upper_body":
             ok_presence = upper >= self.min_upper
         elif gt == "lower_body":
             ok_presence = lower >= self.min_lower
-        else:  # dresses / one-piece / sets
+        else:
             ok_presence = (upper >= self.min_both_upper) and (lower >= self.min_both_lower)
 
-        # Preserve constraints
         if face > self.max_face or corners > self.max_corners:
             ok_preserve = False
 
-        # Outfit completeness:
-        # - For upper_body, lower should not be massively changed
-        # - For lower_body, upper should not be massively changed
         if gt == "upper_body" and lower > self.max_non_target:
             ok_preserve = False
         if gt == "lower_body" and upper > self.max_non_target:
@@ -1392,7 +1980,6 @@ class NonSareeQC:
 
         ok = bool(ok_presence and ok_preserve)
 
-        # Score: favor strong presence, penalize face/corners
         score = float(upper + lower) - float(2.0 * face) - float(1.0 * corners)
 
         return {
@@ -1496,49 +2083,56 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
         quote_request = _merge_missing(quote_request, db_req)
 
         product_assets, model_ref, language, resolution, count, request_hash, debug_inputs = _extract_vton_request_parts(
-            quote_request=quote_request, payload=payload, quote_id=quote_id
+            quote_request=quote_request,
+            payload=payload,
+            quote_id=quote_id,
         )
 
-        # Resolve dominant garment from items[] (best-effort)
         async with pool.acquire() as con:
             product_assets, dominant_code = await _apply_items_resolver_best_effort(con, product_assets=product_assets)
 
-        # Merge DB-resolved nested dicts even if payload had partial dicts
         product_assets = _merge_missing(product_assets, _as_dict(db_req.get("product_assets")))
         model_ref = _merge_missing(model_ref, _as_dict(db_req.get("model_ref")))
 
         product_assets = _ensure_garment_image_url(product_assets)
         model_ref = _ensure_human_image_url(model_ref)
 
-        # Determine dominant component code
         dominant_component_code = str(product_assets.get("dominant_component_code") or dominant_code or "").strip()
 
-        # Infer garment_type from code if missing (helps provider category)
         if not str(product_assets.get("garment_type") or "").strip() and dominant_component_code:
             gt = _infer_garment_type_from_code(dominant_component_code)
             if gt:
                 product_assets["garment_type"] = gt
 
-        # Determine target gender from costume rules
         target_gender = _infer_target_gender(quote_request=quote_request, product_assets=product_assets)
 
-        # Apply platform-model preselection (production-grade approved manifest)
         platform_pick_dbg: Dict[str, Any] = {}
         try:
-            model_ref, platform_pick_dbg = await _preselect_platform_model_for_non_saree(
-                quote_request=quote_request,
-                product_assets=product_assets,
-                model_ref=model_ref,
-                request_hash=request_hash,
-                quote_id=quote_id,
-                user_id=user_id,
-            )
+            if _looks_saree_like_for_platform_selector(product_assets=product_assets):
+                model_ref, platform_pick_dbg = await _inject_platform_model_for_saree_best_effort(
+                    quote_request=quote_request,
+                    product_assets=product_assets,
+                    model_ref=model_ref,
+                    request_hash=request_hash,
+                    quote_id=quote_id,
+                    user_id=user_id,
+                )
+            else:
+                model_ref, platform_pick_dbg = await _preselect_platform_model_for_non_saree(
+                    quote_request=quote_request,
+                    product_assets=product_assets,
+                    model_ref=model_ref,
+                    request_hash=request_hash,
+                    quote_id=quote_id,
+                    user_id=user_id,
+                )
         except Exception as e:
-            raise RuntimeError(f"commerce_processor: platform model preselection failed err={type(e).__name__}: {e}") from e
+            raise RuntimeError(
+                f"commerce_processor: platform model resolution failed err={type(e).__name__}: {e}"
+            ) from e
 
         model_ref = _ensure_human_image_url(model_ref)
 
-        # Inject full-body hints so Saree strict pipeline doesn't fail with SAREE_DRAPE_REQUIRES_FULL_BODY
         product_assets, model_ref, full_body = _apply_full_body_hints(
             quote_request=quote_request,
             product_assets=product_assets,
@@ -1548,11 +2142,19 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
         garment_url = product_assets.get("garment_image_url")
         human_url = model_ref.get("human_image_url")
 
+        if human_url:
+            _assert_desifaces_platform_model_ref(
+                value=human_url,
+                label="commerce_processor.final_human_image_url",
+            )
+            human_url = _resolve_existing_platform_model_ref_to_http(value=str(human_url))
+            model_ref["human_image_url"] = human_url
+            model_ref["url"] = human_url
+
         provider = VTONProvider()
 
         must_have_inputs = bool(provider.enable_real and provider.provider == "fal" and not getattr(provider, "demo_mode", False))
 
-        # Allow human_url to be missing only if provider selector is expected to fill it later.
         provider_selector_enabled = (os.getenv("COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR") or "1").strip().lower() not in ("0", "false", "no")
         provider_force_when_missing = (os.getenv("COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN") or "1").strip().lower() not in ("0", "false", "no")
         platform_requested = _platform_mode_requested(
@@ -1575,7 +2177,6 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                 logger.warning("commerce_processor: human_image_url missing; proceeding (demo/placeholder). quote_id=%s", quote_id)
                 human_url = None
 
-        # Gender-costume enforcement (optional strict)
         strict_gender = (os.getenv("COMMERCE_GENDER_COSTUME_STRICT") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
         model_gender = _extract_gender_from_model_ref(model_ref)
         gender_policy_dbg = _apply_gender_policy_or_raise(
@@ -1585,7 +2186,6 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
             strict=strict_gender,
         )
 
-        # Persist resolved info (quote table)
         resolved_json = {
             "source": "commerce_processor",
             "resolved_at": datetime.now(timezone.utc).isoformat(),
@@ -1659,10 +2259,8 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
             variants=variants,
         )
 
-        # Call provider
         result = await provider.generate(req)
 
-        # Extract urls
         urls = None
         if isinstance(result, dict):
             urls = result.get("urls") or _as_dict(result.get("computed")).get("urls")
@@ -1683,20 +2281,25 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
             provider_name = str(getattr(result, "provider", "") or "unknown")
             provider_meta = _as_dict(getattr(result, "meta", None))
 
-        # If provider selected platform model internally, use that human url for downstream QC/persistence.
         provider_platform_sel = _as_dict(provider_meta.get("platform_model_selection"))
         if provider_platform_sel:
             purl = str(provider_platform_sel.get("primary_asset_url") or "").strip()
-            if _is_http_url(purl):
-                human_url = purl
-                model_ref["human_image_url"] = purl
-                meta2 = _as_dict(model_ref.get("meta"))
-                meta2["platform_model_selection"] = provider_platform_sel
-                model_ref["meta"] = meta2
-                if provider_platform_sel.get("gender") and not model_ref.get("gender"):
-                    model_ref["gender"] = str(provider_platform_sel.get("gender"))
+            if purl:
+                _assert_desifaces_platform_model_ref(
+                    value=purl,
+                    label="commerce_processor.provider_platform_model_selection.primary_asset_url",
+                )
+                if _is_http_url(purl):
+                    human_url = purl
+                    model_ref["human_image_url"] = purl
+                    if not str(model_ref.get("url") or "").strip():
+                        model_ref["url"] = purl
+                    meta2 = _as_dict(model_ref.get("meta"))
+                    meta2["platform_model_selection"] = provider_platform_sel
+                    model_ref["meta"] = meta2
+                    if provider_platform_sel.get("gender") and not model_ref.get("gender"):
+                        model_ref["gender"] = str(provider_platform_sel.get("gender"))
 
-        # Enforce common variant tag contract (STRICT by default)
         strict_variants = (os.getenv("COMMERCE_STRICT_VARIANT_TAGS") or "1").strip().lower() not in ("0", "false", "no")
         _validate_variant_urls_or_raise(
             job_id=job_id,
@@ -1705,10 +2308,6 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
             strict=strict_variants,
         )
 
-        # -----------------------------
-        # Non-saree QC + best selection
-        # (Saree pipeline remains unchanged inside provider)
-        # -----------------------------
         qc = NonSareeQC()
         qc_summary: Dict[str, Any] = {"qc_enabled": qc.enabled, "qc_strict": qc.strict}
         best_idx: Optional[int] = None
@@ -1726,7 +2325,6 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                     r = {"qc_enabled": True, "ok": False, "score": -999.0, "error": f"{type(e).__name__}: {e}"}
                 ranked.append({"i": i, "url": u, **_as_dict(r)})
 
-            # pick best ok, else best score
             ok_items = [x for x in ranked if x.get("ok") is True]
             if ok_items:
                 ok_items_sorted = sorted(ok_items, key=lambda x: float(x.get("score") or -999.0), reverse=True)

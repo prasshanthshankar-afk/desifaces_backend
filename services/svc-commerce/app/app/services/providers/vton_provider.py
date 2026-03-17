@@ -1,4 +1,3 @@
-# services/svc-commerce/app/app/services/providers/vton_provider.py
 from __future__ import annotations
 
 import re
@@ -14,6 +13,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import UUID
+
+from app.services.providers.vton.indian_non_saree_router import (
+    build_required_pipeline_error,
+    is_phase1_indian_non_saree_family,
+    resolve_indian_non_saree_routing,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +126,18 @@ def _uniq_norm(xs: Any) -> List[str]:
         s = _norm_text(x)
         if s and s not in seen:
             seen.add(s)
+            out.append(s)
+    return out
+
+
+_SUPPORTED_NON_SAREE_PROVIDERS = {"imageapps_v2", "fashn", "catvton"}
+
+
+def _csv_tokens(v: Any) -> List[str]:
+    out: List[str] = []
+    for part in str(v or "").split(","):
+        s = _norm_text(part)
+        if s:
             out.append(s)
     return out
 
@@ -1150,91 +1167,6 @@ def _resolve_recent_platform_model_codes(*, product_assets: Dict[str, Any], mode
     return _uniq_norm(codes)
 
 
-def _infer_non_saree_platform_garment_kind(
-    *,
-    product_assets: Dict[str, Any],
-    ns: Dict[str, Any],
-    garment_type: str,
-    primary_url: Optional[str],
-) -> Optional[str]:
-    """
-    Resolve to:
-      - Indian Phase-1 families when we can
-      - else generic families for western / mixed catalog:
-          upper_body, lower_body, dresses
-    """
-    blob_parts: List[str] = [
-        _norm_text(product_assets.get("garment_kind")),
-        _norm_text(product_assets.get("outfit_kind")),
-        _norm_text(product_assets.get("dominant_component_code")),
-        _norm_text(ns.get("dominant_component_code")),
-        _norm_text(product_assets.get("title")),
-        _norm_text(product_assets.get("name")),
-        _norm_text(product_assets.get("category")),
-        _norm_text(primary_url),
-    ]
-
-    for it in _as_list(product_assets.get("items")):
-        d = _as_dict(it)
-        blob_parts.extend(
-            [
-                _norm_text(d.get("component_code")),
-                _norm_text(d.get("kind")),
-                _norm_text(d.get("name")),
-                _norm_text(d.get("category")),
-                _norm_text(d.get("image_url")),
-            ]
-        )
-
-    blob = " | ".join([p for p in blob_parts if p])
-
-    item_codes = []
-    for it in _as_list(ns.get("items_norm")):
-        d = _as_dict(it)
-        item_codes.append(_norm_text(d.get("component_code") or d.get("kind")))
-        item_codes.append(_norm_text(d.get("name")))
-    joined = " | ".join([x for x in item_codes if x])
-
-    # Indian explicit families first
-    if any(t in blob for t in ("dhoti_kurta", "dhoti kurta")):
-        return "dhoti_kurta"
-    if "sherwani" in blob:
-        return "sherwani"
-    if any(t in blob for t in ("salwar_suit", "salwar suit", "shalwar", "kameez", "salwar kameez")):
-        return "salwar_suit"
-    if any(t in blob for t in ("lehenga_set", "lehenga set", "lehenga choli", "lehenga")):
-        return "lehenga_set"
-    if any(t in blob for t in ("kurta_pyjama", "kurta pyjama", "kurta pajama", "pyjama set", "pajama set")):
-        return "kurta_pyjama"
-
-    if "dhoti" in joined and "kurta" in joined:
-        return "dhoti_kurta"
-    if "lehenga" in joined:
-        return "lehenga_set"
-    if "salwar" in joined or "kameez" in joined:
-        return "salwar_suit"
-    if "kurta" in joined and any(t in joined for t in ("pyjama", "pajama")):
-        return "kurta_pyjama"
-    if "sherwani" in joined:
-        return "sherwani"
-
-    # Generic western / mixed fallback
-    if any(t in blob for t in ("hoodie", "blazer", "jacket", "coat", "overcoat", "sweater", "cardigan", "shirt", "tshirt", "t-shirt", "top", "kurta", "blouse", "choli")):
-        return "upper_body"
-
-    if any(t in blob for t in ("jeans", "pant", "pants", "trouser", "trousers", "skirt", "shorts", "pyjama", "pajama", "dhoti", "lungi")):
-        return "lower_body"
-
-    if any(t in blob for t in ("dress", "gown", "jumpsuit", "anarkali", "salwar", "lehenga", "suit", "kurta_set", "onepiece", "one-piece")):
-        return "dresses"
-
-    gt = _norm_text(garment_type)
-    if gt in {"upper_body", "lower_body", "dresses"}:
-        return gt
-
-    return None
-
-
 # -----------------------------------------------------------------------------
 # Saree Providers (UNCHANGED)
 # -----------------------------------------------------------------------------
@@ -1507,7 +1439,20 @@ class VTONProvider:
             for p in (_env_str("COMMERCE_NON_SAREE_PROVIDER_ORDER", "imageapps_v2,fashn,catvton") or "imageapps_v2,fashn,catvton").split(",")
             if p.strip()
         ]
+
         self.two_piece_sequential = _env_bool("COMMERCE_VTON_TWO_PIECE_SEQUENTIAL", default=False)
+
+        # Indian non-saree Phase-1 families must not silently degrade into western generic VTON
+        # unless an explicit escape hatch is enabled.
+        self.indian_non_saree_strict = _env_bool("COMMERCE_INDIAN_NON_SAREE_STRICT", default=True)
+        self.enable_indian_non_saree_generic_fallback = (
+            _env_bool("COMMERCE_ENABLE_INDIAN_NON_SAREE_GENERIC_FALLBACK", default=False)
+            or _env_bool("COMMERCE_ALLOW_GENERIC_INDIAN_NON_SAREE_FALLBACK", default=False)
+            or _env_bool("DF_ENABLE_INDIAN_NON_SAREE_GENERIC_FALLBACK", default=False)
+            or _env_bool("DF_ALLOW_GENERIC_INDIAN_NON_SAREE_GENERIC_FALLBACK", default=False)
+            or _env_bool("DF_ALLOW_GENERIC_INDIAN_NON_SAREE_FALLBACK", default=False)
+        )
+        self.supported_non_saree_providers = set(_SUPPORTED_NON_SAREE_PROVIDERS)
 
         # Platform-model selector for non-saree
         self.enable_platform_model_selector = _env_bool("COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR", default=True)
@@ -1578,6 +1523,67 @@ class VTONProvider:
             asset_url_resolver=self._resolve_platform_model_asset_url,
         )
         return self._platform_selector
+
+    def _resolve_non_saree_provider_order(self, *, family: Optional[str]) -> List[str]:
+        configured = [p for p in self.non_saree_provider_order if p in self.supported_non_saree_providers]
+        if not configured:
+            configured = ["imageapps_v2", "fashn", "catvton"]
+
+        fam = _norm_text(family)
+        if not fam:
+            return configured
+
+        fam_key = re.sub(r"[^A-Za-z0-9]+", "_", fam).strip("_").upper()
+        if not fam_key:
+            return configured
+
+        raw_override = ""
+        for env_name in (
+            f"DF_NONSAREE_PROVIDER_{fam_key}",
+            f"COMMERCE_NONSAREE_PROVIDER_{fam_key}",
+            f"COMMERCE_NON_SAREE_PROVIDER_{fam_key}",
+        ):
+            raw_override = (os.getenv(env_name) or "").strip()
+            if raw_override:
+                break
+
+        if not raw_override:
+            return configured
+
+        requested = _csv_tokens(raw_override)
+        if not requested:
+            return configured
+
+        if any(p in ("auto", "default", "global") for p in requested):
+            return configured
+
+        valid: List[str] = []
+        invalid: List[str] = []
+
+        for p in requested:
+            if p in self.supported_non_saree_providers:
+                if p not in valid:
+                    valid.append(p)
+            else:
+                invalid.append(p)
+
+        if invalid:
+            logger.warning(
+                "Ignoring unsupported non-saree provider override family=%s override=%s invalid=%s supported=%s",
+                fam,
+                raw_override,
+                invalid,
+                sorted(self.supported_non_saree_providers),
+            )
+
+        if not valid:
+            return configured
+
+        out = list(valid)
+        for p in configured:
+            if p not in out:
+                out.append(p)
+        return out
 
     async def _select_platform_model_for_non_saree(
         self,
@@ -1757,7 +1763,8 @@ class VTONProvider:
             )
 
         urls_placeholders = [
-            self._placeholder_url(product_type=product_type, pose=v.pose, bg=v.background, idx=i) for i, v in enumerate(req.variants)
+            self._placeholder_url(product_type=product_type, pose=v.pose, bg=v.background, idx=i)
+            for i, v in enumerate(req.variants)
         ]
         n_real = min(len(req.variants), self.max_provider_images)
 
@@ -1782,7 +1789,11 @@ class VTONProvider:
             lora_meta: Dict[str, Any] = {"proxy": proxy_dbg}
             if self.saree_lora.can_run() and self.enable_real and self.provider == "fal":
                 try:
-                    seed0 = req.variants[0].seed if req.variants and req.variants[0].seed is not None else _stable_seed(req.request_hash, 0)
+                    seed0 = (
+                        req.variants[0].seed
+                        if req.variants and req.variants[0].seed is not None
+                        else _stable_seed(req.request_hash, 0)
+                    )
                     urls, dbg = await self.saree_lora.generate(
                         human_url=human_url,
                         garment_proxy_url=proxy_url,
@@ -1814,7 +1825,9 @@ class VTONProvider:
                     lora_meta["lora_error"] = f"{type(e).__name__}: {e}"
 
             else:
-                lora_meta["lora_disabled_reason"] = "missing DF_SAREE_TRAINED_LORA_URL or COMMERCE_ENABLE_SAREE_TRYON_PROVIDER=0"
+                lora_meta["lora_disabled_reason"] = (
+                    "missing DF_SAREE_TRAINED_LORA_URL or COMMERCE_ENABLE_SAREE_TRYON_PROVIDER=0"
+                )
 
             if self.saree_overlay.enabled:
                 try:
@@ -1865,7 +1878,12 @@ class VTONProvider:
                     return VTONGenerateResult(
                         provider="placeholder_saree_failed",
                         urls=mat_urls,
-                        meta={"route": "saree_failed_non_strict", "lora": lora_meta, "overlay_err": err, "storage": mat_dbg},
+                        meta={
+                            "route": "saree_failed_non_strict",
+                            "lora": lora_meta,
+                            "overlay_err": err,
+                            "storage": mat_dbg,
+                        },
                     )
 
             if self.saree_strict:
@@ -1880,7 +1898,12 @@ class VTONProvider:
             return VTONGenerateResult(
                 provider="placeholder_saree_failed",
                 urls=mat_urls,
-                meta={"route": "saree_failed_non_strict", "lora": lora_meta, "overlay_disabled": True, "storage": mat_dbg},
+                meta={
+                    "route": "saree_failed_non_strict",
+                    "lora": lora_meta,
+                    "overlay_disabled": True,
+                    "storage": mat_dbg,
+                },
             )
 
         # -------------------------
@@ -1897,7 +1920,11 @@ class VTONProvider:
             return VTONGenerateResult(
                 provider="placeholder",
                 urls=mat_urls,
-                meta={"note": "COMMERCE_ENABLE_REAL_PROVIDERS is off; using placeholders", "variant_count": len(mat_urls), "storage": mat_dbg},
+                meta={
+                    "note": "COMMERCE_ENABLE_REAL_PROVIDERS is off; using placeholders",
+                    "variant_count": len(mat_urls),
+                    "storage": mat_dbg,
+                },
             )
 
         if self.provider != "fal":
@@ -1925,15 +1952,38 @@ class VTONProvider:
         lower_url = ns.get("lower_url")
         outer_url = ns.get("outer_url")
 
-        resolved_platform_garment_kind = _infer_non_saree_platform_garment_kind(
+        indian_routing = resolve_indian_non_saree_routing(
             product_assets=product_assets,
             ns=ns,
             garment_type=garment_type,
             primary_url=primary_url,
+            strict=bool(self.indian_non_saree_strict),
+            enable_generic_fallback=bool(self.enable_indian_non_saree_generic_fallback),
         )
 
+        indian_non_saree_family = indian_routing.family
+        garment_type = indian_routing.runtime_garment_type
+        resolved_platform_garment_kind = indian_routing.platform_garment_kind
+
+        generic_indian_non_saree_fallback_enabled = bool(self.enable_indian_non_saree_generic_fallback)
+
+        if indian_routing.requires_dedicated_pipeline:
+            if not generic_indian_non_saree_fallback_enabled:
+                raise RuntimeError(build_required_pipeline_error(indian_routing))
+
+            logger.warning(
+                "INDIAN_NON_SAREE_GENERIC_FALLBACK_OVERRIDE family=%s route=%s runtime_garment_type=%s platform_garment_kind=%s",
+                indian_non_saree_family,
+                getattr(indian_routing, "route", None),
+                garment_type,
+                resolved_platform_garment_kind,
+            )
+
         platform_model_selection: Optional[Dict[str, Any]] = None
-        platform_mode_requested = _non_saree_platform_mode_requested(product_assets=product_assets, model_ref=model_ref)
+        platform_mode_requested = _non_saree_platform_mode_requested(
+            product_assets=product_assets,
+            model_ref=model_ref,
+        )
 
         if self.enable_platform_model_selector and resolved_platform_garment_kind and (
             platform_mode_requested or (self.platform_model_force_when_missing_human and not human_url)
@@ -1949,7 +1999,8 @@ class VTONProvider:
             except Exception as e:
                 if platform_mode_requested or not human_url:
                     raise RuntimeError(
-                        f"PLATFORM_MODEL_SELECTION_FAILED garment_kind={resolved_platform_garment_kind} err={type(e).__name__}: {e}"
+                        f"PLATFORM_MODEL_SELECTION_FAILED garment_kind={resolved_platform_garment_kind} "
+                        f"err={type(e).__name__}: {e}"
                     ) from e
                 logger.exception("Platform model selection failed; falling back to provided human_url")
 
@@ -1963,14 +2014,22 @@ class VTONProvider:
             )
 
         is_outerwear = bool(
-            _is_http_url(outer_url)
+            indian_routing.treat_as_outerwear
+            or _is_http_url(outer_url)
             or _looks_outerwear_url(primary_url)
             or _looks_outerwear_url(product_assets.get("title"))
             or _looks_outerwear_url(product_assets.get("name"))
         )
 
-        # Sequential upper+lower is disabled for outerwear by design (outerwear is not a 2-piece outfit)
-        use_sequential = bool((not is_outerwear) and self.two_piece_sequential and _is_http_url(upper_url) and _is_http_url(lower_url))
+        # Indian Phase-1 families are reserved for dedicated routing/training and should not
+        # be reduced into western sequential upper/lower composition.
+        use_sequential = bool(
+            (not is_outerwear)
+            and (not is_phase1_indian_non_saree_family(indian_non_saree_family))
+            and self.two_piece_sequential
+            and _is_http_url(upper_url)
+            and _is_http_url(lower_url)
+        )
 
         provider_errors: List[Dict[str, Any]] = []
 
@@ -1997,11 +2056,21 @@ class VTONProvider:
             if n_real < len(req.variants):
                 urls.extend(urls_placeholders[n_real:])
 
-            qc = await self.nonsaree_qc.evaluate(garment_type=garment_type, human_url=human_url, out_url=urls[0], is_outerwear=is_outerwear)
+            qc = await self.nonsaree_qc.evaluate(
+                garment_type=garment_type,
+                human_url=human_url,
+                out_url=urls[0],
+                is_outerwear=is_outerwear,
+            )
             if not bool(qc.get("ok_hard", False)):
                 raise RuntimeError(f"IMAGEAPPS_V2_QC_HARD_FAILED qc={qc}")
 
-            return urls, {"provider": "imageapps_v2", "debug": dbg[:3], "qc": qc, "sequential": bool(use_sequential)}, qc
+            return urls, {
+                "provider": "imageapps_v2",
+                "debug": dbg[:3],
+                "qc": qc,
+                "sequential": bool(use_sequential),
+            }, qc
 
         async def _attempt_catvton() -> Tuple[List[str], Dict[str, Any], Dict[str, Any]]:
             if not self.catvton.can_run():
@@ -2015,23 +2084,46 @@ class VTONProvider:
             for i in range(n_real):
                 base_person = human_url
                 if use_sequential:
-                    u1, d1 = await self.catvton.generate_one(human_url=base_person, garment_url=str(upper_url), cloth_type="upper")
-                    u2, d2 = await self.catvton.generate_one(human_url=u1, garment_url=str(lower_url), cloth_type="lower")
+                    u1, d1 = await self.catvton.generate_one(
+                        human_url=base_person,
+                        garment_url=str(upper_url),
+                        cloth_type="upper",
+                    )
+                    u2, d2 = await self.catvton.generate_one(
+                        human_url=u1,
+                        garment_url=str(lower_url),
+                        cloth_type="lower",
+                    )
                     urls.append(u2)
                     dbg.append({"i": i, "seq": True, "upper": d1, "lower": d2})
                 else:
-                    u, d = await self.catvton.generate_one(human_url=base_person, garment_url=clothing_primary, cloth_type=cloth_type)
+                    u, d = await self.catvton.generate_one(
+                        human_url=base_person,
+                        garment_url=clothing_primary,
+                        cloth_type=cloth_type,
+                    )
                     urls.append(u)
                     dbg.append({"i": i, "seq": False, "dbg": d})
 
             if n_real < len(req.variants):
                 urls.extend(urls_placeholders[n_real:])
 
-            qc = await self.nonsaree_qc.evaluate(garment_type=garment_type, human_url=human_url, out_url=urls[0], is_outerwear=is_outerwear)
+            qc = await self.nonsaree_qc.evaluate(
+                garment_type=garment_type,
+                human_url=human_url,
+                out_url=urls[0],
+                is_outerwear=is_outerwear,
+            )
             if not bool(qc.get("ok_hard", False)):
                 raise RuntimeError(f"CATVTON_QC_HARD_FAILED qc={qc}")
 
-            return urls, {"provider": "catvton", "debug": dbg[:3], "qc": qc, "cloth_type": cloth_type, "sequential": bool(use_sequential)}, qc
+            return urls, {
+                "provider": "catvton",
+                "debug": dbg[:3],
+                "qc": qc,
+                "cloth_type": cloth_type,
+                "sequential": bool(use_sequential),
+            }, qc
 
         async def _attempt_fashn() -> Tuple[List[str], Dict[str, Any], Dict[str, Any]]:
             endpoint_id = self.fal_fashn_endpoint_id
@@ -2046,7 +2138,11 @@ class VTONProvider:
 
             if use_sequential:
                 for i in range(n_real):
-                    seed = req.variants[i].seed if i < len(req.variants) and req.variants[i].seed is not None else _stable_seed(req.request_hash, i)
+                    seed = (
+                        req.variants[i].seed
+                        if i < len(req.variants) and req.variants[i].seed is not None
+                        else _stable_seed(req.request_hash, i)
+                    )
 
                     fashn_input_1: Dict[str, Any] = {
                         "model_image": human_url,
@@ -2126,12 +2222,22 @@ class VTONProvider:
                     batch_urls = _parse_fal_any_image_urls(out_d)
 
                     if len(batch_urls) < batch_n:
-                        raise RuntimeError(f"FASHN returned {len(batch_urls)} images, expected {batch_n}. out_keys={list(out_d.keys())[:30]}")
+                        raise RuntimeError(
+                            f"FASHN returned {len(batch_urls)} images, expected {batch_n}. "
+                            f"out_keys={list(out_d.keys())[:30]}"
+                        )
 
                     for j, u in enumerate(batch_urls[:batch_n]):
                         idx = batch_start + j
                         urls.append(u)
-                        debug.append({"i": idx, "url": u, "seed": int(seed), "request_id": _as_dict(dbg).get("request_id")})
+                        debug.append(
+                            {
+                                "i": idx,
+                                "url": u,
+                                "seed": int(seed),
+                                "request_id": _as_dict(dbg).get("request_id"),
+                            }
+                        )
 
                     remaining -= batch_n
                     batch_start += batch_n
@@ -2139,7 +2245,12 @@ class VTONProvider:
             if n_real < len(req.variants):
                 urls.extend(urls_placeholders[n_real:])
 
-            qc = await self.nonsaree_qc.evaluate(garment_type=garment_type, human_url=human_url, out_url=urls[0], is_outerwear=is_outerwear)
+            qc = await self.nonsaree_qc.evaluate(
+                garment_type=garment_type,
+                human_url=human_url,
+                out_url=urls[0],
+                is_outerwear=is_outerwear,
+            )
             if not bool(qc.get("ok_hard", False)):
                 raise RuntimeError(f"FASHN_QC_HARD_FAILED qc={qc}")
 
@@ -2157,19 +2268,50 @@ class VTONProvider:
         # Collect candidates instead of "first pass wins"
         candidates: List[Dict[str, Any]] = []
 
-        for p in self.non_saree_provider_order:
+        effective_provider_order = self._resolve_non_saree_provider_order(
+            family=indian_non_saree_family or None
+        )
+
+        for p in effective_provider_order:
             try:
                 if p == "imageapps_v2":
                     urls, meta, qc = await _attempt_imageapps_v2()
-                    candidates.append({"provider": "fal_imageapps_v2", "route": "imageapps_v2", "tag": "imageapps_v2", "urls": urls, "meta": meta, "qc": qc})
+                    candidates.append(
+                        {
+                            "provider": "fal_imageapps_v2",
+                            "route": "imageapps_v2",
+                            "tag": "imageapps_v2",
+                            "urls": urls,
+                            "meta": meta,
+                            "qc": qc,
+                        }
+                    )
                     continue
                 if p == "catvton":
                     urls, meta, qc = await _attempt_catvton()
-                    candidates.append({"provider": "fal_catvton", "route": "catvton", "tag": "catvton", "urls": urls, "meta": meta, "qc": qc})
+                    candidates.append(
+                        {
+                            "provider": "fal_catvton",
+                            "route": "catvton",
+                            "tag": "catvton",
+                            "urls": urls,
+                            "meta": meta,
+                            "qc": qc,
+                        }
+                    )
                     continue
                 if p == "fashn":
                     urls, meta, qc = await _attempt_fashn()
-                    candidates.append({"provider": "fal_fashn", "route": "fashn", "tag": "fashn", "urls": urls, "meta": meta, "qc": qc})
+                    candidates.append(
+                        {
+                            "provider": "fal_fashn",
+                            "route": "fashn",
+                            "tag": "fashn",
+                            "urls": urls,
+                            "meta": meta,
+                            "qc": qc,
+                        }
+                    )
                     continue
 
                 raise RuntimeError(f"unknown_non_saree_provider {p!r}")
@@ -2190,9 +2332,13 @@ class VTONProvider:
                     urls=mat_urls,
                     meta={
                         "route": "non_saree_failed_placeholder",
+                        "indian_non_saree_family": indian_non_saree_family,
                         "errors": provider_errors[:5],
                         "storage": mat_dbg,
                         "two_piece_sequential": bool(use_sequential),
+                        "provider_order": effective_provider_order,
+                        "provider_order_configured": self.non_saree_provider_order,
+                        "generic_indian_non_saree_fallback_enabled": generic_indian_non_saree_fallback_enabled,
                         "resolved": {
                             "primary_url": primary_url,
                             "upper_url": upper_url,
@@ -2239,10 +2385,14 @@ class VTONProvider:
                     urls=mat_urls,
                     meta={
                         "route": "non_saree_qc_failed_placeholder",
+                        "indian_non_saree_family": indian_non_saree_family,
                         "errors": provider_errors[:5],
                         "candidates": [{"provider": c.get("provider"), "qc": c.get("qc")} for c in candidates[:5]],
                         "storage": mat_dbg,
                         "two_piece_sequential": bool(use_sequential),
+                        "provider_order": effective_provider_order,
+                        "provider_order_configured": self.non_saree_provider_order,
+                        "generic_indian_non_saree_fallback_enabled": generic_indian_non_saree_fallback_enabled,
                         "resolved": {
                             "primary_url": primary_url,
                             "upper_url": upper_url,
@@ -2254,7 +2404,8 @@ class VTONProvider:
                     },
                 )
             raise RuntimeError(
-                f"NON_SAREE_QC_FAILED_STRICT_AND_FAIL_OPEN_OFF candidates={[{'provider': c.get('provider'), 'qc': c.get('qc')} for c in candidates[:3]]}"
+                "NON_SAREE_QC_FAILED_STRICT_AND_FAIL_OPEN_OFF "
+                f"candidates={[{'provider': c.get('provider'), 'qc': c.get('qc')} for c in candidates[:3]]}"
             )
 
         assert chosen is not None
@@ -2277,10 +2428,16 @@ class VTONProvider:
             meta={
                 "route": route,
                 "garment_type": garment_type,
+                "indian_non_saree_family": indian_non_saree_family,
                 "is_outerwear": bool(is_outerwear),
-                "provider_order": self.non_saree_provider_order,
+                "provider_order": effective_provider_order,
+                "provider_order_configured": self.non_saree_provider_order,
+                "generic_indian_non_saree_fallback_enabled": generic_indian_non_saree_fallback_enabled,
                 "selection_reason": selection_reason,
-                "candidates": [{"provider": c.get("provider"), "qc": c.get("qc"), "route": c.get("route")} for c in candidates[:5]],
+                "candidates": [
+                    {"provider": c.get("provider"), "qc": c.get("qc"), "route": c.get("route")}
+                    for c in candidates[:5]
+                ],
                 "errors": provider_errors[:5],
                 "resolved": {
                     "primary_url": primary_url,

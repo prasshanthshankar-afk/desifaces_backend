@@ -134,7 +134,7 @@ def _load_json_from_uri(uri: str) -> Dict[str, Any]:
 def _default_allowed_for_gender(gender: str) -> List[str]:
     g = _norm(gender)
     if g == "female":
-        return ["salwar_suit", "lehenga_set", "upper_body", "lower_body", "dresses"]
+        return ["saree_set", "salwar_suit", "lehenga_set", "upper_body", "lower_body", "dresses"]
     if g == "male":
         return ["kurta_pyjama", "dhoti_kurta", "sherwani", "upper_body", "lower_body", "dresses"]
     return ["upper_body", "lower_body", "dresses"]
@@ -151,6 +151,21 @@ def _derive_scan_prefix_from_manifest_uri(manifest_uri: str) -> Optional[str]:
             prefix = blob_name[: -len("/manifest.json")]
             return f"az://{container}/{prefix}".rstrip("/")
     return None
+
+
+def _infer_asset_role_from_filename(filename: str) -> str:
+    lower = filename.lower()
+    if lower.startswith("source.") or lower.startswith("primary."):
+        return "primary"
+    if "preview" in lower or "thumb" in lower:
+        return "preview"
+    if "alt_pose" in lower:
+        return "alt_pose"
+    if "alt_background" in lower or "alt_bg" in lower:
+        return "alt_background"
+    if lower.startswith("mask.") or "_mask." in lower or "mask_" in lower:
+        return "mask"
+    return Path(filename).stem.lower() or "primary"
 
 
 # -------------------------------------------------------------------
@@ -173,6 +188,7 @@ class PlatformModel:
     pose: str
     age_band: str
     region: str
+    region_tags: List[str]
     body_type: str
     skin_tone: str
     style_tags: List[str]
@@ -193,10 +209,10 @@ class PlatformModelSelector:
     """
     Production-grade selector.
 
-    Improvements over the earlier version:
+    Notes:
     - manifest-first, but auto-falls back to Azure prefix scan if manifest is missing
     - skips broken/missing blob assets instead of crashing
-    - supports both Indian garment families and generic western/non-saree families
+    - supports Indian garment families + generic western/non-saree families
     - deterministic selection from top-K, but blob-aware
     """
 
@@ -213,7 +229,7 @@ class PlatformModelSelector:
         self.manifest_uri = (
             manifest_uri
             or os.environ.get("COMMERCE_PLATFORM_MODELS_MANIFEST")
-            or "az://commerce-training/pools/platform_models/v1/manifest.json"
+            or "az://commerce-catalog/platform_models/manifest.json"
         )
         self.cache_dir = (
             cache_dir
@@ -257,6 +273,12 @@ class PlatformModelSelector:
         return manifest
 
     def _scan_azure_prefix_to_manifest(self, prefix_uri: str) -> Dict[str, Any]:
+        """
+        Fallback scanner for current catalog layout:
+          az://commerce-catalog/platform_models/<model_code>/source.jpg
+          az://commerce-catalog/platform_models/<model_code>/preview.jpg
+          az://commerce-catalog/platform_models/<model_code>/meta.json
+        """
         if not prefix_uri.startswith("az://"):
             raise ValueError(f"Unsupported scan prefix: {prefix_uri}")
 
@@ -270,26 +292,26 @@ class PlatformModelSelector:
         for blob in cc.list_blobs(name_starts_with=prefix):
             name = str(blob.name)
             rel = name[len(prefix) :]
-            parts = rel.split("/")
-            if len(parts) < 5:
+            parts = [p for p in rel.split("/") if p]
+            if len(parts) < 2:
                 continue
 
-            gender, framing, pose, model_code = parts[0], parts[1], parts[2], parts[3]
-            filename = parts[4]
-            key = f"{gender}/{framing}/{pose}/{model_code}"
+            model_code = parts[0]
+            filename = parts[-1]
 
             entry = by_model.setdefault(
-                key,
+                model_code,
                 {
                     "model_code": model_code,
-                    "gender": _norm(gender),
-                    "framing": _norm(framing),
-                    "pose": _norm(pose),
+                    "gender": "any",
+                    "framing": "full_body",
+                    "pose": "front",
                     "age_band": "adult",
                     "region": "india",
+                    "region_tags": ["india", "south_asian"],
                     "body_type": "average",
                     "skin_tone": "medium",
-                    "style_tags": ["catalog", "clean_bg"],
+                    "style_tags": ["catalog", "studio"],
                     "quality_score": 0.0,
                     "is_active": True,
                     "allowed_garment_kinds": [],
@@ -306,27 +328,39 @@ class PlatformModelSelector:
                     meta = json.loads(bc.download_blob().readall().decode("utf-8", errors="replace"))
                 except Exception:
                     meta = {}
+
                 if isinstance(meta, dict):
+                    entry["gender"] = _norm(meta.get("gender") or entry["gender"])
+                    entry["framing"] = _norm(meta.get("framing") or entry["framing"])
+                    entry["pose"] = _norm(meta.get("pose") or entry["pose"])
                     entry["age_band"] = _norm(meta.get("age_band") or entry["age_band"])
-                    entry["region"] = _norm(meta.get("region") or entry["region"])
                     entry["body_type"] = _norm(meta.get("body_type") or entry["body_type"])
                     entry["skin_tone"] = _norm(meta.get("skin_tone") or entry["skin_tone"])
                     entry["quality_score"] = _safe_float(meta.get("quality_score"), entry["quality_score"])
                     entry["is_active"] = bool(meta.get("is_active", True))
                     entry["style_tags"] = _uniq_strs(meta.get("style_tags") or entry["style_tags"])
-                    entry["allowed_garment_kinds"] = _uniq_strs(meta.get("allowed_garment_kinds") or entry["allowed_garment_kinds"])
-                    entry["preferred_garment_kinds"] = _uniq_strs(meta.get("preferred_garment_kinds") or entry["preferred_garment_kinds"])
+                    entry["region_tags"] = _uniq_strs(meta.get("region_tags") or entry["region_tags"])
+                    entry["region"] = next(
+                        (x for x in entry["region_tags"] if x not in {"india", "south_asian"}),
+                        "india",
+                    )
+                    entry["allowed_garment_kinds"] = _uniq_strs(
+                        meta.get("allowed_garment_kinds") or entry["allowed_garment_kinds"]
+                    )
+                    entry["preferred_garment_kinds"] = _uniq_strs(
+                        meta.get("preferred_garment_kinds") or entry["preferred_garment_kinds"]
+                    )
                     entry["qc"] = meta.get("qc") if isinstance(meta.get("qc"), dict) else entry["qc"]
                     entry["meta"] = meta
                 continue
 
             lower = filename.lower()
             if lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
-                role = "primary" if lower.startswith("primary") else os.path.splitext(filename)[0]
+                role = _infer_asset_role_from_filename(filename)
                 entry["assets"].append(
                     {
-                        "role": role,
-                        "url": f"az://{container}/{name}",
+                        "asset_role": role,
+                        "asset_url": f"az://{container}/{name}",
                         "width": None,
                         "height": None,
                     }
@@ -353,7 +387,11 @@ class PlatformModelSelector:
             manifest = self._validate_manifest(manifest)
         except Exception as e:
             if self.scan_prefix:
-                logger.warning("platform_model_selector: manifest load failed (%s); scanning prefix %s", e, self.scan_prefix)
+                logger.warning(
+                    "platform_model_selector: manifest load failed (%s); scanning prefix %s",
+                    e,
+                    self.scan_prefix,
+                )
                 manifest = self._scan_azure_prefix_to_manifest(self.scan_prefix)
                 manifest = self._validate_manifest(manifest)
             else:
@@ -439,16 +477,20 @@ class PlatformModelSelector:
             if not isinstance(raw, dict):
                 continue
 
+            raw_meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else (
+                raw.get("meta_json") if isinstance(raw.get("meta_json"), dict) else {}
+            )
+
             assets: List[PlatformModelAsset] = []
             for a in raw.get("assets", []) or []:
                 if not isinstance(a, dict):
                     continue
-                url = str(a.get("url") or "").strip()
+                url = str(a.get("asset_url") or a.get("url") or "").strip()
                 if not url:
                     continue
                 assets.append(
                     PlatformModelAsset(
-                        role=str(a.get("role") or "primary"),
+                        role=str(a.get("asset_role") or a.get("role") or "primary"),
                         url=url,
                         width=_safe_int(a.get("width")) or None,
                         height=_safe_int(a.get("height")) or None,
@@ -462,10 +504,17 @@ class PlatformModelSelector:
             if not model_code:
                 continue
 
+            region_tags = _uniq_strs(_as_list(raw.get("region_tags") or raw_meta.get("region_tags")))
+            region = _norm(raw.get("region"))
+            if not region:
+                region = next((x for x in region_tags if x not in {"india", "south_asian"}), "india")
+
             gender = _norm(raw.get("gender") or "any")
-            allowed = _uniq_strs(_as_list(raw.get("allowed_garment_kinds")))
+            allowed = _uniq_strs(_as_list(raw.get("allowed_garment_kinds") or raw_meta.get("allowed_garment_kinds")))
             if not allowed:
                 allowed = _default_allowed_for_gender(gender)
+
+            preferred = _uniq_strs(_as_list(raw.get("preferred_garment_kinds") or raw_meta.get("preferred_garment_kinds")))
 
             out.append(
                 PlatformModel(
@@ -474,16 +523,19 @@ class PlatformModelSelector:
                     framing=_norm(raw.get("framing")),
                     pose=_norm(raw.get("pose")),
                     age_band=_norm(raw.get("age_band") or "adult"),
-                    region=_norm(raw.get("region") or "india"),
+                    region=region,
+                    region_tags=region_tags,
                     body_type=_norm(raw.get("body_type") or "average"),
-                    skin_tone=_norm(raw.get("skin_tone") or "medium"),
-                    style_tags=_uniq_strs(_as_list(raw.get("style_tags"))),
+                    skin_tone=_norm(raw.get("skin_tone") or raw_meta.get("skin_tone") or "medium"),
+                    style_tags=_uniq_strs(_as_list(raw.get("style_tags") or raw_meta.get("style_tags"))),
                     quality_score=_safe_float(raw.get("quality_score"), 0.0),
                     is_active=bool(raw.get("is_active", True)),
                     allowed_garment_kinds=allowed,
-                    preferred_garment_kinds=_uniq_strs(_as_list(raw.get("preferred_garment_kinds"))),
-                    qc=raw.get("qc") if isinstance(raw.get("qc"), dict) else {},
-                    meta=raw.get("meta") if isinstance(raw.get("meta"), dict) else {},
+                    preferred_garment_kinds=preferred,
+                    qc=raw.get("qc") if isinstance(raw.get("qc"), dict) else (
+                        raw_meta.get("qc") if isinstance(raw_meta.get("qc"), dict) else {}
+                    ),
+                    meta=raw_meta,
                     assets=assets,
                 )
             )
@@ -504,7 +556,7 @@ class PlatformModelSelector:
 
     def _strict_rules(self, garment_kind: str) -> Dict[str, Any]:
         g = _norm(garment_kind)
-        if g in {"salwar_suit", "lehenga_set"}:
+        if g in {"saree_set", "salwar_suit", "lehenga_set"}:
             return {"gender": "female", "framing": {"full_body"}, "pose": {"front"}}
         if g == "kurta_pyjama":
             return {"gender": "male", "framing": {"full_body", "three_quarter"}, "pose": {"front"}}
@@ -512,7 +564,6 @@ class PlatformModelSelector:
             return {"gender": "male", "framing": {"full_body"}, "pose": {"front"}}
         if g == "sherwani":
             return {"gender": "male", "framing": {"full_body", "three_quarter"}, "pose": {"front"}}
-        # generic western / non-saree families
         if g in {"upper_body", "lower_body", "dresses"}:
             return {"gender": None, "framing": {"full_body", "three_quarter"}, "pose": {"front"}}
         return {"gender": None, "framing": set(), "pose": set()}
@@ -542,23 +593,19 @@ class PlatformModelSelector:
                     return False
             return True
 
-        # exact
         exact = [m for m in models if _matches(m, relax_pose_framing=False, relax_allowed=False)]
         if exact:
             return exact
 
-        # generic garment family: allow models with no explicit garment mapping
         if g in generic_garments:
             generic_relaxed = [m for m in models if _matches(m, relax_pose_framing=False, relax_allowed=True)]
             if generic_relaxed:
                 return generic_relaxed
 
-        # relax framing/pose first
         relaxed_pose = [m for m in models if _matches(m, relax_pose_framing=True, relax_allowed=False)]
         if relaxed_pose:
             return relaxed_pose
 
-        # last resort for generic families only
         relaxed_all = [m for m in models if _matches(m, relax_pose_framing=True, relax_allowed=True)]
         return relaxed_all
 
@@ -597,13 +644,16 @@ class PlatformModelSelector:
         if preferred_tags:
             wanted = {_norm(t) for t in preferred_tags if _norm(t)}
             score += sum(2.0 for t in model.style_tags if t in wanted)
+            score += sum(3.0 for t in model.region_tags if t in wanted)
+            if _norm(model.body_type) in wanted:
+                score += 2.0
 
         if recent_model_codes:
             recent = {_norm(x) for x in recent_model_codes if _norm(x)}
             if _norm(model.model_code) in recent:
                 score -= 15.0
 
-        if g in {"salwar_suit", "lehenga_set", "dhoti_kurta"} and model.framing == "full_body":
+        if g in {"saree_set", "salwar_suit", "lehenga_set", "dhoti_kurta"} and model.framing == "full_body":
             score += 6.0
 
         if model.pose == "front":
@@ -639,13 +689,22 @@ class PlatformModelSelector:
     def _safe_resolve_primary(self, model: PlatformModel) -> Optional[str]:
         primary = self._primary_asset(model)
         if not self._asset_exists(primary.url):
-            logger.warning("platform_model_selector: skipping missing asset model_code=%s url=%s", model.model_code, primary.url)
+            logger.warning(
+                "platform_model_selector: skipping missing asset model_code=%s url=%s",
+                model.model_code,
+                primary.url,
+            )
             return None
         try:
             resolved = self._resolve_asset_url(primary.url)
             return str(resolved or "").strip() or None
         except Exception as e:
-            logger.warning("platform_model_selector: skipping unresolved asset model_code=%s url=%s err=%s", model.model_code, primary.url, e)
+            logger.warning(
+                "platform_model_selector: skipping unresolved asset model_code=%s url=%s err=%s",
+                model.model_code,
+                primary.url,
+                e,
+            )
             return None
 
     def list_eligible_models(
@@ -686,6 +745,9 @@ class PlatformModelSelector:
                     "gender": m.gender,
                     "framing": m.framing,
                     "pose": m.pose,
+                    "region": m.region,
+                    "region_tags": m.region_tags,
+                    "body_type": m.body_type,
                     "quality_score": m.quality_score,
                     "rank_score": score,
                     "allowed_garment_kinds": m.allowed_garment_kinds,
@@ -743,7 +805,6 @@ class PlatformModelSelector:
 
         skipped: List[Dict[str, Any]] = []
 
-        # Try top-K first, starting from deterministic index
         for off in range(len(top_candidates)):
             idx = (start_idx + off) % len(top_candidates)
             selected_score, selected_model = top_candidates[idx]
@@ -759,6 +820,9 @@ class PlatformModelSelector:
                 "gender": selected_model.gender,
                 "framing": selected_model.framing,
                 "pose": selected_model.pose,
+                "region": selected_model.region,
+                "region_tags": selected_model.region_tags,
+                "body_type": selected_model.body_type,
                 "allowed_garment_kinds": selected_model.allowed_garment_kinds,
                 "preferred_garment_kinds": selected_model.preferred_garment_kinds,
                 "quality_score": selected_model.quality_score,
@@ -783,6 +847,7 @@ class PlatformModelSelector:
                     "pose": selected_model.pose,
                     "age_band": selected_model.age_band,
                     "region": selected_model.region,
+                    "region_tags": selected_model.region_tags,
                     "body_type": selected_model.body_type,
                     "skin_tone": selected_model.skin_tone,
                     "style_tags": selected_model.style_tags,
@@ -804,7 +869,6 @@ class PlatformModelSelector:
                 },
             }
 
-        # If top-K all stale, try the rest
         for selected_score, selected_model in ranked[effective_top_k:]:
             resolved_url = self._safe_resolve_primary(selected_model)
             if not resolved_url:
@@ -818,6 +882,9 @@ class PlatformModelSelector:
                 "gender": selected_model.gender,
                 "framing": selected_model.framing,
                 "pose": selected_model.pose,
+                "region": selected_model.region,
+                "region_tags": selected_model.region_tags,
+                "body_type": selected_model.body_type,
                 "allowed_garment_kinds": selected_model.allowed_garment_kinds,
                 "preferred_garment_kinds": selected_model.preferred_garment_kinds,
                 "quality_score": selected_model.quality_score,
@@ -842,6 +909,7 @@ class PlatformModelSelector:
                     "pose": selected_model.pose,
                     "age_band": selected_model.age_band,
                     "region": selected_model.region,
+                    "region_tags": selected_model.region_tags,
                     "body_type": selected_model.body_type,
                     "skin_tone": selected_model.skin_tone,
                     "style_tags": selected_model.style_tags,

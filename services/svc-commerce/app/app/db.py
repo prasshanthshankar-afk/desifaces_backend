@@ -1,15 +1,27 @@
 from __future__ import annotations
 
+import json
 import os
-import asyncpg
 from typing import Optional
+
+import asyncpg
 
 _pool: Optional[asyncpg.Pool] = None
 
 
 async def _init_conn(conn: asyncpg.Connection) -> None:
-    await conn.set_type_codec("json", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
-    await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
+    await conn.set_type_codec(
+        "json",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -26,6 +38,7 @@ async def get_pool() -> asyncpg.Pool:
         min_size=int(os.getenv("DB_POOL_MIN_SIZE", "1")),
         max_size=int(os.getenv("DB_POOL_MAX_SIZE", "10")),
         command_timeout=float(os.getenv("DB_COMMAND_TIMEOUT", "30")),
+        init=_init_conn,
     )
     return _pool
 

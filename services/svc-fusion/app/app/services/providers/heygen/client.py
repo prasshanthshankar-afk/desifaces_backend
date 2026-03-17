@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Dict, List, Optional
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from app.config import settings
-from app.services.providers.base import ProviderSubmitResult, ProviderPollResult
+from app.services.providers.base import ProviderPollResult, ProviderSubmitResult
 
 logger = logging.getLogger("heygen_av4")
 
@@ -30,7 +31,7 @@ def _headers() -> Dict[str, str]:
 def _safe_json(resp: httpx.Response) -> Dict[str, Any]:
     """
     HeyGen sometimes returns HTTP 200 with an empty body.
-    That must be treated as retryable.
+    Treat that as retryable.
     """
     text = (resp.text or "").strip()
     if not text:
@@ -44,43 +45,156 @@ def _safe_json(resp: httpx.Response) -> Dict[str, Any]:
     return obj
 
 
+def _is_retryable_exception(exc: BaseException) -> bool:
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+    if isinstance(exc, HeyGenApiError):
+        msg = str(exc).lower()
+        return (
+            "empty_body" in msg
+            or "invalid_json" in msg
+            or "timeout" in msg
+            or "transport" in msg
+            or "503" in msg
+            or "502" in msg
+            or "504" in msg
+            or "429" in msg
+        )
+    return False
+
+
 def _normalize_status(raw_status: Any) -> str:
     s = str(raw_status or "").strip().lower()
-    if s in ("completed", "complete", "done", "succeeded", "success"):
+    if s in ("completed", "complete", "done", "succeeded", "success", "ready"):
         return "succeeded"
     if s in ("failed", "error"):
         return "failed"
-    if s in ("waiting", "pending", "processing", "running", "in_progress", "in-progress", "queued"):
+    if s in ("cancelled", "canceled"):
+        return "failed"
+    if s in (
+        "waiting",
+        "pending",
+        "processing",
+        "running",
+        "in_progress",
+        "in-progress",
+        "queued",
+        "submitted",
+    ):
         return "processing"
     return "processing"
 
 
 def _extract_video_url(obj: Dict[str, Any]) -> Optional[str]:
+    data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+    result = obj.get("result") if isinstance(obj.get("result"), dict) else {}
     return (
         obj.get("video_url")
         or obj.get("url")
-        or (obj.get("result") or {}).get("video_url")
-        or (obj.get("data") or {}).get("video_url")
-        or (obj.get("data") or {}).get("url")
+        or data.get("video_url")
+        or data.get("url")
+        or result.get("video_url")
+        or result.get("url")
     )
 
 
 def _extract_error_message(obj: Dict[str, Any]) -> Optional[str]:
+    data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+    result = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+    err = obj.get("error")
+    if isinstance(err, dict):
+        err = err.get("message") or err.get("code")
     return (
         obj.get("error_message")
-        or obj.get("error")
+        or err
         or obj.get("message")
-        or (obj.get("data") or {}).get("error_message")
-        or (obj.get("data") or {}).get("error")
-        or (obj.get("result") or {}).get("error_message")
-        or (obj.get("result") or {}).get("error")
+        or data.get("error_message")
+        or data.get("error")
+        or data.get("message")
+        or result.get("error_message")
+        or result.get("error")
+        or result.get("message")
     )
+
+
+def _extract_provider_job_id(obj: Dict[str, Any]) -> Optional[str]:
+    data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+    result = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+    candidates = [
+        data.get("video_id"),
+        obj.get("video_id"),
+        data.get("id"),
+        obj.get("id"),
+        result.get("video_id"),
+        result.get("id"),
+    ]
+    for v in candidates:
+        if v:
+            return str(v).strip()
+    return None
+
+
+def _unwrap_status_core(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Accept a few HeyGen response shapes:
+      {status: ...}
+      {data: {status: ...}}
+      {data: {data: {status: ...}}}
+      {result: {status: ...}}
+    """
+    core: Any = obj
+    if isinstance(obj.get("data"), dict):
+        core = obj["data"]
+        if isinstance(core.get("data"), dict):
+            core = core["data"]
+    elif isinstance(obj.get("result"), dict):
+        core = obj["result"]
+
+    if not isinstance(core, dict):
+        return {"raw": obj}
+    return core
+
+
+def _should_fallback_to_next_submit_path(path: str, status_code: int, body: str) -> bool:
+    """
+    Allow AV4 -> V2 fallback for endpoint rollout mismatch or AV4-specific
+    validation mismatch, especially around audio fields.
+    """
+    p = str(path or "").strip()
+    b = (body or "").lower()
+
+    if status_code in (404, 405):
+        return True
+
+    if p.endswith("/v2/video/av4/generate") and status_code == 400:
+        hints = [
+            "audio_url",
+            "audio_asset_id",
+            "script and voice_id",
+            "invalid_parameter",
+            "talking_photo_id",
+            "use_avatar_iv_model",
+        ]
+        if any(h in b for h in hints):
+            return True
+
+    return False
 
 
 class HeyGenAV4Client:
     """
-    Kept as HeyGenAV4Client for compatibility with the rest of Fusion,
-    but now uses the supported V2 create-video endpoint.
+    AV4-first HeyGen client.
+
+    Submit strategy:
+      1) /v2/video/av4/generate
+      2) /v2/video/generate (fallback)
+
+    Poll strategy:
+      1) /v1/video_status.get
+      2) /v1/video.list (optional fallback)
+
+    This keeps Fusion compatible with HeyGen's dedicated AV4 endpoint while
+    still surviving endpoint rollout differences across accounts.
     """
     provider_name = "heygen_av4"
 
@@ -88,47 +202,99 @@ class HeyGenAV4Client:
         self.base = settings.HEYGEN_BASE_URL.rstrip("/")
         self.timeout = settings.HEYGEN_TIMEOUT_SECONDS
 
+    def _submit_paths(self) -> List[str]:
+        env_path = str(os.getenv("HEYGEN_SUBMIT_PATH", "")).strip()
+        if env_path:
+            return [env_path]
+
+        return [
+            "/v2/video/av4/generate",
+            "/v2/video/generate",
+        ]
+
+    def _enable_list_fallback(self) -> bool:
+        v = str(os.getenv("HEYGEN_ENABLE_VIDEO_LIST_FALLBACK", "1")).strip().lower()
+        return v in {"1", "true", "yes", "y"}
+
     @retry(
         reraise=True,
         stop=stop_after_attempt(4),
         wait=wait_exponential(multiplier=0.6, min=0.6, max=6.0),
-        retry=retry_if_exception_type((httpx.TimeoutException, httpx.TransportError, HeyGenApiError)),
+        retry=retry_if_exception(_is_retryable_exception),
     )
     async def submit(self, payload: Dict[str, Any], idempotency_key: str) -> ProviderSubmitResult:
-        url = f"{self.base}/v2/video/generate"
         headers = _headers()
         headers["Idempotency-Key"] = idempotency_key
 
+        last_error: Optional[str] = None
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(url, headers=headers, json=payload)
+            for path in self._submit_paths():
+                url = f"{self.base}{path}"
+                try:
+                    r = await client.post(url, headers=headers, json=payload)
+                except (httpx.TimeoutException, httpx.TransportError):
+                    raise
+                except Exception as e:
+                    last_error = f"{path}: transport/setup error: {e}"
+                    logger.warning(
+                        "heygen_submit_transport_error",
+                        extra={"path": path, "error": str(e)},
+                    )
+                    continue
 
-        if r.status_code >= 400:
-            raise HeyGenApiError(f"HeyGen submit failed {r.status_code}: {r.text}")
+                if _should_fallback_to_next_submit_path(path, r.status_code, r.text):
+                    body = (r.text or "")[:1000]
+                    last_error = f"{path}: endpoint/payload mismatch ({r.status_code}): {body}"
+                    logger.warning(
+                        "heygen_submit_fallback_to_next_path",
+                        extra={"path": path, "status_code": r.status_code, "body": body},
+                    )
+                    continue
 
-        data = _safe_json(r)
+                if r.status_code >= 400:
+                    body = (r.text or "")[:1000]
+                    last_error = f"{path}: HeyGen submit failed {r.status_code}: {body}"
+                    logger.warning(
+                        "heygen_submit_http_error",
+                        extra={"path": path, "status_code": r.status_code, "body": body},
+                    )
+                    raise HeyGenApiError(last_error)
 
-        provider_job_id = (
-            (data.get("data") or {}).get("video_id")
-            or data.get("video_id")
-            or (data.get("data") or {}).get("id")
-            or data.get("id")
-        )
-        if not provider_job_id:
-            raise HeyGenApiError(f"HeyGen submit missing video_id. Response: {data}")
+                data = _safe_json(r)
+                provider_job_id = _extract_provider_job_id(data)
+                if not provider_job_id:
+                    raise HeyGenApiError(f"{path}: HeyGen submit missing video_id. Response: {data}")
 
-        return ProviderSubmitResult(provider_job_id=str(provider_job_id), raw_response=data)
+                logger.info(
+                    "heygen_submit_succeeded",
+                    extra={
+                        "submit_path": path,
+                        "provider_job_id": provider_job_id,
+                    },
+                )
+                return ProviderSubmitResult(provider_job_id=provider_job_id, raw_response=data)
+
+        raise HeyGenApiError(last_error or "HeyGen submit failed on all candidate endpoints")
 
     @retry(
         reraise=True,
         stop=stop_after_attempt(6),
         wait=wait_exponential(multiplier=0.6, min=0.6, max=8.0),
-        retry=retry_if_exception_type((httpx.TimeoutException, httpx.TransportError, HeyGenApiError)),
+        retry=retry_if_exception(_is_retryable_exception),
     )
     async def poll(self, provider_job_id: str) -> ProviderPollResult:
         res = await self._poll_via_status(provider_job_id)
         if res is not None:
             return res
-        return await self._poll_via_list(provider_job_id)
+
+        if self._enable_list_fallback():
+            return await self._poll_via_list(provider_job_id)
+
+        return ProviderPollResult(
+            status="processing",
+            raw_response={"note": "status endpoint unavailable and list fallback disabled"},
+        )
 
     async def _poll_via_status(self, provider_job_id: str) -> Optional[ProviderPollResult]:
         url = f"{self.base}/v1/video_status.get"
@@ -139,29 +305,23 @@ class HeyGenAV4Client:
             r = await client.get(url, headers=headers, params=params)
 
         if r.status_code in (404, 405):
-            logger.info("heygen_status_endpoint_unavailable", extra={"status_code": r.status_code})
+            logger.info(
+                "heygen_status_endpoint_unavailable",
+                extra={"status_code": r.status_code, "provider_job_id": provider_job_id},
+            )
             return None
 
         if r.status_code >= 400:
             raise HeyGenApiError(f"HeyGen video_status.get failed {r.status_code}: {r.text}")
 
         data = _safe_json(r)
-
-        core = data.get("data") if isinstance(data.get("data"), dict) else data
-        if isinstance(core, dict) and isinstance(core.get("data"), dict):
-            core = core["data"]
-
-        if not isinstance(core, dict):
-            return ProviderPollResult(
-                status="processing",
-                raw_response={"note": "unexpected status shape", "response": data},
-            )
+        core = _unwrap_status_core(data)
 
         raw_status = core.get("status") or core.get("state") or core.get("video_status")
         status = _normalize_status(raw_status)
+        video_url = _extract_video_url(core) or _extract_video_url(data)
 
-        if status == "succeeded":
-            video_url = _extract_video_url(core) or _extract_video_url(data)
+        if video_url:
             return ProviderPollResult(status="succeeded", video_url=video_url, raw_response=core)
 
         if status == "failed":
@@ -173,7 +333,7 @@ class HeyGenAV4Client:
     async def _poll_via_list(self, provider_job_id: str) -> ProviderPollResult:
         url = f"{self.base}/v1/video.list"
         headers = _headers()
-        params = {"limit": 50}
+        params = {"limit": 100}
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             r = await client.get(url, headers=headers, params=params)
@@ -189,6 +349,7 @@ class HeyGenAV4Client:
             videos = container.get("videos") or container.get("list") or container.get("items")
         elif isinstance(container, list):
             videos = container
+
         if videos is None:
             videos = data.get("videos") or data.get("list") or data.get("items")
 
@@ -212,11 +373,11 @@ class HeyGenAV4Client:
                 raw_response={"note": "video_id not found in list", "video_id": provider_job_id},
             )
 
-        status = _normalize_status(item.get("status") or item.get("state"))
         video_url = _extract_video_url(item)
-
-        if status == "succeeded":
+        if video_url:
             return ProviderPollResult(status="succeeded", video_url=video_url, raw_response=item)
+
+        status = _normalize_status(item.get("status") or item.get("state") or item.get("video_status"))
 
         if status == "failed":
             msg = _extract_error_message(item) or "provider failed"
@@ -228,7 +389,7 @@ class HeyGenAV4Client:
         reraise=True,
         stop=stop_after_attempt(4),
         wait=wait_exponential(multiplier=0.6, min=0.6, max=6.0),
-        retry=retry_if_exception_type((httpx.TimeoutException, httpx.TransportError, HeyGenApiError)),
+        retry=retry_if_exception(_is_retryable_exception),
     )
     async def get_share_url(self, provider_job_id: str) -> dict:
         url = f"{self.base}/v1/video/share"

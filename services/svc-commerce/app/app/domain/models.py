@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from pydantic import AnyHttpUrl, BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
 
 from app.domain.enums import CommerceChannel, CommerceMode, CommerceProductType, MarketplaceAddon, Resolution
 
@@ -48,6 +48,9 @@ class ProductAssetItem(BaseModel):
     """
     component_code: str = Field(..., min_length=1)  # vendor-defined (DB-driven catalog later)
     kind: str = "garment"  # garment|accessory|jewelry|footwear|other
+
+    # optional garment family hint
+    garment_kind: Optional[str] = None
 
     # Primary image
     image_url: Optional[AnyHttpUrl] = None
@@ -113,8 +116,17 @@ class QuoteCTA(BaseModel):
 
 
 class CommerceQuoteIn(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     mode: CommerceMode
     product_type: CommerceProductType
+
+    # Optional compatibility / routing hint
+    provider_kind: Optional[str] = None
+
+    # Explicit apparel family hints used by non-saree VTON + training bootstrap
+    garment_kind: Optional[str] = None
+    outfit_kind: Optional[str] = None
 
     # Either look_sets or products; allow both for future (mixed)
     look_set_ids: List[UUID] = Field(default_factory=list)
@@ -141,6 +153,9 @@ class CommerceQuoteIn(BaseModel):
     product_assets: ProductAssets = Field(default_factory=ProductAssets)
     model_ref: ModelRef = Field(default_factory=ModelRef)
 
+    # caller metadata preserved into request_json
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
 
 class QuoteLineItem(BaseModel):
     type: str
@@ -165,8 +180,22 @@ class CommerceQuoteOut(BaseModel):
 
 
 class CommerceConfirmIn(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     quote_id: UUID
     idempotency_key: Optional[str] = None  # client-generated key for safe retries
+
+    # optional pass-through fields accepted from bootstrap/E2E callers
+    mode: Optional[str] = None
+    product_type: Optional[str] = None
+    resolution: Optional[str] = None
+
+    quote_request: Dict[str, Any] = Field(default_factory=dict)
+    request: Dict[str, Any] = Field(default_factory=dict)
+
+    confirm: Optional[bool] = None
+    accepted: Optional[bool] = None
+    accept: Optional[bool] = None
 
 
 class CommerceConfirmOut(BaseModel):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import List, Optional
+import json
+from typing import Any, Dict, List, Optional
+
 import asyncpg
 
 
@@ -8,15 +10,49 @@ class TTSJobsRepo:
     """
     Queue access for audio studio_jobs.
 
-    We claim jobs by:
-      - selecting queued jobs ordered by next_run_at, created_at
-      - locking rows with FOR UPDATE SKIP LOCKED
-      - immediately flipping them to 'running'
+    Pricing-safe lifecycle:
+      - create pricing-enabled jobs as pricing_pending
+      - move to queued only after reserve succeeds
+      - worker only claims queued
     """
 
     def __init__(self, pool: asyncpg.Pool, *, studio_type: str = "audio"):
         self.pool = pool
         self.studio_type = studio_type
+
+    async def insert_job(
+        self,
+        *,
+        user_id: str,
+        request_hash: str,
+        payload: Dict[str, Any],
+        initial_status: str = "queued",
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        sql = """
+        INSERT INTO public.studio_jobs (
+            studio_type,
+            status,
+            request_hash,
+            payload_json,
+            meta_json,
+            user_id
+        )
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::uuid)
+        ON CONFLICT (user_id, studio_type, request_hash)
+        DO UPDATE SET updated_at = now()
+        RETURNING id::text
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                sql,
+                self.studio_type,
+                initial_status,
+                request_hash,
+                json.dumps(payload or {}, default=str),
+                json.dumps(meta or {}, default=str),
+                user_id,
+            )
 
     async def fetch_next_queued_jobs(self, *, limit: int = 1) -> List[str]:
         limit = max(1, int(limit))
@@ -42,8 +78,6 @@ class TTSJobsRepo:
 
                 job_ids = [r["id"] for r in rows]
 
-                # Claim: mark running so other workers won't pick it up.
-                # NOTE: do NOT bump attempt_count here; orchestrator does it to avoid double-increment.
                 await conn.execute(
                     """
                     UPDATE studio_jobs
@@ -54,6 +88,55 @@ class TTSJobsRepo:
                     job_ids,
                 )
                 return job_ids
+
+    async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                  id::text AS id,
+                  studio_type,
+                  status,
+                  user_id::text AS user_id,
+                  request_hash,
+                  payload_json,
+                  meta_json,
+                  error_code,
+                  error_message,
+                  attempt_count,
+                  next_run_at,
+                  created_at,
+                  updated_at
+                FROM public.studio_jobs
+                WHERE id = $1::uuid
+                """,
+                job_id,
+            )
+        return dict(row) if row else None
+
+    async def set_status(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE public.studio_jobs
+                   SET status = $2,
+                       error_code = COALESCE($3, error_code),
+                       error_message = COALESCE($4, error_message),
+                       updated_at = now()
+                 WHERE id = $1::uuid
+                """,
+                job_id,
+                status,
+                error_code,
+                error_message,
+            )
 
     async def requeue_job(
         self,

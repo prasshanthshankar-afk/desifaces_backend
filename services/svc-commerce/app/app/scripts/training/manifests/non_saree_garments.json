@@ -1,0 +1,92 @@
+{
+  "items": [
+    {
+      "seed_name": "hoodie",
+      "image_url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Hoodie_m7agar.jpg",
+      "title": "Black hoodie",
+      "brand": "Wikimedia Commons",
+      "vendor_sku": "TMP-HOODIE-001",
+      "license_name": "CC0-1.0",
+      "usage_terms": "temporary_bootstrap_verify_before_production",
+      "source_type": "wikimedia_commons_temp",
+      "description_url": "https://commons.wikimedia.org/wiki/File:Hoodie_m7agar.jpg"
+    },
+    {
+      "seed_name": "blazer",
+      "image_url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Navy_blazer_jacket.jpg",
+      "title": "Navy blazer jacket",
+      "brand": "Wikimedia Commons",
+      "vendor_sku": "TMP-BLAZER-001",
+      "license_name": "CC-BY-SA-4.0",
+      "usage_terms": "temporary_bootstrap_verify_before_production",
+      "source_type": "wikimedia_commons_temp",
+      "description_url": "https://commons.wikimedia.org/wiki/File:Navy_blazer_jacket.jpg"
+    },
+    {
+      "seed_name": "jeans",
+      "image_url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Trendy_jeans.jpg",
+      "title": "Trendy jeans",
+      "brand": "Wikimedia Commons",
+      "vendor_sku": "TMP-JEANS-001",
+      "license_name": "CC0-1.0",
+      "usage_terms": "temporary_bootstrap_verify_before_production",
+      "source_type": "wikimedia_commons_temp",
+      "description_url": "https://commons.wikimedia.org/wiki/File:Trendy_jeans.jpg"
+    },
+    {
+      "seed_name": "dress",
+      "image_url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Dress_MET_60.38.7a-b_front_CP4.jpg",
+      "title": "Museum dress front view",
+      "brand": "Wikimedia Commons",
+      "vendor_sku": "TMP-DRESS-001",
+      "license_name": "CC0-1.0",
+      "usage_terms": "temporary_bootstrap_verify_before_production",
+      "source_type": "wikimedia_commons_temp",
+      "description_url": "https://commons.wikimedia.org/wiki/File:Dress_MET_60.38.7a-b_front_CP4.jpg"
+    },
+    {
+      "seed_name": "kurta",
+      "image_url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Traditional_Kurta_Indian_Style.jpg",
+      "title": "Traditional kurta",
+      "brand": "Wikimedia Commons",
+      "vendor_sku": "TMP-KURTA-001",
+      "license_name": "CC-BY-2.0",
+      "usage_terms": "temporary_bootstrap_verify_before_production",
+      "source_type": "wikimedia_commons_temp",
+      "description_url": "https://commons.wikimedia.org/wiki/File:Traditional_Kurta_Indian_Style.jpg"
+    },
+    {
+      "seed_name": "salwar_suit",
+      "image_url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Shalwar_kameez_%281710606%29.jpg",
+      "title": "Shalwar kameez",
+      "brand": "Wikimedia Commons",
+      "vendor_sku": "TMP-SALWAR-001",
+      "license_name": "CC0-1.0",
+      "usage_terms": "temporary_bootstrap_verify_before_production",
+      "source_type": "wikimedia_commons_temp",
+      "description_url": "https://commons.wikimedia.org/wiki/File:Shalwar_kameez_(1710606).jpg"
+    },
+    {
+      "seed_name": "lehenga",
+      "image_url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Yellow_Lehenga.jpg",
+      "title": "Yellow lehenga",
+      "brand": "Wikimedia Commons",
+      "vendor_sku": "TMP-LEHENGA-001",
+      "license_name": "CC-BY-SA-2.0",
+      "usage_terms": "temporary_bootstrap_verify_before_production",
+      "source_type": "wikimedia_commons_temp",
+      "description_url": "https://commons.wikimedia.org/wiki/File:Yellow_Lehenga.jpg"
+    },
+    {
+      "seed_name": "sherwani",
+      "image_url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Naveed_Sherwani.png",
+      "title": "Sherwani-style formal image",
+      "brand": "Wikimedia Commons",
+      "vendor_sku": "TMP-SHERWANI-001",
+      "license_name": "CC0-1.0",
+      "usage_terms": "temporary_bootstrap_verify_before_production",
+      "source_type": "wikimedia_commons_temp",
+      "description_url": "https://commons.wikimedia.org/wiki/File:Naveed_Sherwani.png"
+    }
+  ]
+}

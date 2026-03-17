@@ -43,7 +43,7 @@ class VoiceAudio(BaseModel):
     type: Literal["audio"] = "audio"
     audio_url: Optional[HttpUrl] = None
     audio_asset_id: Optional[str] = None
-    audio_artifact_id: Optional[str] = None  # stable reference into shared artifacts table
+    audio_artifact_id: Optional[str] = None
 
     @model_validator(mode="after")
     def at_least_one_source(self) -> "VoiceAudio":
@@ -91,13 +91,11 @@ class FusionJobCreate(BaseModel):
       - voice_mode=tts: provide voice_tts
     """
 
-    # Face inputs
     face_image_url: Optional[HttpUrl] = None
     face_artifact_id: Optional[str] = None
     heygen_talking_photo_id: Optional[str] = None
     image_key: Optional[str] = None
 
-    # Voice inputs
     voice_mode: VoiceMode = VoiceMode.audio
     voice_audio: Optional[VoiceAudio] = None
     voice_tts: Optional[VoiceTTS] = None
@@ -110,7 +108,6 @@ class FusionJobCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_inputs(self) -> "FusionJobCreate":
-        # Normalize optional strings
         if self.face_artifact_id is not None and not self.face_artifact_id.strip():
             self.face_artifact_id = None
         if self.heygen_talking_photo_id is not None and not self.heygen_talking_photo_id.strip():
@@ -118,7 +115,6 @@ class FusionJobCreate(BaseModel):
         if self.image_key is not None and not self.image_key.strip():
             self.image_key = None
 
-        # Face input required
         has_face_url = self.face_image_url is not None
         has_face_artifact = bool(self.face_artifact_id)
         has_tp = bool(self.heygen_talking_photo_id)
@@ -133,14 +129,11 @@ class FusionJobCreate(BaseModel):
             except Exception:
                 raise ValueError("face_artifact_id must be a valid UUID")
 
-        # Voice rules
         if self.voice_mode == VoiceMode.audio:
             if not self.voice_audio:
                 raise ValueError("voice_mode=audio requires voice_audio")
-            # voice_tts is allowed as optional metadata in audio mode (do not forbid)
             return self
 
-        # voice_mode == tts
         if not self.voice_tts:
             raise ValueError("voice_mode=tts requires voice_tts")
         if self.voice_audio is not None:
@@ -172,3 +165,4 @@ class FusionJobView(BaseModel):
 
     error_code: Optional[str] = None
     error_message: Optional[str] = None
+    pricing: Optional[Dict[str, Any]] = None

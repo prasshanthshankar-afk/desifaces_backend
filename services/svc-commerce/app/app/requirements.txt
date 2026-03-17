@@ -11,3 +11,7 @@ azure-storage-blob
 requests
 python-multipart
 mediapipe==0.10.14
+torch
+transformers
+safetensors
+sentencepiece

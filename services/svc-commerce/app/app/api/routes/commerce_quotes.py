@@ -188,6 +188,7 @@ def _extract_confirm_patch(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     allowed = {
         "mode",
+        "provider_kind",
         "product_type",
         "resolution",
         "language",
@@ -199,6 +200,9 @@ def _extract_confirm_patch(raw: Dict[str, Any]) -> Dict[str, Any]:
         "model_ref",
         "drape_styles",
         "outfit_kind",
+        "garment_kind",
+        "people",
+        "meta",
         "drape_style",
         "product_ids",
         "look_set_ids",
@@ -214,7 +218,7 @@ def _deep_merge_request_json(base: Dict[str, Any], patch: Dict[str, Any]) -> Dic
     out = dict(base or {})
     patch = dict(patch or {})
 
-    for k in ("product_assets", "model_ref", "outputs", "views", "cta"):
+    for k in ("product_assets", "model_ref", "outputs", "views", "cta", "meta"):
         if isinstance(out.get(k), dict) and isinstance(patch.get(k), dict):
             merged = dict(out[k])
             merged.update(patch[k])
@@ -222,6 +226,115 @@ def _deep_merge_request_json(base: Dict[str, Any], patch: Dict[str, Any]) -> Dic
 
     out.update(patch)
     return out
+
+
+def _infer_people_from_request_json(request_json: Dict[str, Any]) -> Dict[str, Any]:
+    d = dict(request_json or {})
+    mr = _as_dict(d.get("model_ref"))
+    meta = _as_dict(d.get("meta"))
+
+    probe = " ".join(
+        str(x or "")
+        for x in [
+            mr.get("human_image_url"),
+            mr.get("image_url"),
+            mr.get("url"),
+            mr.get("photo_url"),
+            mr.get("platform_model_id"),
+            meta.get("model_code"),
+        ]
+    ).lower()
+
+    if "male_" in probe or "/male_" in probe:
+        d["people"] = ["solo_male"]
+    elif "female_" in probe or "/female_" in probe:
+        d["people"] = ["solo_female"]
+    elif not isinstance(d.get("people"), list) or not d.get("people"):
+        d["people"] = ["solo"]
+
+    return d
+
+
+def _normalize_vton_request_json(request_json: Dict[str, Any]) -> Dict[str, Any]:
+    d = dict(request_json or {})
+
+    pa = dict(_as_dict(d.get("product_assets")))
+    mr = dict(_as_dict(d.get("model_ref")))
+    meta = dict(_as_dict(d.get("meta")))
+
+    items = pa.get("items")
+    if not isinstance(items, list):
+        items = []
+
+    best_item: Optional[Dict[str, Any]] = None
+    best_score = -10**9
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        url = _pick_best_item_image_url(it)
+        if not url:
+            continue
+        score = _score_item(it)
+        if score > best_score:
+            best_score = score
+            best_item = it
+
+    dominant_component_code = pa.get("dominant_component_code")
+    garment_kind = d.get("garment_kind")
+    outfit_kind = d.get("outfit_kind")
+
+    if isinstance(best_item, dict):
+        if not dominant_component_code and best_item.get("component_code"):
+            dominant_component_code = best_item.get("component_code")
+        if not garment_kind and best_item.get("garment_kind"):
+            garment_kind = best_item.get("garment_kind")
+
+    if not garment_kind and isinstance(dominant_component_code, str) and dominant_component_code.strip():
+        garment_kind = dominant_component_code.strip()
+
+    if not outfit_kind and garment_kind:
+        outfit_kind = garment_kind
+
+    if isinstance(best_item, dict):
+        if garment_kind and not best_item.get("garment_kind"):
+            best_item["garment_kind"] = garment_kind
+        if not best_item.get("is_primary"):
+            best_item["is_primary"] = True
+
+    if best_item:
+        updated_items: List[Dict[str, Any]] = []
+        replaced = False
+        for it in items:
+            if it is best_item and isinstance(it, dict):
+                updated_items.append(best_item)
+                replaced = True
+            else:
+                updated_items.append(it)
+        if not replaced:
+            updated_items.insert(0, best_item)
+        pa["items"] = updated_items
+
+    if dominant_component_code:
+        pa["dominant_component_code"] = dominant_component_code
+
+    if best_item:
+        item_url = _pick_best_item_image_url(best_item)
+        if item_url and not _is_http_url(pa.get("garment_image_url")):
+            pa["garment_image_url"] = item_url
+        if item_url and not _is_http_url(pa.get("primary_image_url")):
+            pa["primary_image_url"] = item_url
+
+    d["garment_kind"] = garment_kind
+    d["outfit_kind"] = outfit_kind
+    d["product_assets"] = pa
+    d["model_ref"] = mr
+    d["meta"] = meta
+
+    if not d.get("provider_kind") and d.get("mode"):
+        d["provider_kind"] = d.get("mode")
+
+    d = _infer_people_from_request_json(d)
+    return d
 
 
 def _parse_az_ref(s: str) -> Optional[Tuple[str, str]]:
@@ -285,7 +398,11 @@ def _component_code_from_role(role: str) -> str:
     return "other"
 
 
-def _resolve_vton_inputs_from_request_json(request_json: Dict[str, Any], *, storage: Optional[AzureStorageService] = None) -> Dict[str, Any]:
+def _resolve_vton_inputs_from_request_json(
+    request_json: Dict[str, Any],
+    *,
+    storage: Optional[AzureStorageService] = None,
+) -> Dict[str, Any]:
     pa = dict(_as_dict(request_json.get("product_assets")))
     mr = dict(_as_dict(request_json.get("model_ref")))
 
@@ -314,7 +431,13 @@ def _resolve_vton_inputs_from_request_json(request_json: Dict[str, Any], *, stor
                 dominant_code = cc.strip()
 
     if not garment_url:
-        for k in ("garment_image_url", "product_image_url", "primary_image_url", "saree_image_url", "blouse_image_url"):
+        for k in (
+            "garment_image_url",
+            "product_image_url",
+            "primary_image_url",
+            "saree_image_url",
+            "blouse_image_url",
+        ):
             v = pa.get(k)
             if _is_http_url(v):
                 garment_url = str(v).strip()
@@ -346,7 +469,14 @@ def _resolve_vton_inputs_from_request_json(request_json: Dict[str, Any], *, stor
 
     if "garment_type" not in pa:
         url_l = (garment_url or "").lower()
-        if pa.get("saree_image_url") or "saree" in url_l or "lehenga" in url_l or "anarkali" in url_l or "gown" in url_l or "dress" in url_l:
+        if (
+            pa.get("saree_image_url")
+            or "saree" in url_l
+            or "lehenga" in url_l
+            or "anarkali" in url_l
+            or "gown" in url_l
+            or "dress" in url_l
+        ):
             pa["garment_type"] = "dresses"
 
     resolved_json = {
@@ -451,7 +581,12 @@ async def _expand_product_ids_into_product_assets(
             if not ma_id:
                 continue
 
-            url = await _signed_url_for_media_asset(con=con, storage=storage, asset_id=UUID(str(ma_id)), expected_user_id=user_id)
+            url = await _signed_url_for_media_asset(
+                con=con,
+                storage=storage,
+                asset_id=UUID(str(ma_id)),
+                expected_user_id=user_id,
+            )
             role_urls[role] = url
 
             already = False
@@ -467,6 +602,7 @@ async def _expand_product_ids_into_product_assets(
                 items.append(
                     {
                         "component_code": cc,
+                        "garment_kind": cc,
                         "kind": kind,
                         "image_url": url,
                         "image_urls": [url],
@@ -529,8 +665,18 @@ async def _ensure_confirm_request_has_urls(
     request_json: Dict[str, Any],
     user_id: UUID,
 ) -> Dict[str, Any]:
-    await _expand_product_ids_into_product_assets(con=con, storage=storage, request_json=request_json, user_id=user_id)
-    await _resolve_model_asset_id_to_url(con=con, storage=storage, request_json=request_json, user_id=user_id)
+    await _expand_product_ids_into_product_assets(
+        con=con,
+        storage=storage,
+        request_json=request_json,
+        user_id=user_id,
+    )
+    await _resolve_model_asset_id_to_url(
+        con=con,
+        storage=storage,
+        request_json=request_json,
+        user_id=user_id,
+    )
 
     resolved = _resolve_vton_inputs_from_request_json(request_json, storage=storage)
     request_json["product_assets"] = resolved.get("product_assets") or request_json.get("product_assets")
@@ -538,7 +684,11 @@ async def _ensure_confirm_request_has_urls(
     return resolved
 
 
-def _require_vton_inputs_or_422(*, request_json: Dict[str, Any], storage: AzureStorageService) -> Dict[str, Any]:
+def _require_vton_inputs_or_422(
+    *,
+    request_json: Dict[str, Any],
+    storage: AzureStorageService,
+) -> Dict[str, Any]:
     resolved = _resolve_vton_inputs_from_request_json(request_json, storage=storage)
     garment_url = resolved.get("resolved_garment_image_url")
     human_url = resolved.get("resolved_human_image_url")
@@ -555,9 +705,11 @@ def _require_vton_inputs_or_422(*, request_json: Dict[str, Any], storage: AzureS
             detail={
                 "error": "missing_vton_inputs",
                 "missing": missing,
-                "hint": "Vendor flow: set mode=platform_models and provide saree URL only; backend auto-picks default model. "
-                        "Customer flow: provide model_ref.human_image_url (or model_ref.asset_id). "
-                        "Wrapper bodies {request:{...}} and {quote_request:{...}} are supported.",
+                "hint": (
+                    "Vendor flow: set mode=platform_models and provide garment URL only; backend auto-picks "
+                    "default model. Customer flow: provide model_ref.human_image_url (or model_ref.asset_id). "
+                    "Wrapper bodies {request:{...}} and {quote_request:{...}} are supported."
+                ),
             },
         )
     return resolved
@@ -577,6 +729,7 @@ async def quote(req: CommerceQuoteIn, request: Request, user_id: UUID = Depends(
         raw = {}
 
     normalized = _extract_wrapped_request(raw) if raw else req.model_dump(mode="json")
+    normalized = _normalize_vton_request_json(normalized)
 
     try:
         req2 = CommerceQuoteIn.model_validate(normalized)
@@ -588,6 +741,9 @@ async def quote(req: CommerceQuoteIn, request: Request, user_id: UUID = Depends(
 
     pool = await get_pool()
     req_json = req2.model_dump(mode="json")
+    req_json = _deep_merge_request_json(req_json, normalized)
+    req_json = _normalize_vton_request_json(req_json)
+
     out_json = out.model_dump(mode="json")
 
     storage = AzureStorageService()
@@ -653,6 +809,16 @@ async def quote(req: CommerceQuoteIn, request: Request, user_id: UUID = Depends(
 
 @router.post("/confirm", response_model=CommerceConfirmOut, operation_id="commerce_quote_confirm")
 async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depends(require_user)) -> CommerceConfirmOut:
+    """
+    SHIP-NOW HOTFIX:
+    Keep confirm thin and reliable.
+
+    Why:
+    - quote row already persists request_json with product_assets/model_ref
+    - worker/processor can re-read quote row by quote_id
+    - confirm should only enqueue a campaign + studio_job
+    - avoid brittle synchronous resolution that is causing 500s
+    """
     pool = await get_pool()
     now = datetime.now(timezone.utc)
 
@@ -664,13 +830,18 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
         raw = {}
 
     idem_from_raw = raw.get("idempotency_key") if isinstance(raw, dict) else None
-    idempotency_key = req.idempotency_key or (str(idem_from_raw).strip() if isinstance(idem_from_raw, str) and idem_from_raw.strip() else None)
-
-    storage = AzureStorageService()
+    idempotency_key = req.idempotency_key or (
+        str(idem_from_raw).strip()
+        if isinstance(idem_from_raw, str) and idem_from_raw.strip()
+        else None
+    )
 
     async with pool.acquire() as con:
         async with con.transaction():
-            user_exists = await con.fetchval("select 1 from core.users where id = $1", user_id)
+            user_exists = await con.fetchval(
+                "select 1 from core.users where id = $1",
+                user_id,
+            )
             if not user_exists:
                 raise HTTPException(
                     status_code=401,
@@ -680,9 +851,18 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
             q = await con.fetchrow(
                 """
                 select
-                  id, user_id, status, expires_at, request_json,
-                  mode, resolution,
-                  dominant_component_code, resolved_garment_image_url, resolved_human_image_url, resolved_json
+                  id,
+                  user_id,
+                  status,
+                  expires_at,
+                  request_json,
+                  response_json,
+                  mode,
+                  resolution,
+                  dominant_component_code,
+                  resolved_garment_image_url,
+                  resolved_human_image_url,
+                  resolved_json
                 from public.commerce_quotes
                 where id = $1 and user_id = $2
                 for update
@@ -700,63 +880,71 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
             if q["status"] not in ("quoted", "confirmed"):
                 raise HTTPException(status_code=422, detail=f"quote_not_confirmable: {q['status']}")
 
-            request_json: Dict[str, Any] = dict(q["request_json"] or {})
+            # start from persisted quote request
+            request_json: Dict[str, Any] = _as_dict(q["request_json"])
             request_json.setdefault("product_assets", {})
             request_json.setdefault("model_ref", {})
+            request_json.setdefault("meta", {})
 
+            # allow caller overrides, but keep this light
             patch = _extract_confirm_patch(raw)
             if patch:
                 request_json = _deep_merge_request_json(request_json, patch)
+
+            if getattr(req, "quote_request", None):
+                request_json = _deep_merge_request_json(request_json, _as_dict(req.quote_request))
+            if getattr(req, "request", None):
+                request_json = _deep_merge_request_json(request_json, _as_dict(req.request))
 
             if not request_json.get("mode") and q.get("mode"):
                 request_json["mode"] = q["mode"]
             if not request_json.get("resolution") and q.get("resolution"):
                 request_json["resolution"] = q["resolution"]
+            if getattr(req, "product_type", None) and not request_json.get("product_type"):
+                request_json["product_type"] = req.product_type
+            if getattr(req, "mode", None) and not request_json.get("mode"):
+                request_json["mode"] = req.mode
+            if getattr(req, "resolution", None) and not request_json.get("resolution"):
+                request_json["resolution"] = req.resolution
 
-            pa = _as_dict(request_json.get("product_assets"))
-            mr = _as_dict(request_json.get("model_ref"))
-            if q.get("resolved_garment_image_url") and not _is_http_url(pa.get("garment_image_url")):
-                pa["garment_image_url"] = q["resolved_garment_image_url"]
-            if q.get("dominant_component_code") and not pa.get("dominant_component_code"):
-                pa["dominant_component_code"] = q["dominant_component_code"]
-            if q.get("resolved_human_image_url") and not _is_http_url(mr.get("human_image_url")):
-                mr["human_image_url"] = q["resolved_human_image_url"]
-            request_json["product_assets"] = pa
-            request_json["model_ref"] = mr
+            # normalize only; do NOT do fragile synchronous URL/model resolution here
+            request_json = _normalize_vton_request_json(request_json)
 
-            resolved = await _ensure_confirm_request_has_urls(con=con, storage=storage, request_json=request_json, user_id=user_id)
-            resolved = _require_vton_inputs_or_422(request_json=request_json, storage=storage)
+            mode = str(
+                request_json.get("mode")
+                or getattr(req, "mode", None)
+                or q.get("mode")
+                or "platform_models"
+            ).strip() or "platform_models"
 
-            request_json_for_job = dict(request_json)
-            request_json_for_job["product_assets"] = resolved.get("product_assets") or request_json.get("product_assets")
-            request_json_for_job["model_ref"] = resolved.get("model_ref") or request_json.get("model_ref")
+            product_type = str(
+                request_json.get("product_type")
+                or getattr(req, "product_type", None)
+                or "apparel"
+            ).strip() or "apparel"
 
-            mode = str(request_json_for_job.get("mode") or "platform_models").strip() or "platform_models"
-            product_type = str(request_json_for_job.get("product_type") or "mixed").strip() or "mixed"
-            resolution = str(request_json_for_job.get("resolution") or (q.get("resolution") or "hd")).strip() or "hd"
+            resolution = str(
+                request_json.get("resolution")
+                or getattr(req, "resolution", None)
+                or q.get("resolution")
+                or "hd"
+            ).strip() or "hd"
 
+            # persist the effective request back to quote row
             await con.execute(
                 """
                 update public.commerce_quotes
                 set request_json = $3::jsonb,
-                    resolved_json = $4::jsonb,
-                    mode = $5,
-                    resolution = $6,
-                    dominant_component_code = $7,
-                    resolved_garment_image_url = $8,
-                    resolved_human_image_url = $9,
+                    mode = $4,
+                    resolution = $5,
                     updated_at = now()
                 where id = $1 and user_id = $2
                 """,
                 req.quote_id,
                 user_id,
-                json.dumps(request_json_for_job),
-                json.dumps(resolved.get("resolved_json") or {}),
+                json.dumps(request_json),
                 mode,
                 resolution,
-                resolved.get("dominant_component_code") or q.get("dominant_component_code"),
-                resolved.get("resolved_garment_image_url") or q.get("resolved_garment_image_url"),
-                resolved.get("resolved_human_image_url") or q.get("resolved_human_image_url"),
             )
 
             existing_campaign = await con.fetchrow(
@@ -771,8 +959,35 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
                 req.quote_id,
             )
 
+            campaign_meta = {
+                "source": "confirm_hotfix",
+                "idempotency_key": idempotency_key,
+                "quote_id": str(req.quote_id),
+                "mode": mode,
+                "product_type": product_type,
+                "resolution": resolution,
+            }
+
             if existing_campaign:
                 campaign_id = UUID(str(existing_campaign["id"]))
+                await con.execute(
+                    """
+                    update public.commerce_campaigns
+                    set mode = $3,
+                        product_type = $4,
+                        status = 'queued',
+                        input_json = $5::jsonb,
+                        meta_json = coalesce(meta_json, '{}'::jsonb) || $6::jsonb,
+                        updated_at = now()
+                    where id = $1 and user_id = $2
+                    """,
+                    campaign_id,
+                    user_id,
+                    mode,
+                    product_type,
+                    json.dumps(request_json),
+                    json.dumps(campaign_meta),
+                )
             else:
                 campaign_id = uuid4()
                 await con.execute(
@@ -789,19 +1004,19 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
                     mode,
                     product_type,
                     req.quote_id,
-                    json.dumps(request_json_for_job),
-                    json.dumps({"source": "confirm", "idempotency_key": idempotency_key}),
+                    json.dumps(request_json),
+                    json.dumps(campaign_meta),
                 )
 
-            idem = idempotency_key or str(req.quote_id)
-            request_hash = _stable_hash({"quote_id": str(req.quote_id), "idempotency_key": idem, "kind": "commerce_confirm"})
-
+            # SHIP-NOW: keep payload maximally compatible with worker/processor
             payload = {
                 "quote_id": str(req.quote_id),
+                "input": {"quote_id": str(req.quote_id)},
                 "campaign_id": str(campaign_id),
-                "quote_request": request_json_for_job,
-                "request": request_json_for_job,
-                "resolved": resolved.get("resolved_json") or {},
+                "quote_request": request_json,
+                "request": request_json,
+                "request_json": request_json,
+                "resolved": _as_dict(q.get("resolved_json")),
             }
             meta = {
                 "request_type": "commerce_confirm",
@@ -811,27 +1026,41 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
                 "mode": mode,
                 "product_type": product_type,
                 "resolution": resolution,
+                "confirm_hotfix": True,
             }
 
-            row = await con.fetchrow(
+            # SHIP-NOW: plain insert, avoid brittle ON CONFLICT path
+            studio_job_id = uuid4()
+            await con.execute(
                 """
                 insert into public.studio_jobs(
-                    studio_type, status, request_hash, payload_json, meta_json, user_id, created_at, updated_at, next_run_at
+                    id, studio_type, status, request_hash, payload_json, meta_json, user_id, created_at, updated_at, next_run_at
                 )
-                values('commerce', 'queued', $1, $2::jsonb, $3::jsonb, $4, now(), now(), now())
-                on conflict (user_id, studio_type, request_hash)
-                do update set updated_at = now()
-                returning id
+                values(
+                    $1, 'commerce', 'queued', $2, $3::jsonb, $4::jsonb, $5, now(), now(), now()
+                )
                 """,
-                request_hash,
+                studio_job_id,
+                _stable_hash(
+                    {
+                        "quote_id": str(req.quote_id),
+                        "campaign_id": str(campaign_id),
+                        "kind": "commerce_confirm_hotfix",
+                        "ts_bucket": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
+                    }
+                ),
                 json.dumps(payload),
                 json.dumps(meta),
                 user_id,
             )
-            studio_job_id = UUID(str(row["id"]))
 
             await con.execute(
-                "update public.commerce_quotes set status='confirmed', updated_at=now() where id=$1 and user_id=$2",
+                """
+                update public.commerce_quotes
+                set status = 'confirmed',
+                    updated_at = now()
+                where id = $1 and user_id = $2
+                """,
                 req.quote_id,
                 user_id,
             )
@@ -845,10 +1074,22 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
                 where id = $1
                 """,
                 campaign_id,
-                json.dumps({"studio_job_id": str(studio_job_id), "quote_id": str(req.quote_id), "mode": mode, "resolution": resolution}),
+                json.dumps(
+                    {
+                        "studio_job_id": str(studio_job_id),
+                        "quote_id": str(req.quote_id),
+                        "mode": mode,
+                        "resolution": resolution,
+                        "confirm_hotfix": True,
+                    }
+                ),
             )
 
-            return CommerceConfirmOut(campaign_id=campaign_id, studio_job_id=studio_job_id, status="queued")
+            return CommerceConfirmOut(
+                campaign_id=campaign_id,
+                studio_job_id=studio_job_id,
+                status="queued",
+            )
 
 
 @router.get("/jobs/{studio_job_id}/status", operation_id="commerce_job_status_get")
@@ -877,16 +1118,14 @@ async def job_status(
     payload = _as_dict(j["payload_json"])
     meta = _as_dict(j["meta_json"])
 
-    # ✅ IMPORTANT: worker writes computed_json; payload_json["computed"] is not reliable.
     payload_computed = _as_dict(payload.get("computed"))
     computed_col = _as_dict(j.get("computed_json"))
 
     computed = dict(payload_computed)
-    computed.update(computed_col)  # computed_json wins
+    computed.update(computed_col)
 
     stage = str(computed.get("stage") or j["status"] or "").strip() or str(j["status"])
 
-    # ✅ ALWAYS mirror computed.urls -> top-level urls (vendor/E2E contract)
     urls = computed.get("urls")
     if not isinstance(urls, list):
         urls = []
@@ -906,14 +1145,14 @@ async def job_status(
         "error_code": j["error_code"],
         "error_message": j["error_message"],
         "computed": computed,
-        "urls": urls,  # <-- this fixes “succeeded but urls empty”
+        "urls": urls,
         "variant_count": int(computed.get("variant_count")) if isinstance(computed.get("variant_count"), int) else len(urls),
         "preview_url": urls[0] if urls else None,
     }
 
     if include_payload:
         payload2 = dict(payload)
-        payload2["computed"] = computed  # helpful for debugging
+        payload2["computed"] = computed
         out["payload_json"] = payload2
         out["meta_json"] = meta
 
