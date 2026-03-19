@@ -239,7 +239,6 @@ def _extract_quote_request_anywhere(
 
 
 def _variant_job_id(*, job_id: UUID, variant_index: int) -> str:
-    # canonical: <job_id>-<variant_index>
     return f"{str(job_id)}-{variant_index}"
 
 
@@ -265,7 +264,7 @@ def _validate_variant_urls_or_raise(
     strict: bool,
 ) -> None:
     """
-    Enforce the *common* variant naming pattern across ALL outfits:
+    Enforce the common variant naming pattern across all outfits.
 
       - For expected_count > 1:
           * URLs must not all be identical.
@@ -878,9 +877,9 @@ _DRESS_CODES = {
     "lehenga",
     "lehenga_set",
     "anarkali",
-    "kurta_pyjama",  # treat as set = "dresses" category for provider
+    "kurta_pyjama",
     "kurta_set",
-    "sherwani",  # treat as set-like for provider too
+    "sherwani",
 }
 
 
@@ -1494,43 +1493,123 @@ async def _preselect_platform_model_for_non_saree(
 
 
 # -----------------------------
-# DB read helpers
+# DB read / write helpers
 # -----------------------------
 
 
-async def _read_job_payload(con, *, job_id: UUID) -> Dict[str, Any]:
+async def _read_job_state(con, *, job_id: UUID) -> Dict[str, Any]:
     row = await con.fetchrow(
         """
-        select payload_json
+        select payload_json, meta_json, computed_json, status, error_code, error_message
         from public.studio_jobs
         where id=$1 and studio_type='commerce'
         """,
         job_id,
     )
-    return _as_dict(row["payload_json"] if row else {})
+    if not row:
+        return {
+            "payload_json": {},
+            "meta_json": {},
+            "computed_json": {},
+            "status": None,
+            "error_code": None,
+            "error_message": None,
+        }
+    return {
+        "payload_json": _as_dict(row["payload_json"]),
+        "meta_json": _as_dict(row["meta_json"]),
+        "computed_json": _as_dict(row["computed_json"]),
+        "status": row["status"],
+        "error_code": row["error_code"],
+        "error_message": row["error_message"],
+    }
 
 
-async def _write_job_payload(con, *, job_id: UUID, payload: Dict[str, Any]) -> None:
+async def _write_job_state(
+    con,
+    *,
+    job_id: UUID,
+    payload: Dict[str, Any],
+    meta: Dict[str, Any],
+    computed: Dict[str, Any],
+    status: Optional[str] = None,
+    error_code: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> None:
     await con.execute(
         """
         update public.studio_jobs
-        set payload_json=$2::jsonb, updated_at=now()
-        where id=$1 and studio_type='commerce'
+        set
+          payload_json = $2::jsonb,
+          meta_json = $3::jsonb,
+          computed_json = $4::jsonb,
+          status = coalesce($5, status),
+          error_code = $6,
+          error_message = $7,
+          updated_at = now()
+        where id = $1 and studio_type='commerce'
         """,
         job_id,
         json.dumps(payload or {}, default=str, ensure_ascii=False),
+        json.dumps(meta or {}, default=str, ensure_ascii=False),
+        json.dumps(computed or {}, default=str, ensure_ascii=False),
+        status,
+        error_code,
+        error_message,
     )
 
 
-async def _set_job_computed(con, *, job_id: UUID, stage: str, patch: Dict[str, Any] | None = None) -> None:
-    payload = await _read_job_payload(con, job_id=job_id)
-    computed = _as_dict(payload.get("computed"))
-    computed["stage"] = stage
+async def _set_job_computed(
+    con,
+    *,
+    job_id: UUID,
+    stage: str,
+    patch: Dict[str, Any] | None = None,
+    error_code: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    state = await _read_job_state(con, job_id=job_id)
+    payload = _as_dict(state.get("payload_json"))
+    meta = _as_dict(state.get("meta_json"))
+    computed = _as_dict(state.get("computed_json"))
+
+    payload_computed = _as_dict(payload.get("computed"))
+    merged_computed = dict(payload_computed)
+    merged_computed.update(computed)
+    merged_computed["stage"] = stage
     if patch:
-        computed.update(patch)
-    payload["computed"] = computed
+        merged_computed.update(patch)
+
+    payload["computed"] = merged_computed
     payload["stage"] = stage
-    await _write_job_payload(con, job_id=job_id, payload=payload)
+
+    if "pricing" in merged_computed and isinstance(merged_computed["pricing"], dict):
+        payload["pricing"] = merged_computed["pricing"]
+        payload_meta = _as_dict(payload.get("meta"))
+        payload_meta["pricing"] = merged_computed["pricing"]
+        payload["meta"] = payload_meta
+
+        meta["pricing"] = merged_computed["pricing"]
+        if merged_computed["pricing"].get("state") is not None:
+            meta["pricing_state"] = merged_computed["pricing"].get("state")
+            payload["pricing_state"] = merged_computed["pricing"].get("state")
+            merged_computed["pricing_state"] = merged_computed["pricing"].get("state")
+
+    if stage in {"queued", "running", "succeeded", "failed"}:
+        status_value = stage
+    else:
+        status_value = None
+
+    await _write_job_state(
+        con,
+        job_id=job_id,
+        payload=payload,
+        meta=meta,
+        computed=merged_computed,
+        status=status_value,
+        error_code=error_code if stage == "failed" else None,
+        error_message=error_message if stage == "failed" else None,
+    )
 
 
 class _DisabledPricingClient:
@@ -1597,20 +1676,72 @@ def _extract_pricing_error_code(e: Exception) -> str:
 
 
 async def _persist_pricing_block(con, *, job_id: UUID, pricing: Dict[str, Any]) -> None:
-    payload = await _read_job_payload(con, job_id=job_id)
-    payload["pricing"] = dict(pricing or {})
-    meta = _as_dict(payload.get("meta"))
-    meta["pricing"] = dict(pricing or {})
-    payload["meta"] = meta
-    await _write_job_payload(con, job_id=job_id, payload=payload)
+    state = await _read_job_state(con, job_id=job_id)
+    payload = _as_dict(state.get("payload_json"))
+    meta = _as_dict(state.get("meta_json"))
+    computed = _as_dict(state.get("computed_json"))
+
+    pricing = dict(pricing or {})
+    pricing_state = pricing.get("state")
+
+    payload["pricing"] = pricing
+    payload["pricing_state"] = pricing_state
+
+    payload_meta = _as_dict(payload.get("meta"))
+    payload_meta["pricing"] = pricing
+    if pricing_state is not None:
+        payload_meta["pricing_state"] = pricing_state
+    payload["meta"] = payload_meta
+
+    payload_computed = _as_dict(payload.get("computed"))
+    payload_computed["pricing"] = pricing
+    if pricing_state is not None:
+        payload_computed["pricing_state"] = pricing_state
+    payload["computed"] = payload_computed
+
+    meta["pricing"] = pricing
+    if pricing_state is not None:
+        meta["pricing_state"] = pricing_state
+
+    computed["pricing"] = pricing
+    if pricing_state is not None:
+        computed["pricing_state"] = pricing_state
+
+    await _write_job_state(
+        con,
+        job_id=job_id,
+        payload=payload,
+        meta=meta,
+        computed=computed,
+        status=None,
+        error_code=state.get("error_code"),
+        error_message=state.get("error_message"),
+    )
 
 
 async def _load_latest_pricing(con, *, job_id: UUID) -> Dict[str, Any]:
-    payload = await _read_job_payload(con, job_id=job_id)
+    state = await _read_job_state(con, job_id=job_id)
+    payload = _as_dict(state.get("payload_json"))
+    meta = _as_dict(state.get("meta_json"))
+    computed = _as_dict(state.get("computed_json"))
+
     pricing = _as_dict(payload.get("pricing"))
     if pricing:
         return pricing
-    return _as_dict(_as_dict(payload.get("meta")).get("pricing"))
+
+    pricing = _as_dict(_as_dict(payload.get("meta")).get("pricing"))
+    if pricing:
+        return pricing
+
+    pricing = _as_dict(meta.get("pricing"))
+    if pricing:
+        return pricing
+
+    pricing = _as_dict(computed.get("pricing"))
+    if pricing:
+        return pricing
+
+    return {}
 
 
 async def _commit_pricing_for_job(
@@ -1631,6 +1762,7 @@ async def _commit_pricing_for_job(
 
     reservation_id = str(pricing.get("reservation_id") or "").strip()
     state = str(pricing.get("state") or "").strip().lower()
+
     if not reservation_id:
         pricing = _merge_pricing_block(
             pricing,
@@ -1667,6 +1799,7 @@ async def _commit_pricing_for_job(
                 },
             )
         )
+
         commit_status = str(_pricing_resp_get(resp, "status", "committed") or "committed")
         pricing = _merge_pricing_block(
             pricing,
@@ -1686,9 +1819,11 @@ async def _commit_pricing_for_job(
             settlement_mode=_pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
             entitlement_source=_pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
             disabled_reason=None,
+            error=None,
         )
         await _persist_pricing_block(con, job_id=job_id, pricing=pricing)
         return pricing
+
     except Exception as e:
         logger.exception(
             "commerce_pricing_commit_failed",
@@ -1750,6 +1885,7 @@ async def _release_pricing_for_job(
                 },
             )
         )
+
         release_status = str(_pricing_resp_get(resp, "status", "released") or "released")
         pricing = _merge_pricing_block(
             pricing,
@@ -1762,9 +1898,11 @@ async def _release_pricing_for_job(
             settlement_mode=_pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
             entitlement_source=_pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
             disabled_reason=None,
+            error=None,
         )
         await _persist_pricing_block(con, job_id=job_id, pricing=pricing)
         return pricing
+
     except Exception as e:
         logger.exception(
             "commerce_pricing_release_failed",
@@ -2221,8 +2359,8 @@ class NonSareeQC:
             return im.resize((size, size))
 
         def _roi(im: Image.Image, x0: float, x1: float, y0: float, y1: float) -> Image.Image:
-            W, H = im.size
-            box = (int(x0 * W), int(y0 * H), int(x1 * W), int(y1 * H))
+            w, h = im.size
+            box = (int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h))
             return im.crop(box)
 
         def _roi_diff(a: Image.Image, b: Image.Image, x0: float, x1: float, y0: float, y1: float) -> float:
@@ -2267,7 +2405,6 @@ class NonSareeQC:
             ok_preserve = False
 
         ok = bool(ok_presence and ok_preserve)
-
         score = float(upper + lower) - float(2.0 * face) - float(1.0 * corners)
 
         return {
@@ -2313,7 +2450,21 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
     campaign_meta: Dict[str, Any] = {}
 
     async with pool.acquire() as con:
-        await _set_job_computed(con, job_id=job_id, stage="running", patch={"started_at": started_at, "processor": "vton_v3"})
+        persisted_pricing = await _load_latest_pricing(con, job_id=job_id)
+        if persisted_pricing:
+            pricing = persisted_pricing
+
+        await _set_job_computed(
+            con,
+            job_id=job_id,
+            stage="running",
+            patch={
+                "started_at": started_at,
+                "processor": "vton_v3",
+                "pricing": pricing if pricing else None,
+                "pricing_state": pricing.get("state") if pricing else None,
+            },
+        )
         if pricing:
             await _persist_pricing_block(con, job_id=job_id, pricing=pricing)
 
@@ -2354,8 +2505,9 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                 "commerce_campaign_id": str(campaign_id),
                 "processor": "vton_v3",
                 "started_at": started_at,
-                "pricing_state": pricing.get("state"),
-                "pricing_enabled": bool(pricing.get("enabled", False)),
+                "pricing_state": pricing.get("state") if pricing else None,
+                "pricing_enabled": bool(pricing.get("enabled", False)) if pricing else False,
+                "pricing": pricing if pricing else None,
             },
         )
         await con.execute(
@@ -2539,7 +2691,7 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                 con,
                 job_id=job_id,
                 stage="running",
-                patch={"request_hash": request_hash, "debug_inputs": debug_inputs},
+                patch={"request_hash": request_hash, "debug_inputs": debug_inputs, "pricing": pricing, "pricing_state": pricing.get("state") if pricing else None},
             )
 
         req = VTONGenerateRequest(
@@ -2727,6 +2879,8 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                     "pricing": pricing,
                     "pricing_state": pricing.get("state"),
                 },
+                error_code=code[:200] if code else None,
+                error_message=err[:2000],
             )
             try:
                 merged_meta_fail = _merge(
