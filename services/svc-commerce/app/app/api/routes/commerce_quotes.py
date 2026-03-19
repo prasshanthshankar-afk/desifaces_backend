@@ -1,4 +1,3 @@
-# /Users/home/Desktop/products/desifaces-backend/desifaces_backend/services/svc-commerce/app/app/api/routes/commerce_quotes.py
 from __future__ import annotations
 
 import base64
@@ -6,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
@@ -18,9 +18,331 @@ from app.domain.models import CommerceConfirmIn, CommerceConfirmOut, CommerceQuo
 from app.services.azure_storage_service import AzureStorageService
 from app.services.pricing_client import PricingClient
 
+PRICING_IMPORT_ERROR: Optional[str] = None
+
+try:
+    from desifaces_shared.pricing.client import PricingClientError, SvcPricingClient
+    from desifaces_shared.pricing.models import PricingReleaseRequest, PricingReserveRequest
+except Exception as pricing_import_error:  # pragma: no cover
+    PRICING_IMPORT_ERROR = str(pricing_import_error)
+
+    class PricingClientError(Exception):
+        pass
+
+    @dataclass
+    class PricingReserveRequest:
+        user_id: str
+        service_name: str
+        service_action: str
+        sku_code: str
+        units: str
+        external_ref_type: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+
+    @dataclass
+    class PricingReleaseRequest:
+        user_id: str
+        reservation_id: str
+        reason: str
+        external_ref_type: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+
+    class SvcPricingClient:
+        enabled = False
+
+        @classmethod
+        def from_env(cls, service_name: str) -> "SvcPricingClient":
+            return cls()
+
+        async def reserve(self, req: PricingReserveRequest):
+            raise PricingClientError("pricing client unavailable")
+
+        async def release(self, req: PricingReleaseRequest):
+            raise PricingClientError("pricing client unavailable")
+
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/commerce", tags=["commerce"])
+
+
+# ---------------------------
+# pricing helpers
+# ---------------------------
+
+class _DisabledPricingClient:
+    enabled = False
+
+    async def reserve(self, req: PricingReserveRequest):
+        raise PricingClientError("pricing client unavailable")
+
+    async def release(self, req: PricingReleaseRequest):
+        raise PricingClientError("pricing client unavailable")
+
+
+def _cfg_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _pricing_required() -> bool:
+    return _cfg_bool("DF_PRICING_REQUIRED", False)
+
+
+def _pricing_client() -> SvcPricingClient | _DisabledPricingClient:
+    try:
+        return SvcPricingClient.from_env(service_name="svc-commerce")
+    except Exception:
+        logger.exception("svc_commerce_pricing_client_init_failed")
+        return _DisabledPricingClient()
+
+
+def _pricing_enabled(client: Any) -> bool:
+    try:
+        return bool(getattr(client, "enabled", False))
+    except Exception:
+        return False
+
+
+def _pricing_disabled_reason() -> str:
+    if PRICING_IMPORT_ERROR:
+        return f"pricing_import_failed: {PRICING_IMPORT_ERROR}"
+    return "svc-commerce pricing client is disabled or not configured"
+
+
+def _pricing_resp_get(resp: Any, key: str, default: Any = None) -> Any:
+    if resp is None:
+        return default
+    if isinstance(resp, dict):
+        value = resp.get(key, default)
+    else:
+        value = getattr(resp, key, default)
+    if hasattr(value, "value"):
+        try:
+            return value.value
+        except Exception:
+            return default if value is None else value
+    return value
+
+
+def _extract_pricing_error_code(e: Exception) -> str:
+    msg = str(e or "")
+    for code in (
+        "PRICING_INSUFFICIENT_CREDITS",
+        "PRICING_UNKNOWN_OR_INACTIVE_VARIANT",
+        "PRICING_VARIANT_ZERO_QTY_LINES",
+        "PRICING_CLIENT_DISABLED",
+    ):
+        if code in msg:
+            return code
+    if "pricing client unavailable" in msg.lower():
+        return "PRICING_CLIENT_DISABLED"
+    return "PRICING_RESERVATION_FAILED"
+
+
+def _commerce_pricing_variant_code(*, product_type: str, request_json: Dict[str, Any]) -> str:
+    dominant = str(
+        _as_dict(request_json.get("product_assets")).get("dominant_component_code")
+        or request_json.get("garment_kind")
+        or request_json.get("outfit_kind")
+        or ""
+    ).strip().lower()
+
+    explicit = (os.getenv("DF_PRICING_VARIANT_COMMERCE") or "").strip()
+    if explicit:
+        return explicit
+
+    if product_type == "apparel":
+        if "saree" in dominant:
+            return (os.getenv("DF_PRICING_VARIANT_COMMERCE_SAREE") or "COMMERCE_VTON_SAREE_PREMIUM").strip()
+        if "lehenga" in dominant:
+            return (os.getenv("DF_PRICING_VARIANT_COMMERCE_APPAREL_PREMIUM") or "COMMERCE_VTON_APPAREL_PREMIUM").strip()
+        return (os.getenv("DF_PRICING_VARIANT_COMMERCE_APPAREL") or "COMMERCE_VTON_APPAREL_STANDARD").strip()
+
+    if product_type == "fmcg":
+        return (os.getenv("DF_PRICING_VARIANT_COMMERCE_FMCG") or "COMMERCE_VTON_FMCG_STANDARD").strip()
+
+    if product_type == "electronics":
+        return (os.getenv("DF_PRICING_VARIANT_COMMERCE_ELECTRONICS") or "COMMERCE_VTON_ELECTRONICS_STANDARD").strip()
+
+    return (os.getenv("DF_PRICING_VARIANT_COMMERCE_MIXED") or "COMMERCE_VTON_MULTI_ITEM").strip()
+
+
+def _commerce_pricing_leaf_sku_code(*, product_type: str, request_json: Dict[str, Any]) -> str:
+    dominant = str(
+        _as_dict(request_json.get("product_assets")).get("dominant_component_code")
+        or request_json.get("garment_kind")
+        or request_json.get("outfit_kind")
+        or ""
+    ).strip().lower()
+
+    explicit = (os.getenv("DF_PRICING_LEAF_SKU_COMMERCE") or "").strip()
+    if explicit:
+        return explicit
+
+    if product_type == "apparel":
+        if "saree" in dominant:
+            return (os.getenv("DF_PRICING_LEAF_SKU_COMMERCE_SAREE") or "COMMERCE_VTON_RUN").strip()
+        return (os.getenv("DF_PRICING_LEAF_SKU_COMMERCE_APPAREL") or "COMMERCE_VTON_RUN").strip()
+
+    if product_type == "fmcg":
+        return (os.getenv("DF_PRICING_LEAF_SKU_COMMERCE_FMCG") or "COMMERCE_VTON_RUN").strip()
+
+    if product_type == "electronics":
+        return (os.getenv("DF_PRICING_LEAF_SKU_COMMERCE_ELECTRONICS") or "COMMERCE_VTON_RUN").strip()
+
+    return (os.getenv("DF_PRICING_LEAF_SKU_COMMERCE_MIXED") or "COMMERCE_VTON_RUN").strip()
+
+
+def _build_initial_pricing_block(
+    *,
+    quote_id: UUID,
+    request_json: Dict[str, Any],
+    product_type: str,
+    mode: str,
+    resolution: str,
+    total_credits: int,
+    total_usd: float,
+    total_inr: float,
+    pricing_client: Any,
+) -> Dict[str, Any]:
+    variant_code = _commerce_pricing_variant_code(product_type=product_type, request_json=request_json)
+    leaf_sku_code = _commerce_pricing_leaf_sku_code(product_type=product_type, request_json=request_json)
+
+    enabled = _pricing_enabled(pricing_client)
+    state = "pending_reservation" if enabled else "disabled"
+
+    return {
+        "enabled": enabled,
+        "state": state,
+        "service_name": "svc-commerce",
+        "service_action": "commerce.vton.generate",
+        "variant_code": variant_code,
+        "sku_code": variant_code,
+        "leaf_sku_code": leaf_sku_code,
+        "estimated_units": "1",
+        "unit_type": "run",
+        "reservation_id": None,
+        "reservation_status": None,
+        "quote_id": str(quote_id),
+        "reserved_units": None,
+        "actual_units": None,
+        "billed_units": None,
+        "released_units": None,
+        "amount": None,
+        "currency": None,
+        "ledger_entry_id": None,
+        "billing_mode": None,
+        "billing_account_id": None,
+        "settlement_mode": None,
+        "pricing_mode": None,
+        "entitlement_source": None,
+        "entitlement_reason": None,
+        "tier_code": None,
+        "disabled_reason": None if enabled else _pricing_disabled_reason(),
+        "error": None,
+        "meta": {
+            "variant_code": variant_code,
+            "leaf_sku_code": leaf_sku_code,
+            "requested_units": "1",
+            "mode": mode,
+            "product_type": product_type,
+            "resolution": resolution,
+            "quote_id": str(quote_id),
+            "quote_total_credits": int(total_credits),
+            "quote_total_usd": float(total_usd),
+            "quote_total_inr": float(total_inr),
+            "dominant_component_code": _as_dict(request_json.get("product_assets")).get("dominant_component_code"),
+            "garment_kind": request_json.get("garment_kind"),
+            "outfit_kind": request_json.get("outfit_kind"),
+        },
+    }
+
+
+def _merge_pricing_block(current: Optional[Dict[str, Any]], **updates: Any) -> Dict[str, Any]:
+    out = dict(current or {})
+    for key, value in updates.items():
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def _pricing_from_payload_meta_computed(payload: Dict[str, Any], meta: Dict[str, Any], computed: Dict[str, Any]) -> Dict[str, Any]:
+    pricing = _as_dict(payload.get("pricing"))
+    if pricing:
+        return pricing
+    pricing = _as_dict(meta.get("pricing"))
+    if pricing:
+        return pricing
+    pricing = _as_dict(computed.get("pricing"))
+    if pricing:
+        return pricing
+    return {}
+
+
+def _pricing_has_reservation(pricing: Dict[str, Any]) -> bool:
+    rid = str(pricing.get("reservation_id") or "").strip()
+    return bool(rid)
+
+
+async def _release_pricing_best_effort(
+    *,
+    pricing_client: Any,
+    user_id: UUID,
+    studio_job_id: UUID,
+    pricing: Dict[str, Any],
+    reason: str,
+) -> Dict[str, Any]:
+    if not _pricing_enabled(pricing_client):
+        return pricing
+
+    reservation_id = str(pricing.get("reservation_id") or "").strip()
+    state = str(pricing.get("state") or "").strip().lower()
+    if not reservation_id:
+        return pricing
+    if state in {"released", "committed"}:
+        return pricing
+
+    try:
+        resp = await pricing_client.release(
+            PricingReleaseRequest(
+                user_id=str(user_id),
+                reservation_id=reservation_id,
+                reason=reason,
+                external_ref_type="studio_job",
+                external_ref_id=str(studio_job_id),
+                idempotency_key=f"svc-commerce:job:{studio_job_id}:release",
+                meta={
+                    **_as_dict(pricing.get("meta")),
+                    "variant_code": pricing.get("variant_code"),
+                    "sku_code": pricing.get("sku_code"),
+                    "leaf_sku_code": pricing.get("leaf_sku_code"),
+                    "service_action": pricing.get("service_action"),
+                },
+            )
+        )
+        return _merge_pricing_block(
+            pricing,
+            state="released",
+            release_status=str(_pricing_resp_get(resp, "status", "released") or "released"),
+            released_units=_pricing_resp_get(resp, "released_units"),
+            billing_mode=_pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
+            billing_account_id=_pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
+            settlement_mode=_pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
+            entitlement_source=_pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception(
+            "commerce_pricing_release_failed",
+            extra={"studio_job_id": str(studio_job_id), "reservation_id": reservation_id, "user_id": str(user_id)},
+        )
+        return _merge_pricing_block(pricing, state="release_failed", error=str(e))
 
 
 # ---------------------------
@@ -71,9 +393,6 @@ def _is_http_url(v: Any) -> bool:
 
 
 def _normalize_urls(x: Any) -> List[str]:
-    """
-    Accept list[str] or single str. Strip/validate http(s).
-    """
     urls: List[str] = []
     if isinstance(x, str) and x.strip():
         urls = [x.strip()]
@@ -85,21 +404,12 @@ def _normalize_urls(x: Any) -> List[str]:
 
 
 def _merge_computed(payload_computed: Dict[str, Any], computed_col: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    computed_json (column) wins over payload_json['computed'].
-    """
     out = dict(payload_computed or {})
     out.update(computed_col or {})
     return out
 
 
 def _normalize_job_status_payload(out: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Product-grade contract:
-      - always include top-level urls (mirror computed.urls)
-      - ensure computed.urls exists and matches urls
-      - ensure preview_url and variant_count
-    """
     out = out if isinstance(out, dict) else {}
     computed = out.get("computed")
     computed = computed if isinstance(computed, dict) else {}
@@ -267,7 +577,7 @@ def _normalize_vton_request_json(request_json: Dict[str, Any]) -> Dict[str, Any]
         items = []
 
     best_item: Optional[Dict[str, Any]] = None
-    best_score = -10**9
+    best_score = -(10**9)
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -412,7 +722,7 @@ def _resolve_vton_inputs_from_request_json(
     items = pa.get("items")
     if isinstance(items, list) and items:
         best: Optional[Dict[str, Any]] = None
-        best_score = -10**9
+        best_score = -(10**9)
         for it in items:
             if not isinstance(it, dict):
                 continue
@@ -809,16 +1119,6 @@ async def quote(req: CommerceQuoteIn, request: Request, user_id: UUID = Depends(
 
 @router.post("/confirm", response_model=CommerceConfirmOut, operation_id="commerce_quote_confirm")
 async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depends(require_user)) -> CommerceConfirmOut:
-    """
-    SHIP-NOW HOTFIX:
-    Keep confirm thin and reliable.
-
-    Why:
-    - quote row already persists request_json with product_assets/model_ref
-    - worker/processor can re-read quote row by quote_id
-    - confirm should only enqueue a campaign + studio_job
-    - avoid brittle synchronous resolution that is causing 500s
-    """
     pool = await get_pool()
     now = datetime.now(timezone.utc)
 
@@ -836,260 +1136,528 @@ async def confirm(req: CommerceConfirmIn, request: Request, user_id: UUID = Depe
         else None
     )
 
+    pricing_client = _pricing_client()
+
+    existing_campaign = None
+    existing_job_id: Optional[UUID] = None
+    existing_job_status: Optional[str] = None
+    request_json: Dict[str, Any] = {}
+    mode = "platform_models"
+    product_type = "apparel"
+    resolution = "hd"
+    request_hash = ""
+    total_credits = 0
+    total_usd = 0.0
+    total_inr = 0.0
+    storage = AzureStorageService()
+
     async with pool.acquire() as con:
-        async with con.transaction():
-            user_exists = await con.fetchval(
-                "select 1 from core.users where id = $1",
-                user_id,
-            )
-            if not user_exists:
-                raise HTTPException(
-                    status_code=401,
-                    detail="unknown_user_in_core_users (token sub not present in core.users; use a token issued by svc-core login/signup)",
-                )
+        q = await con.fetchrow(
+            """
+            select
+              id,
+              user_id,
+              status,
+              expires_at,
+              request_json,
+              response_json,
+              mode,
+              resolution,
+              total_credits,
+              total_usd,
+              total_inr,
+              dominant_component_code,
+              resolved_garment_image_url,
+              resolved_human_image_url,
+              resolved_json
+            from public.commerce_quotes
+            where id = $1 and user_id = $2
+            """,
+            req.quote_id,
+            user_id,
+        )
 
-            q = await con.fetchrow(
+        if not q:
+            raise HTTPException(status_code=404, detail="quote_not_found")
+
+        if q["expires_at"] <= now:
+            raise HTTPException(status_code=422, detail="quote_expired")
+
+        if q["status"] not in ("quoted", "confirmed"):
+            raise HTTPException(status_code=422, detail=f"quote_not_confirmable: {q['status']}")
+
+        request_json = _as_dict(q["request_json"])
+        request_json.setdefault("product_assets", {})
+        request_json.setdefault("model_ref", {})
+        request_json.setdefault("meta", {})
+
+        patch = _extract_confirm_patch(raw)
+        if patch:
+            request_json = _deep_merge_request_json(request_json, patch)
+
+        if getattr(req, "quote_request", None):
+            request_json = _deep_merge_request_json(request_json, _as_dict(req.quote_request))
+        if getattr(req, "request", None):
+            request_json = _deep_merge_request_json(request_json, _as_dict(req.request))
+
+        if not request_json.get("mode") and q.get("mode"):
+            request_json["mode"] = q["mode"]
+        if not request_json.get("resolution") and q.get("resolution"):
+            request_json["resolution"] = q["resolution"]
+        if getattr(req, "product_type", None) and not request_json.get("product_type"):
+            request_json["product_type"] = req.product_type
+        if getattr(req, "mode", None) and not request_json.get("mode"):
+            request_json["mode"] = req.mode
+        if getattr(req, "resolution", None) and not request_json.get("resolution"):
+            request_json["resolution"] = req.resolution
+
+        request_json = _normalize_vton_request_json(request_json)
+
+        resolved = await _ensure_confirm_request_has_urls(
+            con=con,
+            storage=storage,
+            request_json=request_json,
+            user_id=user_id,
+        )
+        _require_vton_inputs_or_422(request_json=request_json, storage=storage)
+
+        mode = str(
+            request_json.get("mode")
+            or getattr(req, "mode", None)
+            or q.get("mode")
+            or "platform_models"
+        ).strip() or "platform_models"
+
+        product_type = str(
+            request_json.get("product_type")
+            or getattr(req, "product_type", None)
+            or "apparel"
+        ).strip() or "apparel"
+
+        resolution = str(
+            request_json.get("resolution")
+            or getattr(req, "resolution", None)
+            or q.get("resolution")
+            or "hd"
+        ).strip() or "hd"
+
+        total_credits = int(q.get("total_credits") or 0)
+        total_usd = float(q.get("total_usd") or 0.0)
+        total_inr = float(q.get("total_inr") or 0.0)
+
+        idem_key = (idempotency_key or str(req.quote_id)).strip()
+        request_hash = _stable_hash(
+            {
+                "kind": "commerce_confirm",
+                "user_id": str(user_id),
+                "quote_id": str(req.quote_id),
+                "idempotency_key": idem_key,
+                "mode": mode,
+                "product_type": product_type,
+                "resolution": resolution,
+                "dominant_component_code": resolved.get("dominant_component_code"),
+                "garment_url": str(resolved.get("resolved_garment_image_url") or "").split("?", 1)[0],
+                "human_url": str(resolved.get("resolved_human_image_url") or "").split("?", 1)[0],
+            }
+        )
+
+        existing_campaign = await con.fetchrow(
+            """
+            select id, meta_json
+            from public.commerce_campaigns
+            where user_id = $1 and quote_id = $2
+              and (meta_json->>'request_hash') = $3
+            order by created_at desc
+            limit 1
+            """,
+            user_id,
+            req.quote_id,
+            request_hash,
+        )
+
+        if existing_campaign:
+            mj = _as_dict(existing_campaign["meta_json"])
+            sj = mj.get("studio_job_id")
+            if sj:
+                try:
+                    existing_job_id = UUID(str(sj))
+                except Exception:
+                    existing_job_id = None
+
+        if existing_job_id is None:
+            row = await con.fetchrow(
                 """
-                select
-                  id,
-                  user_id,
-                  status,
-                  expires_at,
-                  request_json,
-                  response_json,
-                  mode,
-                  resolution,
-                  dominant_component_code,
-                  resolved_garment_image_url,
-                  resolved_human_image_url,
-                  resolved_json
-                from public.commerce_quotes
-                where id = $1 and user_id = $2
-                for update
-                """,
-                req.quote_id,
-                user_id,
-            )
-
-            if not q:
-                raise HTTPException(status_code=404, detail="quote_not_found")
-
-            if q["expires_at"] <= now:
-                raise HTTPException(status_code=422, detail="quote_expired")
-
-            if q["status"] not in ("quoted", "confirmed"):
-                raise HTTPException(status_code=422, detail=f"quote_not_confirmable: {q['status']}")
-
-            # start from persisted quote request
-            request_json: Dict[str, Any] = _as_dict(q["request_json"])
-            request_json.setdefault("product_assets", {})
-            request_json.setdefault("model_ref", {})
-            request_json.setdefault("meta", {})
-
-            # allow caller overrides, but keep this light
-            patch = _extract_confirm_patch(raw)
-            if patch:
-                request_json = _deep_merge_request_json(request_json, patch)
-
-            if getattr(req, "quote_request", None):
-                request_json = _deep_merge_request_json(request_json, _as_dict(req.quote_request))
-            if getattr(req, "request", None):
-                request_json = _deep_merge_request_json(request_json, _as_dict(req.request))
-
-            if not request_json.get("mode") and q.get("mode"):
-                request_json["mode"] = q["mode"]
-            if not request_json.get("resolution") and q.get("resolution"):
-                request_json["resolution"] = q["resolution"]
-            if getattr(req, "product_type", None) and not request_json.get("product_type"):
-                request_json["product_type"] = req.product_type
-            if getattr(req, "mode", None) and not request_json.get("mode"):
-                request_json["mode"] = req.mode
-            if getattr(req, "resolution", None) and not request_json.get("resolution"):
-                request_json["resolution"] = req.resolution
-
-            # normalize only; do NOT do fragile synchronous URL/model resolution here
-            request_json = _normalize_vton_request_json(request_json)
-
-            mode = str(
-                request_json.get("mode")
-                or getattr(req, "mode", None)
-                or q.get("mode")
-                or "platform_models"
-            ).strip() or "platform_models"
-
-            product_type = str(
-                request_json.get("product_type")
-                or getattr(req, "product_type", None)
-                or "apparel"
-            ).strip() or "apparel"
-
-            resolution = str(
-                request_json.get("resolution")
-                or getattr(req, "resolution", None)
-                or q.get("resolution")
-                or "hd"
-            ).strip() or "hd"
-
-            # persist the effective request back to quote row
-            await con.execute(
-                """
-                update public.commerce_quotes
-                set request_json = $3::jsonb,
-                    mode = $4,
-                    resolution = $5,
-                    updated_at = now()
-                where id = $1 and user_id = $2
-                """,
-                req.quote_id,
-                user_id,
-                json.dumps(request_json),
-                mode,
-                resolution,
-            )
-
-            existing_campaign = await con.fetchrow(
-                """
-                select id
-                from public.commerce_campaigns
-                where user_id = $1 and quote_id = $2
+                select id, status, payload_json, meta_json, computed_json
+                from public.studio_jobs
+                where user_id = $1 and studio_type = 'commerce' and request_hash = $2
                 order by created_at desc
                 limit 1
                 """,
                 user_id,
-                req.quote_id,
+                request_hash,
+            )
+            if row:
+                row_payload = _as_dict(row["payload_json"])
+                row_meta = _as_dict(row["meta_json"])
+                row_computed = _as_dict(row["computed_json"])
+                row_pricing = _pricing_from_payload_meta_computed(row_payload, row_meta, row_computed)
+
+                if _pricing_required():
+                    # do not dedupe against an old/unpriced broken job
+                    if _pricing_has_reservation(row_pricing) or str(row["status"] or "").lower() in {
+                        "failed",
+                        "released",
+                        "committed",
+                        "succeeded",
+                    }:
+                        existing_job_id = UUID(str(row["id"]))
+                        existing_job_status = str(row["status"] or "queued")
+                else:
+                    existing_job_id = UUID(str(row["id"]))
+                    existing_job_status = str(row["status"] or "queued")
+
+        if existing_job_id:
+            return CommerceConfirmOut(
+                campaign_id=UUID(str(existing_campaign["id"])) if existing_campaign else uuid4(),
+                studio_job_id=existing_job_id,
+                status=existing_job_status or "queued",
             )
 
-            campaign_meta = {
-                "source": "confirm_hotfix",
-                "idempotency_key": idempotency_key,
-                "quote_id": str(req.quote_id),
-                "mode": mode,
-                "product_type": product_type,
-                "resolution": resolution,
-            }
+    studio_job_id = uuid4()
+    campaign_id = UUID(str(existing_campaign["id"])) if existing_campaign else uuid4()
 
-            if existing_campaign:
-                campaign_id = UUID(str(existing_campaign["id"]))
+    pricing = _build_initial_pricing_block(
+        quote_id=req.quote_id,
+        request_json=request_json,
+        product_type=product_type,
+        mode=mode,
+        resolution=resolution,
+        total_credits=total_credits,
+        total_usd=total_usd,
+        total_inr=total_inr,
+        pricing_client=pricing_client,
+    )
+
+    if not _pricing_enabled(pricing_client):
+        if _pricing_required():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "pricing_disabled",
+                    "code": "PRICING_CLIENT_DISABLED",
+                    "message": _pricing_disabled_reason(),
+                },
+            )
+    else:
+        try:
+            reserve_req = PricingReserveRequest(
+                user_id=str(user_id),
+                service_name="svc-commerce",
+                service_action="commerce.vton.generate",
+                sku_code=str(pricing.get("variant_code") or pricing.get("sku_code") or ""),
+                units=str(pricing.get("estimated_units") or "1"),
+                external_ref_type="studio_job",
+                external_ref_id=str(studio_job_id),
+                idempotency_key=f"svc-commerce:job:{studio_job_id}:reserve",
+                meta={
+                    **_as_dict(pricing.get("meta")),
+                    "variant_code": pricing.get("variant_code"),
+                    "sku_code": pricing.get("variant_code"),
+                    "leaf_sku_code": pricing.get("leaf_sku_code"),
+                    "service_action": pricing.get("service_action"),
+                    "quote_id": str(req.quote_id),
+                    "request_hash": request_hash,
+                },
+            )
+            reserve_resp = await pricing_client.reserve(reserve_req)
+            reserve_status = str(_pricing_resp_get(reserve_resp, "status", "reserved") or "reserved")
+            if reserve_status.lower() == "disabled" and _pricing_required():
+                raise PricingClientError("PRICING_CLIENT_DISABLED")
+
+            pricing = _merge_pricing_block(
+                pricing,
+                state="reserved" if reserve_status.lower() != "disabled" else "disabled",
+                reservation_status=reserve_status,
+                reservation_id=_pricing_resp_get(reserve_resp, "reservation_id"),
+                quote_id=_pricing_resp_get(reserve_resp, "quote_id") or pricing.get("quote_id"),
+                reserved_units=_pricing_resp_get(reserve_resp, "reserved_units") or pricing.get("estimated_units"),
+                amount=_pricing_resp_get(reserve_resp, "amount"),
+                currency=_pricing_resp_get(reserve_resp, "currency"),
+                billing_mode=_pricing_resp_get(reserve_resp, "billing_mode"),
+                billing_account_id=_pricing_resp_get(reserve_resp, "billing_account_id"),
+                settlement_mode=_pricing_resp_get(reserve_resp, "settlement_mode"),
+                pricing_mode=_pricing_resp_get(reserve_resp, "pricing_mode"),
+                entitlement_source=_pricing_resp_get(reserve_resp, "entitlement_source"),
+                entitlement_reason=_pricing_resp_get(reserve_resp, "entitlement_reason"),
+                tier_code=_pricing_resp_get(reserve_resp, "tier_code"),
+                disabled_reason=None if reserve_status.lower() != "disabled" else _pricing_disabled_reason(),
+                error=None,
+            )
+            logger.info(
+                "commerce_pricing_reserved",
+                extra={
+                    "studio_job_id": str(studio_job_id),
+                    "quote_id": str(req.quote_id),
+                    "reservation_id": pricing.get("reservation_id"),
+                    "variant_code": pricing.get("variant_code"),
+                    "billing_account_id": pricing.get("billing_account_id"),
+                    "settlement_mode": pricing.get("settlement_mode"),
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            code = _extract_pricing_error_code(e)
+            logger.exception(
+                "commerce_pricing_reserve_failed",
+                extra={
+                    "quote_id": str(req.quote_id),
+                    "studio_job_id": str(studio_job_id),
+                    "user_id": str(user_id),
+                    "product_type": product_type,
+                    "mode": mode,
+                },
+            )
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "pricing_reservation_failed",
+                    "code": code,
+                    "message": str(e),
+                },
+            ) from e
+
+    campaign_meta = {
+        "source": "confirm_pricing",
+        "request_hash": request_hash,
+        "idempotency_key": idempotency_key,
+        "quote_id": str(req.quote_id),
+        "mode": mode,
+        "product_type": product_type,
+        "resolution": resolution,
+        "pricing_state": pricing.get("state"),
+        "pricing_enabled": bool(pricing.get("enabled", False)),
+        "pricing_billing_mode": pricing.get("billing_mode"),
+        "pricing_settlement_mode": pricing.get("settlement_mode"),
+        "pricing_billing_account_id": pricing.get("billing_account_id"),
+        "pricing": pricing,
+    }
+
+    resolved_final = _resolve_vton_inputs_from_request_json(request_json, storage=storage)
+    payload = {
+        "quote_id": str(req.quote_id),
+        "input": {"quote_id": str(req.quote_id)},
+        "campaign_id": str(campaign_id),
+        "commerce_campaign_id": str(campaign_id),
+        "quote_request": request_json,
+        "request": request_json,
+        "request_json": request_json,
+        "resolved": resolved_final.get("resolved_json"),
+        "pricing": pricing,
+        "pricing_state": pricing.get("state"),
+        "computed": {
+            "stage": "queued",
+            "request_hash": request_hash,
+            "quote_id": str(req.quote_id),
+            "pricing": pricing,
+            "pricing_state": pricing.get("state"),
+        },
+        "meta": {
+            "pricing": pricing,
+        },
+    }
+    meta = {
+        "request_type": "commerce_confirm",
+        "request_hash": request_hash,
+        "idempotency_key": idempotency_key,
+        "campaign_id": str(campaign_id),
+        "commerce_campaign_id": str(campaign_id),
+        "quote_id": str(req.quote_id),
+        "mode": mode,
+        "product_type": product_type,
+        "resolution": resolution,
+        "confirm_pricing": True,
+        "pricing": pricing,
+        "pricing_state": pricing.get("state"),
+        "pricing_enabled": bool(pricing.get("enabled", False)),
+        "pricing_billing_mode": pricing.get("billing_mode"),
+        "pricing_settlement_mode": pricing.get("settlement_mode"),
+        "pricing_billing_account_id": pricing.get("billing_account_id"),
+        "totals": {"usd": total_usd, "inr": total_inr},
+        "total_credits": total_credits,
+    }
+    computed_initial = {
+        "stage": "queued",
+        "request_hash": request_hash,
+        "quote_id": str(req.quote_id),
+        "pricing": pricing,
+        "pricing_state": pricing.get("state"),
+    }
+
+    try:
+        async with pool.acquire() as con:
+            async with con.transaction():
                 await con.execute(
                     """
-                    update public.commerce_campaigns
-                    set mode = $3,
-                        product_type = $4,
-                        status = 'queued',
-                        input_json = $5::jsonb,
-                        meta_json = coalesce(meta_json, '{}'::jsonb) || $6::jsonb,
+                    update public.commerce_quotes
+                    set request_json = $3::jsonb,
+                        mode = $4,
+                        resolution = $5,
+                        status = 'confirmed',
+                        resolved_json = $6::jsonb,
+                        dominant_component_code = $7,
+                        resolved_garment_image_url = $8,
+                        resolved_human_image_url = $9,
                         updated_at = now()
                     where id = $1 and user_id = $2
                     """,
-                    campaign_id,
+                    req.quote_id,
                     user_id,
-                    mode,
-                    product_type,
                     json.dumps(request_json),
-                    json.dumps(campaign_meta),
+                    mode,
+                    resolution,
+                    json.dumps(resolved_final.get("resolved_json") or {}),
+                    resolved_final.get("dominant_component_code"),
+                    resolved_final.get("resolved_garment_image_url"),
+                    resolved_final.get("resolved_human_image_url"),
                 )
-            else:
-                campaign_id = uuid4()
+
+                if existing_campaign:
+                    await con.execute(
+                        """
+                        update public.commerce_campaigns
+                        set mode = $3,
+                            product_type = $4,
+                            status = 'queued',
+                            quote_id = $5,
+                            input_json = $6::jsonb,
+                            meta_json = coalesce(meta_json, '{}'::jsonb) || $7::jsonb,
+                            updated_at = now()
+                        where id = $1 and user_id = $2
+                        """,
+                        campaign_id,
+                        user_id,
+                        mode,
+                        product_type,
+                        req.quote_id,
+                        json.dumps(request_json),
+                        json.dumps(campaign_meta),
+                    )
+                else:
+                    await con.execute(
+                        """
+                        insert into public.commerce_campaigns(
+                            id, user_id, mode, product_type, status, quote_id, input_json, meta_json, created_at, updated_at
+                        )
+                        values(
+                            $1, $2, $3, $4, 'queued', $5, $6::jsonb, $7::jsonb, now(), now()
+                        )
+                        """,
+                        campaign_id,
+                        user_id,
+                        mode,
+                        product_type,
+                        req.quote_id,
+                        json.dumps(request_json),
+                        json.dumps(campaign_meta),
+                    )
+
                 await con.execute(
                     """
-                    insert into public.commerce_campaigns(
-                        id, user_id, mode, product_type, status, quote_id, input_json, meta_json, created_at, updated_at
+                    insert into public.studio_jobs(
+                        id, studio_type, status, request_hash, payload_json, meta_json, computed_json, user_id, created_at, updated_at, next_run_at
                     )
                     values(
-                        $1, $2, $3, $4, 'queued', $5, $6::jsonb, $7::jsonb, now(), now()
+                        $1, 'commerce', 'queued', $2, $3::jsonb, $4::jsonb, $5::jsonb, $6, now(), now(), now()
                     )
                     """,
-                    campaign_id,
+                    studio_job_id,
+                    request_hash,
+                    json.dumps(payload),
+                    json.dumps(meta),
+                    json.dumps(computed_initial),
                     user_id,
-                    mode,
-                    product_type,
-                    req.quote_id,
-                    json.dumps(request_json),
-                    json.dumps(campaign_meta),
                 )
 
-            # SHIP-NOW: keep payload maximally compatible with worker/processor
-            payload = {
-                "quote_id": str(req.quote_id),
-                "input": {"quote_id": str(req.quote_id)},
-                "campaign_id": str(campaign_id),
-                "quote_request": request_json,
-                "request": request_json,
-                "request_json": request_json,
-                "resolved": _as_dict(q.get("resolved_json")),
-            }
-            meta = {
-                "request_type": "commerce_confirm",
-                "idempotency_key": idempotency_key,
-                "campaign_id": str(campaign_id),
-                "quote_id": str(req.quote_id),
-                "mode": mode,
-                "product_type": product_type,
-                "resolution": resolution,
-                "confirm_hotfix": True,
-            }
-
-            # SHIP-NOW: plain insert, avoid brittle ON CONFLICT path
-            studio_job_id = uuid4()
-            await con.execute(
-                """
-                insert into public.studio_jobs(
-                    id, studio_type, status, request_hash, payload_json, meta_json, user_id, created_at, updated_at, next_run_at
+                await con.execute(
+                    """
+                    update public.commerce_campaigns
+                    set meta_json = coalesce(meta_json,'{}'::jsonb) || $2::jsonb,
+                        status = 'queued',
+                        updated_at = now()
+                    where id = $1
+                    """,
+                    campaign_id,
+                    json.dumps(
+                        {
+                            "studio_job_id": str(studio_job_id),
+                            "quote_id": str(req.quote_id),
+                            "mode": mode,
+                            "resolution": resolution,
+                            "confirm_pricing": True,
+                            "request_hash": request_hash,
+                            "pricing_state": pricing.get("state"),
+                            "pricing": pricing,
+                        }
+                    ),
                 )
-                values(
-                    $1, 'commerce', 'queued', $2, $3::jsonb, $4::jsonb, $5, now(), now(), now()
+
+                persisted = await con.fetchrow(
+                    """
+                    select payload_json, meta_json, computed_json
+                    from public.studio_jobs
+                    where id = $1 and user_id = $2 and studio_type = 'commerce'
+                    """,
+                    studio_job_id,
+                    user_id,
                 )
-                """,
-                studio_job_id,
-                _stable_hash(
-                    {
-                        "quote_id": str(req.quote_id),
-                        "campaign_id": str(campaign_id),
-                        "kind": "commerce_confirm_hotfix",
-                        "ts_bucket": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
-                    }
-                ),
-                json.dumps(payload),
-                json.dumps(meta),
-                user_id,
-            )
+                if not persisted:
+                    raise RuntimeError("studio_job_insert_missing_after_confirm")
 
-            await con.execute(
-                """
-                update public.commerce_quotes
-                set status = 'confirmed',
-                    updated_at = now()
-                where id = $1 and user_id = $2
-                """,
-                req.quote_id,
-                user_id,
-            )
+                p_payload = _as_dict(persisted["payload_json"])
+                p_meta = _as_dict(persisted["meta_json"])
+                p_computed = _as_dict(persisted["computed_json"])
+                persisted_pricing = _pricing_from_payload_meta_computed(p_payload, p_meta, p_computed)
 
-            await con.execute(
-                """
-                update public.commerce_campaigns
-                set meta_json = coalesce(meta_json,'{}'::jsonb) || $2::jsonb,
-                    status = 'queued',
-                    updated_at = now()
-                where id = $1
-                """,
-                campaign_id,
-                json.dumps(
-                    {
+                if _pricing_enabled(pricing_client):
+                    reservation_id = str(persisted_pricing.get("reservation_id") or "").strip()
+                    if not reservation_id:
+                        raise RuntimeError("pricing_persistence_failed_missing_reservation_id")
+
+                logger.info(
+                    "commerce_confirm_persisted_pricing",
+                    extra={
                         "studio_job_id": str(studio_job_id),
                         "quote_id": str(req.quote_id),
-                        "mode": mode,
-                        "resolution": resolution,
-                        "confirm_hotfix": True,
-                    }
-                ),
-            )
+                        "reservation_id": persisted_pricing.get("reservation_id"),
+                        "pricing_state": persisted_pricing.get("state"),
+                    },
+                )
 
-            return CommerceConfirmOut(
-                campaign_id=campaign_id,
-                studio_job_id=studio_job_id,
-                status="queued",
-            )
+    except Exception as e:  # noqa: BLE001
+        logger.exception(
+            "commerce_confirm_db_write_failed",
+            extra={"studio_job_id": str(studio_job_id), "campaign_id": str(campaign_id), "quote_id": str(req.quote_id)},
+        )
+        pricing = await _release_pricing_best_effort(
+            pricing_client=pricing_client,
+            user_id=user_id,
+            studio_job_id=studio_job_id,
+            pricing=pricing,
+            reason="confirm_db_write_failed",
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "commerce_confirm_failed",
+                "message": str(e),
+                "pricing_state": pricing.get("state"),
+            },
+        ) from e
+
+    return CommerceConfirmOut(
+        campaign_id=campaign_id,
+        studio_job_id=studio_job_id,
+        status="queued",
+    )
 
 
 @router.get("/jobs/{studio_job_id}/status", operation_id="commerce_job_status_get")
@@ -1120,7 +1688,6 @@ async def job_status(
 
     payload_computed = _as_dict(payload.get("computed"))
     computed_col = _as_dict(j.get("computed_json"))
-
     computed = dict(payload_computed)
     computed.update(computed_col)
 
@@ -1133,8 +1700,13 @@ async def job_status(
     urls = [u for u in urls if u.lower().startswith(("http://", "https://"))]
     computed["urls"] = urls
 
+    pricing = _pricing_from_payload_meta_computed(payload, meta, computed)
+    if not pricing and computed.get("pricing_state"):
+        pricing = {"state": computed.get("pricing_state")}
+
     out: Dict[str, Any] = {
         "studio_job_id": str(j["id"]),
+        "job_id": str(j["id"]),
         "studio_type": "commerce",
         "status": j["status"],
         "stage": stage,
@@ -1148,20 +1720,23 @@ async def job_status(
         "urls": urls,
         "variant_count": int(computed.get("variant_count")) if isinstance(computed.get("variant_count"), int) else len(urls),
         "preview_url": urls[0] if urls else None,
+        "pricing": pricing,
     }
 
     if include_payload:
         payload2 = dict(payload)
         payload2["computed"] = computed
+        if pricing:
+            payload2["pricing"] = pricing
         out["payload_json"] = payload2
-        out["meta_json"] = meta
+        meta2 = dict(meta)
+        if pricing and "pricing" not in meta2:
+            meta2["pricing"] = pricing
+        out["meta_json"] = meta2
+        out["computed_json"] = computed_col
 
     return out
 
-
-# ---------------------------
-# PRODUCTION SCALE DEMO ENDPOINTS
-# ---------------------------
 
 @router.get("/gallery", operation_id="commerce_gallery_list")
 async def gallery(
@@ -1202,7 +1777,9 @@ async def gallery(
                   updated_at,
                   payload_json->>'quote_id' as quote_id,
                   payload_json->>'campaign_id' as campaign_id,
-                  coalesce(computed_json, payload_json->'computed') as computed
+                  coalesce(computed_json, payload_json->'computed') as computed,
+                  payload_json->'pricing' as payload_pricing,
+                  meta_json->'pricing' as meta_pricing
                 from public.studio_jobs
                 where user_id = $1
                   and studio_type = 'commerce'
@@ -1227,7 +1804,9 @@ async def gallery(
                   updated_at,
                   payload_json->>'quote_id' as quote_id,
                   payload_json->>'campaign_id' as campaign_id,
-                  coalesce(computed_json, payload_json->'computed') as computed
+                  coalesce(computed_json, payload_json->'computed') as computed,
+                  payload_json->'pricing' as payload_pricing,
+                  meta_json->'pricing' as meta_pricing
                 from public.studio_jobs
                 where user_id = $1
                   and studio_type = 'commerce'
@@ -1251,7 +1830,9 @@ async def gallery(
                   updated_at,
                   payload_json->>'quote_id' as quote_id,
                   payload_json->>'campaign_id' as campaign_id,
-                  coalesce(computed_json, payload_json->'computed') as computed
+                  coalesce(computed_json, payload_json->'computed') as computed,
+                  payload_json->'pricing' as payload_pricing,
+                  meta_json->'pricing' as meta_pricing
                 from public.studio_jobs
                 where user_id = $1
                   and studio_type = 'commerce'
@@ -1271,9 +1852,9 @@ async def gallery(
     for r in rows or []:
         computed = _as_dict(r["computed"])
         urls = _normalize_urls(computed.get("urls"))
-
         provider_meta = _as_dict(computed.get("provider_meta"))
         resolved_inputs = _as_dict(provider_meta.get("resolved_inputs"))
+        pricing = _as_dict(r["payload_pricing"]) or _as_dict(r["meta_pricing"]) or _as_dict(computed.get("pricing"))
 
         items.append(
             {
@@ -1289,6 +1870,7 @@ async def gallery(
                 "urls": urls,
                 "preview_url": urls[0] if urls else None,
                 "resolved_inputs": resolved_inputs,
+                "pricing": pricing,
             }
         )
 
@@ -1319,7 +1901,7 @@ async def campaign_detail(campaign_id: UUID, user_id: UUID = Depends(require_use
 
         job = await con.fetchrow(
             """
-            select id, status, payload_json, computed_json, created_at, updated_at, error_code, error_message
+            select id, status, payload_json, meta_json, computed_json, created_at, updated_at, error_code, error_message
             from public.studio_jobs
             where user_id=$1
               and studio_type='commerce'
@@ -1334,14 +1916,17 @@ async def campaign_detail(campaign_id: UUID, user_id: UUID = Depends(require_use
     job_out: Optional[Dict[str, Any]] = None
     if job:
         payload = _as_dict(job["payload_json"])
+        meta = _as_dict(job["meta_json"])
         payload_computed = _as_dict(payload.get("computed"))
         computed_col = _as_dict(job["computed_json"])
         computed = _merge_computed(payload_computed, computed_col)
         urls = _normalize_urls(computed.get("urls"))
+        pricing = _pricing_from_payload_meta_computed(payload, meta, computed)
 
         job_out = _normalize_job_status_payload(
             {
                 "studio_job_id": str(job["id"]),
+                "job_id": str(job["id"]),
                 "status": job["status"],
                 "stage": str(computed.get("stage") or job["status"]),
                 "created_at": job["created_at"].isoformat() if job["created_at"] else None,
@@ -1351,6 +1936,7 @@ async def campaign_detail(campaign_id: UUID, user_id: UUID = Depends(require_use
                 "computed": computed,
                 "urls": urls,
                 "variant_count": computed.get("variant_count") if isinstance(computed.get("variant_count"), int) else len(urls),
+                "pricing": pricing,
             }
         )
 

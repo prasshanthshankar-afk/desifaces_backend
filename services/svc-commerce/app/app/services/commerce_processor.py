@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -22,6 +23,51 @@ from app.services.providers.vton_provider import (
     VTONProvider,
     VTONVariantSpec,
 )
+
+PRICING_IMPORT_ERROR: Optional[str] = None
+
+try:
+    from desifaces_shared.pricing.client import PricingClientError, SvcPricingClient
+    from desifaces_shared.pricing.models import PricingCommitRequest, PricingReleaseRequest
+except Exception as pricing_import_error:  # pragma: no cover
+    PRICING_IMPORT_ERROR = str(pricing_import_error)
+
+    class PricingClientError(Exception):
+        pass
+
+    @dataclass
+    class PricingCommitRequest:
+        user_id: str
+        reservation_id: str
+        actual_units: str
+        external_ref_type: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+
+    @dataclass
+    class PricingReleaseRequest:
+        user_id: str
+        reservation_id: str
+        reason: str
+        external_ref_type: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+
+    class SvcPricingClient:
+        enabled = False
+
+        @classmethod
+        def from_env(cls, service_name: str) -> "SvcPricingClient":
+            return cls()
+
+        async def commit(self, req: PricingCommitRequest):
+            raise PricingClientError("pricing client unavailable")
+
+        async def release(self, req: PricingReleaseRequest):
+            raise PricingClientError("pricing client unavailable")
+
 
 logger = logging.getLogger(__name__)
 
@@ -1487,6 +1533,248 @@ async def _set_job_computed(con, *, job_id: UUID, stage: str, patch: Dict[str, A
     await _write_job_payload(con, job_id=job_id, payload=payload)
 
 
+class _DisabledPricingClient:
+    enabled = False
+
+    async def commit(self, req: PricingCommitRequest):
+        raise PricingClientError("pricing client unavailable")
+
+    async def release(self, req: PricingReleaseRequest):
+        raise PricingClientError("pricing client unavailable")
+
+
+def _pricing_client() -> SvcPricingClient | _DisabledPricingClient:
+    try:
+        return SvcPricingClient.from_env(service_name="svc-commerce")
+    except Exception:
+        logger.exception("svc_commerce_pricing_client_init_failed")
+        return _DisabledPricingClient()
+
+
+def _pricing_enabled(client: Any) -> bool:
+    try:
+        return bool(getattr(client, "enabled", False))
+    except Exception:
+        return False
+
+
+def _pricing_resp_get(resp: Any, key: str, default: Any = None) -> Any:
+    if resp is None:
+        return default
+    if isinstance(resp, dict):
+        value = resp.get(key, default)
+    else:
+        value = getattr(resp, key, default)
+    if hasattr(value, "value"):
+        try:
+            return value.value
+        except Exception:
+            return default if value is None else value
+    return value
+
+
+def _merge_pricing_block(current: Optional[Dict[str, Any]], **updates: Any) -> Dict[str, Any]:
+    out = dict(current or {})
+    for key, value in updates.items():
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def _extract_pricing_error_code(e: Exception) -> str:
+    msg = str(e or "")
+    for code in (
+        "PRICING_INSUFFICIENT_CREDITS",
+        "PRICING_UNKNOWN_OR_INACTIVE_VARIANT",
+        "PRICING_VARIANT_ZERO_QTY_LINES",
+        "PRICING_CLIENT_DISABLED",
+    ):
+        if code in msg:
+            return code
+    if "pricing client unavailable" in msg.lower():
+        return "PRICING_CLIENT_DISABLED"
+    return "PRICING_RESERVATION_FAILED"
+
+
+async def _persist_pricing_block(con, *, job_id: UUID, pricing: Dict[str, Any]) -> None:
+    payload = await _read_job_payload(con, job_id=job_id)
+    payload["pricing"] = dict(pricing or {})
+    meta = _as_dict(payload.get("meta"))
+    meta["pricing"] = dict(pricing or {})
+    payload["meta"] = meta
+    await _write_job_payload(con, job_id=job_id, payload=payload)
+
+
+async def _load_latest_pricing(con, *, job_id: UUID) -> Dict[str, Any]:
+    payload = await _read_job_payload(con, job_id=job_id)
+    pricing = _as_dict(payload.get("pricing"))
+    if pricing:
+        return pricing
+    return _as_dict(_as_dict(payload.get("meta")).get("pricing"))
+
+
+async def _commit_pricing_for_job(
+    con,
+    *,
+    pricing_client: Any,
+    job_id: UUID,
+    user_id: UUID,
+    pricing: Dict[str, Any],
+    actual_units: int,
+) -> Dict[str, Any]:
+    if not _pricing_enabled(pricing_client):
+        return pricing
+
+    latest_pricing = await _load_latest_pricing(con, job_id=job_id)
+    if latest_pricing:
+        pricing = latest_pricing
+
+    reservation_id = str(pricing.get("reservation_id") or "").strip()
+    state = str(pricing.get("state") or "").strip().lower()
+    if not reservation_id:
+        pricing = _merge_pricing_block(
+            pricing,
+            state="commit_failed",
+            actual_units=str(max(1, int(actual_units))),
+            error="missing_reservation_id_at_commit",
+        )
+        await _persist_pricing_block(con, job_id=job_id, pricing=pricing)
+        return pricing
+
+    if state not in {"reserved", "commit_failed"}:
+        return pricing
+
+    variant_code = str(pricing.get("variant_code") or pricing.get("sku_code") or "").strip()
+    leaf_sku_code = str(pricing.get("leaf_sku_code") or pricing.get("sku_code") or variant_code).strip()
+
+    try:
+        resp = await pricing_client.commit(
+            PricingCommitRequest(
+                user_id=str(user_id),
+                reservation_id=reservation_id,
+                actual_units=str(max(1, int(actual_units))),
+                external_ref_type="studio_job",
+                external_ref_id=str(job_id),
+                idempotency_key=f"svc-commerce:job:{job_id}:commit",
+                meta={
+                    "variant_code": variant_code,
+                    "sku_code": variant_code,
+                    "leaf_sku_code": leaf_sku_code,
+                    "service_action": pricing.get("service_action"),
+                    "requested_units": pricing.get("estimated_units"),
+                    "actual_units": str(max(1, int(actual_units))),
+                    "quote_id": pricing.get("quote_id"),
+                },
+            )
+        )
+        commit_status = str(_pricing_resp_get(resp, "status", "committed") or "committed")
+        pricing = _merge_pricing_block(
+            pricing,
+            state="committed",
+            variant_code=_pricing_resp_get(resp, "variant_code") or variant_code,
+            sku_code=_pricing_resp_get(resp, "variant_code") or variant_code,
+            leaf_sku_code=_pricing_resp_get(resp, "sku_code") or leaf_sku_code,
+            actual_units=str(max(1, int(actual_units))),
+            commit_status=commit_status,
+            reservation_status=commit_status,
+            ledger_entry_id=_pricing_resp_get(resp, "ledger_entry_id"),
+            billed_units=_pricing_resp_get(resp, "billed_units") or str(max(1, int(actual_units))),
+            amount=_pricing_resp_get(resp, "amount"),
+            currency=_pricing_resp_get(resp, "currency"),
+            billing_mode=_pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
+            billing_account_id=_pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
+            settlement_mode=_pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
+            entitlement_source=_pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
+            disabled_reason=None,
+        )
+        await _persist_pricing_block(con, job_id=job_id, pricing=pricing)
+        return pricing
+    except Exception as e:
+        logger.exception(
+            "commerce_pricing_commit_failed",
+            extra={"job_id": str(job_id), "reservation_id": reservation_id, "user_id": str(user_id)},
+        )
+        pricing = _merge_pricing_block(
+            pricing,
+            state="commit_failed",
+            actual_units=str(max(1, int(actual_units))),
+            error=str(e),
+        )
+        await _persist_pricing_block(con, job_id=job_id, pricing=pricing)
+        return pricing
+
+
+async def _release_pricing_for_job(
+    con,
+    *,
+    pricing_client: Any,
+    job_id: UUID,
+    user_id: UUID,
+    pricing: Dict[str, Any],
+    reason: str,
+) -> Dict[str, Any]:
+    if not _pricing_enabled(pricing_client):
+        return pricing
+
+    latest_pricing = await _load_latest_pricing(con, job_id=job_id)
+    if latest_pricing:
+        pricing = latest_pricing
+
+    reservation_id = str(pricing.get("reservation_id") or "").strip()
+    state = str(pricing.get("state") or "").strip().lower()
+
+    if not reservation_id:
+        return pricing
+    if state not in {"reserved", "release_failed"}:
+        return pricing
+
+    variant_code = str(pricing.get("variant_code") or pricing.get("sku_code") or "").strip()
+    leaf_sku_code = str(pricing.get("leaf_sku_code") or pricing.get("sku_code") or variant_code).strip()
+
+    try:
+        resp = await pricing_client.release(
+            PricingReleaseRequest(
+                user_id=str(user_id),
+                reservation_id=reservation_id,
+                reason=reason,
+                external_ref_type="studio_job",
+                external_ref_id=str(job_id),
+                idempotency_key=f"svc-commerce:job:{job_id}:release",
+                meta={
+                    "variant_code": variant_code,
+                    "sku_code": variant_code,
+                    "leaf_sku_code": leaf_sku_code,
+                    "service_action": pricing.get("service_action"),
+                    "requested_units": pricing.get("estimated_units"),
+                    "quote_id": pricing.get("quote_id"),
+                },
+            )
+        )
+        release_status = str(_pricing_resp_get(resp, "status", "released") or "released")
+        pricing = _merge_pricing_block(
+            pricing,
+            state="released",
+            release_status=release_status,
+            reservation_status=release_status,
+            released_units=_pricing_resp_get(resp, "released_units") or pricing.get("estimated_units"),
+            billing_mode=_pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
+            billing_account_id=_pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
+            settlement_mode=_pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
+            entitlement_source=_pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
+            disabled_reason=None,
+        )
+        await _persist_pricing_block(con, job_id=job_id, pricing=pricing)
+        return pricing
+    except Exception as e:
+        logger.exception(
+            "commerce_pricing_release_failed",
+            extra={"job_id": str(job_id), "reservation_id": reservation_id, "user_id": str(user_id)},
+        )
+        pricing = _merge_pricing_block(pricing, state="release_failed", error=str(e))
+        await _persist_pricing_block(con, job_id=job_id, pricing=pricing)
+        return pricing
+
+
 async def _read_quote_request_from_db(con, *, quote_id: UUID) -> Dict[str, Any]:
     """
     Pull original request_json from public.commerce_quotes and apply resolved_* columns if present.
@@ -2015,6 +2303,10 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
     quote_id = _extract_quote_id(payload, meta)
     started_at = datetime.now(timezone.utc).isoformat()
     pool = await get_pool()
+    pricing_client = _pricing_client()
+    pricing = _as_dict(payload.get("pricing"))
+    if not pricing:
+        pricing = _as_dict(meta.get("pricing"))
 
     campaign_id: Optional[UUID] = None
     merged_meta: Dict[str, Any] = {}
@@ -2022,6 +2314,8 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
 
     async with pool.acquire() as con:
         await _set_job_computed(con, job_id=job_id, stage="running", patch={"started_at": started_at, "processor": "vton_v3"})
+        if pricing:
+            await _persist_pricing_block(con, job_id=job_id, pricing=pricing)
 
         camp = await con.fetchrow(
             """
@@ -2060,6 +2354,8 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                 "commerce_campaign_id": str(campaign_id),
                 "processor": "vton_v3",
                 "started_at": started_at,
+                "pricing_state": pricing.get("state"),
+                "pricing_enabled": bool(pricing.get("enabled", False)),
             },
         )
         await con.execute(
@@ -2349,6 +2645,14 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
         finished_at = datetime.now(timezone.utc).isoformat()
 
         async with pool.acquire() as con:
+            pricing = await _commit_pricing_for_job(
+                con,
+                pricing_client=pricing_client,
+                job_id=job_id,
+                user_id=user_id,
+                pricing=pricing,
+                actual_units=1,
+            )
             await _set_job_computed(
                 con,
                 job_id=job_id,
@@ -2368,6 +2672,8 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                     "commerce_campaign_id": str(campaign_id),
                     "quote_id": str(quote_id),
                     "request_hash": request_hash,
+                    "pricing": pricing,
+                    "pricing_state": pricing.get("state"),
                 },
             )
 
@@ -2380,6 +2686,8 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                     "request_hash": request_hash,
                     "best_variant_index": best_idx,
                     "platform_model_selection": provider_platform_sel or _as_dict(platform_pick_dbg.get("selection")),
+                    "pricing_state": pricing.get("state"),
+                    "pricing": pricing,
                 },
             )
             await con.execute(
@@ -2394,10 +2702,19 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
 
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
+        code = _extract_pricing_error_code(e) if isinstance(e, PricingClientError) else type(e).__name__.upper()
         logger.exception("commerce_processor: job failed job_id=%s quote_id=%s", job_id, quote_id)
         failed_at = datetime.now(timezone.utc).isoformat()
 
         async with pool.acquire() as con:
+            pricing = await _release_pricing_for_job(
+                con,
+                pricing_client=pricing_client,
+                job_id=job_id,
+                user_id=user_id,
+                pricing=pricing,
+                reason=code.lower(),
+            )
             await _set_job_computed(
                 con,
                 job_id=job_id,
@@ -2407,10 +2724,21 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                     "error": err[:2000],
                     "commerce_campaign_id": str(campaign_id) if campaign_id else None,
                     "quote_id": str(quote_id),
+                    "pricing": pricing,
+                    "pricing_state": pricing.get("state"),
                 },
             )
             try:
-                merged_meta_fail = _merge(merged_meta, {"failed_at": failed_at, "status": "failed", "error": err[:2000]})
+                merged_meta_fail = _merge(
+                    merged_meta,
+                    {
+                        "failed_at": failed_at,
+                        "status": "failed",
+                        "error": err[:2000],
+                        "pricing_state": pricing.get("state"),
+                        "pricing": pricing,
+                    },
+                )
                 await con.execute(
                     """
                     update public.commerce_campaigns
