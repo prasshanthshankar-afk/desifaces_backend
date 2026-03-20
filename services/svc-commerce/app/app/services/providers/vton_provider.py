@@ -130,6 +130,15 @@ def _uniq_norm(xs: Any) -> List[str]:
     return out
 
 
+def _text_blob(*parts: Any) -> str:
+    vals: List[str] = []
+    for p in parts:
+        s = _norm_text(p)
+        if s:
+            vals.append(s)
+    return " ".join(vals)
+
+
 _SUPPORTED_NON_SAREE_PROVIDERS = {"imageapps_v2", "fashn", "catvton"}
 
 
@@ -455,10 +464,7 @@ class FalQueueClient:
     def __init__(self) -> None:
         self.base_url = (_env_str("COMMERCE_FAL_BASE_URL", "https://queue.fal.run") or "https://queue.fal.run").rstrip("/")
         self.http_timeout_s = _clamp_int(_env_str("COMMERCE_FAL_HTTP_TIMEOUT_S", "180"), default=180, lo=20, hi=600)
-
-        # Production default: queues can be backed up (FASHN frequently stays IN_QUEUE).
         self.poll_timeout_s = _clamp_int(_env_str("COMMERCE_FAL_POLL_TIMEOUT_S", "900"), default=900, lo=30, hi=1800)
-
         self.poll_secs = max(0.25, _coerce_float(_env_str("COMMERCE_FAL_POLL_SECS", "1.5") or "1.5", 1.5))
         self.poll_logs = _env_bool("COMMERCE_FAL_POLL_LOGS", default=False)
 
@@ -466,8 +472,6 @@ class FalQueueClient:
         return (_env_str("FAL_KEY", "") or _env_str("FAL_API_KEY", "") or _env_str("COMMERCE_FAL_KEY", "")).strip()
 
     def _status_endpoint_id_for(self, endpoint_id: str) -> str:
-        # IMPORTANT: fal queue status/result endpoints often require only the first 2 segments:
-        #   fal-ai/flux-general/inpainting  -> poll under fal-ai/flux-general
         parts = [p for p in (endpoint_id or "").split("/") if p]
         if len(parts) >= 2:
             return "/".join(parts[:2])
@@ -549,13 +553,6 @@ class FalQueueClient:
 
 
 def _parse_fal_any_image_urls(out_d: Dict[str, Any]) -> List[str]:
-    """
-    Safer parse order:
-      1) images[].url
-      2) image.url
-      3) nested response/output/data
-      4) last-resort scan of url keys only
-    """
     urls: List[str] = []
 
     def _add(u: Any) -> None:
@@ -719,7 +716,6 @@ def _infer_garment_type(*, product_assets: Dict[str, Any], garment_url: Optional
         return "dresses"
     u = (garment_url or "").lower()
 
-    # broadened heuristics for non-saree first batch
     if any(t in u for t in ("saree", "sari", "saari", "pallu", "pleat", "kanjivaram", "banarasi")):
         return "dresses"
     if any(t in u for t in ("jeans", "pant", "pants", "trouser", "skirt", "shorts", "lehenga", "dhoti")):
@@ -772,10 +768,6 @@ class SareeQC:
         self.max_face_diff = _env_float("COMMERCE_SAREE_QC_MAX_FACE_DIFF", 0.10)
 
     async def quick_gate(self, *, human_url: str, out_url: str) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Fast, cheap gate: output must differ from human in lower body & should not destroy face.
-        (No garment similarity here; this is purely to block “no saree” / tiny blob.)
-        """
         if not self.enabled:
             return True, {"qc_enabled": False}
 
@@ -843,176 +835,11 @@ class SareeQC:
 
 
 # -----------------------------------------------------------------------------
-# Non-saree QC (PRODUCTION HARDENED)
-# -----------------------------------------------------------------------------
-
-
-class NonSareeQC:
-    """
-    Production guardrail for non-saree:
-      - computes region diffs (face/upper/lower/full)
-      - detects blank/near-solid outputs
-      - returns strict + hard decisions + a score (used to pick the best candidate across providers)
-
-    IMPORTANT:
-      - Strict gate is meant to block obvious garbage.
-      - Hard gate prevents total job failure: if every provider fails strict but one is "reasonable",
-        we can still ship *something* (configurable).
-    """
-
-    def __init__(self) -> None:
-        self.enabled = _env_bool("COMMERCE_VTON_QC_ENABLE", default=True)
-
-        # If True: if no provider passes strict, we still pick the best hard-pass candidate
-        self.fail_open = _env_bool("COMMERCE_VTON_QC_FAIL_OPEN", default=True)
-
-        self.timeout_s = _clamp_int(_env_str("COMMERCE_VTON_QC_TIMEOUT_S", "25"), default=25, lo=5, hi=120)
-        self.image_size = _clamp_int(_env_str("COMMERCE_VTON_QC_IMAGE_SIZE", "256"), default=256, lo=96, hi=512)
-
-        # STRICT thresholds (default tuned for quality)
-        self.min_upper_diff = _env_float("COMMERCE_VTON_QC_MIN_UPPER_DIFF", 0.03)
-        self.min_lower_diff = _env_float("COMMERCE_VTON_QC_MIN_LOWER_DIFF", 0.03)
-        self.min_full_diff = _env_float("COMMERCE_VTON_QC_MIN_FULL_DIFF", 0.02)
-        self.max_face_diff = _env_float("COMMERCE_VTON_QC_MAX_FACE_DIFF", 0.12)
-
-        # HARD thresholds (default tuned to prevent total failure)
-        self.hard_min_upper_diff = _env_float("COMMERCE_VTON_QC_HARD_MIN_UPPER_DIFF", 0.015)
-        self.hard_min_lower_diff = _env_float("COMMERCE_VTON_QC_HARD_MIN_LOWER_DIFF", 0.015)
-        self.hard_min_full_diff = _env_float("COMMERCE_VTON_QC_HARD_MIN_FULL_DIFF", 0.010)
-        self.hard_max_face_diff = _env_float("COMMERCE_VTON_QC_HARD_MAX_FACE_DIFF", 0.20)
-
-        # Outerwear tends to touch neck/hairline; allow a small face-diff bonus in STRICT mode
-        self.outer_face_bonus = _env_float("COMMERCE_VTON_QC_OUTER_FACE_BONUS", 0.05)
-
-        # Blank/solid detection
-        self.min_stddev = _env_float("COMMERCE_VTON_QC_MIN_STDDEV", 0.015)  # stddev/255
-
-    async def evaluate(
-        self,
-        *,
-        garment_type: str,
-        human_url: str,
-        out_url: str,
-        is_outerwear: bool = False,
-    ) -> Dict[str, Any]:
-        if not self.enabled:
-            return {"qc_enabled": False, "ok_strict": True, "ok_hard": True, "score": 1.0}
-
-        from PIL import Image, ImageChops, ImageStat
-        import io
-
-        size = int(self.image_size)
-        timeout_s = int(self.timeout_s)
-
-        def _fetch(url: str) -> Image.Image:
-            req = Request(url, headers={"User-Agent": "df-vton-qc"})
-            raw = urlopen(req, timeout=timeout_s).read()
-            im = Image.open(io.BytesIO(raw)).convert("RGB")
-            return im.resize((size, size))
-
-        def _roi(im: Image.Image, x0: float, x1: float, y0: float, y1: float) -> Image.Image:
-            W, H = im.size
-            box = (int(x0 * W), int(y0 * H), int(x1 * W), int(y1 * H))
-            return im.crop(box)
-
-        def _roi_diff(a: Image.Image, b: Image.Image, x0: float, x1: float, y0: float, y1: float) -> float:
-            da = _roi(a, x0, x1, y0, y1)
-            db = _roi(b, x0, x1, y0, y1)
-            d = ImageChops.difference(da, db)
-            st = ImageStat.Stat(d)
-            mean = float(sum(st.mean) / max(1.0, float(len(st.mean))))
-            return mean / 255.0
-
-        def _stddev_norm(im: Image.Image) -> float:
-            st = ImageStat.Stat(im)
-            sd = float(sum(st.stddev) / max(1.0, float(len(st.stddev))))
-            return sd / 255.0
-
-        human = await asyncio.to_thread(_fetch, human_url)
-        out = await asyncio.to_thread(_fetch, out_url)
-
-        # Face ROI: slightly narrower to reduce hair influence
-        face = _roi_diff(human, out, 0.34, 0.66, 0.02, 0.28)
-
-        # Torso ROI
-        upper = _roi_diff(human, out, 0.10, 0.90, 0.22, 0.58)
-
-        # Legs ROI
-        lower = _roi_diff(human, out, 0.10, 0.90, 0.58, 0.98)
-
-        # Full-body clothing ROI
-        full = _roi_diff(human, out, 0.08, 0.92, 0.18, 0.98)
-
-        out_std = _stddev_norm(out)
-        blankish = out_std < float(self.min_stddev)
-
-        gt = (garment_type or "").strip().lower() or "unknown"
-
-        strict_max_face = float(self.max_face_diff) + (float(self.outer_face_bonus) if is_outerwear else 0.0)
-        hard_max_face = float(self.hard_max_face_diff) + (float(self.outer_face_bonus) if is_outerwear else 0.0)
-
-        if gt == "upper_body":
-            ok_strict = (upper >= float(self.min_upper_diff) and face <= strict_max_face and not blankish)
-            ok_hard = (upper >= float(self.hard_min_upper_diff) and face <= hard_max_face and not blankish)
-            main_change = upper
-        elif gt == "lower_body":
-            ok_strict = (lower >= float(self.min_lower_diff) and face <= strict_max_face and not blankish)
-            ok_hard = (lower >= float(self.hard_min_lower_diff) and face <= hard_max_face and not blankish)
-            main_change = lower
-        else:
-            ok_strict = (full >= float(self.min_full_diff) and face <= strict_max_face and not blankish)
-            ok_hard = (full >= float(self.hard_min_full_diff) and face <= hard_max_face and not blankish)
-            main_change = full
-
-        # Score: reward garment change, penalize face drift; blank gets a hard penalty
-        score = float(main_change) - 0.6 * float(face)
-        if blankish:
-            score -= 1.0
-
-        return {
-            "qc_enabled": True,
-            "ok_strict": bool(ok_strict),
-            "ok_hard": bool(ok_hard),
-            "score": float(score),
-            "garment_type": gt,
-            "is_outerwear": bool(is_outerwear),
-            "face": float(face),
-            "upper": float(upper),
-            "lower": float(lower),
-            "full": float(full),
-            "out_stddev": float(out_std),
-            "blankish": bool(blankish),
-            "thresholds": {
-                "strict": {
-                    "min_upper_diff": float(self.min_upper_diff),
-                    "min_lower_diff": float(self.min_lower_diff),
-                    "min_full_diff": float(self.min_full_diff),
-                    "max_face_diff": float(self.max_face_diff),
-                    "outer_face_bonus": float(self.outer_face_bonus),
-                    "min_stddev": float(self.min_stddev),
-                },
-                "hard": {
-                    "min_upper_diff": float(self.hard_min_upper_diff),
-                    "min_lower_diff": float(self.hard_min_lower_diff),
-                    "min_full_diff": float(self.hard_min_full_diff),
-                    "max_face_diff": float(self.hard_max_face_diff),
-                    "outer_face_bonus": float(self.outer_face_bonus),
-                    "min_stddev": float(self.min_stddev),
-                },
-            },
-            "computed": {"strict_max_face": float(strict_max_face), "hard_max_face": float(hard_max_face)},
-        }
-
-
-# -----------------------------------------------------------------------------
-# Non-saree garment resolution
+# Non-saree garment resolution / priors
 # -----------------------------------------------------------------------------
 
 
 def _infer_component_role(code: str, name: str, category: str) -> str:
-    """
-    Returns one of: upper, lower, overall, outer, accessory, other
-    """
     blob = " ".join([_norm_text(code), _norm_text(name), _norm_text(category)])
 
     if any(t in blob for t in ("jewelry", "necklace", "earring", "bangle", "ring", "accessory", "watch", "sunglass")):
@@ -1039,12 +866,6 @@ def _looks_outerwear_url(u: Any) -> bool:
 
 
 def _resolve_non_saree_garments(*, product_assets: Dict[str, Any], comps: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Returns:
-      - primary_url
-      - upper_url, lower_url, overall_url, outer_url
-      - items_norm (passthrough)
-    """
     items_norm = _as_list(comps.get("items_norm"))
     dominant = _norm_text(product_assets.get("dominant_component_code"))
 
@@ -1080,11 +901,9 @@ def _resolve_non_saree_garments(*, product_assets: Dict[str, Any], comps: Dict[s
 
     primary = primary or _first_http_str(product_assets.get("garment_image_url"))
 
-    # If we clearly have an overall garment, that is primary
     if overall_url:
         primary = overall_url
 
-    # If outerwear exists and primary isn't explicit, prefer outerwear for blazer/coat flows
     if outer_url and (not primary or _looks_outerwear_url(primary) or _looks_outerwear_url(outer_url)):
         if not dominant or dominant in ("outer", "blazer", "jacket", "coat"):
             primary = outer_url
@@ -1165,6 +984,399 @@ def _resolve_recent_platform_model_codes(*, product_assets: Dict[str, Any], mode
             if cc:
                 codes.append(cc)
     return _uniq_norm(codes)
+
+
+def _infer_non_saree_style_priors(
+    *,
+    product_assets: Dict[str, Any],
+    ns: Dict[str, Any],
+    garment_type: str,
+    is_outerwear: bool,
+) -> Dict[str, Any]:
+    items_norm = _as_list(ns.get("items_norm"))
+
+    blob_parts: List[str] = [
+        _norm_text(product_assets.get("title")),
+        _norm_text(product_assets.get("name")),
+        _norm_text(product_assets.get("category")),
+        _norm_text(product_assets.get("subcategory")),
+        _norm_text(product_assets.get("garment_type")),
+        _norm_text(product_assets.get("outfit_kind")),
+        _norm_text(product_assets.get("dominant_component_code")),
+        _norm_text(ns.get("primary_url")),
+        _norm_text(ns.get("upper_url")),
+        _norm_text(ns.get("lower_url")),
+        _norm_text(ns.get("overall_url")),
+        _norm_text(ns.get("outer_url")),
+    ]
+
+    for it in items_norm:
+        d = _as_dict(it)
+        blob_parts.extend(
+            [
+                _norm_text(d.get("component_code")),
+                _norm_text(d.get("kind")),
+                _norm_text(d.get("name")),
+                _norm_text(d.get("category")),
+                _norm_text(d.get("image_url")),
+            ]
+        )
+
+    blob = " ".join([b for b in blob_parts if b])
+
+    sleeveless_tokens = (
+        "sleeveless",
+        "strapless",
+        "tube",
+        "cami",
+        "camisole",
+        "tank",
+        "halter",
+        "spaghetti",
+        "off shoulder",
+        "off-shoulder",
+    )
+    sleeve_tokens = (
+        "sleeve",
+        "shirt",
+        "kurta",
+        "kameez",
+        "blouse",
+        "top",
+        "tunic",
+        "kaftan",
+        "blazer",
+        "jacket",
+        "coat",
+        "hoodie",
+        "cardigan",
+        "sweater",
+        "gown",
+        "dress",
+    )
+    long_body_tokens = (
+        "kurta",
+        "kameez",
+        "tunic",
+        "kaftan",
+        "anarkali",
+        "gown",
+        "dress",
+        "maxi",
+        "longline",
+        "long length",
+        "long-length",
+        "knee length",
+        "knee-length",
+        "calf length",
+        "calf-length",
+    )
+    modest_side_tokens = (
+        "kurta",
+        "kameez",
+        "kaftan",
+        "anarkali",
+        "blazer",
+        "jacket",
+        "coat",
+        "hoodie",
+        "cardigan",
+        "sweater",
+        "gown",
+        "dress",
+        "modest",
+    )
+
+    overall_like = bool(ns.get("overall_url")) or (garment_type == "dresses")
+    explicitly_sleeveless = any(t in blob for t in sleeveless_tokens)
+    expects_sleeves = (
+        bool(is_outerwear)
+        or any(t in blob for t in sleeve_tokens)
+        or overall_like
+        or bool(ns.get("outer_url"))
+    ) and not explicitly_sleeveless
+
+    expects_long_body = (
+        overall_like
+        or any(t in blob for t in long_body_tokens)
+        or ("kurta set" in blob)
+    )
+
+    expects_modest_side_coverage = (
+        bool(is_outerwear)
+        or expects_long_body
+        or any(t in blob for t in modest_side_tokens)
+    )
+
+    return {
+        "blob": blob,
+        "overall_like": bool(overall_like),
+        "expects_sleeves": bool(expects_sleeves),
+        "expects_long_body": bool(expects_long_body),
+        "expects_modest_side_coverage": bool(expects_modest_side_coverage),
+        "explicitly_sleeveless": bool(explicitly_sleeveless),
+    }
+
+
+# -----------------------------------------------------------------------------
+# Non-saree QC (STRICTER + PER-IMAGE)
+# -----------------------------------------------------------------------------
+
+
+class NonSareeQC:
+    """
+    Non-saree QC is intentionally conservative:
+      - every generated image is evaluated individually
+      - strict pass means "shippable"
+      - hard pass is only used if fail_open is explicitly enabled
+      - if nothing is shippable, caller should return zero outputs
+    """
+
+    def __init__(self) -> None:
+        self.enabled = _env_bool("COMMERCE_VTON_QC_ENABLE", default=True)
+        self.fail_open = _env_bool("COMMERCE_VTON_QC_FAIL_OPEN", default=False)
+
+        self.timeout_s = _clamp_int(_env_str("COMMERCE_VTON_QC_TIMEOUT_S", "25"), default=25, lo=5, hi=120)
+        self.image_size = _clamp_int(_env_str("COMMERCE_VTON_QC_IMAGE_SIZE", "256"), default=256, lo=96, hi=512)
+
+        # Base strict thresholds
+        self.min_upper_diff = _env_float("COMMERCE_VTON_QC_MIN_UPPER_DIFF", 0.03)
+        self.min_lower_diff = _env_float("COMMERCE_VTON_QC_MIN_LOWER_DIFF", 0.03)
+        self.min_full_diff = _env_float("COMMERCE_VTON_QC_MIN_FULL_DIFF", 0.02)
+        self.max_face_diff = _env_float("COMMERCE_VTON_QC_MAX_FACE_DIFF", 0.12)
+
+        # Base hard thresholds
+        self.hard_min_upper_diff = _env_float("COMMERCE_VTON_QC_HARD_MIN_UPPER_DIFF", 0.015)
+        self.hard_min_lower_diff = _env_float("COMMERCE_VTON_QC_HARD_MIN_LOWER_DIFF", 0.015)
+        self.hard_min_full_diff = _env_float("COMMERCE_VTON_QC_HARD_MIN_FULL_DIFF", 0.010)
+        self.hard_max_face_diff = _env_float("COMMERCE_VTON_QC_HARD_MAX_FACE_DIFF", 0.20)
+
+        self.outer_face_bonus = _env_float("COMMERCE_VTON_QC_OUTER_FACE_BONUS", 0.05)
+        self.min_stddev = _env_float("COMMERCE_VTON_QC_MIN_STDDEV", 0.015)
+
+        # Prior-aware strict thresholds
+        self.sleeve_shoulder_min_diff = _env_float("COMMERCE_VTON_QC_SLEEVE_SHOULDER_MIN_DIFF", 0.012)
+        self.sleeve_arm_min_diff = _env_float("COMMERCE_VTON_QC_SLEEVE_ARM_MIN_DIFF", 0.010)
+        self.side_torso_min_diff = _env_float("COMMERCE_VTON_QC_SIDE_TORSO_MIN_DIFF", 0.012)
+        self.long_body_min_diff = _env_float("COMMERCE_VTON_QC_LONG_BODY_MIN_DIFF", 0.014)
+
+        # Prior-aware hard thresholds
+        self.hard_sleeve_shoulder_min_diff = _env_float("COMMERCE_VTON_QC_HARD_SLEEVE_SHOULDER_MIN_DIFF", 0.007)
+        self.hard_sleeve_arm_min_diff = _env_float("COMMERCE_VTON_QC_HARD_SLEEVE_ARM_MIN_DIFF", 0.006)
+        self.hard_side_torso_min_diff = _env_float("COMMERCE_VTON_QC_HARD_SIDE_TORSO_MIN_DIFF", 0.007)
+        self.hard_long_body_min_diff = _env_float("COMMERCE_VTON_QC_HARD_LONG_BODY_MIN_DIFF", 0.008)
+
+    async def evaluate(
+        self,
+        *,
+        garment_type: str,
+        human_url: str,
+        out_url: str,
+        is_outerwear: bool = False,
+        style_priors: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not self.enabled:
+            return {
+                "qc_enabled": False,
+                "ok_strict": True,
+                "ok_hard": True,
+                "score": 1.0,
+                "reject_reasons_strict": [],
+                "reject_reasons_hard": [],
+            }
+
+        from PIL import Image, ImageChops, ImageStat
+        import io
+
+        size = int(self.image_size)
+        timeout_s = int(self.timeout_s)
+        priors = _as_dict(style_priors)
+
+        def _fetch(url: str) -> Image.Image:
+            req = Request(url, headers={"User-Agent": "df-vton-qc"})
+            raw = urlopen(req, timeout=timeout_s).read()
+            im = Image.open(io.BytesIO(raw)).convert("RGB")
+            return im.resize((size, size))
+
+        def _roi(im: Image.Image, x0: float, x1: float, y0: float, y1: float) -> Image.Image:
+            W, H = im.size
+            box = (int(x0 * W), int(y0 * H), int(x1 * W), int(y1 * H))
+            return im.crop(box)
+
+        def _roi_diff(a: Image.Image, b: Image.Image, x0: float, x1: float, y0: float, y1: float) -> float:
+            da = _roi(a, x0, x1, y0, y1)
+            db = _roi(b, x0, x1, y0, y1)
+            d = ImageChops.difference(da, db)
+            st = ImageStat.Stat(d)
+            mean = float(sum(st.mean) / max(1.0, float(len(st.mean))))
+            return mean / 255.0
+
+        def _stddev_norm(im: Image.Image) -> float:
+            st = ImageStat.Stat(im)
+            sd = float(sum(st.stddev) / max(1.0, float(len(st.stddev))))
+            return sd / 255.0
+
+        human = await asyncio.to_thread(_fetch, human_url)
+        out = await asyncio.to_thread(_fetch, out_url)
+
+        face = _roi_diff(human, out, 0.34, 0.66, 0.02, 0.28)
+        upper = _roi_diff(human, out, 0.10, 0.90, 0.22, 0.58)
+        lower = _roi_diff(human, out, 0.10, 0.90, 0.58, 0.98)
+        full = _roi_diff(human, out, 0.08, 0.92, 0.18, 0.98)
+
+        shoulder_left = _roi_diff(human, out, 0.06, 0.28, 0.20, 0.36)
+        shoulder_right = _roi_diff(human, out, 0.72, 0.94, 0.20, 0.36)
+        arm_left = _roi_diff(human, out, 0.02, 0.22, 0.28, 0.70)
+        arm_right = _roi_diff(human, out, 0.78, 0.98, 0.28, 0.70)
+        side_left = _roi_diff(human, out, 0.08, 0.24, 0.32, 0.72)
+        side_right = _roi_diff(human, out, 0.76, 0.92, 0.32, 0.72)
+        lower_mid = _roi_diff(human, out, 0.24, 0.76, 0.52, 0.84)
+        center_torso = _roi_diff(human, out, 0.28, 0.72, 0.28, 0.66)
+
+        out_std = _stddev_norm(out)
+        blankish = out_std < float(self.min_stddev)
+
+        gt = (garment_type or "").strip().lower() or "unknown"
+
+        strict_max_face = float(self.max_face_diff) + (float(self.outer_face_bonus) if is_outerwear else 0.0)
+        hard_max_face = float(self.hard_max_face_diff) + (float(self.outer_face_bonus) if is_outerwear else 0.0)
+
+        strict_reasons: List[str] = []
+        hard_reasons: List[str] = []
+
+        if blankish:
+            strict_reasons.append("blankish_output")
+            hard_reasons.append("blankish_output")
+
+        if gt == "upper_body":
+            main_change = upper
+            if upper < float(self.min_upper_diff):
+                strict_reasons.append("upper_change_too_low")
+            if upper < float(self.hard_min_upper_diff):
+                hard_reasons.append("upper_change_too_low")
+        elif gt == "lower_body":
+            main_change = lower
+            if lower < float(self.min_lower_diff):
+                strict_reasons.append("lower_change_too_low")
+            if lower < float(self.hard_min_lower_diff):
+                hard_reasons.append("lower_change_too_low")
+        else:
+            main_change = full
+            if full < float(self.min_full_diff):
+                strict_reasons.append("full_change_too_low")
+            if full < float(self.hard_min_full_diff):
+                hard_reasons.append("full_change_too_low")
+
+        if face > strict_max_face:
+            strict_reasons.append("face_drift_too_high")
+        if face > hard_max_face:
+            hard_reasons.append("face_drift_too_high")
+
+        expects_sleeves = bool(priors.get("expects_sleeves"))
+        expects_long_body = bool(priors.get("expects_long_body"))
+        expects_modest_side_coverage = bool(priors.get("expects_modest_side_coverage"))
+
+        shoulder_cov = max(float(shoulder_left), float(shoulder_right))
+        arm_cov = (float(arm_left) + float(arm_right)) / 2.0
+        side_cov = min(float(side_left), float(side_right))
+
+        if expects_sleeves:
+            if shoulder_cov < float(self.sleeve_shoulder_min_diff) and arm_cov < float(self.sleeve_arm_min_diff):
+                strict_reasons.append("missing_sleeve_coverage")
+            if shoulder_cov < float(self.hard_sleeve_shoulder_min_diff) and arm_cov < float(self.hard_sleeve_arm_min_diff):
+                hard_reasons.append("missing_sleeve_coverage")
+
+        if expects_modest_side_coverage:
+            if side_cov < float(self.side_torso_min_diff):
+                strict_reasons.append("side_torso_coverage_too_low")
+            if side_cov < float(self.hard_side_torso_min_diff):
+                hard_reasons.append("side_torso_coverage_too_low")
+
+        if expects_long_body:
+            if lower_mid < float(self.long_body_min_diff):
+                strict_reasons.append("long_body_coverage_too_low")
+            if lower_mid < float(self.hard_long_body_min_diff):
+                hard_reasons.append("long_body_coverage_too_low")
+
+        ok_strict = len(strict_reasons) == 0
+        ok_hard = len(hard_reasons) == 0
+
+        score = float(main_change) - 0.70 * float(face)
+        score += 0.25 * min(0.08, shoulder_cov)
+        score += 0.20 * min(0.08, arm_cov)
+        score += 0.25 * min(0.08, side_cov)
+        score += 0.25 * min(0.08, float(lower_mid))
+        score += 0.10 * min(0.08, float(center_torso))
+
+        if blankish:
+            score -= 1.0
+        if strict_reasons:
+            score -= 0.15 * float(len(strict_reasons))
+        elif hard_reasons:
+            score -= 0.05 * float(len(hard_reasons))
+
+        return {
+            "qc_enabled": True,
+            "ok_strict": bool(ok_strict),
+            "ok_hard": bool(ok_hard),
+            "score": float(score),
+            "garment_type": gt,
+            "is_outerwear": bool(is_outerwear),
+            "style_priors": {
+                "expects_sleeves": expects_sleeves,
+                "expects_long_body": expects_long_body,
+                "expects_modest_side_coverage": expects_modest_side_coverage,
+            },
+            "face": float(face),
+            "upper": float(upper),
+            "lower": float(lower),
+            "full": float(full),
+            "shoulder_left": float(shoulder_left),
+            "shoulder_right": float(shoulder_right),
+            "arm_left": float(arm_left),
+            "arm_right": float(arm_right),
+            "side_left": float(side_left),
+            "side_right": float(side_right),
+            "lower_mid": float(lower_mid),
+            "center_torso": float(center_torso),
+            "out_stddev": float(out_std),
+            "blankish": bool(blankish),
+            "reject_reasons_strict": strict_reasons,
+            "reject_reasons_hard": hard_reasons,
+            "thresholds": {
+                "strict": {
+                    "min_upper_diff": float(self.min_upper_diff),
+                    "min_lower_diff": float(self.min_lower_diff),
+                    "min_full_diff": float(self.min_full_diff),
+                    "max_face_diff": float(self.max_face_diff),
+                    "sleeve_shoulder_min_diff": float(self.sleeve_shoulder_min_diff),
+                    "sleeve_arm_min_diff": float(self.sleeve_arm_min_diff),
+                    "side_torso_min_diff": float(self.side_torso_min_diff),
+                    "long_body_min_diff": float(self.long_body_min_diff),
+                    "outer_face_bonus": float(self.outer_face_bonus),
+                    "min_stddev": float(self.min_stddev),
+                },
+                "hard": {
+                    "min_upper_diff": float(self.hard_min_upper_diff),
+                    "min_lower_diff": float(self.hard_min_lower_diff),
+                    "min_full_diff": float(self.hard_min_full_diff),
+                    "max_face_diff": float(self.hard_max_face_diff),
+                    "sleeve_shoulder_min_diff": float(self.hard_sleeve_shoulder_min_diff),
+                    "sleeve_arm_min_diff": float(self.hard_sleeve_arm_min_diff),
+                    "side_torso_min_diff": float(self.hard_side_torso_min_diff),
+                    "long_body_min_diff": float(self.hard_long_body_min_diff),
+                    "outer_face_bonus": float(self.outer_face_bonus),
+                    "min_stddev": float(self.min_stddev),
+                },
+            },
+            "computed": {
+                "strict_max_face": float(strict_max_face),
+                "hard_max_face": float(hard_max_face),
+                "shoulder_cov": float(shoulder_cov),
+                "arm_cov": float(arm_cov),
+                "side_cov": float(side_cov),
+            },
+        }
 
 
 # -----------------------------------------------------------------------------
@@ -1300,7 +1512,7 @@ class SareeOverlayFallbackProvider:
 
 
 # -----------------------------------------------------------------------------
-# Non-saree providers (UNCHANGED API + selection logic improved in router)
+# Non-saree providers
 # -----------------------------------------------------------------------------
 
 
@@ -1391,17 +1603,10 @@ def _catvton_cloth_type_for(*, garment_type: str, has_outer: bool = False) -> st
 
 class VTONProvider:
     """
-    IMPORTANT (frozen output approach):
-      - We do NOT change saree generation approach.
-      - We ONLY enforce a common storage pattern: every variant MUST be stored under
-        '<studio_job_id>-<variant_index>' so downstream can count/track variants reliably.
-
-    Production hardening for NON-SAREE:
-      - run providers in configured order
-      - optionally resolve a platform-model human from the approved manifest
-      - compute QC score per provider candidate
-      - choose best strict-pass candidate; if none, optionally choose best hard-pass candidate
-        (COMMERCE_VTON_QC_FAIL_OPEN=1 by default)
+    Key non-saree behavior:
+      - evaluate every generated output individually
+      - only return top shippable result(s)
+      - return [] when nothing is shippable
     """
 
     def __init__(self) -> None:
@@ -1412,6 +1617,14 @@ class VTONProvider:
         self.enforce_full_body_for_saree = _env_bool("COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE", default=True)
 
         self.max_provider_images = _clamp_int(_env_str("COMMERCE_MAX_PROVIDER_IMAGES", "4"), default=4, lo=1, hi=12)
+
+        # Non-saree final-return policy
+        self.max_returned_images = _clamp_int(_env_str("COMMERCE_VTON_MAX_RETURNED_IMAGES", "2"), default=2, lo=1, hi=4)
+        self.min_top_strict_score = _env_float("COMMERCE_VTON_MIN_TOP_STRICT_SCORE", 0.0)
+        self.min_second_strict_score = _env_float("COMMERCE_VTON_MIN_SECOND_STRICT_SCORE", 0.015)
+        self.max_second_score_gap = _env_float("COMMERCE_VTON_MAX_SECOND_SCORE_GAP", 0.020)
+        self.min_top_hard_score = _env_float("COMMERCE_VTON_MIN_TOP_HARD_SCORE", 0.010)
+        self.min_second_hard_score = _env_float("COMMERCE_VTON_MIN_SECOND_HARD_SCORE", 0.020)
 
         # Fal endpoints
         self.fal_fashn_endpoint_id = (_env_str("COMMERCE_FAL_FASHN_ENDPOINT_ID", "fal-ai/fashn/tryon/v1.6") or "fal-ai/fashn/tryon/v1.6").strip().strip("/")
@@ -1433,7 +1646,6 @@ class VTONProvider:
             self.fashn_output_format = "png"
         self.fashn_sync_mode = _env_bool("COMMERCE_FASHN_SYNC_MODE", default=False)
 
-        # Non-saree provider order (recommended default)
         self.non_saree_provider_order = [
             p.strip().lower()
             for p in (_env_str("COMMERCE_NON_SAREE_PROVIDER_ORDER", "imageapps_v2,fashn,catvton") or "imageapps_v2,fashn,catvton").split(",")
@@ -1442,8 +1654,6 @@ class VTONProvider:
 
         self.two_piece_sequential = _env_bool("COMMERCE_VTON_TWO_PIECE_SEQUENTIAL", default=False)
 
-        # Indian non-saree Phase-1 families must not silently degrade into western generic VTON
-        # unless an explicit escape hatch is enabled.
         self.indian_non_saree_strict = _env_bool("COMMERCE_INDIAN_NON_SAREE_STRICT", default=True)
         self.enable_indian_non_saree_generic_fallback = (
             _env_bool("COMMERCE_ENABLE_INDIAN_NON_SAREE_GENERIC_FALLBACK", default=False)
@@ -1454,20 +1664,17 @@ class VTONProvider:
         )
         self.supported_non_saree_providers = set(_SUPPORTED_NON_SAREE_PROVIDERS)
 
-        # Platform-model selector for non-saree
         self.enable_platform_model_selector = _env_bool("COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR", default=True)
         self.platform_model_force_when_missing_human = _env_bool("COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN", default=True)
         self.platform_model_top_k = _clamp_int(_env_str("COMMERCE_PLATFORM_MODELS_TOP_K", "10"), default=10, lo=1, hi=50)
         self._platform_selector: Optional[Any] = None
         self._platform_asset_url_cache: Dict[str, str] = {}
 
-        # Dependencies
         self.fal = FalQueueClient()
         self.saree_lora = SareeLoRAProvider(fal=self.fal)
         self.saree_overlay = SareeOverlayFallbackProvider()
         self.saree_qc = SareeQC()
 
-        # Non-saree deps
         self.nonsaree_qc = NonSareeQC()
         self.imageapps_v2 = ImageAppsV2TryOnProvider(fal=self.fal)
         self.catvton = CatVTONProvider(fal=self.fal)
@@ -1475,7 +1682,6 @@ class VTONProvider:
         self.allow_placeholder_fallback = _env_bool("COMMERCE_ALLOW_PLACEHOLDER_FALLBACK", default=False)
         self.placeholder_base = (_env_str("COMMERCE_PLACEHOLDER_BASE", "https://placehold.co") or "https://placehold.co").rstrip("/")
 
-        # Storage/materialization knobs
         self.output_container = (_env_str("COMMERCE_OUTPUT_CONTAINER", "commerce-output") or "commerce-output").strip()
         self.output_prefix_base = (_env_str("COMMERCE_VTON_OUTPUT_PREFIX", "commerce/vton") or "commerce/vton").strip().strip("/")
         self.materialize_to_azure = _env_bool("COMMERCE_VTON_MATERIALIZE_TO_AZURE", default=True)
@@ -1633,9 +1839,6 @@ class VTONProvider:
         job_id: UUID,
         saree_ref_url: str,
     ) -> Tuple[str, Dict[str, Any]]:
-        """
-        Delegates to SareeDrapeProvider helper so we do proxy creation in one place.
-        """
         from app.services.azure_storage_service import AzureStorageService
         from app.services.providers.saree_drape_provider import SareeDrapeProvider
 
@@ -1657,18 +1860,21 @@ class VTONProvider:
         route: str,
         provider_tag: str,
         source_urls: List[str],
+        expand_to_requested_count: bool = False,
     ) -> Tuple[List[str], Dict[str, Any]]:
         """
-        Common pattern for ALL outfits:
-          - Ensure output[i] is stored under:
-              <output_prefix_base>/<route>/<user_id>/<studio_job_id>-<i>/<request_hash>/<filename>
-          - Return SAS URLs that include '<studio_job_id>-<i>' in the path.
+        If expand_to_requested_count=True, replicate last source URL until len(req.variants).
+        Otherwise materialize exactly len(source_urls).
         """
-        if not self.materialize_to_azure:
-            return list(source_urls), {"materialized": False}
-
         if not source_urls:
-            raise RuntimeError("materialize_no_source_urls")
+            return [], {"materialized": False, "reason": "no_source_urls"}
+
+        source_urls_norm = list(source_urls)
+        if expand_to_requested_count and len(source_urls_norm) < len(req.variants):
+            source_urls_norm = list(source_urls_norm) + [source_urls_norm[-1]] * (len(req.variants) - len(source_urls_norm))
+
+        if not self.materialize_to_azure:
+            return source_urls_norm, {"materialized": False}
 
         storage = _get_storage_service_best_effort()
         container = self.output_container
@@ -1676,14 +1882,12 @@ class VTONProvider:
         out_urls: List[str] = []
         debug: List[Dict[str, Any]] = []
 
-        for i in range(len(req.variants)):
-            src = source_urls[i] if i < len(source_urls) else source_urls[-1]
+        for i, src in enumerate(source_urls_norm):
             if not _is_http_url(src):
                 raise RuntimeError(f"materialize_bad_source_url idx={i} url={src!r}")
 
             variant_id = _variant_job_id(job_id=req.studio_job_id, variant_index=i)
 
-            # If it's already in our variant path, keep it
             if f"/{variant_id}/" in src:
                 out_urls.append(src)
                 debug.append({"i": i, "variant_job_id": variant_id, "src": src, "dst": src, "kept": True})
@@ -1732,7 +1936,181 @@ class VTONProvider:
             out_urls.append(sas_url)
             debug.append({"i": i, "variant_job_id": variant_id, "src": src, "dst": sas_url, "blob": blob_name, "content_type": ct})
 
-        return out_urls, {"materialized": True, "container": container, "route": route, "debug": debug[:5]}
+        return out_urls, {"materialized": True, "container": container, "route": route, "debug": debug[:8]}
+
+    async def _evaluate_non_saree_provider_outputs(
+        self,
+        *,
+        provider_name: str,
+        provider_id: str,
+        route: str,
+        tag: str,
+        urls: List[str],
+        base_meta: Dict[str, Any],
+        garment_type: str,
+        human_url: str,
+        is_outerwear: bool,
+        style_priors: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        image_results: List[Dict[str, Any]] = []
+
+        for i, out_url in enumerate(urls):
+            qc = await self.nonsaree_qc.evaluate(
+                garment_type=garment_type,
+                human_url=human_url,
+                out_url=out_url,
+                is_outerwear=is_outerwear,
+                style_priors=style_priors,
+            )
+            image_results.append(
+                {
+                    "index": int(i),
+                    "url": out_url,
+                    "score": float(_as_dict(qc).get("score", -999.0)),
+                    "ok_strict": bool(_as_dict(qc).get("ok_strict", False)),
+                    "ok_hard": bool(_as_dict(qc).get("ok_hard", False)),
+                    "qc": qc,
+                }
+            )
+
+        strict_images = sorted([x for x in image_results if x["ok_strict"]], key=lambda x: float(x["score"]), reverse=True)
+        hard_images = sorted([x for x in image_results if x["ok_hard"]], key=lambda x: float(x["score"]), reverse=True)
+        best_image = sorted(image_results, key=lambda x: float(x["score"]), reverse=True)[0] if image_results else None
+
+        meta = dict(base_meta)
+        meta.update(
+            {
+                "provider_name": provider_name,
+                "style_priors": {
+                    "expects_sleeves": bool(style_priors.get("expects_sleeves")),
+                    "expects_long_body": bool(style_priors.get("expects_long_body")),
+                    "expects_modest_side_coverage": bool(style_priors.get("expects_modest_side_coverage")),
+                },
+                "qc_summary": {
+                    "image_count": len(image_results),
+                    "strict_pass_count": len(strict_images),
+                    "hard_pass_count": len(hard_images),
+                    "best_score": float(best_image["score"]) if best_image else None,
+                    "best_strict_score": float(strict_images[0]["score"]) if strict_images else None,
+                    "best_hard_score": float(hard_images[0]["score"]) if hard_images else None,
+                },
+                "image_results": [
+                    {
+                        "index": x["index"],
+                        "score": x["score"],
+                        "ok_strict": x["ok_strict"],
+                        "ok_hard": x["ok_hard"],
+                        "reject_reasons_strict": _as_dict(x["qc"]).get("reject_reasons_strict", []),
+                        "reject_reasons_hard": _as_dict(x["qc"]).get("reject_reasons_hard", []),
+                    }
+                    for x in image_results[:8]
+                ],
+            }
+        )
+
+        return {
+            "provider": provider_id,
+            "route": route,
+            "tag": tag,
+            "meta": meta,
+            "image_results": image_results,
+            "strict_images": strict_images,
+            "hard_images": hard_images,
+            "best_image": best_image,
+            "best_score": float(best_image["score"]) if best_image else -999.0,
+            "best_strict_score": float(strict_images[0]["score"]) if strict_images else -999.0,
+            "best_hard_score": float(hard_images[0]["score"]) if hard_images else -999.0,
+        }
+
+    def _pick_final_images_from_provider(self, *, chosen: Dict[str, Any], pool_name: str) -> List[Dict[str, Any]]:
+        ranked = list(_as_list(chosen.get("strict_images" if pool_name == "strict" else "hard_images")))
+        if not ranked:
+            return []
+
+        best = ranked[0]
+        best_score = float(best.get("score", -999.0))
+
+        if pool_name == "strict":
+            if best_score < float(self.min_top_strict_score):
+                return []
+            min_second_score = float(self.min_second_strict_score)
+        else:
+            if best_score < float(self.min_top_hard_score):
+                return []
+            min_second_score = float(self.min_second_hard_score)
+
+        out: List[Dict[str, Any]] = [best]
+        seen = {str(best.get("url") or "").strip()}
+
+        if int(self.max_returned_images) <= 1:
+            return out
+
+        for cand in ranked[1:]:
+            if len(out) >= int(self.max_returned_images):
+                break
+
+            url = str(cand.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+
+            score = float(cand.get("score", -999.0))
+            if score < min_second_score:
+                continue
+
+            if (best_score - score) > float(self.max_second_score_gap):
+                continue
+
+            out.append(cand)
+            seen.add(url)
+
+        return out
+
+    def _empty_non_saree_result(
+        self,
+        *,
+        reason: str,
+        garment_type: str,
+        indian_non_saree_family: Optional[str],
+        is_outerwear: bool,
+        provider_order: List[str],
+        provider_errors: List[Dict[str, Any]],
+        provider_candidates: List[Dict[str, Any]],
+        resolved: Dict[str, Any],
+        platform_model_selection: Optional[Dict[str, Any]],
+        use_sequential: bool,
+        generic_indian_non_saree_fallback_enabled: bool,
+    ) -> VTONGenerateResult:
+        return VTONGenerateResult(
+            provider="none",
+            urls=[],
+            meta={
+                "route": "non_saree_no_shippable_outputs",
+                "reason": reason,
+                "garment_type": garment_type,
+                "indian_non_saree_family": indian_non_saree_family,
+                "is_outerwear": bool(is_outerwear),
+                "provider_order": provider_order,
+                "provider_order_configured": self.non_saree_provider_order,
+                "generic_indian_non_saree_fallback_enabled": generic_indian_non_saree_fallback_enabled,
+                "two_piece_sequential": bool(use_sequential),
+                "errors": provider_errors[:8],
+                "candidates": [
+                    {
+                        "provider": c.get("provider"),
+                        "route": c.get("route"),
+                        "best_score": c.get("best_score"),
+                        "best_strict_score": c.get("best_strict_score"),
+                        "best_hard_score": c.get("best_hard_score"),
+                        "qc_summary": _as_dict(c.get("meta")).get("qc_summary"),
+                        "image_results": _as_dict(c.get("meta")).get("image_results", []),
+                    }
+                    for c in provider_candidates[:8]
+                ],
+                "resolved": resolved,
+                "platform_model_selection": platform_model_selection,
+                "no_shippable_outputs": True,
+            },
+        )
 
     async def generate(self, req: VTONGenerateRequest) -> VTONGenerateResult:
         product_assets = _as_dict(req.product_assets)
@@ -1769,7 +2147,7 @@ class VTONProvider:
         n_real = min(len(req.variants), self.max_provider_images)
 
         # -------------------------
-        # Saree routing (UNCHANGED)
+        # Saree routing
         # -------------------------
         if saree_like:
             if self.enforce_full_body_for_saree and not full_body_flag:
@@ -1812,6 +2190,7 @@ class VTONProvider:
                             route="saree_drape",
                             provider_tag="flux2",
                             source_urls=raw_urls,
+                            expand_to_requested_count=False,
                         )
                         return VTONGenerateResult(
                             provider="fal_flux2_lora_edit",
@@ -1852,6 +2231,7 @@ class VTONProvider:
                         route="saree_drape",
                         provider_tag="overlay",
                         source_urls=raw_urls,
+                        expand_to_requested_count=False,
                     )
 
                     return VTONGenerateResult(
@@ -1874,6 +2254,7 @@ class VTONProvider:
                         route="saree_drape",
                         provider_tag="placeholder",
                         source_urls=urls_placeholders,
+                        expand_to_requested_count=False,
                     )
                     return VTONGenerateResult(
                         provider="placeholder_saree_failed",
@@ -1894,6 +2275,7 @@ class VTONProvider:
                 route="saree_drape",
                 provider_tag="placeholder",
                 source_urls=urls_placeholders,
+                expand_to_requested_count=False,
             )
             return VTONGenerateResult(
                 provider="placeholder_saree_failed",
@@ -1911,19 +2293,14 @@ class VTONProvider:
         # -------------------------
 
         if not self.enable_real:
-            mat_urls, mat_dbg = await self._materialize_variant_urls(
-                req=req,
-                route="fashn",
-                provider_tag="placeholder",
-                source_urls=urls_placeholders,
-            )
             return VTONGenerateResult(
-                provider="placeholder",
-                urls=mat_urls,
+                provider="none",
+                urls=[],
                 meta={
-                    "note": "COMMERCE_ENABLE_REAL_PROVIDERS is off; using placeholders",
-                    "variant_count": len(mat_urls),
-                    "storage": mat_dbg,
+                    "route": "non_saree_real_providers_disabled",
+                    "note": "COMMERCE_ENABLE_REAL_PROVIDERS is off; returning no outputs",
+                    "requested_variants": len(req.variants),
+                    "returned_variants": 0,
                 },
             )
 
@@ -1932,19 +2309,16 @@ class VTONProvider:
 
         fal_key = self._fal_key()
         if not fal_key:
-            if self.allow_placeholder_fallback:
-                mat_urls, mat_dbg = await self._materialize_variant_urls(
-                    req=req,
-                    route="fashn",
-                    provider_tag="placeholder",
-                    source_urls=urls_placeholders,
-                )
-                return VTONGenerateResult(
-                    provider="placeholder_fallback_missing_fal_key",
-                    urls=mat_urls,
-                    meta={"error": "missing FAL_KEY", "variant_count": len(mat_urls), "storage": mat_dbg},
-                )
-            raise RuntimeError("VTONProvider: missing FAL_KEY (or FAL_API_KEY / COMMERCE_FAL_KEY)")
+            return VTONGenerateResult(
+                provider="none",
+                urls=[],
+                meta={
+                    "route": "non_saree_missing_provider_key",
+                    "error": "missing FAL_KEY (or FAL_API_KEY / COMMERCE_FAL_KEY)",
+                    "requested_variants": len(req.variants),
+                    "returned_variants": 0,
+                },
+            )
 
         ns = _resolve_non_saree_garments(product_assets=product_assets, comps=comps)
         primary_url = ns.get("primary_url") or garment_url
@@ -1964,7 +2338,6 @@ class VTONProvider:
         indian_non_saree_family = indian_routing.family
         garment_type = indian_routing.runtime_garment_type
         resolved_platform_garment_kind = indian_routing.platform_garment_kind
-
         generic_indian_non_saree_fallback_enabled = bool(self.enable_indian_non_saree_generic_fallback)
 
         if indian_routing.requires_dedicated_pipeline:
@@ -2021,8 +2394,13 @@ class VTONProvider:
             or _looks_outerwear_url(product_assets.get("name"))
         )
 
-        # Indian Phase-1 families are reserved for dedicated routing/training and should not
-        # be reduced into western sequential upper/lower composition.
+        style_priors = _infer_non_saree_style_priors(
+            product_assets=product_assets,
+            ns=ns,
+            garment_type=garment_type,
+            is_outerwear=is_outerwear,
+        )
+
         use_sequential = bool(
             (not is_outerwear)
             and (not is_phase1_indian_non_saree_family(indian_non_saree_family))
@@ -2032,13 +2410,14 @@ class VTONProvider:
         )
 
         provider_errors: List[Dict[str, Any]] = []
+        provider_candidates: List[Dict[str, Any]] = []
 
-        async def _attempt_imageapps_v2() -> Tuple[List[str], Dict[str, Any], Dict[str, Any]]:
+        async def _attempt_imageapps_v2() -> Dict[str, Any]:
             if not self.imageapps_v2.can_run():
                 raise RuntimeError("IMAGEAPPS_V2_DISABLED")
+
             urls: List[str] = []
             dbg: List[Dict[str, Any]] = []
-
             clothing_primary = str(outer_url) if (is_outerwear and _is_http_url(outer_url)) else str(primary_url)
 
             for i in range(n_real):
@@ -2053,28 +2432,27 @@ class VTONProvider:
                     urls.append(u)
                     dbg.append({"i": i, "seq": False, "dbg": d})
 
-            if n_real < len(req.variants):
-                urls.extend(urls_placeholders[n_real:])
-
-            qc = await self.nonsaree_qc.evaluate(
+            return await self._evaluate_non_saree_provider_outputs(
+                provider_name="imageapps_v2",
+                provider_id="fal_imageapps_v2",
+                route="imageapps_v2",
+                tag="imageapps_v2",
+                urls=urls,
+                base_meta={
+                    "provider": "imageapps_v2",
+                    "debug": dbg[:5],
+                    "sequential": bool(use_sequential),
+                },
                 garment_type=garment_type,
                 human_url=human_url,
-                out_url=urls[0],
                 is_outerwear=is_outerwear,
+                style_priors=style_priors,
             )
-            if not bool(qc.get("ok_hard", False)):
-                raise RuntimeError(f"IMAGEAPPS_V2_QC_HARD_FAILED qc={qc}")
 
-            return urls, {
-                "provider": "imageapps_v2",
-                "debug": dbg[:3],
-                "qc": qc,
-                "sequential": bool(use_sequential),
-            }, qc
-
-        async def _attempt_catvton() -> Tuple[List[str], Dict[str, Any], Dict[str, Any]]:
+        async def _attempt_catvton() -> Dict[str, Any]:
             if not self.catvton.can_run():
                 raise RuntimeError("CATVTON_DISABLED")
+
             urls: List[str] = []
             dbg: List[Dict[str, Any]] = []
 
@@ -2105,35 +2483,30 @@ class VTONProvider:
                     urls.append(u)
                     dbg.append({"i": i, "seq": False, "dbg": d})
 
-            if n_real < len(req.variants):
-                urls.extend(urls_placeholders[n_real:])
-
-            qc = await self.nonsaree_qc.evaluate(
+            return await self._evaluate_non_saree_provider_outputs(
+                provider_name="catvton",
+                provider_id="fal_catvton",
+                route="catvton",
+                tag="catvton",
+                urls=urls,
+                base_meta={
+                    "provider": "catvton",
+                    "debug": dbg[:5],
+                    "cloth_type": cloth_type,
+                    "sequential": bool(use_sequential),
+                },
                 garment_type=garment_type,
                 human_url=human_url,
-                out_url=urls[0],
                 is_outerwear=is_outerwear,
+                style_priors=style_priors,
             )
-            if not bool(qc.get("ok_hard", False)):
-                raise RuntimeError(f"CATVTON_QC_HARD_FAILED qc={qc}")
 
-            return urls, {
-                "provider": "catvton",
-                "debug": dbg[:3],
-                "qc": qc,
-                "cloth_type": cloth_type,
-                "sequential": bool(use_sequential),
-            }, qc
-
-        async def _attempt_fashn() -> Tuple[List[str], Dict[str, Any], Dict[str, Any]]:
+        async def _attempt_fashn() -> Dict[str, Any]:
             endpoint_id = self.fal_fashn_endpoint_id
-
-            # Outerwear works better with "auto" more often than forcing "tops"
             cat = "auto" if is_outerwear else _fashn_category_for_garment_type(garment_type)
 
             urls: List[str] = []
             debug: List[Dict[str, Any]] = []
-
             clothing_primary = str(outer_url) if (is_outerwear and _is_http_url(outer_url)) else str(primary_url)
 
             if use_sequential:
@@ -2242,31 +2615,25 @@ class VTONProvider:
                     remaining -= batch_n
                     batch_start += batch_n
 
-            if n_real < len(req.variants):
-                urls.extend(urls_placeholders[n_real:])
-
-            qc = await self.nonsaree_qc.evaluate(
+            return await self._evaluate_non_saree_provider_outputs(
+                provider_name="fashn",
+                provider_id="fal_fashn",
+                route="fashn",
+                tag="fashn",
+                urls=urls,
+                base_meta={
+                    "provider": "fashn",
+                    "endpoint_id": endpoint_id,
+                    "category": cat,
+                    "provider_images": n_real,
+                    "debug": debug[:8],
+                    "sequential": bool(use_sequential),
+                },
                 garment_type=garment_type,
                 human_url=human_url,
-                out_url=urls[0],
                 is_outerwear=is_outerwear,
+                style_priors=style_priors,
             )
-            if not bool(qc.get("ok_hard", False)):
-                raise RuntimeError(f"FASHN_QC_HARD_FAILED qc={qc}")
-
-            return urls, {
-                "provider": "fashn",
-                "endpoint_id": endpoint_id,
-                "category": cat,
-                "variant_count": len(req.variants),
-                "provider_images": n_real,
-                "debug": debug[:5],
-                "qc": qc,
-                "sequential": bool(use_sequential),
-            }, qc
-
-        # Collect candidates instead of "first pass wins"
-        candidates: List[Dict[str, Any]] = []
 
         effective_provider_order = self._resolve_non_saree_provider_order(
             family=indian_non_saree_family or None
@@ -2275,142 +2642,76 @@ class VTONProvider:
         for p in effective_provider_order:
             try:
                 if p == "imageapps_v2":
-                    urls, meta, qc = await _attempt_imageapps_v2()
-                    candidates.append(
-                        {
-                            "provider": "fal_imageapps_v2",
-                            "route": "imageapps_v2",
-                            "tag": "imageapps_v2",
-                            "urls": urls,
-                            "meta": meta,
-                            "qc": qc,
-                        }
-                    )
+                    provider_candidates.append(await _attempt_imageapps_v2())
                     continue
                 if p == "catvton":
-                    urls, meta, qc = await _attempt_catvton()
-                    candidates.append(
-                        {
-                            "provider": "fal_catvton",
-                            "route": "catvton",
-                            "tag": "catvton",
-                            "urls": urls,
-                            "meta": meta,
-                            "qc": qc,
-                        }
-                    )
+                    provider_candidates.append(await _attempt_catvton())
                     continue
                 if p == "fashn":
-                    urls, meta, qc = await _attempt_fashn()
-                    candidates.append(
-                        {
-                            "provider": "fal_fashn",
-                            "route": "fashn",
-                            "tag": "fashn",
-                            "urls": urls,
-                            "meta": meta,
-                            "qc": qc,
-                        }
-                    )
+                    provider_candidates.append(await _attempt_fashn())
                     continue
-
                 raise RuntimeError(f"unknown_non_saree_provider {p!r}")
             except Exception as e:
                 provider_errors.append({"provider": p, "error": f"{type(e).__name__}: {e}"})
                 continue
 
-        if not candidates:
-            if self.allow_placeholder_fallback:
-                mat_urls, mat_dbg = await self._materialize_variant_urls(
-                    req=req,
-                    route="fashn",
-                    provider_tag="placeholder",
-                    source_urls=urls_placeholders,
-                )
-                return VTONGenerateResult(
-                    provider="placeholder_non_saree_failed",
-                    urls=mat_urls,
-                    meta={
-                        "route": "non_saree_failed_placeholder",
-                        "indian_non_saree_family": indian_non_saree_family,
-                        "errors": provider_errors[:5],
-                        "storage": mat_dbg,
-                        "two_piece_sequential": bool(use_sequential),
-                        "provider_order": effective_provider_order,
-                        "provider_order_configured": self.non_saree_provider_order,
-                        "generic_indian_non_saree_fallback_enabled": generic_indian_non_saree_fallback_enabled,
-                        "resolved": {
-                            "primary_url": primary_url,
-                            "upper_url": upper_url,
-                            "lower_url": lower_url,
-                            "outer_url": outer_url,
-                            "resolved_platform_garment_kind": resolved_platform_garment_kind,
-                        },
-                        "platform_model_selection": platform_model_selection,
-                    },
-                )
-            raise RuntimeError(f"NON_SAREE_ALL_PROVIDERS_FAILED errors={provider_errors[:5]}")
+        resolved_block = {
+            "primary_url": primary_url,
+            "upper_url": upper_url,
+            "lower_url": lower_url,
+            "outer_url": outer_url,
+            "resolved_platform_garment_kind": resolved_platform_garment_kind,
+        }
 
-        # Pick best candidate:
-        #  1) strict-pass highest score
-        #  2) else if fail_open, hard-pass highest score
-        #  3) else fail (or placeholder if allowed)
-        strict_ok = [c for c in candidates if bool(_as_dict(c.get("qc")).get("ok_strict"))]
-        hard_ok = [c for c in candidates if bool(_as_dict(c.get("qc")).get("ok_hard"))]
+        if not provider_candidates:
+            return self._empty_non_saree_result(
+                reason="all_providers_failed",
+                garment_type=garment_type,
+                indian_non_saree_family=indian_non_saree_family,
+                is_outerwear=is_outerwear,
+                provider_order=effective_provider_order,
+                provider_errors=provider_errors,
+                provider_candidates=provider_candidates,
+                resolved=resolved_block,
+                platform_model_selection=platform_model_selection,
+                use_sequential=use_sequential,
+                generic_indian_non_saree_fallback_enabled=generic_indian_non_saree_fallback_enabled,
+            )
 
-        def _score(c: Dict[str, Any]) -> float:
-            try:
-                return float(_as_dict(c.get("qc")).get("score", -999.0))
-            except Exception:
-                return -999.0
+        strict_provider_candidates = [c for c in provider_candidates if len(_as_list(c.get("strict_images"))) > 0]
+        hard_provider_candidates = [c for c in provider_candidates if len(_as_list(c.get("hard_images"))) > 0]
 
         chosen: Optional[Dict[str, Any]] = None
         selection_reason = ""
-        if strict_ok:
-            chosen = sorted(strict_ok, key=_score, reverse=True)[0]
-            selection_reason = "best_strict"
-        elif self.nonsaree_qc.fail_open and hard_ok:
-            chosen = sorted(hard_ok, key=_score, reverse=True)[0]
-            selection_reason = "best_hard_fail_open"
+
+        if strict_provider_candidates:
+            chosen = sorted(strict_provider_candidates, key=lambda c: float(c.get("best_strict_score", -999.0)), reverse=True)[0]
+            selection_reason = "best_provider_best_strict_image"
+            selected_images = self._pick_final_images_from_provider(chosen=chosen, pool_name="strict")
+        elif self.nonsaree_qc.fail_open and hard_provider_candidates:
+            chosen = sorted(hard_provider_candidates, key=lambda c: float(c.get("best_hard_score", -999.0)), reverse=True)[0]
+            selection_reason = "best_provider_best_hard_image_fail_open"
+            selected_images = self._pick_final_images_from_provider(chosen=chosen, pool_name="hard")
         else:
-            if self.allow_placeholder_fallback:
-                mat_urls, mat_dbg = await self._materialize_variant_urls(
-                    req=req,
-                    route="fashn",
-                    provider_tag="placeholder",
-                    source_urls=urls_placeholders,
-                )
-                return VTONGenerateResult(
-                    provider="placeholder_non_saree_qc_failed",
-                    urls=mat_urls,
-                    meta={
-                        "route": "non_saree_qc_failed_placeholder",
-                        "indian_non_saree_family": indian_non_saree_family,
-                        "errors": provider_errors[:5],
-                        "candidates": [{"provider": c.get("provider"), "qc": c.get("qc")} for c in candidates[:5]],
-                        "storage": mat_dbg,
-                        "two_piece_sequential": bool(use_sequential),
-                        "provider_order": effective_provider_order,
-                        "provider_order_configured": self.non_saree_provider_order,
-                        "generic_indian_non_saree_fallback_enabled": generic_indian_non_saree_fallback_enabled,
-                        "resolved": {
-                            "primary_url": primary_url,
-                            "upper_url": upper_url,
-                            "lower_url": lower_url,
-                            "outer_url": outer_url,
-                            "resolved_platform_garment_kind": resolved_platform_garment_kind,
-                        },
-                        "platform_model_selection": platform_model_selection,
-                    },
-                )
-            raise RuntimeError(
-                "NON_SAREE_QC_FAILED_STRICT_AND_FAIL_OPEN_OFF "
-                f"candidates={[{'provider': c.get('provider'), 'qc': c.get('qc')} for c in candidates[:3]]}"
+            selected_images = []
+
+        if not chosen or not selected_images:
+            return self._empty_non_saree_result(
+                reason="no_shippable_outputs_after_qc",
+                garment_type=garment_type,
+                indian_non_saree_family=indian_non_saree_family,
+                is_outerwear=is_outerwear,
+                provider_order=effective_provider_order,
+                provider_errors=provider_errors,
+                provider_candidates=provider_candidates,
+                resolved=resolved_block,
+                platform_model_selection=platform_model_selection,
+                use_sequential=use_sequential,
+                generic_indian_non_saree_fallback_enabled=generic_indian_non_saree_fallback_enabled,
             )
 
-        assert chosen is not None
         selected_provider = str(chosen["provider"])
-        selected_urls = list(chosen["urls"])
+        selected_urls = [str(x.get("url")) for x in selected_images if _is_http_url(x.get("url"))]
         route = str(chosen["route"])
         tag = str(chosen["tag"])
         selected_meta = _as_dict(chosen.get("meta"))
@@ -2420,6 +2721,7 @@ class VTONProvider:
             route=route,
             provider_tag=tag,
             source_urls=selected_urls,
+            expand_to_requested_count=False,
         )
 
         return VTONGenerateResult(
@@ -2434,18 +2736,30 @@ class VTONProvider:
                 "provider_order_configured": self.non_saree_provider_order,
                 "generic_indian_non_saree_fallback_enabled": generic_indian_non_saree_fallback_enabled,
                 "selection_reason": selection_reason,
-                "candidates": [
-                    {"provider": c.get("provider"), "qc": c.get("qc"), "route": c.get("route")}
-                    for c in candidates[:5]
+                "returned_variants": len(mat_urls),
+                "requested_variants": len(req.variants),
+                "selected_images": [
+                    {
+                        "index": x.get("index"),
+                        "score": x.get("score"),
+                        "ok_strict": x.get("ok_strict"),
+                        "ok_hard": x.get("ok_hard"),
+                        "reject_reasons_strict": _as_dict(x.get("qc")).get("reject_reasons_strict", []),
+                        "reject_reasons_hard": _as_dict(x.get("qc")).get("reject_reasons_hard", []),
+                    }
+                    for x in selected_images
                 ],
-                "errors": provider_errors[:5],
-                "resolved": {
-                    "primary_url": primary_url,
-                    "upper_url": upper_url,
-                    "lower_url": lower_url,
-                    "outer_url": outer_url,
-                    "resolved_platform_garment_kind": resolved_platform_garment_kind,
-                },
+                "candidates": [
+                    {
+                        "provider": c.get("provider"),
+                        "qc_summary": _as_dict(c.get("meta")).get("qc_summary"),
+                        "image_results": _as_dict(c.get("meta")).get("image_results", []),
+                        "route": c.get("route"),
+                    }
+                    for c in provider_candidates[:8]
+                ],
+                "errors": provider_errors[:8],
+                "resolved": resolved_block,
                 "provider_meta": selected_meta,
                 "platform_model_selection": platform_model_selection,
                 "storage": mat_dbg,

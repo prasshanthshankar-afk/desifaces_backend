@@ -71,6 +71,18 @@ except Exception as pricing_import_error:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+
+class CommerceJobFailure(RuntimeError):
+    def __init__(self, failure: Dict[str, Any]):
+        self.failure = _as_dict(failure)
+        msg = (
+            str(self.failure.get("message") or "").strip()
+            or str(self.failure.get("user_message") or "").strip()
+            or "commerce job failed"
+        )
+        super().__init__(msg)
+
+
 # -----------------------------
 # Generic parsing helpers
 # -----------------------------
@@ -181,6 +193,17 @@ def _uniq_norm(xs: Any) -> List[str]:
     return out
 
 
+def _dedupe_strs(xs: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for x in xs:
+        s = str(x or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 def _extract_quote_id(payload: Dict[str, Any], meta: Dict[str, Any]) -> UUID:
     p = _as_dict(payload)
     m = _as_dict(meta)
@@ -234,7 +257,317 @@ def _extract_quote_request_anywhere(
 
 
 # -----------------------------
-# Variant contract helpers (COMMON pattern for all outfits)
+# Failure helpers
+# -----------------------------
+
+
+def _failure_dict(
+    *,
+    code: str,
+    category: str,
+    message: str,
+    user_message: Optional[str] = None,
+    likely_causes: Optional[List[str]] = None,
+    remedy: Optional[List[str]] = None,
+    input_requirements: Optional[Dict[str, Any]] = None,
+    ownership: Optional[Dict[str, Any]] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "code": str(code or "").strip() or "COMMERCE_VTON_FAILED",
+        "category": str(category or "").strip() or "provider_error",
+        "message": str(message or "").strip() or "Commerce VTON job failed.",
+        "user_message": str(user_message or "").strip()
+        or str(message or "").strip()
+        or "Commerce VTON job failed.",
+    }
+
+    lc = _dedupe_strs([str(x) for x in (likely_causes or []) if str(x or "").strip()])
+    rm = _dedupe_strs([str(x) for x in (remedy or []) if str(x or "").strip()])
+    ir = _as_dict(input_requirements)
+    ow = _as_dict(ownership)
+    dt = _as_dict(details)
+
+    if lc:
+        out["likely_causes"] = lc
+    if rm:
+        out["remedy"] = rm
+    if ir:
+        out["input_requirements"] = ir
+    if ow:
+        out["ownership"] = ow
+    if dt:
+        out["details"] = dt
+
+    return out
+
+
+def _build_no_shippable_outputs_failure(
+    *,
+    provider_name: str,
+    provider_meta: Dict[str, Any],
+    product_assets: Dict[str, Any],
+) -> Dict[str, Any]:
+    details = {
+        "provider": provider_name,
+        "reason": provider_meta.get("reason"),
+        "route": provider_meta.get("route"),
+        "selection_reason": provider_meta.get("selection_reason"),
+        "provider_order": provider_meta.get("provider_order"),
+        "errors": _as_list(provider_meta.get("errors"))[:8],
+        "candidates": _as_list(provider_meta.get("candidates"))[:8],
+        "garment_type": provider_meta.get("garment_type") or product_assets.get("garment_type"),
+        "outfit_kind": product_assets.get("outfit_kind"),
+        "dominant_component_code": product_assets.get("dominant_component_code"),
+    }
+
+    return _failure_dict(
+        code="NO_SHIPPABLE_OUTPUTS",
+        category="quality_gate",
+        message="We generated try-on results, but none met the minimum quality bar for delivery.",
+        user_message="We could not produce a usable try-on image from this garment photo.",
+        likely_causes=[
+            "The garment photo is unclear, cropped, folded, or visually ambiguous.",
+            "The garment silhouette or sleeve/body structure is hard for the try-on provider to interpret.",
+            "The generated outputs had visible defects such as broken garment geometry, missing coverage, or unrealistic draping.",
+            "The selected platform model and provider combination did not produce a reliable result for this garment.",
+        ],
+        remedy=[
+            "Upload a clean garment-only image on a plain or uncluttered background.",
+            "Ensure the full garment is visible and not cut off.",
+            "Avoid heavily folded, wrinkled, mannequin-worn, or person-worn garment photos unless that flow is explicitly supported.",
+            "Retry with a different provider and/or a different platform model from the catalog.",
+        ],
+        input_requirements={
+            "garment_photo": [
+                "single garment only",
+                "full garment visible",
+                "good lighting",
+                "minimal wrinkles or folds",
+                "plain or uncluttered background",
+            ]
+        },
+        ownership={
+            "garment_photo": "user_or_catalog_input",
+            "model_photo": "desifaces_platform_model",
+            "provider_selection": "desifaces",
+        },
+        details=details,
+    )
+
+
+def _provider_failure_from_meta(
+    *,
+    provider_name: str,
+    provider_meta: Dict[str, Any],
+    product_assets: Dict[str, Any],
+) -> Dict[str, Any]:
+    pm = _as_dict(provider_meta)
+    failure = _as_dict(pm.get("failure"))
+    if failure:
+        return failure
+
+    reason = str(pm.get("reason") or "").strip()
+    route = str(pm.get("route") or "").strip()
+
+    if provider_name == "none" or reason in {
+        "no_shippable_outputs_after_qc",
+        "all_providers_failed",
+    } or route == "non_saree_no_shippable_outputs":
+        return _build_no_shippable_outputs_failure(
+            provider_name=provider_name,
+            provider_meta=pm,
+            product_assets=product_assets,
+        )
+
+    if route == "non_saree_missing_provider_key":
+        return _failure_dict(
+            code="PROVIDER_CONFIGURATION_ERROR",
+            category="configuration",
+            message="The try-on provider is not configured correctly.",
+            user_message="We could not run the try-on provider for this request.",
+            likely_causes=[
+                "The provider API key is missing or invalid.",
+                "The provider configuration is incomplete.",
+            ],
+            remedy=[
+                "Retry the request after provider configuration is fixed.",
+            ],
+            ownership={
+                "model_photo": "desifaces_platform_model",
+                "provider_selection": "desifaces",
+            },
+            details={"provider": provider_name, "route": route},
+        )
+
+    return {}
+
+
+def _normalize_failure_from_exception(
+    *,
+    exc: Exception,
+    product_assets: Dict[str, Any],
+    provider_name: Optional[str] = None,
+    provider_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if isinstance(exc, CommerceJobFailure):
+        return _as_dict(exc.failure)
+
+    pm = _as_dict(provider_meta)
+    if pm:
+        meta_failure = _provider_failure_from_meta(
+            provider_name=str(provider_name or "unknown"),
+            provider_meta=pm,
+            product_assets=product_assets,
+        )
+        if meta_failure:
+            return meta_failure
+
+    msg = str(exc or "")
+    low = msg.lower()
+
+    if "missing garment_image_url" in low or "missing garment image" in low:
+        return _failure_dict(
+            code="MISSING_GARMENT_IMAGE",
+            category="input_validation",
+            message="The garment image is missing.",
+            user_message="We could not start try-on because the garment photo is missing.",
+            likely_causes=[
+                "No garment image was attached to the request.",
+                "The garment asset could not be resolved.",
+            ],
+            remedy=[
+                "Provide a garment-only image for the product.",
+                "Ensure the garment asset upload/resolution step completed successfully.",
+            ],
+            input_requirements={
+                "garment_photo": [
+                    "single garment only",
+                    "full garment visible",
+                    "good lighting",
+                ]
+            },
+            ownership={
+                "garment_photo": "user_or_catalog_input",
+                "model_photo": "desifaces_platform_model",
+            },
+        )
+
+    if "platform model resolution failed" in low or "platform_model_selection_failed" in low:
+        return _failure_dict(
+            code="PLATFORM_MODEL_RESOLUTION_FAILED",
+            category="configuration",
+            message="Platform model resolution failed.",
+            user_message="We could not select a platform model for this try-on request.",
+            likely_causes=[
+                "No eligible platform model was available for the required gender/framing bucket.",
+                "The platform-model catalog asset could not be resolved.",
+                "The platform-model selector failed.",
+            ],
+            remedy=[
+                "Retry the request.",
+                "Ensure the platform-model catalog contains eligible full-body models for this garment category.",
+                "Check platform-model asset resolution and SAS generation.",
+            ],
+            ownership={
+                "model_photo": "desifaces_platform_model",
+                "provider_selection": "desifaces",
+            },
+        )
+
+    if "timed out" in low or "timeout" in low:
+        return _failure_dict(
+            code="PROVIDER_TIMEOUT",
+            category="timeout",
+            message="The try-on provider timed out.",
+            user_message="The try-on provider took too long to respond for this request.",
+            likely_causes=[
+                "The provider queue was backed up.",
+                "The upstream provider was slow or unavailable.",
+            ],
+            remedy=[
+                "Retry the request.",
+                "Try a different provider or platform model for this garment.",
+            ],
+            ownership={
+                "model_photo": "desifaces_platform_model",
+                "provider_selection": "desifaces",
+            },
+        )
+
+    if "no output urls" in low or "empty urls" in low:
+        return _failure_dict(
+            code="PROVIDER_NO_OUTPUTS",
+            category="provider_error",
+            message="The try-on provider returned no output images.",
+            user_message="We could not get any output images from the try-on provider.",
+            likely_causes=[
+                "The provider returned an empty result.",
+                "The provider failed internally while generating outputs.",
+            ],
+            remedy=[
+                "Retry the request.",
+                "Try a different provider or platform model for this garment.",
+            ],
+            ownership={
+                "model_photo": "desifaces_platform_model",
+                "provider_selection": "desifaces",
+            },
+        )
+
+    if "no_shippable_outputs" in low or "qc_strict_failed" in low:
+        return _build_no_shippable_outputs_failure(
+            provider_name=str(provider_name or "unknown"),
+            provider_meta=pm,
+            product_assets=product_assets,
+        )
+
+    if isinstance(exc, PricingClientError):
+        return _failure_dict(
+            code=_extract_pricing_error_code(exc),
+            category="pricing",
+            message="Pricing finalization failed.",
+            user_message="We could not finalize billing for this try-on job.",
+            likely_causes=[
+                "The pricing service was unavailable.",
+                "The pricing reservation could not be finalized.",
+            ],
+            remedy=[
+                "Retry the job after pricing service recovery.",
+            ],
+            details={"raw_error": msg[:2000]},
+        )
+
+    return _failure_dict(
+        code="COMMERCE_VTON_FAILED",
+        category="provider_error",
+        message=msg[:500] or "Commerce VTON job failed.",
+        user_message="We could not complete this try-on request.",
+        likely_causes=[
+            "The try-on provider or worker encountered an unexpected error.",
+        ],
+        remedy=[
+            "Retry the request.",
+            "If the failure repeats, inspect provider logs and worker diagnostics.",
+        ],
+        ownership={
+            "model_photo": "desifaces_platform_model",
+            "provider_selection": "desifaces",
+        },
+        details={"raw_error": msg[:2000]},
+    )
+
+
+def _attach_raw_error_to_failure(failure: Dict[str, Any], raw_error: str) -> Dict[str, Any]:
+    out = dict(failure or {})
+    details = _as_dict(out.get("details"))
+    details["raw_error"] = str(raw_error or "")[:2000]
+    out["details"] = details
+    return out
+
+
+# -----------------------------
+# Variant contract helpers
 # -----------------------------
 
 
@@ -259,59 +592,46 @@ def _normalize_urls(urls: Any) -> List[str]:
 def _validate_variant_urls_or_raise(
     *,
     job_id: UUID,
-    expected_count: int,
     urls: List[str],
     strict: bool,
 ) -> None:
     """
-    Enforce the common variant naming pattern across all outfits.
-
-      - For expected_count > 1:
-          * URLs must not all be identical.
-          * Each expected variant tag "<job_id>-<i>" must appear in at least one URL.
+    For curated best-of-N outputs:
+      - at least one URL must exist
+      - returned URLs must be valid http(s)
+      - if >1 URLs returned, they should be distinct
+      - variant tags only need to exist for the returned URLs, not the originally requested count
     """
     if not urls:
         raise RuntimeError("COMMERCE_NO_OUTPUT_URLS: provider returned empty urls")
 
-    if expected_count <= 1:
+    bad = [u for u in urls if not isinstance(u, str) or not u.startswith("http")]
+    if bad:
+        raise RuntimeError(f"COMMERCE_BAD_OUTPUT_URLS: {bad[:3]}")
+
+    if len(urls) <= 1:
         return
 
-    if not strict:
-        unique = len(set(urls))
-        if unique == 1:
-            logger.warning(
-                "commerce_processor: variant urls identical (non-strict). job_id=%s expected=%s url=%s",
-                job_id,
-                expected_count,
-                urls[0],
-            )
-        missing = [i for i in range(expected_count) if not any(f"{job_id}-{i}" in u for u in urls)]
-        if missing:
-            logger.warning(
-                "commerce_processor: variant url tags missing (non-strict). job_id=%s expected=%s missing=%s sample=%s",
-                job_id,
-                expected_count,
-                missing,
-                urls[0],
-            )
-        return
-
-    if len(set(urls)) == 1:
-        raise RuntimeError(
-            f"COMMERCE_VARIANT_URLS_DUPLICATE: expected={expected_count} all_urls_identical url={urls[0]}"
-        )
+    if len(set(urls)) != len(urls):
+        if strict:
+            raise RuntimeError("COMMERCE_VARIANT_URLS_DUPLICATE: returned urls contain duplicates")
+        logger.warning("commerce_processor: duplicate returned variant urls (non-strict). job_id=%s", job_id)
 
     missing_tags: List[int] = []
-    for i in range(expected_count):
+    for i, u in enumerate(urls):
         tag = f"{job_id}-{i}"
-        if not any(tag in u for u in urls):
+        if tag not in u:
             missing_tags.append(i)
 
     if missing_tags:
-        raise RuntimeError(
-            "COMMERCE_VARIANT_URLS_MISSING_TAGS: "
-            f"job_id={job_id} expected={expected_count} missing={missing_tags} "
-            "hint=provider must upload each variant under variant_job_id '<job_id>-<i>'"
+        if strict:
+            raise RuntimeError(
+                f"COMMERCE_VARIANT_URLS_MISSING_TAGS: job_id={job_id} missing_returned_tags={missing_tags}"
+            )
+        logger.warning(
+            "commerce_processor: returned variant url tags missing (non-strict). job_id=%s missing=%s",
+            job_id,
+            missing_tags,
         )
 
 
@@ -498,11 +818,6 @@ def _configured_default_platform_model_ref(
     bucket_gender: str,
     saree_like: bool,
 ) -> Tuple[str, str]:
-    """
-    Azure-only configured fallback refs.
-    Primary behavior should come from Azure catalog random selection.
-    These are safety-net fallbacks only.
-    """
     bucket = _normalize_gender(bucket_gender)
 
     if saree_like:
@@ -566,10 +881,6 @@ async def _list_azure_catalog_platform_models_best_effort(
     bucket_gender: str,
     require_full_body: bool,
 ) -> List[Dict[str, Any]]:
-    """
-    Enumerate only DesiFaces Azure catalog platform models:
-      az://commerce-catalog/platform_models/<model_code>/source.jpg
-    """
     conn = (
         (os.getenv("AZURE_STORAGE_CONNECTION_STRING") or "").strip()
         or (os.getenv("COMMERCE_AZURE_STORAGE_CONNECTION_STRING") or "").strip()
@@ -641,10 +952,6 @@ async def _pick_random_platform_model_from_azure_catalog(
     saree_like: bool,
     require_full_body: bool,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Deterministic-random selection from DesiFaces Azure platform-model catalog.
-    Falls back to configured Azure-only env refs if the catalog has zero eligible candidates.
-    """
     bucket = _normalize_gender(bucket_gender)
     dbg: Dict[str, Any] = {
         "source": "azure_catalog_random",
@@ -812,7 +1119,7 @@ def _resolve_existing_platform_model_ref_to_http(
 
 
 # -----------------------------
-# Costume gender policy + garment type inference (non-saree)
+# Costume gender policy + garment type inference
 # -----------------------------
 
 
@@ -950,10 +1257,6 @@ def _apply_gender_policy_or_raise(
     dominant_component_code: str,
     strict: bool,
 ) -> Dict[str, Any]:
-    """
-    Enforce: sherwani/kurta_pyjama must be male; salwar/lehenga must be female.
-    Only enforce if we have a meaningful model_gender (male/female) and target_gender is male/female.
-    """
     out: Dict[str, Any] = {
         "target_gender": target_gender,
         "model_gender": model_gender,
@@ -1041,12 +1344,6 @@ def _looks_saree_like_for_platform_selector(*, product_assets: Dict[str, Any]) -
 
 
 def _infer_non_saree_platform_garment_kind(*, product_assets: Dict[str, Any]) -> Optional[str]:
-    """
-    Resolve to:
-      - Indian Phase-1 families when we can
-      - else generic families for western / mixed catalog:
-          upper_body, lower_body, dresses
-    """
     pa = _as_dict(product_assets)
     blob_parts: List[str] = [
         _norm_text(pa.get("garment_kind")),
@@ -1180,12 +1477,6 @@ async def _inject_platform_model_for_saree_best_effort(
     quote_id: UUID,
     user_id: UUID,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Saree vendor-only flow:
-    if no explicit human image is present, inject a deterministic-random female full-body
-    platform model from DesiFaces Azure catalog. Uses configured Azure-only env refs
-    only as fallback when the catalog has zero eligible candidates.
-    """
     mr = dict(model_ref or {})
     dbg: Dict[str, Any] = {
         "requested": False,
@@ -1308,16 +1599,6 @@ async def _preselect_platform_model_for_non_saree(
     quote_id: UUID,
     user_id: UUID,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Non-saree platform-model resolution.
-
-    Primary:
-      deterministic-random selection from DesiFaces Azure platform-model catalog
-      using the resolved target-gender bucket (female / male / any).
-
-    Fallback:
-      existing approved selector path, but still enforce Azure-only platform-model assets.
-    """
     mr = dict(model_ref or {})
     dbg: Dict[str, Any] = {
         "requested": False,
@@ -1500,7 +1781,7 @@ async def _preselect_platform_model_for_non_saree(
 async def _read_job_state(con, *, job_id: UUID) -> Dict[str, Any]:
     row = await con.fetchrow(
         """
-        select payload_json, meta_json, computed_json, status, error_code, error_message
+        select payload_json, meta_json, status, error_code, error_message
         from public.studio_jobs
         where id=$1 and studio_type='commerce'
         """,
@@ -1510,7 +1791,6 @@ async def _read_job_state(con, *, job_id: UUID) -> Dict[str, Any]:
         return {
             "payload_json": {},
             "meta_json": {},
-            "computed_json": {},
             "status": None,
             "error_code": None,
             "error_message": None,
@@ -1518,7 +1798,6 @@ async def _read_job_state(con, *, job_id: UUID) -> Dict[str, Any]:
     return {
         "payload_json": _as_dict(row["payload_json"]),
         "meta_json": _as_dict(row["meta_json"]),
-        "computed_json": _as_dict(row["computed_json"]),
         "status": row["status"],
         "error_code": row["error_code"],
         "error_message": row["error_message"],
@@ -1531,7 +1810,6 @@ async def _write_job_state(
     job_id: UUID,
     payload: Dict[str, Any],
     meta: Dict[str, Any],
-    computed: Dict[str, Any],
     status: Optional[str] = None,
     error_code: Optional[str] = None,
     error_message: Optional[str] = None,
@@ -1542,17 +1820,15 @@ async def _write_job_state(
         set
           payload_json = $2::jsonb,
           meta_json = $3::jsonb,
-          computed_json = $4::jsonb,
-          status = coalesce($5, status),
-          error_code = $6,
-          error_message = $7,
+          status = coalesce($4, status),
+          error_code = $5,
+          error_message = $6,
           updated_at = now()
         where id = $1 and studio_type='commerce'
         """,
         job_id,
         json.dumps(payload or {}, default=str, ensure_ascii=False),
         json.dumps(meta or {}, default=str, ensure_ascii=False),
-        json.dumps(computed or {}, default=str, ensure_ascii=False),
         status,
         error_code,
         error_message,
@@ -1571,11 +1847,12 @@ async def _set_job_computed(
     state = await _read_job_state(con, job_id=job_id)
     payload = _as_dict(state.get("payload_json"))
     meta = _as_dict(state.get("meta_json"))
-    computed = _as_dict(state.get("computed_json"))
 
     payload_computed = _as_dict(payload.get("computed"))
-    merged_computed = dict(payload_computed)
-    merged_computed.update(computed)
+    meta_computed = _as_dict(meta.get("computed"))
+
+    merged_computed = dict(meta_computed)
+    merged_computed.update(payload_computed)
     merged_computed["stage"] = stage
     if patch:
         merged_computed.update(patch)
@@ -1583,29 +1860,57 @@ async def _set_job_computed(
     payload["computed"] = merged_computed
     payload["stage"] = stage
 
+    payload_meta = _as_dict(payload.get("meta"))
+    payload_meta["stage"] = stage
+
     if "pricing" in merged_computed and isinstance(merged_computed["pricing"], dict):
         payload["pricing"] = merged_computed["pricing"]
-        payload_meta = _as_dict(payload.get("meta"))
         payload_meta["pricing"] = merged_computed["pricing"]
-        payload["meta"] = payload_meta
-
         meta["pricing"] = merged_computed["pricing"]
-        if merged_computed["pricing"].get("state") is not None:
-            meta["pricing_state"] = merged_computed["pricing"].get("state")
-            payload["pricing_state"] = merged_computed["pricing"].get("state")
-            merged_computed["pricing_state"] = merged_computed["pricing"].get("state")
 
-    if stage in {"queued", "running", "succeeded", "failed"}:
-        status_value = stage
-    else:
-        status_value = None
+        pricing_state = merged_computed["pricing"].get("state")
+        if pricing_state is not None:
+            payload["pricing_state"] = pricing_state
+            payload_meta["pricing_state"] = pricing_state
+            merged_computed["pricing_state"] = pricing_state
+            meta["pricing_state"] = pricing_state
+
+    failure = _as_dict(merged_computed.get("failure"))
+    if stage == "failed" and failure:
+        payload["failure"] = failure
+        meta["failure"] = failure
+        payload_meta["failure"] = failure
+        merged_computed["failure"] = failure
+
+        failure_code = str(failure.get("code") or "").strip()
+        if failure_code:
+            payload["failure_code"] = failure_code
+            meta["failure_code"] = failure_code
+            payload_meta["failure_code"] = failure_code
+            merged_computed["failure_code"] = failure_code
+
+    if stage == "succeeded":
+        payload.pop("failure", None)
+        payload.pop("failure_code", None)
+        meta.pop("failure", None)
+        meta.pop("failure_code", None)
+        payload_meta.pop("failure", None)
+        payload_meta.pop("failure_code", None)
+        merged_computed.pop("failure", None)
+        merged_computed.pop("failure_code", None)
+
+    payload["meta"] = payload_meta
+
+    meta["stage"] = stage
+    meta["computed"] = merged_computed
+
+    status_value = stage if stage in {"queued", "running", "succeeded", "failed"} else None
 
     await _write_job_state(
         con,
         job_id=job_id,
         payload=payload,
         meta=meta,
-        computed=merged_computed,
         status=status_value,
         error_code=error_code if stage == "failed" else None,
         error_message=error_message if stage == "failed" else None,
@@ -1679,7 +1984,6 @@ async def _persist_pricing_block(con, *, job_id: UUID, pricing: Dict[str, Any]) 
     state = await _read_job_state(con, job_id=job_id)
     payload = _as_dict(state.get("payload_json"))
     meta = _as_dict(state.get("meta_json"))
-    computed = _as_dict(state.get("computed_json"))
 
     pricing = dict(pricing or {})
     pricing_state = pricing.get("state")
@@ -1702,17 +2006,13 @@ async def _persist_pricing_block(con, *, job_id: UUID, pricing: Dict[str, Any]) 
     meta["pricing"] = pricing
     if pricing_state is not None:
         meta["pricing_state"] = pricing_state
-
-    computed["pricing"] = pricing
-    if pricing_state is not None:
-        computed["pricing_state"] = pricing_state
+    meta["computed"] = payload_computed
 
     await _write_job_state(
         con,
         job_id=job_id,
         payload=payload,
         meta=meta,
-        computed=computed,
         status=None,
         error_code=state.get("error_code"),
         error_message=state.get("error_message"),
@@ -1723,7 +2023,6 @@ async def _load_latest_pricing(con, *, job_id: UUID) -> Dict[str, Any]:
     state = await _read_job_state(con, job_id=job_id)
     payload = _as_dict(state.get("payload_json"))
     meta = _as_dict(state.get("meta_json"))
-    computed = _as_dict(state.get("computed_json"))
 
     pricing = _as_dict(payload.get("pricing"))
     if pricing:
@@ -1737,7 +2036,7 @@ async def _load_latest_pricing(con, *, job_id: UUID) -> Dict[str, Any]:
     if pricing:
         return pricing
 
-    pricing = _as_dict(computed.get("pricing"))
+    pricing = _as_dict(_as_dict(meta.get("computed")).get("pricing"))
     if pricing:
         return pricing
 
@@ -1914,9 +2213,6 @@ async def _release_pricing_for_job(
 
 
 async def _read_quote_request_from_db(con, *, quote_id: UUID) -> Dict[str, Any]:
-    """
-    Pull original request_json from public.commerce_quotes and apply resolved_* columns if present.
-    """
     try:
         row = await con.fetchrow(
             """
@@ -2021,11 +2317,29 @@ def _minify_provider_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     dbg = m.get("debug")
     if isinstance(dbg, list):
         slim: List[Dict[str, Any]] = []
-        for item in dbg[:5]:
+        for item in dbg[:8]:
             if isinstance(item, dict):
-                slim.append({"i": item.get("i"), "url": item.get("url")})
+                slim.append(
+                    {
+                        "i": item.get("i"),
+                        "url": item.get("url"),
+                        "seed": item.get("seed"),
+                        "seq": item.get("seq"),
+                    }
+                )
         m["debug"] = slim
     return m
+
+
+def _pick_best_delivered_url(*, urls: List[str], provider_meta: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
+    if not urls:
+        return None, None
+
+    selected_images = _as_list(provider_meta.get("selected_images"))
+    if selected_images:
+        return 0, urls[0]
+
+    return 0, urls[0]
 
 
 def _pick_best_image_from_item(item: Dict[str, Any]) -> Optional[str]:
@@ -2148,12 +2462,6 @@ def _ensure_garment_image_url(product_assets: Dict[str, Any]) -> Dict[str, Any]:
 def _apply_full_body_hints(
     *, quote_request: Dict[str, Any], product_assets: Dict[str, Any], model_ref: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], Dict[str, Any], bool]:
-    """
-    IMPORTANT for COMMERCE_SAREE_STRICT=1:
-    vton_provider's saree_drape pipeline needs a "full body" signal.
-
-    For platform_models (vendor) we FORCE full_body=True.
-    """
     qr = _as_dict(quote_request)
     mode = str(qr.get("mode") or "platform_models").strip() or "platform_models"
 
@@ -2305,130 +2613,6 @@ def _build_variants(*, quote_request: Dict[str, Any], request_hash: str, count: 
 
 
 # -----------------------------
-# Non-saree QC (best-of-N selection)
-# -----------------------------
-
-
-class NonSareeQC:
-    """
-    Fast, cheap QC that compares output vs human in ROIs.
-
-    Goals:
-      - Ensure the target garment region changed enough (upper/lower/both)
-      - Ensure the non-target region did NOT get destroyed (outfit completeness)
-      - Preserve face region (avoid identity destruction)
-    """
-
-    def __init__(self) -> None:
-        self.enabled = (os.getenv("COMMERCE_VTON_QC_ENABLE") or "1").strip().lower() not in ("0", "false", "no")
-        self.strict = (os.getenv("COMMERCE_VTON_QC_STRICT") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
-        self.timeout_s = _coerce_int(os.getenv("COMMERCE_VTON_QC_TIMEOUT_S"), 25) or 25
-        self.image_size = _coerce_int(os.getenv("COMMERCE_VTON_QC_IMAGE_SIZE"), 256) or 256
-
-        self.min_upper = float(os.getenv("COMMERCE_VTON_QC_MIN_UPPER_DIFF") or "0.04")
-        self.min_lower = float(os.getenv("COMMERCE_VTON_QC_MIN_LOWER_DIFF") or "0.04")
-        self.min_both_upper = float(os.getenv("COMMERCE_VTON_QC_MIN_DRESS_UPPER_DIFF") or "0.03")
-        self.min_both_lower = float(os.getenv("COMMERCE_VTON_QC_MIN_DRESS_LOWER_DIFF") or "0.05")
-
-        self.max_face = float(os.getenv("COMMERCE_VTON_QC_MAX_FACE_DIFF") or "0.14")
-        self.max_corners = float(os.getenv("COMMERCE_VTON_QC_MAX_CORNER_DIFF") or "0.15")
-
-        self.max_non_target = float(os.getenv("COMMERCE_VTON_QC_MAX_NON_TARGET_DIFF") or "0.20")
-
-    async def score(
-        self,
-        *,
-        human_url: str,
-        out_url: str,
-        garment_type: str,
-    ) -> Dict[str, Any]:
-        if not self.enabled:
-            return {"qc_enabled": False, "ok": True, "score": 0.0}
-
-        import io
-
-        from PIL import Image, ImageChops, ImageStat
-
-        size = int(self.image_size)
-        timeout_s = int(self.timeout_s)
-
-        def _fetch(url: str) -> Image.Image:
-            req = Request(url, headers={"User-Agent": "df-vton-qc"})
-            raw = urlopen(req, timeout=timeout_s).read()
-            im = Image.open(io.BytesIO(raw)).convert("RGB")
-            return im.resize((size, size))
-
-        def _roi(im: Image.Image, x0: float, x1: float, y0: float, y1: float) -> Image.Image:
-            w, h = im.size
-            box = (int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h))
-            return im.crop(box)
-
-        def _roi_diff(a: Image.Image, b: Image.Image, x0: float, x1: float, y0: float, y1: float) -> float:
-            da = _roi(a, x0, x1, y0, y1)
-            db = _roi(b, x0, x1, y0, y1)
-            d = ImageChops.difference(da, db)
-            st = ImageStat.Stat(d)
-            mean = float(sum(st.mean) / max(1.0, float(len(st.mean))))
-            return mean / 255.0
-
-        human = await asyncio.to_thread(_fetch, human_url)
-        out = await asyncio.to_thread(_fetch, out_url)
-
-        upper = _roi_diff(human, out, 0.10, 0.90, 0.18, 0.60)
-        lower = _roi_diff(human, out, 0.08, 0.92, 0.60, 0.98)
-
-        face = _roi_diff(human, out, 0.30, 0.70, 0.00, 0.28)
-
-        c1 = _roi_diff(human, out, 0.00, 0.18, 0.00, 0.18)
-        c2 = _roi_diff(human, out, 0.82, 1.00, 0.00, 0.18)
-        c3 = _roi_diff(human, out, 0.00, 0.18, 0.82, 1.00)
-        c4 = _roi_diff(human, out, 0.82, 1.00, 0.82, 1.00)
-        corners = (c1 + c2 + c3 + c4) / 4.0
-
-        gt = (garment_type or "upper_body").strip().lower()
-        ok_presence = True
-        ok_preserve = True
-
-        if gt == "upper_body":
-            ok_presence = upper >= self.min_upper
-        elif gt == "lower_body":
-            ok_presence = lower >= self.min_lower
-        else:
-            ok_presence = (upper >= self.min_both_upper) and (lower >= self.min_both_lower)
-
-        if face > self.max_face or corners > self.max_corners:
-            ok_preserve = False
-
-        if gt == "upper_body" and lower > self.max_non_target:
-            ok_preserve = False
-        if gt == "lower_body" and upper > self.max_non_target:
-            ok_preserve = False
-
-        ok = bool(ok_presence and ok_preserve)
-        score = float(upper + lower) - float(2.0 * face) - float(1.0 * corners)
-
-        return {
-            "qc_enabled": True,
-            "ok": ok,
-            "score": score,
-            "garment_type": gt,
-            "upper": upper,
-            "lower": lower,
-            "face": face,
-            "corners": corners,
-            "thresholds": {
-                "min_upper": self.min_upper,
-                "min_lower": self.min_lower,
-                "min_dress_upper": self.min_both_upper,
-                "min_dress_lower": self.min_both_lower,
-                "max_face": self.max_face,
-                "max_corners": self.max_corners,
-                "max_non_target": self.max_non_target,
-            },
-        }
-
-
-# -----------------------------
 # Main worker entry
 # -----------------------------
 
@@ -2449,6 +2633,10 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
     merged_meta: Dict[str, Any] = {}
     campaign_meta: Dict[str, Any] = {}
 
+    provider_name: Optional[str] = None
+    provider_meta: Dict[str, Any] = {}
+    product_assets_for_failure: Dict[str, Any] = {}
+
     async with pool.acquire() as con:
         persisted_pricing = await _load_latest_pricing(con, job_id=job_id)
         if persisted_pricing:
@@ -2460,7 +2648,7 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
             stage="running",
             patch={
                 "started_at": started_at,
-                "processor": "vton_v3",
+                "processor": "vton_v4",
                 "pricing": pricing if pricing else None,
                 "pricing_state": pricing.get("state") if pricing else None,
             },
@@ -2503,7 +2691,7 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                 "studio_job_id": str(job_id),
                 "quote_id": str(quote_id),
                 "commerce_campaign_id": str(campaign_id),
-                "processor": "vton_v3",
+                "processor": "vton_v4",
                 "started_at": started_at,
                 "pricing_state": pricing.get("state") if pricing else None,
                 "pricing_enabled": bool(pricing.get("enabled", False)) if pricing else False,
@@ -2601,31 +2789,57 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
 
         provider = VTONProvider()
 
-        must_have_inputs = bool(provider.enable_real and provider.provider == "fal" and not getattr(provider, "demo_mode", False))
+        must_have_inputs = bool(
+            provider.enable_real and provider.provider == "fal" and not getattr(provider, "demo_mode", False)
+        )
 
-        provider_selector_enabled = (os.getenv("COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR") or "1").strip().lower() not in ("0", "false", "no")
-        provider_force_when_missing = (os.getenv("COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN") or "1").strip().lower() not in ("0", "false", "no")
+        provider_selector_enabled = (os.getenv("COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR") or "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+        provider_force_when_missing = (
+            os.getenv("COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN") or "1"
+        ).strip().lower() not in ("0", "false", "no")
         platform_requested = _platform_mode_requested(
             quote_request=quote_request,
             product_assets=product_assets,
             model_ref=model_ref,
         )
-        allow_missing_human_for_provider_selector = bool(provider_selector_enabled and (platform_requested or provider_force_when_missing))
+        allow_missing_human_for_provider_selector = bool(
+            provider_selector_enabled and (platform_requested or provider_force_when_missing)
+        )
 
         if must_have_inputs:
             if not (isinstance(garment_url, str) and garment_url.strip()):
-                raise RuntimeError("commerce_processor: missing garment_image_url (provide product_assets.items[] or garment_image_url)")
+                raise RuntimeError(
+                    "commerce_processor: missing garment_image_url (provide product_assets.items[] or garment_image_url)"
+                )
             if not (isinstance(human_url, str) and human_url.strip()) and not allow_missing_human_for_provider_selector:
-                raise RuntimeError("commerce_processor: missing human_image_url (provide model_ref.image_url or model_ref.human_image_url)")
+                raise RuntimeError(
+                    "commerce_processor: missing human_image_url (provide model_ref.image_url or model_ref.human_image_url)"
+                )
         else:
             if not (isinstance(garment_url, str) and garment_url.strip()):
-                logger.warning("commerce_processor: garment_image_url missing; proceeding (demo/placeholder). quote_id=%s", quote_id)
+                logger.warning(
+                    "commerce_processor: garment_image_url missing; proceeding (demo/placeholder). quote_id=%s",
+                    quote_id,
+                )
                 garment_url = None
             if not (isinstance(human_url, str) and human_url.strip()) and not allow_missing_human_for_provider_selector:
-                logger.warning("commerce_processor: human_image_url missing; proceeding (demo/placeholder). quote_id=%s", quote_id)
+                logger.warning(
+                    "commerce_processor: human_image_url missing; proceeding (demo/placeholder). quote_id=%s",
+                    quote_id,
+                )
                 human_url = None
 
-        strict_gender = (os.getenv("COMMERCE_GENDER_COSTUME_STRICT") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
+        strict_gender = (os.getenv("COMMERCE_GENDER_COSTUME_STRICT") or "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
         model_gender = _extract_gender_from_model_ref(model_ref)
         gender_policy_dbg = _apply_gender_policy_or_raise(
             target_gender=target_gender,
@@ -2691,7 +2905,12 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                 con,
                 job_id=job_id,
                 stage="running",
-                patch={"request_hash": request_hash, "debug_inputs": debug_inputs, "pricing": pricing, "pricing_state": pricing.get("state") if pricing else None},
+                patch={
+                    "request_hash": request_hash,
+                    "debug_inputs": debug_inputs,
+                    "pricing": pricing,
+                    "pricing_state": pricing.get("state") if pricing else None,
+                },
             )
 
         req = VTONGenerateRequest(
@@ -2707,27 +2926,41 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
             variants=variants,
         )
 
+        product_assets_for_failure = dict(product_assets or {})
+
         result = await provider.generate(req)
 
-        urls = None
-        if isinstance(result, dict):
-            urls = result.get("urls") or _as_dict(result.get("computed")).get("urls")
-        else:
-            urls = getattr(result, "urls", None)
-
-        urls = _normalize_urls(urls)
-        bad = [u for u in urls if not u.startswith("http")]
-        if bad:
-            raise RuntimeError(f"COMMERCE_BAD_OUTPUT_URLS: {bad[:3]}")
-
-        provider_name = None
-        provider_meta: Dict[str, Any] = {}
         if isinstance(result, dict):
             provider_name = str(result.get("provider") or "unknown")
             provider_meta = _as_dict(result.get("meta"))
+            urls = result.get("urls") or _as_dict(result.get("computed")).get("urls")
         else:
             provider_name = str(getattr(result, "provider", "") or "unknown")
             provider_meta = _as_dict(getattr(result, "meta", None))
+            urls = getattr(result, "urls", None)
+
+        urls = _normalize_urls(urls)
+
+        if not urls:
+            failure = _provider_failure_from_meta(
+                provider_name=str(provider_name or "unknown"),
+                provider_meta=provider_meta,
+                product_assets=product_assets,
+            )
+            if not failure:
+                failure = _build_no_shippable_outputs_failure(
+                    provider_name=str(provider_name or "unknown"),
+                    provider_meta=provider_meta,
+                    product_assets=product_assets,
+                )
+            raise CommerceJobFailure(failure)
+
+        strict_variants = (os.getenv("COMMERCE_STRICT_VARIANT_TAGS") or "1").strip().lower() not in ("0", "false", "no")
+        _validate_variant_urls_or_raise(
+            job_id=job_id,
+            urls=urls,
+            strict=strict_variants,
+        )
 
         provider_platform_sel = _as_dict(provider_meta.get("platform_model_selection"))
         if provider_platform_sel:
@@ -2748,51 +2981,16 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                     if provider_platform_sel.get("gender") and not model_ref.get("gender"):
                         model_ref["gender"] = str(provider_platform_sel.get("gender"))
 
-        strict_variants = (os.getenv("COMMERCE_STRICT_VARIANT_TAGS") or "1").strip().lower() not in ("0", "false", "no")
-        _validate_variant_urls_or_raise(
-            job_id=job_id,
-            expected_count=expected_variant_count,
-            urls=urls,
-            strict=strict_variants,
-        )
+        best_idx, best_url = _pick_best_delivered_url(urls=urls, provider_meta=provider_meta)
 
-        qc = NonSareeQC()
-        qc_summary: Dict[str, Any] = {"qc_enabled": qc.enabled, "qc_strict": qc.strict}
-        best_idx: Optional[int] = None
-        ranked: List[Dict[str, Any]] = []
-        if qc.enabled and isinstance(human_url, str) and human_url.startswith("http") and urls:
-            gt = (
-                str(product_assets.get("garment_type") or "").strip().lower()
-                or _infer_garment_type_from_code(dominant_component_code)
-                or "upper_body"
-            )
-            for i, u in enumerate(urls[:expected_variant_count]):
-                try:
-                    r = await qc.score(human_url=str(human_url), out_url=str(u), garment_type=gt)
-                except Exception as e:
-                    r = {"qc_enabled": True, "ok": False, "score": -999.0, "error": f"{type(e).__name__}: {e}"}
-                ranked.append({"i": i, "url": u, **_as_dict(r)})
-
-            ok_items = [x for x in ranked if x.get("ok") is True]
-            if ok_items:
-                ok_items_sorted = sorted(ok_items, key=lambda x: float(x.get("score") or -999.0), reverse=True)
-                best_idx = int(ok_items_sorted[0]["i"])
-            else:
-                ranked_sorted = sorted(ranked, key=lambda x: float(x.get("score") or -999.0), reverse=True)
-                best_idx = int(ranked_sorted[0]["i"]) if ranked_sorted else None
-
-            qc_summary.update(
-                {
-                    "garment_type": gt,
-                    "ranked": ranked[: min(12, len(ranked))],
-                    "best_variant_index": best_idx,
-                    "best_url": (urls[best_idx] if best_idx is not None and best_idx < len(urls) else None),
-                    "ok_count": len([x for x in ranked if x.get("ok") is True]),
-                }
-            )
-
-            if qc.strict and not any(x.get("ok") is True for x in ranked):
-                raise RuntimeError(f"COMMERCE_VTON_QC_STRICT_FAILED qc={qc_summary}")
+        qc_summary: Dict[str, Any] = {
+            "provider_curated": True,
+            "requested_variant_count": expected_variant_count,
+            "returned_variant_count": len(urls),
+            "selection_reason": provider_meta.get("selection_reason"),
+            "selected_images": _as_list(provider_meta.get("selected_images"))[:4],
+            "candidates": _as_list(provider_meta.get("candidates"))[:8],
+        }
 
         finished_at = datetime.now(timezone.utc).isoformat()
 
@@ -2814,9 +3012,10 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                     "expected_variant_count": expected_variant_count,
                     "variant_count": len(urls),
                     "expected_variant_job_ids": expected_variant_job_ids,
+                    "returned_variant_job_ids": _variant_job_ids(job_id=job_id, count=len(urls)),
                     "urls": urls,
                     "best_variant_index": best_idx,
-                    "best_url": (urls[best_idx] if best_idx is not None and best_idx < len(urls) else None),
+                    "best_url": best_url,
                     "qc": qc_summary,
                     "provider": provider_name,
                     "provider_meta": _minify_provider_meta(provider_meta),
@@ -2837,6 +3036,9 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                     "provider": provider_name,
                     "request_hash": request_hash,
                     "best_variant_index": best_idx,
+                    "best_url": best_url,
+                    "variant_count": len(urls),
+                    "expected_variant_count": expected_variant_count,
                     "platform_model_selection": provider_platform_sel or _as_dict(platform_pick_dbg.get("selection")),
                     "pricing_state": pricing.get("state"),
                     "pricing": pricing,
@@ -2854,7 +3056,23 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
 
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
-        code = _extract_pricing_error_code(e) if isinstance(e, PricingClientError) else type(e).__name__.upper()
+        failure = _normalize_failure_from_exception(
+            exc=e,
+            product_assets=product_assets_for_failure,
+            provider_name=provider_name,
+            provider_meta=provider_meta,
+        )
+        failure = _attach_raw_error_to_failure(failure, err)
+
+        code = str(failure.get("code") or "").strip() or (
+            _extract_pricing_error_code(e) if isinstance(e, PricingClientError) else type(e).__name__.upper()
+        )
+        user_error_message = str(
+            failure.get("user_message")
+            or failure.get("message")
+            or err
+        )[:2000]
+
         logger.exception("commerce_processor: job failed job_id=%s quote_id=%s", job_id, quote_id)
         failed_at = datetime.now(timezone.utc).isoformat()
 
@@ -2874,13 +3092,16 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                 patch={
                     "failed_at": failed_at,
                     "error": err[:2000],
+                    "failure": failure,
                     "commerce_campaign_id": str(campaign_id) if campaign_id else None,
                     "quote_id": str(quote_id),
+                    "provider": provider_name,
+                    "provider_meta": _minify_provider_meta(provider_meta),
                     "pricing": pricing,
                     "pricing_state": pricing.get("state"),
                 },
                 error_code=code[:200] if code else None,
-                error_message=err[:2000],
+                error_message=user_error_message,
             )
             try:
                 merged_meta_fail = _merge(
@@ -2889,6 +3110,8 @@ async def process_commerce_job(*, job_id: UUID, payload: Dict[str, Any], meta: D
                         "failed_at": failed_at,
                         "status": "failed",
                         "error": err[:2000],
+                        "failure": failure,
+                        "provider": provider_name,
                         "pricing_state": pricing.get("state"),
                         "pricing": pricing,
                     },

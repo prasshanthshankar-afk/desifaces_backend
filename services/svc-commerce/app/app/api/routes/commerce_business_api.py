@@ -22,8 +22,130 @@ from app.services.ops.operational_controls import (
     make_request_fingerprint,
 )
 
-
 router = APIRouter(prefix="/api/commerce/v1", tags=["commerce-business-api"])
+
+
+# -----------------------------------------------------------------------------
+# tiny helpers
+# -----------------------------------------------------------------------------
+
+
+def _as_dict(x: Any) -> Dict[str, Any]:
+    if x is None:
+        return {}
+    if isinstance(x, dict):
+        return x
+    try:
+        return dict(x)
+    except Exception:
+        return {}
+
+
+def _as_list(x: Any) -> List[Any]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    if isinstance(x, tuple):
+        return list(x)
+    return []
+
+
+def _first_non_empty_dict(*candidates: Any) -> Dict[str, Any]:
+    for c in candidates:
+        d = _as_dict(c)
+        if d:
+            return d
+    return {}
+
+
+def _first_non_empty_str(*candidates: Any) -> Optional[str]:
+    for c in candidates:
+        s = str(c or "").strip()
+        if s:
+            return s
+    return None
+
+
+def _extract_failure_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Surface actionable failure details no matter where the repo persisted them.
+    Preference order:
+      1) explicit error_json.failure or error_json
+      2) resolved_json.failure
+      3) artifact_status_json.failure
+      4) fallback from legacy error/message fields
+    """
+    row_d = _as_dict(row)
+    error_json = _as_dict(row_d.get("error_json"))
+    resolved_json = _as_dict(row_d.get("resolved_json"))
+    artifact_status_json = _as_dict(row_d.get("artifact_status_json"))
+    qc_json = _as_dict(row_d.get("qc_json"))
+
+    failure = _first_non_empty_dict(
+        error_json.get("failure"),
+        error_json,
+        resolved_json.get("failure"),
+        artifact_status_json.get("failure"),
+        qc_json.get("failure"),
+    )
+    if failure:
+        return failure
+
+    error_code = _first_non_empty_str(
+        row_d.get("error_code"),
+        error_json.get("code"),
+        resolved_json.get("error_code"),
+        artifact_status_json.get("error_code"),
+    )
+    error_message = _first_non_empty_str(
+        row_d.get("error_message"),
+        error_json.get("message"),
+        resolved_json.get("error_message"),
+        artifact_status_json.get("error_message"),
+    )
+
+    if error_code or error_message:
+        return {
+            "code": error_code or "JOB_FAILED",
+            "category": "provider_error",
+            "message": error_message or "The commerce try-on job failed.",
+            "user_message": error_message or "The commerce try-on job failed.",
+        }
+
+    return {}
+
+
+def _normalize_outputs(outputs: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for item in _as_list(outputs):
+        d = _as_dict(item)
+        if d:
+            out.append(d)
+    return out
+
+
+def _normalize_errors(row: Dict[str, Any], failure: Dict[str, Any]) -> List[Dict[str, Any]]:
+    row_d = _as_dict(row)
+    errors: List[Dict[str, Any]] = []
+
+    err_json = _as_dict(row_d.get("error_json"))
+    if err_json:
+        errors.append(err_json)
+
+    if failure:
+        if not errors or failure != errors[0]:
+            errors.append(failure)
+
+    return errors
+
+
+def _safe_first_garment_kind(row: Dict[str, Any]) -> Optional[str]:
+    request_json = _as_dict(_as_dict(row).get("request_json"))
+    garments = _as_list(request_json.get("garment_assets"))
+    if garments:
+        return _as_dict(garments[0]).get("kind")
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -82,6 +204,18 @@ class BusinessJobCreateIn(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class FailureOut(BaseModel):
+    code: str
+    category: Optional[str] = None
+    message: str
+    user_message: Optional[str] = None
+    likely_causes: List[str] = Field(default_factory=list)
+    remedy: List[str] = Field(default_factory=list)
+    input_requirements: Dict[str, Any] = Field(default_factory=dict)
+    ownership: Dict[str, Any] = Field(default_factory=dict)
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
 class BusinessJobCreateOut(BaseModel):
     job_id: str
     client_job_id: Optional[str] = None
@@ -105,6 +239,7 @@ class BusinessJobStatusOut(BaseModel):
     artifact_status: Dict[str, Any] = Field(default_factory=dict)
     qc_summary: Optional[Dict[str, Any]] = None
     outputs: List[Dict[str, Any]] = Field(default_factory=list)
+    failure: Optional[FailureOut] = None
     errors: List[Dict[str, Any]] = Field(default_factory=list)
 
 
@@ -193,7 +328,6 @@ async def upload_asset(
     if not decision.allowed:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=decision.deny_reason)
 
-    # assets_service is expected to validate mime/resolution/NSFW and persist asset metadata.
     result = await assets_service.upload_business_asset(
         tenant_id=auth.tenant_id,
         upload=file,
@@ -377,6 +511,7 @@ async def get_business_job(
     t0 = time.time()
     request_id = str(uuid4())
     auth = await _authenticate(authorization, auth_service)
+
     decision = await rate_limits.check_and_increment(
         tenant_id=auth.tenant_id,
         route_pattern="/api/commerce/v1/jobs/{job_id}",
@@ -385,11 +520,22 @@ async def get_business_job(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=decision.deny_reason)
 
     row = await jobs_repo.get_by_id(job_id)
-    if not row or str(row.get("tenant_id")) != auth.tenant_id:
+    row_d = _as_dict(row)
+    if not row_d or str(row_d.get("tenant_id")) != auth.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
 
-    outputs = await jobs_repo.list_outputs(job_id)
-    resolved_json = row.get("resolved_json") or {}
+    outputs = _normalize_outputs(await jobs_repo.list_outputs(job_id))
+    resolved_json = _as_dict(row_d.get("resolved_json"))
+    artifact_status = _as_dict(row_d.get("artifact_status_json"))
+    failure = _extract_failure_from_row(row_d)
+    errors = _normalize_errors(row_d, failure)
+
+    qc_summary = _first_non_empty_dict(
+        row_d.get("qc_json"),
+        resolved_json.get("qc"),
+        resolved_json.get("qc_summary"),
+    ) or None
+
     await audit_logs.log(
         request_id=request_id,
         route_pattern="/api/commerce/v1/jobs/{job_id}",
@@ -397,36 +543,38 @@ async def get_business_job(
         http_status=200,
         tenant_id=auth.tenant_id,
         credential_id=auth.credential_id,
-        client_job_id=row.get("client_job_id"),
+        client_job_id=row_d.get("client_job_id"),
         business_job_id=job_id,
         remote_addr=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
         payload_size_bytes=0,
         duration_ms=int((time.time() - t0) * 1000),
-        provider_name=(resolved_json or {}).get("provider_name"),
-        provider_request_id=(resolved_json or {}).get("provider_request_id"),
-        audit_json={"status": row.get("status"), "stage": row.get("stage")},
+        provider_name=resolved_json.get("provider_name"),
+        provider_request_id=resolved_json.get("provider_request_id"),
+        audit_json={"status": row_d.get("status"), "stage": row_d.get("stage")},
     )
+
     return BusinessJobStatusOut(
-        job_id=str(row["id"]),
-        client_job_id=row.get("client_job_id"),
-        tenant_id=str(row["tenant_id"]),
-        status=str(row["status"]),
-        stage=str(row["stage"]),
-        created_at=str(row["created_at"]),
-        updated_at=str(row["updated_at"]),
+        job_id=str(row_d["id"]),
+        client_job_id=row_d.get("client_job_id"),
+        tenant_id=str(row_d["tenant_id"]),
+        status=str(row_d.get("status") or ""),
+        stage=str(row_d.get("stage") or ""),
+        created_at=str(row_d.get("created_at") or ""),
+        updated_at=str(row_d.get("updated_at") or ""),
         inputs_summary={
-            "garment_kinds": [g.get("kind") for g in (row.get("request_json") or {}).get("garment_assets", [])],
-            "target_gender": ((row.get("request_json") or {}).get("target_model") or {}).get("gender"),
-            "mode": row.get("mode"),
+            "garment_kinds": [g.get("kind") for g in _as_list(_as_dict(row_d.get("request_json")).get("garment_assets"))],
+            "target_gender": _as_dict(_as_dict(row_d.get("request_json")).get("target_model")).get("gender"),
+            "mode": row_d.get("mode"),
         },
         routing_summary={
-            "resolved_provider": (resolved_json or {}).get("provider_name"),
-            "resolved_category": (row.get("request_json") or {}).get("garment_assets", [{}])[0].get("kind"),
-            "resolved_platform_model_id": ((resolved_json or {}).get("platform_model_selection") or {}).get("platform_model_id"),
+            "resolved_provider": resolved_json.get("provider_name"),
+            "resolved_category": _safe_first_garment_kind(row_d),
+            "resolved_platform_model_id": _as_dict(resolved_json.get("platform_model_selection")).get("platform_model_id"),
         },
-        artifact_status=row.get("artifact_status_json") or {},
-        qc_summary=row.get("qc_json") or None,
-        outputs=outputs or [],
-        errors=[row.get("error_json")] if row.get("error_json") else [],
+        artifact_status=artifact_status,
+        qc_summary=qc_summary,
+        outputs=outputs,
+        failure=FailureOut(**failure) if failure else None,
+        errors=errors,
     )
