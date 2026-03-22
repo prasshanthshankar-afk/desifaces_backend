@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import logging
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
+from pydantic import BaseModel, ValidationError
 
 try:
     from desifaces_shared.pricing.client import PricingClientError
@@ -25,12 +25,16 @@ from app.config import settings
 from app.db import get_pool
 from app.domain.models import (
     ContextConfigView,
+    CreatorGenerateRequest,
     CreatorPlatformRequest,
     FaceGenerateRequest,
     FaceJobView,
     FaceProfileView,
     JobCreatedResponse,
     JobStatusResponse,
+    PricingConfirmationModel,
+    PricingPreviewRequestModel,
+    PricingPreviewResponseModel,
     RegionConfigView,
 )
 from app.repos.creator_config_repo import CreatorPlatformConfigRepo
@@ -108,6 +112,39 @@ def _localized_text(value: Any, language: str, fallback: str) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return fallback
+
+
+def _normalize_creator_generate_payload(
+    payload: Dict[str, Any],
+) -> tuple[CreatorPlatformRequest, Optional[PricingConfirmationModel]]:
+    """
+    Deterministic request parsing for creator generate.
+
+    Why this exists:
+    FastAPI/Pydantic union parsing can select the legacy CreatorPlatformRequest
+    and silently drop pricing_confirmation because that model is permissive.
+    So we parse the raw dict ourselves.
+
+    Supported request shapes:
+      - Legacy:
+          { ...CreatorPlatformRequest fields... }
+
+      - New:
+          {
+            "studio": "face",
+            "studio_input": { ...CreatorPlatformRequest fields... },
+            "pricing_confirmation": { ... }
+          }
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_request_body")
+
+    if "studio_input" in payload:
+        wrapped = CreatorGenerateRequest.model_validate(payload)
+        return wrapped.studio_input, wrapped.pricing_confirmation
+
+    legacy = CreatorPlatformRequest.model_validate(payload)
+    return legacy, None
 
 
 class UploadImageResponse(BaseModel):
@@ -394,25 +431,110 @@ async def list_legacy_user_jobs(
 # CREATOR PLATFORM (LIVE) - wired to CreatorOrchestrator
 # ------------------------------------------------------------------------------
 
+@router.post("/creator/pricing/preview", response_model=PricingPreviewResponseModel)
+async def creator_preview_pricing(
+    req: PricingPreviewRequestModel,
+    user_id: str = Depends(get_current_user_id),
+) -> PricingPreviewResponseModel:
+    """
+    Creator platform pricing preview.
+
+    Standardized flow:
+      1) frontend sends studio_input here
+      2) backend returns quote_id + preview_fingerprint + estimate/balance
+      3) frontend confirms and then calls /creator/generate
+    """
+    pool = await get_pool()
+    orch = CreatorOrchestrator(pool)
+
+    try:
+        return await orch.preview_pricing(
+            user_id=user_id,
+            request=req.studio_input,
+            client_context=req.client_context,
+        )
+
+    except PricingClientError as e:
+        logger.warning(
+            "creator_preview_pricing pricing preview failed user_id=%s err=%s",
+            user_id,
+            str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "error": "pricing_preview_failed",
+                "code": "DF_PRICING_PREVIEW_FAILED",
+                "message": str(e),
+            },
+        )
+
+    except ValueError as e:
+        reason = _parse_unsafe_prompt_reason(e)
+        if reason:
+            _raise_friendly_unsafe_prompt(user_id=str(user_id), reason=reason)
+
+        logger.warning("creator_preview_pricing ValueError user_id=%s err=%s", user_id, str(e))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "bad_request", "message": str(e)},
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception("creator_preview_pricing failed user_id=%s", user_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "internal_error",
+                "code": "DF_FACE_PRICING_PREVIEW_FAILED",
+                "message": "Failed to preview pricing.",
+            },
+        )
+
+
 @router.post("/creator/generate", response_model=JobCreatedResponse)
 async def creator_generate_faces(
-    req: CreatorPlatformRequest,
+    payload: Dict[str, Any] = Body(...),
     user_id: str = Depends(get_current_user_id),
 ) -> JobCreatedResponse:
     """
     Creator platform: database-driven diversity engine.
     Creates a job and returns creator job metadata.
 
+    Supported request shapes:
+      - Legacy: CreatorPlatformRequest
+      - New: CreatorGenerateRequest { studio_input, pricing_confirmation }
+
     For image-to-image identity lock:
-      - req.mode must be "image-to-image"
-      - req.source_image_url or req.source_image_asset_id must be provided
-      - req.preservation_strength ~ 0.15 - 0.35
+      - mode must be "image-to-image"
+      - source_image_url or source_image_asset_id must be provided
+      - preservation_strength ~ 0.15 - 0.35
     """
     pool = await get_pool()
     orch = CreatorOrchestrator(pool)
 
     try:
-        return await orch.create_job(user_id=user_id, request=req)
+        studio_req, pricing_confirmation = _normalize_creator_generate_payload(payload)
+
+        return await orch.create_job(
+            user_id=user_id,
+            request=studio_req,
+            pricing_confirmation=pricing_confirmation,
+        )
+
+    except ValidationError as e:
+        logger.warning("creator_generate_faces ValidationError user_id=%s err=%s", user_id, str(e))
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "validation_error",
+                "message": "Invalid creator generate request payload.",
+                "fields": e.errors(),
+            },
+        )
 
     except PricingClientError as e:
         logger.warning(

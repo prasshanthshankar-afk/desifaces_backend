@@ -1,4 +1,3 @@
-# services/creator_prompt_service.py
 from __future__ import annotations
 
 import hashlib
@@ -130,7 +129,6 @@ class CreatorPromptService:
             s = x.strip()
             if not s:
                 return []
-            # tolerate JSON list passed as string
             if s.startswith("[") and s.endswith("]"):
                 try:
                     j = json.loads(s)
@@ -140,6 +138,20 @@ class CreatorPromptService:
                     return []
             return [s]
         return []
+
+    @staticmethod
+    def _is_nonempty_code(x: Any) -> bool:
+        return bool(str(x or "").strip())
+
+    def _region_name(self, region: Any) -> str:
+        region_display = self._get(region, "display_name")
+        if isinstance(region_display, dict):
+            return (
+                self._as_text(region_display.get("en"))
+                or self._as_text(region_display.get("name"))
+                or self._as_text(self._get(region, "code"))
+            )
+        return self._as_text(region_display) or self._as_text(self._get(region, "code"))
 
     # ---------------------------------------------------------------------
     # Public: translate + validate
@@ -195,7 +207,7 @@ class CreatorPromptService:
         else:
             mode_norm = "text-to-image"
 
-        is_i2i = (mode_norm == "image-to-image")
+        is_i2i = mode_norm == "image-to-image"
 
         # -------------------------
         # Resolve configs from DB
@@ -207,7 +219,6 @@ class CreatorPromptService:
         region_code = request_dict.get("region_code")
         skin_tone_code = request_dict.get("skin_tone_code")
 
-        # Always resolve image_format + use_case (needed for output specs + prompt base)
         image_format = await self.config_repo.get_image_format_by_code(image_format_code) if image_format_code else None
         use_case = await self.config_repo.get_use_case_by_code(use_case_code) if use_case_code else None
 
@@ -242,9 +253,21 @@ class CreatorPromptService:
             except Exception:
                 style = None
 
-        context = await self.config_repo.get_context_by_code(request_dict.get("context_code")) if request_dict.get("context_code") else None
-        clothing = await self.config_repo.get_clothing_by_code(request_dict.get("clothing_style_code")) if request_dict.get("clothing_style_code") else None
-        platform = await self.config_repo.get_platform_requirements_by_code(request_dict.get("platform_code")) if request_dict.get("platform_code") else None
+        context = (
+            await self.config_repo.get_context_by_code(request_dict.get("context_code"))
+            if request_dict.get("context_code")
+            else None
+        )
+        clothing = (
+            await self.config_repo.get_clothing_by_code(request_dict.get("clothing_style_code"))
+            if request_dict.get("clothing_style_code")
+            else None
+        )
+        platform = (
+            await self.config_repo.get_platform_requirements_by_code(request_dict.get("platform_code"))
+            if request_dict.get("platform_code")
+            else None
+        )
 
         # Seed: respect explicit seed if present and job_seed not provided
         if job_seed is None:
@@ -269,8 +292,14 @@ class CreatorPromptService:
         )
         translated_prompt = self._as_text(translated_prompt)
 
+        # Track what the user explicitly supplied BEFORE T2I defaulting
+        explicit_gender = self._coerce_gender(request_dict.get("gender"))
+        explicit_age = self._is_nonempty_code(age_range_code)
+        explicit_region = self._is_nonempty_code(region_code)
+        explicit_skin_tone = self._is_nonempty_code(skin_tone_code)
+
         # Gender policy
-        gender = self._coerce_gender(request_dict.get("gender"))  # "" if not provided
+        gender = explicit_gender
         if (not is_i2i) and (not gender):
             gender = "female"  # T2I default
         # I2I: keep empty unless UI explicitly sends it
@@ -296,11 +325,7 @@ class CreatorPromptService:
                 demographic_parts.append(gp)
 
             if region:
-                region_display = self._get(region, "display_name")
-                if isinstance(region_display, dict):
-                    region_name = region_display.get("en") or region_display.get("name") or self._get(region, "code")
-                else:
-                    region_name = region_display or self._get(region, "code")
+                region_name = self._region_name(region)
                 if region_name:
                     demographic_parts.append(f"from {region_name}")
                 rb = self._as_text(self._get(region, "prompt_base"))
@@ -382,7 +407,6 @@ class CreatorPromptService:
             # Build creative parts
             creative_parts: List[str] = []
 
-            # Use-case base:
             if not is_i2i:
                 uc_base = self._as_text(self._get(use_case, "prompt_base"))
                 if uc_base:
@@ -412,7 +436,7 @@ class CreatorPromptService:
                         creative_parts.append(self._as_text(pm))
 
             if platform:
-                guidelines = platform.get("content_guidelines") or {}
+                guidelines = self._get(platform, "content_guidelines") or {}
                 if isinstance(guidelines, dict):
                     if guidelines.get("professionalism") == "high":
                         creative_parts.append("highly professional, polished, credible")
@@ -438,19 +462,19 @@ class CreatorPromptService:
                 demo_light: List[str] = []
                 if age_range:
                     demo_light.append(self._as_text(self._get(age_range, "prompt_descriptor")))
+
                 gp = gender_phrase(gender) if gender else None
                 if gp:
                     demo_light.append(gp)
+
                 if region:
-                    region_display = self._get(region, "display_name")
-                    if isinstance(region_display, dict):
-                        region_name = region_display.get("en") or region_display.get("name") or self._get(region, "code")
-                    else:
-                        region_name = region_display or self._get(region, "code")
+                    region_name = self._region_name(region)
                     if region_name:
                         demo_light.append(f"from {region_name}")
+
                 if skin_tone:
                     demo_light.append(self._as_text(self._get(skin_tone, "prompt_descriptor")))
+
                 if demo_light:
                     i2i_parts.append(self._join(demo_light))
 
@@ -467,47 +491,86 @@ class CreatorPromptService:
             if len(full_prompt) > 3500:
                 full_prompt = full_prompt[:3500].rstrip()
 
+            # -------------------------
             # Negative prompts
+            # -------------------------
             if is_i2i:
-                negative = [
+                negative: List[str] = [
                     "different person, different face, identity drift, face morphing",
-                    "face swap, wrong identity, wrong gender",
-                    "low quality, blurry, distorted, deformed, watermark, text overlay",
-                    self.safety.get_safety_negative_prompt(),
+                    "face swap, wrong identity",
                 ]
+
+                if explicit_gender:
+                    negative.append("wrong gender")
+
+                negative.extend(
+                    [
+                        "low quality, blurry, distorted, deformed, watermark, text overlay",
+                        self.safety.get_safety_negative_prompt(),
+                    ]
+                )
             else:
                 negative = [
-                    "different age, different skin tone, different ethnicity, different gender",
-                    "demographic change, western-only features, face morphing, identity drift",
-                    "clone-like, identical appearance, monotonous, generic stock photo",
-                    "low quality, blurry, distorted, deformed, watermark, text overlay",
-                    self.safety.get_safety_negative_prompt(),
+                    "clone-like, identical appearance, repeated identity, monotonous, generic stock photo",
+                    "face morphing, identity drift",
                 ]
+
+                # Only lock demographics the user explicitly supplied.
+                # Do NOT globally lock unspecified age / region / skin tone.
+                if explicit_age:
+                    negative.append("wrong age range, different age")
+
+                if explicit_skin_tone:
+                    negative.append("wrong skin tone")
+
+                if explicit_region:
+                    negative.append("wrong regional cues, incorrect regional identity cues")
+
+                # For T2I, gender is defaulted to female if omitted. It is still a desired output
+                # attribute for the request, but we avoid the old blanket demographic lock list.
+                if gender:
+                    negative.append("wrong gender")
+
+                negative.extend(
+                    [
+                        "low quality, blurry, distorted, deformed, watermark, text overlay",
+                        self.safety.get_safety_negative_prompt(),
+                    ]
+                )
 
             negative_prompt = self._join(negative)
 
-            variants.append({
-                "variant_number": variant_number,
-                "seed": int(variant_seed),
-                "prompt": full_prompt,
-                "negative_prompt": negative_prompt,
-                "technical_specs": {"width": width, "height": height, "aspect_ratio": aspect_ratio},
-                "creative_variations": {
-                    vt: {
-                        "code": vrow.get("code"),
-                        "prompt_modifier": vrow.get("prompt_modifier"),
-                        "professional_level": vrow.get("professional_level"),
-                        "creativity_level": vrow.get("creativity_level"),
-                        "mood_impact": vrow.get("mood_impact"),
-                        "use_case_compatibility": vrow.get("use_case_compatibility"),
-                    }
-                    for vt, vrow in chosen.items()
-                },
-                "prompt_used": full_prompt,
-                "demographic_base": demographic_prefix,  # keep key name stable for your existing logs/tools
-                "prompt_instruction": prompt_instruction,
-                "prompt_source": "preferred_variations" if preferred_variations else "translated_prompt",
-            })
+            variants.append(
+                {
+                    "variant_number": variant_number,
+                    "seed": int(variant_seed),
+                    "prompt": full_prompt,
+                    "negative_prompt": negative_prompt,
+                    "technical_specs": {"width": width, "height": height, "aspect_ratio": aspect_ratio},
+                    "creative_variations": {
+                        vt: {
+                            "code": vrow.get("code"),
+                            "prompt_modifier": vrow.get("prompt_modifier"),
+                            "professional_level": vrow.get("professional_level"),
+                            "creativity_level": vrow.get("creativity_level"),
+                            "mood_impact": vrow.get("mood_impact"),
+                            "use_case_compatibility": vrow.get("use_case_compatibility"),
+                        }
+                        for vt, vrow in chosen.items()
+                    },
+                    "prompt_used": full_prompt,
+                    "demographic_base": demographic_prefix,  # keep key name stable for your existing logs/tools
+                    "prompt_instruction": prompt_instruction,
+                    "prompt_source": "preferred_variations" if preferred_variations else "translated_prompt",
+                    "demographic_constraints": {
+                        "gender": gender,
+                        "gender_explicit": bool(explicit_gender),
+                        "age_range_explicit": bool(explicit_age),
+                        "region_explicit": bool(explicit_region),
+                        "skin_tone_explicit": bool(explicit_skin_tone),
+                    },
+                }
+            )
 
         resolved = {
             "mode": mode_norm,

@@ -32,6 +32,8 @@ class JobStatus(str, Enum):
 # ============================================================================
 # LEGACY COMPATIBILITY MODELS (for existing routes)
 # ============================================================================
+
+
 class FaceGenerateRequest(BaseModel):
     """Legacy model for backward compatibility with /api/face/generate"""
 
@@ -208,6 +210,110 @@ class CreatorPlatformRequest(BaseModel):
 
 
 # ============================================================================
+# PRICING MODELS (canonical cross-studio language)
+# ============================================================================
+
+
+class PricingConfirmationModel(BaseModel):
+    """
+    Passed by the frontend to prove the user saw and confirmed a preview.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    quote_id: str
+    preview_fingerprint: Optional[str] = None
+    user_confirmed: bool = True
+    client_presented_amount: Optional[str] = None
+    client_presented_currency: Optional[str] = None
+
+
+class CreatorGenerateRequest(BaseModel):
+    """
+    New wrapped generate request.
+    Keep legacy compatibility by still allowing routes to accept CreatorPlatformRequest
+    during migration, but this is the target contract.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    studio: str = "face"
+    studio_input: CreatorPlatformRequest
+    pricing_confirmation: Optional[PricingConfirmationModel] = None
+
+
+class PricingStateView(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    state: str
+
+    quote_id: Optional[str] = None
+    quote_expires_at: Optional[str] = None
+    preview_fingerprint: Optional[str] = None
+    reservation_id: Optional[str] = None
+
+    service_name: Optional[str] = None
+    service_action: Optional[str] = None
+    sku_code: Optional[str] = None
+    unit_type: Optional[str] = None
+
+    estimated_units: Optional[str] = None
+    reserved_units: Optional[str] = None
+    actual_units: Optional[str] = None
+    billed_units: Optional[str] = None
+    released_units: Optional[str] = None
+
+    estimated_amount: Optional[str] = None
+    final_amount: Optional[str] = None
+
+    # Backward-compatible raw money field from current pricing block
+    amount: Optional[str] = None
+    currency: Optional[str] = None
+    ledger_entry_id: Optional[str] = None
+
+    billing_mode: Optional[str] = None
+    billing_account_id: Optional[str] = None
+    settlement_mode: Optional[str] = None
+    pricing_mode: Optional[str] = None
+    entitlement_source: Optional[str] = None
+    entitlement_reason: Optional[str] = None
+    tier_code: Optional[str] = None
+
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PricingSummaryView(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    display_estimate: Optional[str] = None
+    display_final: Optional[str] = None
+    display_delta: Optional[str] = None
+    display_note: Optional[str] = None
+
+
+class PricingPreviewRequestModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    studio: str = "face"
+    action: str = "generate"
+    studio_input: CreatorPlatformRequest
+    client_context: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PricingPreviewResponseModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    studio: str = "face"
+    action: str = "generate"
+
+    quote_id: str
+    quote_expires_at: Optional[str] = None
+    preview_fingerprint: Optional[str] = None
+
+    pricing: PricingStateView
+    balance: Dict[str, Any] = Field(default_factory=dict)
+    summary: Dict[str, Any] = Field(default_factory=dict)
+
+
+# ============================================================================
 # RESPONSES (creator platform)
 # ============================================================================
 
@@ -220,6 +326,9 @@ class JobCreatedResponse(BaseModel):
     message: str
     estimated_completion_time: str
     config: Dict[str, Any]
+
+    # New standardized pricing response block
+    pricing: Optional[PricingStateView] = None
 
 
 class GeneratedVariant(BaseModel):
@@ -243,6 +352,11 @@ class JobStatusResponse(BaseModel):
     progress: Optional[Dict[str, Any]] = None
     variants: Optional[List[GeneratedVariant]] = None
     error: Optional[str] = None
+
+    # New standardized pricing blocks
+    pricing: Optional[PricingStateView] = None
+    pricing_summary: Optional[PricingSummaryView] = None
+
     created_at: datetime
     updated_at: datetime
 

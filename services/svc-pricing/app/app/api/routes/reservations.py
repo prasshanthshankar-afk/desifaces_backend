@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional, Sequence
 from uuid import UUID
@@ -12,11 +13,13 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.api.deps import PoolDep
+from app.services.engine.pricing_engine import quote_variant
 from app.services.entitlement_service import resolve_entitlement
 from app.services.reservations.reservation_service import (
     FinalizeReceipt,
     ReservationView,
     finalize as finalize_impl,
+    get_balance,
     release as release_impl,
     reserve as reserve_impl,
 )
@@ -192,6 +195,19 @@ def _normalize_settlement_mode(x: Any) -> str:
     if s in {"hybrid", "mixed"}:
         return "hybrid"
     return ""
+
+
+def _stable_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def _compute_preview_fingerprint(payload: Dict[str, Any]) -> str:
+    stable = _stable_json(payload)
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
+def _make_quote_id(preview_fingerprint: str) -> str:
+    return f"qt_{preview_fingerprint[:24]}"
 
 
 async def _table_exists(conn, regclass_name: str) -> bool:
@@ -477,6 +493,31 @@ async def _patch_quote_json(
     )
 
 
+def _build_preview_summary(
+    *,
+    estimated_amount: str,
+    currency: str,
+    units: str,
+    unit_type: str,
+) -> Dict[str, Any]:
+    display_total = f"{currency} {estimated_amount}" if currency else estimated_amount
+    display_unit_rate = None
+    try:
+        amt = Decimal(str(estimated_amount or "0"))
+        qty = Decimal(str(units or "0"))
+        if qty > 0:
+            unit_amt = (amt / qty).quantize(Decimal("0.01"))
+            display_unit_rate = f"{currency} {unit_amt} / {unit_type}" if currency else f"{unit_amt} / {unit_type}"
+    except Exception:
+        display_unit_rate = None
+
+    return {
+        "display_total": display_total,
+        "display_unit_rate": display_unit_rate,
+        "display_estimate_note": "Final charge may be lower if fewer outputs succeed.",
+    }
+
+
 # ---------------------------------------------------------------------
 # internal caller auth
 # ---------------------------------------------------------------------
@@ -515,7 +556,7 @@ def _require_internal_pricing_caller(
         for s in (
             os.getenv(
                 "DF_PRICING_ALLOWED_SERVICES",
-                "svc-face,svc-commerce,svc-music,svc-marketing",
+                "svc-face,svc-audio,svc-fusion,svc-commerce,svc-music,svc-marketing",
             )
         ).split(",")
         if s.strip()
@@ -538,6 +579,53 @@ def _require_internal_pricing_caller(
 # ---------------------------------------------------------------------
 # request / response models
 # ---------------------------------------------------------------------
+class PricingPreviewRequest(BaseModel):
+    user_id: str
+    service_name: str
+    service_action: str
+    sku_code: str
+    units: str
+    external_ref_type: str = "studio_job_preview"
+    external_ref_id: Optional[str] = None
+    idempotency_key: str
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PricingPreviewResponse(BaseModel):
+    status: str = "quoted"
+
+    quote_id: Optional[str] = None
+    quote_expires_at: Optional[str] = None
+    preview_fingerprint: Optional[str] = None
+
+    service_name: Optional[str] = None
+    service_action: Optional[str] = None
+    sku_code: Optional[str] = None
+    unit_type: Optional[str] = None
+
+    estimated_units: Optional[str] = None
+    estimated_amount: Optional[str] = None
+    currency: Optional[str] = None
+
+    billing_mode: Optional[str] = None
+    pricing_mode: Optional[str] = None
+    entitlement_source: Optional[str] = None
+    entitlement_reason: Optional[str] = None
+    tier_code: Optional[str] = None
+    billing_account_id: Optional[str] = None
+    settlement_mode: Optional[str] = None
+
+    before_credits: Optional[str] = None
+    after_estimated_credits: Optional[str] = None
+    before_money: Optional[str] = None
+    after_estimated_money: Optional[str] = None
+
+    quote_breakdown: Dict[str, Any] = Field(default_factory=dict)
+    summary: Dict[str, Any] = Field(default_factory=dict)
+
+    message: Optional[str] = None
+
+
 class PricingReserveRequest(BaseModel):
     user_id: str
     service_name: str
@@ -547,6 +635,8 @@ class PricingReserveRequest(BaseModel):
     external_ref_type: str = "studio_job"
     external_ref_id: str
     idempotency_key: str
+    quote_id: Optional[str] = None
+    preview_fingerprint: Optional[str] = None
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -554,6 +644,7 @@ class PricingReserveResponse(BaseModel):
     status: str = "reserved"
     reservation_id: Optional[str] = None
     quote_id: Optional[str] = None
+    preview_fingerprint: Optional[str] = None
     reserved_units: Optional[str] = None
     billed_units: Optional[str] = None
     amount: Optional[str] = None
@@ -634,6 +725,213 @@ class ReservationOut(BaseModel):
 
 
 # ---------------------------------------------------------------------
+# preview -> quote + balance + entitlement context (no reservation)
+# ---------------------------------------------------------------------
+@router.post("/api/pricing/reservations/preview", response_model=PricingPreviewResponse)
+async def preview_reservation(
+    req: PricingPreviewRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    x_service_name: Optional[str] = Header(default=None, alias="X-Service-Name"),
+    pool=PoolDep,
+) -> PricingPreviewResponse:
+    caller = _require_internal_pricing_caller(authorization, x_user_id, x_service_name)
+
+    if str(req.user_id) != str(caller.user_id):
+        raise HTTPException(status_code=403, detail="user_mismatch")
+
+    user_uuid = UUID(str(req.user_id))
+    meta = _as_dict_loose(req.meta)
+    channel = _first_non_empty(meta.get("channel"), "service")
+    country_code = _norm_country(meta.get("country_code"))
+    currency = _norm_currency(meta.get("currency"))
+
+    requested_units = _to_units_str(req.units, "1")
+    params = {
+        **meta,
+        "service_name": req.service_name,
+        "service_action": req.service_action,
+        "external_ref_type": req.external_ref_type,
+        "external_ref_id": req.external_ref_id,
+        "requested_units": requested_units,
+        "variant_count": _to_int(req.units, 1),
+        "units": requested_units,
+        "caller_service_name": caller.service_name,
+    }
+
+    async with pool.acquire() as conn:
+        resolved = await resolve_entitlement(
+            conn,
+            user_id=user_uuid,
+            service_name=req.service_name,
+            service_action=req.service_action,
+            sku_code=req.sku_code,
+            channel=channel,
+            country_code=country_code,
+        )
+        if resolved.reason == "PRICING_UNKNOWN_OR_INACTIVE_VARIANT":
+            raise HTTPException(status_code=404, detail=resolved.reason)
+        if not resolved.allowed:
+            raise HTTPException(status_code=403, detail=resolved.reason or "ENTITLEMENT_BLOCKED")
+
+        billing_ctx = await _resolve_billing_account_context(conn, user_uuid)
+        settlement_mode = _resolve_effective_settlement_mode(
+            account_billing_mode=str(billing_ctx.get("account_billing_mode") or "prepaid"),
+            entitlement_billing_mode=str(resolved.billing_mode or ""),
+            meta=meta,
+        )
+
+        final_currency = currency or str(billing_ctx.get("default_currency") or "USD")
+
+        try:
+            quote = await quote_variant(
+                conn,
+                user_id=user_uuid,
+                variant_code=req.sku_code,
+                params=params,
+                channel=channel,
+                country_code=country_code,
+                currency=final_currency,
+                billing_mode=resolved.pricing_mode,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        balance = await get_balance(conn, user_uuid)
+
+        quote_lines = []
+        for line in getattr(quote, "lines", []) or []:
+            quote_lines.append(
+                {
+                    "sku_code": getattr(line, "sku_code", None),
+                    "name": getattr(line, "name", None),
+                    "category": getattr(line, "category", None),
+                    "provider_hint": getattr(line, "provider_hint", None),
+                    "unit": getattr(line, "unit", None),
+                    "qty": str(getattr(line, "qty", None)) if getattr(line, "qty", None) is not None else None,
+                    "unit_credits": getattr(line, "unit_credits", None),
+                    "line_credits": getattr(line, "line_credits", None),
+                    "unit_money": (
+                        str(getattr(line, "unit_money", None))
+                        if getattr(line, "unit_money", None) is not None
+                        else None
+                    ),
+                    "line_money": (
+                        str(getattr(line, "line_money", None))
+                        if getattr(line, "line_money", None) is not None
+                        else None
+                    ),
+                }
+            )
+
+        quote_breakdown = {
+            "pricing_engine_version": "1",
+            "quote_kind": "preview",
+            "variant_code": str(getattr(quote, "variant_code", req.sku_code) or req.sku_code),
+            "sku_code": req.sku_code,
+            "service_name": req.service_name,
+            "service_action": req.service_action,
+            "channel": channel,
+            "country_code": country_code,
+            "currency": str(getattr(quote, "currency", None) or final_currency or "USD"),
+            "requested_units": requested_units,
+            "estimated_units": requested_units,
+            "total_credits": str(getattr(quote, "total_credits", 0) or 0),
+            "total_money": _safe_money_str(getattr(quote, "total_money", None)),
+            "pricebook_id": (
+                str(getattr(quote, "pricebook_id", None))
+                if getattr(quote, "pricebook_id", None) is not None
+                else None
+            ),
+            "billing_mode_snapshot": resolved.billing_mode,
+            "pricing_mode_used": resolved.pricing_mode,
+            "entitlement_source": resolved.source,
+            "entitlement_reason": resolved.reason,
+            "tier_code": resolved.tier_code,
+            "module_code": resolved.module_code,
+            "category": resolved.category,
+            "billing_account_id": billing_ctx.get("billing_account_id"),
+            "billing_account_code": billing_ctx.get("billing_account_code"),
+            "billing_account_type": billing_ctx.get("billing_account_type"),
+            "account_billing_mode": billing_ctx.get("account_billing_mode"),
+            "settlement_mode": settlement_mode,
+            "lines": quote_lines,
+            "balance_before": {
+                "balance_credits": int(getattr(balance, "balance_credits", 0) or 0),
+                "reserved_credits": int(getattr(balance, "reserved_credits", 0) or 0),
+                "available_credits": int(getattr(balance, "available_credits", 0) or 0),
+            },
+        }
+
+    preview_payload = {
+        "user_id": req.user_id,
+        "service_name": req.service_name,
+        "service_action": req.service_action,
+        "sku_code": req.sku_code,
+        "units": requested_units,
+        "external_ref_type": req.external_ref_type,
+        "external_ref_id": req.external_ref_id,
+        "idempotency_key": req.idempotency_key,
+        "quote_breakdown": quote_breakdown,
+    }
+    preview_fingerprint = _compute_preview_fingerprint(preview_payload)
+    quote_id = _make_quote_id(preview_fingerprint)
+    quote_expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+
+    estimated_credits = int(getattr(balance, "balance_credits", 0) or 0)
+    reserved_credits = int(getattr(balance, "reserved_credits", 0) or 0)
+    available_credits = int(getattr(balance, "available_credits", 0) or 0)
+
+    quoted_credits = _to_int(getattr(quote, "total_credits", 0), 0)
+    before_credits = str(estimated_credits)
+    after_estimated_credits = str(max(0, available_credits - quoted_credits))
+    estimated_amount = _safe_money_str(getattr(quote, "total_money", None))
+    currency_text = str(getattr(quote, "currency", None) or final_currency or "USD")
+
+    quote_breakdown.update(
+        {
+            "quote_id": quote_id,
+            "quote_expires_at": quote_expires_at,
+            "preview_fingerprint": preview_fingerprint,
+            "estimated_amount": estimated_amount,
+        }
+    )
+
+    return PricingPreviewResponse(
+        status="quoted",
+        quote_id=quote_id,
+        quote_expires_at=quote_expires_at,
+        preview_fingerprint=preview_fingerprint,
+        service_name=req.service_name,
+        service_action=req.service_action,
+        sku_code=req.sku_code,
+        unit_type="image",
+        estimated_units=requested_units,
+        estimated_amount=estimated_amount,
+        currency=currency_text,
+        billing_mode=str(resolved.billing_mode or ""),
+        pricing_mode=str(resolved.pricing_mode or ""),
+        entitlement_source=str(resolved.source or ""),
+        entitlement_reason=str(resolved.reason or "") if resolved.reason else None,
+        tier_code=str(resolved.tier_code or "") if resolved.tier_code else None,
+        billing_account_id=str(billing_ctx.get("billing_account_id") or "") or None,
+        settlement_mode=settlement_mode or None,
+        before_credits=before_credits,
+        after_estimated_credits=after_estimated_credits,
+        before_money=None,
+        after_estimated_money=None,
+        quote_breakdown=quote_breakdown,
+        summary=_build_preview_summary(
+            estimated_amount=estimated_amount,
+            currency=currency_text,
+            units=requested_units,
+            unit_type="image",
+        ),
+        message="Preview created",
+    )
+
+
+# ---------------------------------------------------------------------
 # reserve -> real reserve_impl
 # ---------------------------------------------------------------------
 @router.post("/api/pricing/reservations/reserve", response_model=PricingReserveResponse)
@@ -665,6 +963,8 @@ async def reserve_reservation(
         "variant_count": _to_int(req.units, 1),
         "units": _to_units_str(req.units, "1"),
         "caller_service_name": caller.service_name,
+        "quote_id": req.quote_id,
+        "preview_fingerprint": req.preview_fingerprint,
     }
 
     async with pool.acquire() as conn:
@@ -744,6 +1044,8 @@ async def reserve_reservation(
                 "billing_account_type": billing_ctx.get("billing_account_type"),
                 "account_billing_mode": billing_ctx.get("account_billing_mode"),
                 "settlement_mode": settlement_mode,
+                "quote_id": req.quote_id,
+                "preview_fingerprint": req.preview_fingerprint,
             },
         )
 
@@ -759,7 +1061,9 @@ async def reserve_reservation(
             ("economics", "quote_id"),
             ("economics_final", "quote_id"),
         )
+        or req.quote_id
         or None,
+        preview_fingerprint=_first_non_empty(qb.get("preview_fingerprint"), req.preview_fingerprint) or None,
         reserved_units=_to_units_str(
             getattr(rv, "reserved_credits", None),
             "0",

@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
@@ -17,12 +18,25 @@ try:
     from desifaces_shared.pricing.client import PricingClientError, SvcPricingClient
     from desifaces_shared.pricing.models import (
         PricingCommitRequest,
+        PricingPreviewRequest,
         PricingReleaseRequest,
         PricingReserveRequest,
     )
 except Exception:
     class PricingClientError(Exception):
         pass
+
+    @dataclass
+    class PricingPreviewRequest:
+        user_id: str
+        service_name: str
+        service_action: str
+        sku_code: str
+        units: str
+        external_ref_type: str
+        external_ref_id: Optional[str]
+        idempotency_key: str
+        meta: Dict[str, Any]
 
     @dataclass
     class PricingReserveRequest:
@@ -34,6 +48,8 @@ except Exception:
         external_ref_type: str
         external_ref_id: str
         idempotency_key: str
+        quote_id: Optional[str]
+        preview_fingerprint: Optional[str]
         meta: Dict[str, Any]
 
     @dataclass
@@ -63,6 +79,9 @@ except Exception:
         def from_env(cls, service_name: str) -> "SvcPricingClient":
             return cls()
 
+        async def preview(self, req: PricingPreviewRequest):
+            raise PricingClientError("pricing client unavailable")
+
         async def reserve(self, req: PricingReserveRequest):
             raise PricingClientError("pricing client unavailable")
 
@@ -79,6 +98,10 @@ from ..domain.models import (
     JobCreatedResponse,
     JobStatus,
     JobStatusResponse,
+    PricingConfirmationModel,
+    PricingPreviewResponseModel,
+    PricingStateView,
+    PricingSummaryView,
 )
 
 from ..repos.artifacts_repo import ArtifactsRepo
@@ -263,12 +286,12 @@ class CreatorOrchestrator:
     @staticmethod
     def _coerce_gender(g: Any) -> str:
         if g is None:
-            return "person"
+            return ""
         if hasattr(g, "value"):
-            return str(g.value)
+            return str(g.value or "").strip()
         if isinstance(g, dict) and "value" in g:
-            return str(g.get("value"))
-        return str(g)
+            return str(g.get("value") or "").strip()
+        return str(g).strip()
 
     @staticmethod
     def _coerce_dict(v: Any) -> Dict[str, Any]:
@@ -358,6 +381,37 @@ class CreatorOrchestrator:
         except Exception:
             pass
         return u
+
+    @staticmethod
+    def _decimal_or_zero(v: Any) -> Decimal:
+        try:
+            if v is None or str(v).strip() == "":
+                return Decimal("0")
+            return Decimal(str(v))
+        except (InvalidOperation, ValueError, TypeError):
+            return Decimal("0")
+
+    @classmethod
+    def _money_str(cls, v: Any, default: str = "0.00") -> str:
+        try:
+            d = cls._decimal_or_zero(v).quantize(Decimal("0.01"))
+            return format(d, "f")
+        except Exception:
+            return default
+
+    @classmethod
+    def _units_str(cls, v: Any, default: str = "0") -> str:
+        try:
+            d = cls._decimal_or_zero(v)
+            if d == d.to_integral():
+                return str(int(d))
+            return format(d.normalize(), "f")
+        except Exception:
+            return default
+
+    @staticmethod
+    def _clean_text(v: Any) -> str:
+        return str(v or "").strip()
 
     async def _get_media_asset_row(self, asset_id: str) -> Optional[Dict[str, Any]]:
         try:
@@ -539,13 +593,20 @@ class CreatorOrchestrator:
             "estimated_units": str(requested_variants),
             "unit_type": "image",
             "mode": mode,
+            "quote_id": None,
+            "quote_expires_at": None,
+            "preview_fingerprint": None,
             "reservation_id": None,
             "reservation_status": None,
-            "quote_id": None,
+            "quote_idempotency_key": None,
+            "quote_breakdown": {},
+            "summary": {},
             "reserved_units": None,
             "actual_units": None,
             "billed_units": None,
             "released_units": None,
+            "estimated_amount": None,
+            "final_amount": None,
             "amount": None,
             "currency": None,
             "ledger_entry_id": None,
@@ -556,6 +617,9 @@ class CreatorOrchestrator:
             "entitlement_source": None,
             "entitlement_reason": None,
             "tier_code": None,
+            "client_presented_amount": None,
+            "client_presented_currency": None,
+            "user_confirmed": None,
             "meta": {
                 "requested_variants": requested_variants,
                 "mode": mode,
@@ -690,6 +754,8 @@ class CreatorOrchestrator:
             external_ref_type="studio_job",
             external_ref_id=str(job_id),
             idempotency_key=f"svc-face:job:{job_id}:reserve",
+            quote_id=self._string_or_none(pricing.get("quote_id")),
+            preview_fingerprint=self._string_or_none(pricing.get("preview_fingerprint")),
             meta=self._coerce_dict(pricing.get("meta")),
         )
 
@@ -697,16 +763,30 @@ class CreatorOrchestrator:
             resp = await self.pricing_client.reserve(req)
             reserve_status = str(self._pricing_resp_get(resp, "status", "reserved") or "reserved")
 
+            reserve_amount = self._pricing_resp_get(resp, "amount")
+            quote_id = self._pricing_resp_get(resp, "quote_id") or pricing.get("quote_id")
+            preview_fingerprint = self._pricing_resp_get(resp, "preview_fingerprint") or pricing.get(
+                "preview_fingerprint"
+            )
+            billing_mode = self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode")
+            resp_reserved_units = self._pricing_resp_get(resp, "reserved_units")
+
+            normalized_reserved_units = resp_reserved_units
+            if str(billing_mode or "").strip().lower() == "bill" and str(resp_reserved_units or "").strip() in {"", "0"}:
+                normalized_reserved_units = None
+
             pricing = self._merge_pricing_block(
                 pricing,
                 state="reserved",
                 reservation_id=self._pricing_resp_get(resp, "reservation_id"),
-                quote_id=self._pricing_resp_get(resp, "quote_id"),
-                reserved_units=self._pricing_resp_get(resp, "reserved_units") or pricing.get("estimated_units"),
+                quote_id=quote_id,
+                preview_fingerprint=preview_fingerprint,
+                reserved_units=normalized_reserved_units,
                 reservation_status=reserve_status,
-                amount=self._pricing_resp_get(resp, "amount"),
-                currency=self._pricing_resp_get(resp, "currency"),
-                billing_mode=self._pricing_resp_get(resp, "billing_mode"),
+                estimated_amount=reserve_amount or pricing.get("estimated_amount"),
+                amount=reserve_amount or pricing.get("amount"),
+                currency=self._pricing_resp_get(resp, "currency") or pricing.get("currency"),
+                billing_mode=billing_mode,
                 billing_account_id=self._pricing_resp_get(resp, "billing_account_id"),
                 settlement_mode=self._pricing_resp_get(resp, "settlement_mode"),
                 pricing_mode=self._pricing_resp_get(resp, "pricing_mode"),
@@ -786,6 +866,7 @@ class CreatorOrchestrator:
                 )
             )
             commit_status = str(self._pricing_resp_get(resp, "status", "committed") or "committed")
+            committed_amount = self._pricing_resp_get(resp, "amount")
             pricing = self._merge_pricing_block(
                 pricing,
                 state="committed",
@@ -794,8 +875,9 @@ class CreatorOrchestrator:
                 reservation_status=commit_status,
                 ledger_entry_id=self._pricing_resp_get(resp, "ledger_entry_id"),
                 billed_units=self._pricing_resp_get(resp, "billed_units") or str(max(1, int(actual_units))),
-                amount=self._pricing_resp_get(resp, "amount"),
-                currency=self._pricing_resp_get(resp, "currency"),
+                final_amount=committed_amount or pricing.get("final_amount") or pricing.get("amount"),
+                amount=committed_amount or pricing.get("amount"),
+                currency=self._pricing_resp_get(resp, "currency") or pricing.get("currency"),
                 billing_mode=self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
                 billing_account_id=self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
                 settlement_mode=self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
@@ -870,6 +952,7 @@ class CreatorOrchestrator:
                 release_status=release_status,
                 reservation_status=release_status,
                 released_units=self._pricing_resp_get(resp, "released_units"),
+                final_amount=pricing.get("final_amount") or "0.00",
                 billing_mode=self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
                 billing_account_id=self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
                 settlement_mode=self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
@@ -951,35 +1034,7 @@ class CreatorOrchestrator:
             if picked:
                 rd["image_format_code"] = picked
 
-        if not (rd.get("age_range_code") or "").strip():
-            try:
-                ages = await self.creator_config_repo.get_age_ranges()
-                if ages:
-                    a0 = ages[0]
-                    code = a0.get("code") if isinstance(a0, dict) else getattr(a0, "code", None)
-                    if code:
-                        rd["age_range_code"] = str(code)
-            except Exception:
-                pass
-
-        if not (rd.get("skin_tone_code") or "").strip():
-            try:
-                tones = await self.creator_config_repo.get_skin_tones()
-                picked = None
-                for t in (tones or []):
-                    c = t.get("code") if isinstance(t, dict) else getattr(t, "code", None)
-                    if c == "medium_brown":
-                        picked = "medium_brown"
-                        break
-                if not picked and tones:
-                    t0 = tones[0]
-                    c0 = t0.get("code") if isinstance(t0, dict) else getattr(t0, "code", None)
-                    picked = str(c0) if c0 else None
-                if picked:
-                    rd["skin_tone_code"] = picked
-            except Exception:
-                pass
-
+        # Intentionally DO NOT auto-default age_range_code or skin_tone_code.
         return rd
 
     # -------------------------
@@ -1013,36 +1068,36 @@ class CreatorOrchestrator:
     ) -> None:
         q = """
         INSERT INTO public.provider_runs (
-          job_id,
-          provider,
-          idempotency_key,
-          provider_status,
-          request_json,
-          response_json,
-          meta_json,
-          created_at,
-          updated_at
+            job_id,
+            provider,
+            idempotency_key,
+            provider_status,
+            request_json,
+            response_json,
+            meta_json,
+            created_at,
+            updated_at
         )
         VALUES (
-          $1::uuid,
-          $2::text,
-          $3::text,
-          $4::text,
-          $5::jsonb,
-          $6::jsonb,
-          $7::jsonb,
-          now(),
-          now()
+            $1::uuid,
+            $2::text,
+            $3::text,
+            $4::text,
+            $5::jsonb,
+            $6::jsonb,
+            $7::jsonb,
+            now(),
+            now()
         )
         ON CONFLICT (idempotency_key)
         DO UPDATE SET
-          job_id = EXCLUDED.job_id,
-          provider = EXCLUDED.provider,
-          provider_status = EXCLUDED.provider_status,
-          request_json = EXCLUDED.request_json,
-          response_json = EXCLUDED.response_json,
-          meta_json = EXCLUDED.meta_json,
-          updated_at = now()
+            job_id = EXCLUDED.job_id,
+            provider = EXCLUDED.provider,
+            provider_status = EXCLUDED.provider_status,
+            request_json = EXCLUDED.request_json,
+            response_json = EXCLUDED.response_json,
+            meta_json = EXCLUDED.meta_json,
+            updated_at = now()
         """
         try:
             await self.jobs_repo.execute_command(
@@ -1201,51 +1256,135 @@ class CreatorOrchestrator:
         job_seed: int,
         request_hash: str,
         request_dict: Dict[str, Any],
+        variant_number: int = 1,
+        variant_seed: Optional[int] = None,
     ) -> Dict[str, str]:
+        variant_scope = f"{request_hash}|v={int(variant_number)}|vs={int(variant_seed or 0)}"
+
         signature = hashlib.sha256(
-            f"{self.ID_CONTEXT}|{job_seed}|{request_hash}".encode("utf-8")
+            f"{self.ID_CONTEXT}|{job_seed}|{variant_scope}".encode("utf-8")
         ).hexdigest()[:12]
 
-        face = self._id_pick(job_seed=job_seed, request_hash=request_hash, key="face_shape", options=self.ID_FACE_SHAPES)
-        jaw = self._id_pick(job_seed=job_seed, request_hash=request_hash, key="jawline", options=self.ID_JAWLINES)
-        nose = self._id_pick(job_seed=job_seed, request_hash=request_hash, key="nose", options=self.ID_NOSES)
-        eyes = self._id_pick(job_seed=job_seed, request_hash=request_hash, key="eyes", options=self.ID_EYES)
-        spacing = self._id_pick(job_seed=job_seed, request_hash=request_hash, key="eye_spacing", options=self.ID_EYE_SPACING)
+        face = self._id_pick(
+            job_seed=job_seed,
+            request_hash=variant_scope,
+            key="face_shape",
+            options=self.ID_FACE_SHAPES,
+        )
+        jaw = self._id_pick(
+            job_seed=job_seed,
+            request_hash=variant_scope,
+            key="jawline",
+            options=self.ID_JAWLINES,
+        )
+        nose = self._id_pick(
+            job_seed=job_seed,
+            request_hash=variant_scope,
+            key="nose",
+            options=self.ID_NOSES,
+        )
+        eyes = self._id_pick(
+            job_seed=job_seed,
+            request_hash=variant_scope,
+            key="eyes",
+            options=self.ID_EYES,
+        )
+        spacing = self._id_pick(
+            job_seed=job_seed,
+            request_hash=variant_scope,
+            key="eye_spacing",
+            options=self.ID_EYE_SPACING,
+        )
         proportions = self._id_pick(
             job_seed=job_seed,
-            request_hash=request_hash,
+            request_hash=variant_scope,
             key="proportions",
             options=self.ID_FACE_PROPORTIONS,
         )
 
         cheek = (
-            self._id_pick(job_seed=job_seed, request_hash=request_hash, key="cheekbones", options=self.ID_CHEEKBONES)
-            if self._id_bool(job_seed=job_seed, request_hash=request_hash, key="use_cheekbones", true_pct=70)
+            self._id_pick(
+                job_seed=job_seed,
+                request_hash=variant_scope,
+                key="cheekbones",
+                options=self.ID_CHEEKBONES,
+            )
+            if self._id_bool(
+                job_seed=job_seed,
+                request_hash=variant_scope,
+                key="use_cheekbones",
+                true_pct=70,
+            )
             else ""
         )
         brows = (
-            self._id_pick(job_seed=job_seed, request_hash=request_hash, key="brows", options=self.ID_EYEBROWS)
-            if self._id_bool(job_seed=job_seed, request_hash=request_hash, key="use_brows", true_pct=60)
+            self._id_pick(
+                job_seed=job_seed,
+                request_hash=variant_scope,
+                key="brows",
+                options=self.ID_EYEBROWS,
+            )
+            if self._id_bool(
+                job_seed=job_seed,
+                request_hash=variant_scope,
+                key="use_brows",
+                true_pct=60,
+            )
             else ""
         )
         lips = (
-            self._id_pick(job_seed=job_seed, request_hash=request_hash, key="lips", options=self.ID_LIPS)
-            if self._id_bool(job_seed=job_seed, request_hash=request_hash, key="use_lips", true_pct=60)
+            self._id_pick(
+                job_seed=job_seed,
+                request_hash=variant_scope,
+                key="lips",
+                options=self.ID_LIPS,
+            )
+            if self._id_bool(
+                job_seed=job_seed,
+                request_hash=variant_scope,
+                key="use_lips",
+                true_pct=60,
+            )
             else ""
         )
         chin = (
-            self._id_pick(job_seed=job_seed, request_hash=request_hash, key="chin", options=self.ID_CHINS)
-            if self._id_bool(job_seed=job_seed, request_hash=request_hash, key="use_chin", true_pct=55)
+            self._id_pick(
+                job_seed=job_seed,
+                request_hash=variant_scope,
+                key="chin",
+                options=self.ID_CHINS,
+            )
+            if self._id_bool(
+                job_seed=job_seed,
+                request_hash=variant_scope,
+                key="use_chin",
+                true_pct=55,
+            )
             else ""
         )
 
         expression = (
-            self._id_pick(job_seed=job_seed, request_hash=request_hash, key="expression", options=self.ID_EXPRESSIONS)
-            if self._id_bool(job_seed=job_seed, request_hash=request_hash, key="use_expression", true_pct=65)
+            self._id_pick(
+                job_seed=job_seed,
+                request_hash=variant_scope,
+                key="expression",
+                options=self.ID_EXPRESSIONS,
+            )
+            if self._id_bool(
+                job_seed=job_seed,
+                request_hash=variant_scope,
+                key="use_expression",
+                true_pct=65,
+            )
             else "neutral expression"
         )
 
-        mark = self._id_pick(job_seed=job_seed, request_hash=request_hash, key="marks", options=self.ID_MARKS)
+        mark = self._id_pick(
+            job_seed=job_seed,
+            request_hash=variant_scope,
+            key="marks",
+            options=self.ID_MARKS,
+        )
 
         base_anchor = "different person, distinct facial identity, unique individual"
         realism = "natural facial asymmetry, realistic pores, realistic skin texture"
@@ -1270,31 +1409,138 @@ class CreatorOrchestrator:
         ]
         tokens = f"{base_anchor}, {', '.join(parts)}, {realism}"
 
-        user_prompt = str(request_dict.get("user_prompt") or "").lower()
-        neg = self.ID_NEG_DEFAULT
-        if "smile" in user_prompt:
-            neg = neg
-
         return {
             "signature": signature,
             "tokens": tokens,
-            "negative_tokens": neg,
+            "negative_tokens": self.ID_NEG_DEFAULT,
         }
 
     # -------------------------
-    # Public API
+    # Pricing preview / summary helpers
     # -------------------------
-    async def create_job(self, user_id: str, request: CreatorPlatformRequest) -> JobCreatedResponse:
-        logger.info(
-            "Creating creator platform job",
-            extra={
-                "user_id": user_id,
-                "image_format": getattr(request, "image_format_code", None),
-                "use_case": getattr(request, "use_case_code", None),
-                "variants": getattr(request, "num_variants", None),
-            },
+    def _pricing_to_view(self, pricing: Dict[str, Any]) -> Optional[PricingStateView]:
+        if not pricing:
+            return None
+
+        final_amount = pricing.get("final_amount")
+        if final_amount in (None, "") and str(pricing.get("state") or "").lower() == "committed":
+            final_amount = pricing.get("amount")
+
+        estimated_amount = pricing.get("estimated_amount")
+        if estimated_amount in (None, "") and str(pricing.get("state") or "").lower() in {"reserved", "committed"}:
+            estimated_amount = pricing.get("amount")
+
+        reserved_units = pricing.get("reserved_units")
+        if str(pricing.get("billing_mode") or "").strip().lower() == "bill" and str(reserved_units or "").strip() == "0":
+            reserved_units = None
+
+        return PricingStateView(
+            state=str(pricing.get("state") or ""),
+            quote_id=self._string_or_none(pricing.get("quote_id")),
+            quote_expires_at=self._string_or_none(pricing.get("quote_expires_at")),
+            preview_fingerprint=self._string_or_none(pricing.get("preview_fingerprint")),
+            reservation_id=self._string_or_none(pricing.get("reservation_id")),
+            service_name=self._string_or_none(pricing.get("service_name")),
+            service_action=self._string_or_none(pricing.get("service_action")),
+            sku_code=self._string_or_none(pricing.get("sku_code")),
+            unit_type=self._string_or_none(pricing.get("unit_type")),
+            estimated_units=self._string_or_none(pricing.get("estimated_units")),
+            reserved_units=self._string_or_none(reserved_units),
+            actual_units=self._string_or_none(pricing.get("actual_units")),
+            billed_units=self._string_or_none(pricing.get("billed_units")),
+            released_units=self._string_or_none(pricing.get("released_units")),
+            estimated_amount=self._string_or_none(estimated_amount),
+            final_amount=self._string_or_none(final_amount),
+            amount=self._string_or_none(pricing.get("amount")),
+            currency=self._string_or_none(pricing.get("currency")),
+            ledger_entry_id=self._string_or_none(pricing.get("ledger_entry_id")),
+            billing_mode=self._string_or_none(pricing.get("billing_mode")),
+            billing_account_id=self._string_or_none(pricing.get("billing_account_id")),
+            settlement_mode=self._string_or_none(pricing.get("settlement_mode")),
+            pricing_mode=self._string_or_none(pricing.get("pricing_mode")),
+            entitlement_source=self._string_or_none(pricing.get("entitlement_source")),
+            entitlement_reason=self._string_or_none(pricing.get("entitlement_reason")),
+            tier_code=self._string_or_none(pricing.get("tier_code")),
+            meta=self._coerce_dict(pricing.get("meta")),
         )
 
+    def _pricing_summary_view(self, pricing: Dict[str, Any]) -> Optional[PricingSummaryView]:
+        if not pricing:
+            return None
+
+        state = self._clean_text(pricing.get("state")).lower()
+        currency = self._clean_text(pricing.get("currency"))
+
+        estimated_amount = self._money_str(
+            pricing.get("estimated_amount")
+            if pricing.get("estimated_amount") not in (None, "")
+            else pricing.get("amount")
+        )
+
+        def _fmt(amount_text: Optional[str]) -> Optional[str]:
+            if amount_text in (None, ""):
+                return None
+            return f"{currency} {amount_text}" if currency else amount_text
+
+        if state == "committed":
+            final_amount = self._money_str(
+                pricing.get("final_amount")
+                if pricing.get("final_amount") not in (None, "")
+                else pricing.get("amount")
+            )
+            est_dec = self._decimal_or_zero(estimated_amount)
+            fin_dec = self._decimal_or_zero(final_amount)
+            delta = fin_dec - est_dec
+            delta_text = format(delta.quantize(Decimal("0.01")), "f")
+
+            return PricingSummaryView(
+                display_estimate=_fmt(estimated_amount),
+                display_final=_fmt(final_amount),
+                display_delta=_fmt(delta_text),
+                display_note="Final charge recorded after execution.",
+            )
+
+        if state == "released":
+            final_amount = "0.00"
+            est_dec = self._decimal_or_zero(estimated_amount)
+            fin_dec = self._decimal_or_zero(final_amount)
+            delta = fin_dec - est_dec
+            delta_text = format(delta.quantize(Decimal("0.01")), "f")
+
+            return PricingSummaryView(
+                display_estimate=_fmt(estimated_amount),
+                display_final=_fmt(final_amount),
+                display_delta=_fmt(delta_text),
+                display_note="No charge because the reservation was released.",
+            )
+
+        if state in {"quoted", "reserved", "pending_reservation"}:
+            return PricingSummaryView(
+                display_estimate=_fmt(estimated_amount),
+                display_final=None,
+                display_delta=None,
+                display_note="Estimated amount reserved pending execution.",
+            )
+
+        if state == "disabled":
+            return PricingSummaryView(
+                display_estimate=_fmt(estimated_amount),
+                display_final=None,
+                display_delta=None,
+                display_note="Pricing is disabled for this request.",
+            )
+
+        return PricingSummaryView(
+            display_estimate=_fmt(estimated_amount),
+            display_final=None,
+            display_delta=None,
+            display_note="Pricing is being processed.",
+        )
+
+    async def _prepare_creator_request_dict(
+        self,
+        request: CreatorPlatformRequest,
+    ) -> Tuple[JsonDict, Dict[str, Any], str]:
         request_dict: JsonDict = request.model_dump(mode="json")
 
         if not (request_dict.get("user_prompt") or "").strip():
@@ -1303,25 +1549,16 @@ class CreatorOrchestrator:
                 request_dict["user_prompt"] = p
 
         mode = self._coerce_mode(request_dict.get("mode"))
+        request_dict["mode"] = mode
 
         if mode == "image-to-image":
             asset_ref = (request_dict.get("source_image_asset_id") or "").strip()
             url_ref = (request_dict.get("source_image_url") or "").strip()
             ref = asset_ref or url_ref
-
-            logger.debug(
-                "Image-to-image mode; resolving source image ref",
-                extra={"asset_ref": asset_ref or None, "url_ref": url_ref or None},
-            )
-
             if not ref:
                 raise ValueError("missing_required_fields: ['source_image_url'] for image-to-image mode")
 
-            try:
-                resolved = await self._resolve_source_image_ref(ref)
-            except Exception as e:
-                raise ValueError(f"invalid_source_image_url:{ref} err={e!s}") from e
-
+            resolved = await self._resolve_source_image_ref(ref)
             request_dict["source_image_ref"] = ref
             request_dict["source_image_url"] = resolved
 
@@ -1342,6 +1579,183 @@ class CreatorOrchestrator:
             request_dict.update(translation_meta)
 
         request_dict = await self._ensure_required_config_codes(request_dict)
+        return request_dict, translation_meta, mode
+
+    async def preview_pricing(
+        self,
+        *,
+        user_id: str,
+        request: CreatorPlatformRequest,
+        client_context: Optional[Dict[str, Any]] = None,
+    ) -> PricingPreviewResponseModel:
+        request_dict, _, mode = await self._prepare_creator_request_dict(request)
+
+        pricing = self._build_initial_pricing_block(request_dict)
+        if not pricing.get("enabled"):
+            preview_payload = {
+                "service_name": pricing.get("service_name"),
+                "service_action": pricing.get("service_action"),
+                "sku_code": pricing.get("sku_code"),
+                "estimated_units": pricing.get("estimated_units"),
+                "mode": mode,
+                "request": {
+                    "image_format_code": request_dict.get("image_format_code"),
+                    "use_case_code": request_dict.get("use_case_code"),
+                    "platform_code": request_dict.get("platform_code"),
+                },
+            }
+            preview_fingerprint = hashlib.sha256(self._stable_json(preview_payload).encode("utf-8")).hexdigest()
+            quote_id = f"qt_{preview_fingerprint[:24]}"
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="quoted",
+                quote_id=quote_id,
+                preview_fingerprint=preview_fingerprint,
+                quote_expires_at=None,
+                estimated_amount="0.00",
+                currency="USD",
+                summary={
+                    "display_total": "USD 0.00",
+                    "display_unit_rate": None,
+                    "display_estimate_note": "Pricing is currently disabled.",
+                },
+            )
+            return PricingPreviewResponseModel(
+                studio="face",
+                action="generate",
+                quote_id=quote_id,
+                quote_expires_at=None,
+                preview_fingerprint=preview_fingerprint,
+                pricing=self._pricing_to_view(pricing) or PricingStateView(state="quoted"),
+                balance={
+                    "before_credits": None,
+                    "after_estimated_credits": None,
+                    "before_money": None,
+                    "after_estimated_money": None,
+                },
+                summary=self._coerce_dict(pricing.get("summary")),
+            )
+
+        request_hash_payload = {
+            "language": request_dict.get("language"),
+            "user_prompt": request_dict.get("user_prompt"),
+            "user_prompt_translated_en": request_dict.get("user_prompt_translated_en")
+            or request_dict.get("translated_prompt"),
+            "num_variants": request_dict.get("num_variants"),
+            "age_range_code": request_dict.get("age_range_code"),
+            "skin_tone_code": request_dict.get("skin_tone_code"),
+            "region_code": request_dict.get("region_code"),
+            "gender": request_dict.get("gender"),
+            "image_format_code": request_dict.get("image_format_code"),
+            "use_case_code": request_dict.get("use_case_code"),
+            "style_code": request_dict.get("style_code"),
+            "context_code": request_dict.get("context_code"),
+            "clothing_style_code": request_dict.get("clothing_style_code"),
+            "platform_code": request_dict.get("platform_code"),
+            "mode": mode,
+        }
+
+        if mode == "image-to-image":
+            if (request_dict.get("source_image_asset_id") or "").strip():
+                request_hash_payload["source_image_asset_id"] = request_dict.get("source_image_asset_id")
+            else:
+                request_hash_payload["source_image_url"] = self._stable_source_url_for_hash(
+                    str(request_dict.get("source_image_url") or "")
+                )
+            request_hash_payload["preservation_strength"] = request_dict.get("preservation_strength")
+
+        preview_ref = self._generate_request_hash(request_hash_payload)
+
+        preview_meta = {
+            **self._coerce_dict(pricing.get("meta")),
+            "channel": "service",
+            "country_code": self._clean_text((client_context or {}).get("country_code")),
+            "currency": self._clean_text((client_context or {}).get("currency")),
+            "client_context": client_context or {},
+            "request_hash": preview_ref,
+            "mode": mode,
+        }
+
+        resp = await self.pricing_client.preview(
+            PricingPreviewRequest(
+                user_id=str(user_id),
+                service_name=str(pricing.get("service_name") or "svc-face"),
+                service_action=str(pricing.get("service_action") or ""),
+                sku_code=str(pricing.get("sku_code") or ""),
+                units=str(pricing.get("estimated_units") or "1"),
+                external_ref_type="studio_job_preview",
+                external_ref_id=preview_ref,
+                idempotency_key=f"svc-face:preview:{preview_ref}",
+                meta=preview_meta,
+            )
+        )
+
+        quote_id = self._clean_text(self._pricing_resp_get(resp, "quote_id")) or f"qt_{preview_ref}"
+        preview_fingerprint = self._clean_text(self._pricing_resp_get(resp, "preview_fingerprint")) or hashlib.sha256(
+            f"{quote_id}|{preview_ref}".encode("utf-8")
+        ).hexdigest()
+
+        quote_breakdown = self._coerce_dict(self._pricing_resp_get(resp, "quote_breakdown"))
+        summary = self._coerce_dict(self._pricing_resp_get(resp, "summary"))
+
+        pricing = self._merge_pricing_block(
+            pricing,
+            state=str(self._pricing_resp_get(resp, "status", "quoted") or "quoted"),
+            quote_id=quote_id,
+            quote_expires_at=self._pricing_resp_get(resp, "quote_expires_at"),
+            preview_fingerprint=preview_fingerprint,
+            estimated_amount=self._pricing_resp_get(resp, "estimated_amount"),
+            amount=self._pricing_resp_get(resp, "estimated_amount"),
+            currency=self._pricing_resp_get(resp, "currency"),
+            billing_mode=self._pricing_resp_get(resp, "billing_mode"),
+            billing_account_id=self._pricing_resp_get(resp, "billing_account_id"),
+            settlement_mode=self._pricing_resp_get(resp, "settlement_mode"),
+            pricing_mode=self._pricing_resp_get(resp, "pricing_mode"),
+            entitlement_source=self._pricing_resp_get(resp, "entitlement_source"),
+            entitlement_reason=self._pricing_resp_get(resp, "entitlement_reason"),
+            tier_code=self._pricing_resp_get(resp, "tier_code"),
+            quote_breakdown=quote_breakdown,
+            summary=summary,
+        )
+
+        pricing_view = self._pricing_to_view(pricing) or PricingStateView(state="quoted")
+
+        return PricingPreviewResponseModel(
+            studio="face",
+            action="generate",
+            quote_id=quote_id,
+            quote_expires_at=self._string_or_none(self._pricing_resp_get(resp, "quote_expires_at")),
+            preview_fingerprint=preview_fingerprint,
+            pricing=pricing_view,
+            balance={
+                "before_credits": self._pricing_resp_get(resp, "before_credits"),
+                "after_estimated_credits": self._pricing_resp_get(resp, "after_estimated_credits"),
+                "before_money": self._pricing_resp_get(resp, "before_money"),
+                "after_estimated_money": self._pricing_resp_get(resp, "after_estimated_money"),
+            },
+            summary=summary,
+        )
+
+    # -------------------------
+    # Public API
+    # -------------------------
+    async def create_job(
+        self,
+        user_id: str,
+        request: CreatorPlatformRequest,
+        pricing_confirmation: Optional[PricingConfirmationModel] = None,
+    ) -> JobCreatedResponse:
+        logger.info(
+            "Creating creator platform job",
+            extra={
+                "user_id": user_id,
+                "image_format": getattr(request, "image_format_code", None),
+                "use_case": getattr(request, "use_case_code", None),
+                "variants": getattr(request, "num_variants", None),
+            },
+        )
+
+        request_dict, translation_meta, mode = await self._prepare_creator_request_dict(request)
 
         pre_mode = self._pre_resolve_seed_mode(request_dict)
 
@@ -1401,7 +1815,32 @@ class CreatorOrchestrator:
         request_dict["mode"] = mode
 
         pricing = self._build_initial_pricing_block(request_dict)
+
+        if pricing.get("enabled"):
+            if not pricing_confirmation:
+                raise ValueError("missing_pricing_confirmation")
+            if not bool(pricing_confirmation.user_confirmed):
+                raise ValueError("pricing_confirmation_not_confirmed")
+            if not self._clean_text(pricing_confirmation.quote_id):
+                raise ValueError("missing_quote_id")
+
+            pricing = self._merge_pricing_block(
+                pricing,
+                quote_id=self._clean_text(pricing_confirmation.quote_id),
+                preview_fingerprint=self._clean_text(pricing_confirmation.preview_fingerprint),
+                client_presented_amount=self._clean_text(pricing_confirmation.client_presented_amount),
+                client_presented_currency=self._clean_text(pricing_confirmation.client_presented_currency),
+                user_confirmed=bool(pricing_confirmation.user_confirmed),
+            )
+
         request_dict["pricing"] = pricing
+
+        explicit_demographics = bool(
+            (request_dict.get("age_range_code") or "").strip()
+            or (request_dict.get("region_code") or "").strip()
+            or (request_dict.get("skin_tone_code") or "").strip()
+            or self._coerce_gender(request_dict.get("gender"))
+        )
 
         job_id = await self.jobs_repo.create_job(
             user_id=user_id,
@@ -1429,6 +1868,7 @@ class CreatorOrchestrator:
                 "pricing_billing_mode": pricing.get("billing_mode"),
                 "pricing_settlement_mode": pricing.get("settlement_mode"),
                 "pricing_billing_account_id": pricing.get("billing_account_id"),
+                "demographics_fixed": explicit_demographics,
             },
         )
 
@@ -1460,12 +1900,13 @@ class CreatorOrchestrator:
                 "image_format": request_dict.get("image_format_code"),
                 "platform_optimized": True,
                 "variants_requested": request_dict.get("num_variants"),
-                "demographics_fixed": True,
+                "demographics_fixed": explicit_demographics,
                 "creativity_varied": True,
                 "mode": mode,
                 "pricing_state": pricing.get("state"),
                 "pricing_enabled": bool(pricing.get("enabled")),
             },
+            pricing=self._pricing_to_view(pricing),
         )
 
     async def process_job(self, job_id: str) -> None:
@@ -1608,19 +2049,26 @@ class CreatorOrchestrator:
                 )
 
             if mode == "text-to-image":
-                ident = self._build_identity_profile(
-                    job_seed=int(job_seed),
-                    request_hash=request_hash,
-                    request_dict=payload_json,
-                )
-                identity_signature = ident.get("signature")
-
                 for v in variants:
-                    v["identity_signature"] = identity_signature
+                    vn = int(v.get("variant_number") or 1)
+                    vseed = int(v.get("seed") or 0)
+
+                    ident = self._build_identity_profile(
+                        job_seed=int(job_seed),
+                        request_hash=request_hash,
+                        request_dict=payload_json,
+                        variant_number=vn,
+                        variant_seed=vseed,
+                    )
+
+                    v["identity_signature"] = ident.get("signature")
+
                     p = (v.get("prompt") or "").strip()
                     n = (v.get("negative_prompt") or "").strip()
                     v["prompt"] = f"{p}, {ident['tokens']}" if p else ident["tokens"]
-                    v["negative_prompt"] = f"{n}, {ident['negative_tokens']}" if n else ident["negative_tokens"]
+                    v["negative_prompt"] = (
+                        f"{n}, {ident['negative_tokens']}" if n else ident["negative_tokens"]
+                    )
 
             generated: List[GeneratedVariant] = []
 
@@ -1878,7 +2326,9 @@ class CreatorOrchestrator:
                     job_id=job_id,
                     variant=variant_num,
                 )
-            elif hasattr(self.storage_service, "upload_from_file") and callable(getattr(self.storage_service, "upload_from_file")):
+            elif hasattr(self.storage_service, "upload_from_file") and callable(
+                getattr(self.storage_service, "upload_from_file")
+            ):
                 ext = "png" if "png" in content_type else "jpg"
                 tmp_out_path = f"/tmp/df_face_out_{uuid.uuid4().hex}.{ext}"
                 with open(tmp_out_path, "wb") as f:
@@ -1890,7 +2340,9 @@ class CreatorOrchestrator:
                     job_id=job_id,
                     variant=variant_num,
                 )
-            elif hasattr(self.storage_service, "upload_local_file") and callable(getattr(self.storage_service, "upload_local_file")):
+            elif hasattr(self.storage_service, "upload_local_file") and callable(
+                getattr(self.storage_service, "upload_local_file")
+            ):
                 ext = "png" if "png" in content_type else "jpg"
                 tmp_out_path = f"/tmp/df_face_out_{uuid.uuid4().hex}.{ext}"
                 with open(tmp_out_path, "wb") as f:
@@ -2101,6 +2553,7 @@ class CreatorOrchestrator:
           negative_prompt = EXCLUDED.negative_prompt,
           technical_specs = EXCLUDED.technical_specs,
           creative_variations = EXCLUDED.creative_variations
+        )
         """
         await self.jobs_repo.execute_command(
             q,
@@ -2226,6 +2679,9 @@ class CreatorOrchestrator:
             if pricing.get("settlement_mode"):
                 progress["pricing_settlement_mode"] = pricing.get("settlement_mode")
 
+        pricing_view = self._pricing_to_view(pricing)
+        pricing_summary = self._pricing_summary_view(pricing)
+
         return JobStatusResponse(
             job_id=job_id,
             status=status_enum,
@@ -2233,6 +2689,8 @@ class CreatorOrchestrator:
             progress=progress,
             variants=variants if variants else None,
             error=self._row_get(job, "error_message", None),
+            pricing=pricing_view,
+            pricing_summary=pricing_summary,
             created_at=self._row_get(job, "created_at", None),
             updated_at=self._row_get(job, "updated_at", None),
         )

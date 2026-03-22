@@ -11,6 +11,8 @@ from pydantic import BaseModel
 from .models import (
     PricingCommitRequest,
     PricingCommitResponse,
+    PricingPreviewRequest,
+    PricingPreviewResponse,
     PricingReleaseRequest,
     PricingReleaseResponse,
     PricingReserveRequest,
@@ -116,6 +118,14 @@ class SvcPricingClient:
             pass
 
         return response_type.model_validate({"status": "ok"})
+
+    async def preview(self, req: PricingPreviewRequest) -> PricingPreviewResponse:
+        return await self._post(
+            "/api/pricing/reservations/preview",
+            req,
+            PricingPreviewResponse,
+            user_id=req.user_id,
+        )
 
     async def reserve(self, req: PricingReserveRequest) -> PricingReserveResponse:
         return await self._post(
