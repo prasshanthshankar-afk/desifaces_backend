@@ -23,6 +23,7 @@ class CreatorPromptService:
       - I2I: DO NOT inject demographic defaults; do NOT append random “Andhra/Kerala” style bases.
             The USER_PROMPT (edit instruction) must dominate.
             By default, we minimize variation modifiers that fight the edit.
+            Head, body, limbs must be proportionally consistent with each other and the original photo.
             (Optionally enable extra variations via request_dict["enable_i2i_variations"]=True.)
     """
 

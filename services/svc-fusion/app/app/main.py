@@ -1,8 +1,44 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 import os
 from fastapi import FastAPI
 from app.api import build_router
+from app.config import settings
+from app.db import get_pool
+from app.services.fusion_orchestrator import FusionOrchestrator
+
+logger = logging.getLogger("svc-fusion.main")
+
+
+async def _recovery_loop() -> None:
+    pool = await get_pool()
+    orch = FusionOrchestrator(pool)
+    owner = f"fusion-recovery:{os.getpid()}"
+    logger.info(
+        "fusion recovery loop started batch=%s stale_seconds=%s claim_ttl_seconds=%s poll_seconds=%.2f",
+        settings.FUSION_RECOVERY_BATCH_SIZE,
+        settings.FUSION_RECOVERY_STALE_SECONDS,
+        settings.FUSION_RECOVERY_CLAIM_TTL_SECONDS,
+        float(settings.FUSION_RECOVERY_POLL_SECONDS),
+    )
+    while True:
+        try:
+            recovered = await orch.recover_stale_processing_jobs_once(
+                limit=max(1, int(settings.FUSION_RECOVERY_BATCH_SIZE)),
+                stale_seconds=max(15, int(settings.FUSION_RECOVERY_STALE_SECONDS)),
+                claim_ttl_seconds=max(15, int(settings.FUSION_RECOVERY_CLAIM_TTL_SECONDS)),
+                owner=owner,
+            )
+            if recovered:
+                logger.info("fusion recovery processed stale jobs count=%s", recovered)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("fusion recovery loop failed")
+        await asyncio.sleep(max(1.0, float(settings.FUSION_RECOVERY_POLL_SECONDS)))
 
 
 def create_app() -> FastAPI:
@@ -15,6 +51,20 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(build_router())
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        if bool(getattr(settings, "FUSION_RECOVERY_ENABLED", True)):
+            app.state.fusion_recovery_task = asyncio.create_task(_recovery_loop())
+            logger.info("fusion recovery task scheduled")
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        task = getattr(app.state, "fusion_recovery_task", None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     @app.get("/")
     async def root():

@@ -12,6 +12,127 @@ import asyncpg
 from app.services.azure_tts_service import AzureTTSService
 
 
+
+class TerminalTTSValidationError(RuntimeError):
+    """Deterministic input/locale/voice validation failure. Do not retry automatically."""
+
+
+class RetryableTTSProviderError(RuntimeError):
+    """Transient provider/transport failure that may succeed on retry."""
+
+
+_LOCALE_ALIASES = {
+    "in": "hi-IN",
+    "india": "hi-IN",
+    "hindi": "hi-IN",
+    "hindi-india": "hi-IN",
+    "hi": "hi-IN",
+    "hi-in": "hi-IN",
+    "english-india": "en-IN",
+    "en-in": "en-IN",
+    "en": "en-US",
+    "tamil": "ta-IN",
+    "ta": "ta-IN",
+    "ta-in": "ta-IN",
+    "telugu": "te-IN",
+    "te": "te-IN",
+    "te-in": "te-IN",
+    "kannada": "kn-IN",
+    "kn": "kn-IN",
+    "kn-in": "kn-IN",
+    "malayalam": "ml-IN",
+    "ml": "ml-IN",
+    "ml-in": "ml-IN",
+    "marathi": "mr-IN",
+    "mr": "mr-IN",
+    "mr-in": "mr-IN",
+    "gujarati": "gu-IN",
+    "gu": "gu-IN",
+    "gu-in": "gu-IN",
+    "punjabi": "pa-IN",
+    "pa": "pa-IN",
+    "pa-in": "pa-IN",
+    "bengali": "bn-IN",
+    "bn": "bn-IN",
+    "bn-in": "bn-IN",
+}
+
+_TRANSLATION_TARGET_ALIASES = {
+    "in": "hi",
+    "india": "hi",
+    "hindi": "hi",
+    "hindi-india": "hi",
+    "hi": "hi",
+    "hi-in": "hi",
+    "english-india": "en",
+    "en-in": "en",
+    "en": "en",
+    "tamil": "ta",
+    "ta": "ta",
+    "ta-in": "ta",
+    "telugu": "te",
+    "te": "te",
+    "te-in": "te",
+    "kannada": "kn",
+    "kn": "kn",
+    "kn-in": "kn",
+    "malayalam": "ml",
+    "ml": "ml",
+    "ml-in": "ml",
+    "marathi": "mr",
+    "mr": "mr",
+    "mr-in": "mr",
+    "gujarati": "gu",
+    "gu": "gu",
+    "gu-in": "gu",
+    "punjabi": "pa",
+    "pa": "pa",
+    "pa-in": "pa",
+    "bengali": "bn",
+    "bn": "bn",
+    "bn-in": "bn",
+}
+
+
+def _normalize_speech_locale(locale: str) -> str:
+    raw = (locale or "").strip().replace("_", "-")
+    if not raw:
+        raise TerminalTTSValidationError("missing_target_locale")
+    key = raw.lower()
+    if key in _LOCALE_ALIASES:
+        return _LOCALE_ALIASES[key]
+    if re.fullmatch(r"[a-z]{2,3}-[A-Z]{2,3}", raw):
+        return raw
+    if re.fullmatch(r"[a-z]{2,3}-[a-z]{2,3}", raw):
+        lang, region = raw.split("-", 1)
+        return f"{lang.lower()}-{region.upper()}"
+    if re.fullmatch(r"[a-z]{2,3}", key):
+        if key in _LOCALE_ALIASES:
+            return _LOCALE_ALIASES[key]
+    return raw
+
+
+def _normalize_translation_target(target_locale: str, *, input_language: str = "") -> str:
+    raw = (target_locale or "").strip().replace("_", "-").lower()
+    if not raw:
+        fallback = (input_language or "").strip().lower()
+        return fallback or "en"
+    if raw in _TRANSLATION_TARGET_ALIASES:
+        return _TRANSLATION_TARGET_ALIASES[raw]
+    if "-" in raw:
+        return raw.split("-", 1)[0]
+    return raw
+
+
+def _should_translate(*, translate: bool, input_language: str, target_lang: str) -> bool:
+    if not translate:
+        return False
+    in_lang = _base_lang(input_language)
+    tgt = (target_lang or "").strip().lower()
+    if not in_lang or not tgt:
+        return False
+    return in_lang != tgt
+
 def _base_lang(locale: str) -> str:
     return (locale or "").split("-")[0].lower().strip()
 
@@ -60,10 +181,14 @@ class TTSService:
         - If you have a global translator key, region may be optional.
         """
         if not self.translator_key:
-            raise RuntimeError("missing_azure_translator_key")
+            raise TerminalTTSValidationError("missing_azure_translator_key")
+
+        normalized_to_lang = _normalize_translation_target(to_lang)
+        if not normalized_to_lang:
+            raise TerminalTTSValidationError(f"invalid_target_language to_lang={to_lang!r}")
 
         url = f"{self.translator_endpoint.rstrip('/')}/translate"
-        params = {"api-version": "3.0", "to": to_lang}
+        params = {"api-version": "3.0", "to": normalized_to_lang}
         headers = {
             "Ocp-Apim-Subscription-Key": self.translator_key,
             "Content-Type": "application/json",
@@ -74,11 +199,24 @@ class TTSService:
         body = [{"text": text}]
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(url, params=params, headers=headers, json=body)
-            if r.status_code != 200:
-                raise RuntimeError(f"translator_failed status={r.status_code} body={r.text[:500]}")
-            j = r.json()
-            return j[0]["translations"][0]["text"]
+            try:
+                r = await client.post(url, params=params, headers=headers, json=body)
+            except httpx.HTTPError as e:
+                raise RetryableTTSProviderError(f"translator_transport_error: {e}") from e
+
+            if r.status_code == 200:
+                j = r.json()
+                return j[0]["translations"][0]["text"]
+
+            body_text = r.text[:500]
+            if r.status_code == 400 and ('"code":400036' in body_text or "target language is not valid" in body_text.lower()):
+                raise TerminalTTSValidationError(
+                    f"invalid_target_language to_lang={normalized_to_lang} body={body_text}"
+                )
+            if 400 <= r.status_code < 500:
+                raise TerminalTTSValidationError(f"translator_failed status={r.status_code} body={body_text}")
+            raise RetryableTTSProviderError(f"translator_failed status={r.status_code} body={body_text}")
+
 
     async def _voice_exists(self, voice_name: str) -> bool:
         row = await self.pool.fetchrow(
@@ -103,6 +241,7 @@ class TTSService:
           2) Else pick default for exact locale (enabled locale only).
           3) Else fallback to base language match (hi-IN -> any hi-*)
         """
+        locale = _normalize_speech_locale(locale)
         req = (requested_voice or "").strip()
         if req and req.lower() != "auto":
             if await self._voice_exists(req):
@@ -164,7 +303,7 @@ class TTSService:
             if row2 and row2.get("voice_name"):
                 return str(row2["voice_name"])
 
-        raise RuntimeError(f"no_voice_for_locale:{locale}")
+        raise TerminalTTSValidationError(f"no_voice_for_locale:{locale}")
 
     def build_ssml(
         self,

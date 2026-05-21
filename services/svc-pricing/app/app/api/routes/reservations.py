@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import json
 import os
 import secrets
@@ -15,6 +16,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import PoolDep
 from app.services.engine.pricing_engine import quote_variant
 from app.services.entitlement_service import resolve_entitlement
+from app.services.entitlements.free_signup_bootstrap_service import bootstrap_free_user_pricing
 from app.services.reservations.reservation_service import (
     FinalizeReceipt,
     ReservationView,
@@ -25,6 +27,7 @@ from app.services.reservations.reservation_service import (
 )
 
 router = APIRouter(tags=["pricing-reservations"])
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------
@@ -216,6 +219,58 @@ async def _table_exists(conn, regclass_name: str) -> bool:
         return bool(row and row.get("reg"))
     except Exception:
         return False
+
+
+async def _bootstrap_free_user_pricing_tx(
+    conn,
+    *,
+    user_id: UUID,
+    email: Optional[str] = None,
+    source: str,
+    credits: Optional[int] = None,
+    lock_timeout_ms: int = 1500,
+    statement_timeout_ms: int = 5000,
+) -> Dict[str, Any]:
+    safe_lock_timeout_ms = max(250, min(int(lock_timeout_ms), 10000))
+    safe_statement_timeout_ms = max(1000, min(int(statement_timeout_ms), 20000))
+
+    async with conn.transaction():
+        # Launch-hardening:
+        # free-user bootstrap is write-heavy and should never be allowed to hang preview/reserve forever.
+        # Apply LOCAL postgres timeouts only for this transaction.
+        await conn.execute(f"set local lock_timeout = '{safe_lock_timeout_ms}ms'")
+        await conn.execute(f"set local statement_timeout = '{safe_statement_timeout_ms}ms'")
+
+        return await bootstrap_free_user_pricing(
+            conn,
+            user_id=user_id,
+            email=email,
+            source=source,
+            credits=credits,
+        )
+
+
+async def _bootstrap_free_user_pricing_preview_best_effort(
+    conn,
+    *,
+    user_id: UUID,
+    source: str,
+) -> None:
+    try:
+        await _bootstrap_free_user_pricing_tx(
+            conn,
+            user_id=user_id,
+            source=source,
+            lock_timeout_ms=750,
+            statement_timeout_ms=2500,
+        )
+    except Exception:
+        logger.warning(
+            "pricing.preview_bootstrap_skipped user_id=%s source=%s",
+            user_id,
+            source,
+            exc_info=True,
+        )
 
 
 async def _resolve_tier_code(conn, user_id: UUID) -> str:
@@ -493,29 +548,86 @@ async def _patch_quote_json(
     )
 
 
+def _derive_unit_type_from_quote_lines(lines: Sequence[Dict[str, Any]]) -> str:
+    for line in lines or []:
+        unit = _first_non_empty(line.get("unit"))
+        if unit:
+            return unit
+    return "unit"
+
+
 def _build_preview_summary(
     *,
     estimated_amount: str,
     currency: str,
     units: str,
     unit_type: str,
+    estimated_credits: Optional[str] = None,
 ) -> Dict[str, Any]:
-    display_total = f"{currency} {estimated_amount}" if currency else estimated_amount
+    # Customer-facing studio UX is credits-only. Money/currency stays in the
+    # structured fields for settlement, receipts, and admin reports, but summary
+    # labels must never render "$" / "₹" in the creative workflow.
+    credits_text = _to_units_str(estimated_credits, "0")
+    display_total = f"{credits_text} credits"
     display_unit_rate = None
     try:
-        amt = Decimal(str(estimated_amount or "0"))
+        credits = Decimal(str(credits_text or "0"))
         qty = Decimal(str(units or "0"))
         if qty > 0:
-            unit_amt = (amt / qty).quantize(Decimal("0.01"))
-            display_unit_rate = f"{currency} {unit_amt} / {unit_type}" if currency else f"{unit_amt} / {unit_type}"
+            unit_credits = credits / qty
+            unit_label = _to_units_str(unit_credits, "0")
+            display_unit_rate = f"{unit_label} credits / {unit_type}"
     except Exception:
         display_unit_rate = None
 
     return {
         "display_total": display_total,
         "display_unit_rate": display_unit_rate,
-        "display_estimate_note": "Final charge may be lower if fewer outputs succeed.",
+        "display_estimate_note": "Final credit use may be lower if fewer outputs succeed.",
+        "estimated_credits_label": display_total,
+        "currency_hidden_for_customer_display": True,
     }
+
+
+def _feature_block_preview_response(
+    *,
+    req: "PricingPreviewRequest",
+    resolved: Any,
+    billing_account_id: Optional[str],
+    settlement_mode: Optional[str],
+    before_credits: Optional[str],
+) -> "PricingPreviewResponse":
+    return PricingPreviewResponse(
+        status="blocked",
+        service_name=req.service_name,
+        service_action=req.service_action,
+        sku_code=req.sku_code,
+        unit_type="unit",
+        estimated_units=_to_units_str(req.units, "1"),
+        billing_mode=str(getattr(resolved, "billing_mode", "") or ""),
+        pricing_mode=str(getattr(resolved, "pricing_mode", "") or ""),
+        entitlement_source=str(getattr(resolved, "source", "") or ""),
+        entitlement_reason=str(getattr(resolved, "reason", "") or "") or "ENTITLEMENT_BLOCKED",
+        tier_code=str(getattr(resolved, "tier_code", "") or "") or None,
+        billing_account_id=billing_account_id or None,
+        settlement_mode=settlement_mode or None,
+        before_credits=before_credits,
+        after_estimated_credits=before_credits,
+        quote_breakdown={
+            "blocking_reason": str(getattr(resolved, "reason", "") or "") or "ENTITLEMENT_BLOCKED",
+            "service_name": req.service_name,
+            "service_action": req.service_action,
+            "sku_code": req.sku_code,
+        },
+        summary={
+            "display_total": None,
+            "display_unit_rate": None,
+            "display_estimate_note": "Upgrade required for this feature.",
+            "blocking_reason": str(getattr(resolved, "reason", "") or "") or "ENTITLEMENT_BLOCKED",
+            "cta_intent": "upgrade",
+        },
+        message="Upgrade your plan to use this video feature.",
+    )
 
 
 # ---------------------------------------------------------------------
@@ -525,6 +637,26 @@ class PricingCallerContext(BaseModel):
     user_id: str
     service_name: str
     auth_mode: str = "internal_bearer"
+
+
+class FreeUserBootstrapRequest(BaseModel):
+    user_id: str
+    email: Optional[str] = None
+    source: str = "internal_bootstrap"
+    credits: Optional[int] = None
+
+
+class FreeUserBootstrapResponse(BaseModel):
+    status: str = "ok"
+    user_id: str
+    bootstrapped: bool
+    tier_code: Optional[str] = None
+    plan_code: Optional[str] = None
+    included_credits_total: Optional[int] = None
+    included_credits_remaining: Optional[int] = None
+    target_credits: Optional[int] = None
+    account_action: Optional[str] = None
+    reason: Optional[str] = None
 
 
 def _require_internal_pricing_caller(
@@ -556,7 +688,7 @@ def _require_internal_pricing_caller(
         for s in (
             os.getenv(
                 "DF_PRICING_ALLOWED_SERVICES",
-                "svc-face,svc-audio,svc-fusion,svc-commerce,svc-music,svc-marketing",
+                "svc-core,svc-face,svc-audio,svc-fusion,svc-fusion-extension,svc-commerce,svc-music,svc-marketing",
             )
         ).split(",")
         if s.strip()
@@ -724,6 +856,48 @@ class ReservationOut(BaseModel):
     quote_breakdown: Dict[str, Any] = Field(default_factory=dict)
 
 
+
+# ---------------------------------------------------------------------
+# internal bootstrap for brand-new free users
+# ---------------------------------------------------------------------
+@router.post("/api/pricing/bootstrap/free-user", response_model=FreeUserBootstrapResponse)
+async def bootstrap_free_user(
+    req: FreeUserBootstrapRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    x_service_name: Optional[str] = Header(default=None, alias="X-Service-Name"),
+    pool=PoolDep,
+) -> FreeUserBootstrapResponse:
+    caller = _require_internal_pricing_caller(authorization, x_user_id, x_service_name)
+
+    if str(req.user_id) != str(caller.user_id):
+        raise HTTPException(status_code=403, detail="user_mismatch")
+
+    user_uuid = UUID(str(req.user_id))
+
+    async with pool.acquire() as conn:
+        result = await _bootstrap_free_user_pricing_tx(
+            conn,
+            user_id=user_uuid,
+            email=req.email,
+            source=req.source or "internal_bootstrap",
+            credits=req.credits,
+        )
+
+    return FreeUserBootstrapResponse(
+        status="ok",
+        user_id=str(req.user_id),
+        bootstrapped=bool(result.get("bootstrapped")),
+        tier_code=(str(result.get("tier_code")) if result.get("tier_code") else None),
+        plan_code=(str(result.get("plan_code")) if result.get("plan_code") else None),
+        included_credits_total=(int(result.get("included_credits_total")) if result.get("included_credits_total") is not None else None),
+        included_credits_remaining=(int(result.get("included_credits_remaining")) if result.get("included_credits_remaining") is not None else None),
+        target_credits=(int(result.get("target_credits")) if result.get("target_credits") is not None else None),
+        account_action=(str(result.get("account_action")) if result.get("account_action") else None),
+        reason=(str(result.get("reason")) if result.get("reason") else None),
+    )
+
+
 # ---------------------------------------------------------------------
 # preview -> quote + balance + entitlement context (no reservation)
 # ---------------------------------------------------------------------
@@ -760,6 +934,15 @@ async def preview_reservation(
     }
 
     async with pool.acquire() as conn:
+        # Root-cause fix:
+        # pricing preview must stay read-mostly and fast. Do not let free-user bootstrap
+        # block or wedge preview. Attempt bootstrap best-effort with tight DB timeouts, then continue.
+        await _bootstrap_free_user_pricing_preview_best_effort(
+            conn,
+            user_id=user_uuid,
+            source="pricing_preview_first_touch",
+        )
+
         resolved = await resolve_entitlement(
             conn,
             user_id=user_uuid,
@@ -771,8 +954,6 @@ async def preview_reservation(
         )
         if resolved.reason == "PRICING_UNKNOWN_OR_INACTIVE_VARIANT":
             raise HTTPException(status_code=404, detail=resolved.reason)
-        if not resolved.allowed:
-            raise HTTPException(status_code=403, detail=resolved.reason or "ENTITLEMENT_BLOCKED")
 
         billing_ctx = await _resolve_billing_account_context(conn, user_uuid)
         settlement_mode = _resolve_effective_settlement_mode(
@@ -780,6 +961,28 @@ async def preview_reservation(
             entitlement_billing_mode=str(resolved.billing_mode or ""),
             meta=meta,
         )
+
+        if not resolved.allowed:
+            if resolved.reason == "ENTITLEMENT_BLOCKED_FEATURE_FLAG":
+                balance = await get_balance(conn, user_uuid)
+                before_credits = str(int(getattr(balance, "available_credits", 0) or 0))
+                logger.info(
+                    "pricing.preview_feature_block user_id=%s caller_service=%s service_name=%s service_action=%s sku_code=%s tier=%s",
+                    req.user_id,
+                    caller.service_name,
+                    req.service_name,
+                    req.service_action,
+                    req.sku_code,
+                    resolved.tier_code,
+                )
+                return _feature_block_preview_response(
+                    req=req,
+                    resolved=resolved,
+                    billing_account_id=str(billing_ctx.get("billing_account_id") or "") or None,
+                    settlement_mode=settlement_mode or None,
+                    before_credits=before_credits,
+                )
+            raise HTTPException(status_code=403, detail=resolved.reason or "ENTITLEMENT_BLOCKED")
 
         final_currency = currency or str(billing_ctx.get("default_currency") or "USD")
 
@@ -878,12 +1081,14 @@ async def preview_reservation(
     quote_id = _make_quote_id(preview_fingerprint)
     quote_expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
 
-    estimated_credits = int(getattr(balance, "balance_credits", 0) or 0)
+    balance_credits = int(getattr(balance, "balance_credits", 0) or 0)
     reserved_credits = int(getattr(balance, "reserved_credits", 0) or 0)
     available_credits = int(getattr(balance, "available_credits", 0) or 0)
 
     quoted_credits = _to_int(getattr(quote, "total_credits", 0), 0)
-    before_credits = str(estimated_credits)
+    # Customer-facing affordability is based on available/spendable credits,
+    # not raw account balance. Raw balance remains in quote_breakdown.balance_before.
+    before_credits = str(available_credits)
     after_estimated_credits = str(max(0, available_credits - quoted_credits))
     estimated_amount = _safe_money_str(getattr(quote, "total_money", None))
     currency_text = str(getattr(quote, "currency", None) or final_currency or "USD")
@@ -926,6 +1131,7 @@ async def preview_reservation(
             currency=currency_text,
             units=requested_units,
             unit_type="image",
+            estimated_credits=str(quoted_credits),
         ),
         message="Preview created",
     )
@@ -968,6 +1174,27 @@ async def reserve_reservation(
     }
 
     async with pool.acquire() as conn:
+        try:
+            await _bootstrap_free_user_pricing_tx(
+                conn,
+                user_id=user_uuid,
+                source="pricing_reserve_first_touch",
+                lock_timeout_ms=1500,
+                statement_timeout_ms=5000,
+            )
+        except Exception:
+            logger.exception(
+                "pricing.reserve_bootstrap_failed user_id=%s service_name=%s service_action=%s sku_code=%s",
+                req.user_id,
+                req.service_name,
+                req.service_action,
+                req.sku_code,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="FREE_USER_BOOTSTRAP_UNAVAILABLE",
+            )
+
         resolved = await resolve_entitlement(
             conn,
             user_id=user_uuid,

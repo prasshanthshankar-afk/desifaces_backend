@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -11,9 +12,12 @@ from uuid import UUID
 import asyncpg
 
 from app.config import settings
+from app.repo.billing_entitlements_repo import BillingEntitlementsRepo
 from app.services.engine.pricing_engine import QuoteResult, quote_variant
 
 logger = logging.getLogger(__name__)
+
+_BILLING_ENTITLEMENTS_REPO = BillingEntitlementsRepo()
 
 
 def _now() -> datetime:
@@ -110,6 +114,60 @@ def _as_uuid_or_none(x: Any) -> Optional[UUID]:
         return None
 
 
+def _clean_text(x: Any, *, default: str = "") -> str:
+    if x is None:
+        return default
+    s = str(x).strip()
+    return s if s else default
+
+
+def _clean_currency(x: Any, *, default: str = "") -> str:
+    s = _clean_text(x, default=default)
+    return s.upper() if s else default
+
+
+def _clean_country_code(x: Any, *, default: str = "") -> str:
+    # Keep it lenient: preserve non-empty user/system values, just trim + uppercase.
+    s = _clean_text(x, default=default)
+    return s.upper() if s else default
+
+
+def _derive_tier_code(
+    tier_code: Any,
+    *,
+    billing_account_id: Optional[UUID],
+    settlement_mode: Optional[str],
+) -> str:
+    explicit = _clean_text(tier_code)
+    if explicit:
+        return explicit
+
+    normalized_settlement_mode = _normalize_settlement_mode(settlement_mode)
+    if billing_account_id and normalized_settlement_mode == "postpaid":
+        return "enterprise"
+    if billing_account_id and normalized_settlement_mode == "hybrid":
+        return "business"
+    return "free"
+
+
+def _derive_entitlement_source(
+    entitlement_source: Any,
+    *,
+    billing_account_id: Optional[UUID],
+    settlement_mode: Optional[str],
+) -> str:
+    explicit = _clean_text(entitlement_source)
+    if explicit:
+        return explicit
+
+    normalized_settlement_mode = _normalize_settlement_mode(settlement_mode)
+    if billing_account_id and normalized_settlement_mode == "postpaid":
+        return "credit_account"
+    if billing_account_id:
+        return "billing_account"
+    return "module_gate_fallback"
+
+
 def _normalize_settlement_mode(x: Any) -> str:
     s = str(x or "").strip().lower()
     if s in {"postpaid", "invoice", "bill", "billed"}:
@@ -160,6 +218,124 @@ def _held_credits_from_reservation(row_reserved_credits: int, quote: Dict[str, A
     snapshot_mode = str(quote.get("billing_mode_snapshot") or quote.get("billing_mode") or "").strip().lower()
     settlement_mode = _normalize_settlement_mode(quote.get("settlement_mode")) or "prepaid"
     return max(0, row_reserved_credits) if (snapshot_mode == "bill" and settlement_mode == "prepaid" and row_reserved_credits > 0) else 0
+
+
+def _ledger_metadata_with_service_job_hints(
+    metadata: Optional[dict],
+    *,
+    service_name: Optional[str] = None,
+    service_action: Optional[str] = None,
+    params: Optional[Dict[str, Any]] = None,
+    studio_job_id: Optional[UUID] = None,
+) -> Dict[str, Any]:
+    md = _as_dict_loose(metadata)
+    p = _as_dict_loose(params)
+
+    service_job_id = (
+        md.get("service_job_id")
+        or p.get("service_job_id")
+        or p.get("longform_job_id")
+    )
+    service_job_table = (
+        md.get("service_job_table")
+        or p.get("service_job_table")
+    )
+    pricing_entity_kind = (
+        md.get("pricing_entity_kind")
+        or p.get("pricing_entity_kind")
+    )
+    omit_studio_job_id = (
+        md.get("omit_studio_job_id")
+        if md.get("omit_studio_job_id") is not None
+        else p.get("omit_studio_job_id")
+    )
+
+    effective_service_name = _clean_text(service_name) or _clean_text(md.get("service_name")) or _clean_text(p.get("service_name"))
+    effective_service_action = _clean_text(service_action) or _clean_text(md.get("service_action")) or _clean_text(p.get("service_action"))
+
+    is_longform_service = (
+        effective_service_name == "svc-fusion-extension"
+        or effective_service_action.startswith("fusion.longform.")
+        or _clean_text(p.get("external_ref_type")) == "longform_run"
+        or str(p.get("service_job_table") or "").strip() == "longform_jobs"
+    )
+
+    if is_longform_service:
+        if not service_job_id and studio_job_id:
+            service_job_id = str(studio_job_id)
+        if not service_job_table:
+            service_job_table = "longform_jobs"
+        if pricing_entity_kind in ("", None):
+            pricing_entity_kind = "service_job"
+        if omit_studio_job_id is None:
+            omit_studio_job_id = True
+
+    if service_job_id:
+        md["service_job_id"] = str(service_job_id)
+    if service_job_table:
+        md["service_job_table"] = str(service_job_table)
+    if pricing_entity_kind:
+        md["pricing_entity_kind"] = str(pricing_entity_kind)
+    if omit_studio_job_id is not None:
+        md["omit_studio_job_id"] = _as_bool(omit_studio_job_id)
+
+    return md
+
+
+async def _normalize_ledger_target(
+    conn: asyncpg.Connection,
+    *,
+    studio_job_id: Optional[UUID],
+    metadata: Optional[dict],
+    service_name: Optional[str] = None,
+    service_action: Optional[str] = None,
+) -> tuple[Optional[UUID], Dict[str, Any]]:
+    md = _as_dict_loose(metadata)
+    effective_service_name = _clean_text(service_name) or _clean_text(md.get("service_name"))
+    effective_service_action = _clean_text(service_action) or _clean_text(md.get("service_action"))
+
+    omit_studio_job_id = _as_bool(md.get("omit_studio_job_id"), False)
+    pricing_entity_kind = _clean_text(md.get("pricing_entity_kind")).lower()
+    service_job_table = _clean_text(md.get("service_job_table"))
+    service_job_id = _clean_text(md.get("service_job_id"))
+
+    if (
+        omit_studio_job_id
+        or pricing_entity_kind == "service_job"
+        or (service_job_table and service_job_table != "studio_jobs")
+    ):
+        if studio_job_id and not service_job_id:
+            md["service_job_id"] = str(studio_job_id)
+        if not service_job_table:
+            if effective_service_name == "svc-fusion-extension" or effective_service_action.startswith("fusion.longform."):
+                md["service_job_table"] = "longform_jobs"
+            else:
+                md["service_job_table"] = "external_or_service_job"
+        md["pricing_entity_kind"] = "service_job"
+        md["omit_studio_job_id"] = True
+        return None, md
+
+    if studio_job_id is not None:
+        try:
+            exists = await conn.fetchval(
+                "select 1 from public.studio_jobs where id = $1::uuid",
+                studio_job_id,
+            )
+        except Exception:
+            exists = 1
+        if not exists:
+            if not service_job_id:
+                md["service_job_id"] = str(studio_job_id)
+            if not service_job_table:
+                if effective_service_name == "svc-fusion-extension" or effective_service_action.startswith("fusion.longform."):
+                    md["service_job_table"] = "longform_jobs"
+                else:
+                    md["service_job_table"] = "external_or_service_job"
+            md["pricing_entity_kind"] = "service_job"
+            md["omit_studio_job_id"] = True
+            return None, md
+
+    return studio_job_id, md
 
 
 def _ledger_leaf_sku_code_from_quote(quote: Dict[str, Any]) -> Optional[str]:
@@ -222,6 +398,15 @@ class FinalizeReceipt:
     available_after: int
 
 
+
+async def _table_exists(conn: asyncpg.Connection, regclass_name: str) -> bool:
+    try:
+        row = await conn.fetchrow("select to_regclass($1) as reg", regclass_name)
+        return bool(row and row.get("reg"))
+    except Exception:
+        return False
+
+
 async def _ensure_account_row(conn: asyncpg.Connection, user_id: UUID) -> None:
     await conn.execute(
         """
@@ -233,8 +418,268 @@ async def _ensure_account_row(conn: asyncpg.Connection, user_id: UUID) -> None:
     )
 
 
+async def _fetch_active_entitlement_row(conn: asyncpg.Connection, user_id: UUID):
+    try:
+        return await conn.fetchrow(
+            """
+            select
+              user_id,
+              tier_code,
+              plan_code,
+              billing_mode,
+              settlement_mode,
+              included_credits_total,
+              included_credits_remaining,
+              effective_from,
+              effective_to,
+              updated_at,
+              source
+            from billing_entitlements
+            where user_id = $1
+              and effective_from <= now()
+              and (effective_to is null or effective_to > now())
+            order by effective_from desc nulls last, updated_at desc nulls last
+            limit 1
+            """,
+            user_id,
+        )
+    except Exception:
+        return None
+
+
+def _lot_bucket_priority(bucket_type: str) -> int:
+    bucket = str(bucket_type or "").strip().lower()
+    if bucket == "included":
+        return 0
+    if bucket == "promo":
+        return 1
+    if bucket == "purchased":
+        return 2
+    return 9
+
+
+async def _has_credit_lots(conn: asyncpg.Connection, user_id: UUID) -> bool:
+    if not await _table_exists(conn, "public.pricing_credit_lots"):
+        return False
+    row = await conn.fetchrow(
+        "select exists(select 1 from pricing_credit_lots where user_id = $1) as present",
+        user_id,
+    )
+    return bool(row and row.get("present"))
+
+
+async def _backfill_legacy_lots_if_needed(conn: asyncpg.Connection, user_id: UUID) -> bool:
+    if not await _table_exists(conn, "public.pricing_credit_lots"):
+        return False
+
+    if await _has_credit_lots(conn, user_id):
+        return False
+
+    ent = await _fetch_active_entitlement_row(conn, user_id)
+    acc = await conn.fetchrow(
+        """
+        select user_id, billing_account_id, balance_credits, reserved_credits, settlement_mode, updated_at
+        from pricing_credit_accounts
+        where user_id = $1
+        """,
+        user_id,
+    )
+    if not acc:
+        return False
+
+    account_settlement_mode = _normalize_settlement_mode(_row_get(acc, "settlement_mode"))
+    entitlement_settlement_mode = _normalize_settlement_mode(_row_get(ent, "settlement_mode"))
+    effective_settlement_mode = account_settlement_mode or entitlement_settlement_mode or "prepaid"
+    if effective_settlement_mode == "postpaid":
+        return False
+
+    balance_credits = max(0, _as_int(_row_get(acc, "balance_credits"), 0))
+    reserved_credits = max(0, _as_int(_row_get(acc, "reserved_credits"), 0))
+
+    included_remaining = max(0, _as_int(_row_get(ent, "included_credits_remaining"), 0))
+    included_total = max(0, _as_int(_row_get(ent, "included_credits_total"), 0))
+    included_amount = 0
+    if included_remaining > 0:
+        included_amount = min(balance_credits, included_remaining) if balance_credits > 0 else included_remaining
+    elif included_total > 0 and balance_credits > 0:
+        # Defensive fallback for partially inconsistent rows where included total exists but remaining drifted to zero.
+        included_amount = min(balance_credits, included_total)
+
+    purchased_amount = max(0, balance_credits - included_amount)
+
+    billing_account_id = _as_uuid_or_none(_row_get(acc, "billing_account_id"))
+    plan_code = _clean_text(_row_get(ent, "plan_code"), default="legacy")
+    if included_amount > 0:
+        await conn.execute(
+            """
+            insert into pricing_credit_lots(
+              user_id, billing_account_id, bucket_type, source_type, source_ref, plan_code_at_grant,
+              granted_amount, remaining_amount, reserved_amount, granted_at, expires_at, status,
+              metadata_json, created_at, updated_at
+            )
+            values(
+              $1, $2, 'included', 'migration', 'legacy_balance_backfill', $3,
+              $4, $4, 0, now(), null, 'active',
+              $5::jsonb, now(), now()
+            )
+            """,
+            user_id,
+            billing_account_id,
+            plan_code or "legacy",
+            Decimal(str(included_amount)),
+            json.dumps(
+                {
+                    "reason": "legacy_balance_backfill",
+                    "legacy_balance_credits": balance_credits,
+                    "legacy_reserved_credits": reserved_credits,
+                    "legacy_settlement_mode": _row_get(acc, "settlement_mode"),
+                    "legacy_updated_at": _row_get(acc, "updated_at"),
+                },
+                default=str,
+            ),
+        )
+
+    if purchased_amount > 0 or (balance_credits == 0 and reserved_credits > 0):
+        await conn.execute(
+            """
+            insert into pricing_credit_lots(
+              user_id, billing_account_id, bucket_type, source_type, source_ref, plan_code_at_grant,
+              granted_amount, remaining_amount, reserved_amount, granted_at, expires_at, status,
+              metadata_json, created_at, updated_at
+            )
+            values(
+              $1, $2, 'purchased', 'migration', 'legacy_balance_backfill', $3,
+              $4, $4, 0, now(), null, 'active',
+              $5::jsonb, now(), now()
+            )
+            """,
+            user_id,
+            billing_account_id,
+            plan_code or "legacy",
+            Decimal(str(max(0, purchased_amount))),
+            json.dumps(
+                {
+                    "reason": "legacy_balance_backfill",
+                    "legacy_balance_credits": balance_credits,
+                    "legacy_reserved_credits": reserved_credits,
+                    "legacy_settlement_mode": _row_get(acc, "settlement_mode"),
+                    "legacy_updated_at": _row_get(acc, "updated_at"),
+                },
+                default=str,
+            ),
+        )
+
+    return True
+
+
+async def _fetch_active_lots(conn: asyncpg.Connection, user_id: UUID) -> list[dict]:
+    if not await _table_exists(conn, "public.pricing_credit_lots"):
+        return []
+    rows = await conn.fetch(
+        """
+        select
+          id,
+          user_id,
+          billing_account_id,
+          bucket_type,
+          source_type,
+          source_ref,
+          plan_code_at_grant,
+          granted_amount,
+          remaining_amount,
+          reserved_amount,
+          granted_at,
+          expires_at,
+          status,
+          metadata_json,
+          created_at,
+          updated_at
+        from pricing_credit_lots
+        where user_id = $1
+          and status = 'active'
+        order by
+          case bucket_type
+            when 'included' then 0
+            when 'promo' then 1
+            when 'purchased' then 2
+            else 9
+          end,
+          expires_at nulls last,
+          granted_at asc,
+          created_at asc
+        """,
+        user_id,
+    )
+    return [dict(r) for r in rows]
+
+
+def _summarize_lots(lots: list[dict]) -> dict:
+    summary = {
+        "included_available": Decimal("0"),
+        "included_reserved": Decimal("0"),
+        "purchased_available": Decimal("0"),
+        "purchased_reserved": Decimal("0"),
+        "promo_available": Decimal("0"),
+        "promo_reserved": Decimal("0"),
+        "balance_total": Decimal("0"),
+        "reserved_total": Decimal("0"),
+        "available_total": Decimal("0"),
+    }
+    for lot in lots:
+        bucket = str(lot.get("bucket_type") or "").strip().lower()
+        remaining = _as_decimal(lot.get("remaining_amount"), "0")
+        reserved = _as_decimal(lot.get("reserved_amount"), "0")
+        available = max(Decimal("0"), remaining - reserved)
+        summary["balance_total"] += remaining
+        summary["reserved_total"] += reserved
+        summary["available_total"] += available
+        if bucket == "included":
+            summary["included_available"] += available
+            summary["included_reserved"] += reserved
+        elif bucket == "purchased":
+            summary["purchased_available"] += available
+            summary["purchased_reserved"] += reserved
+        elif bucket == "promo":
+            summary["promo_available"] += available
+            summary["promo_reserved"] += reserved
+    return summary
+
+
+async def _sync_legacy_credit_account_summary(conn: asyncpg.Connection, user_id: UUID) -> None:
+    await _ensure_account_row(conn, user_id)
+    if not await _table_exists(conn, "public.pricing_credit_lots"):
+        return
+    lots = await _fetch_active_lots(conn, user_id)
+    if not lots:
+        return
+    summary = _summarize_lots(lots)
+    await conn.execute(
+        """
+        update pricing_credit_accounts
+        set
+          balance_credits = $2,
+          reserved_credits = $3,
+          updated_at = now()
+        where user_id = $1
+        """,
+        user_id,
+        int(summary["balance_total"]),
+        int(summary["reserved_total"]),
+    )
+
+
 async def get_balance(conn: asyncpg.Connection, user_id: UUID) -> BalanceView:
     await _ensure_account_row(conn, user_id)
+    await _backfill_legacy_lots_if_needed(conn, user_id)
+    lots = await _fetch_active_lots(conn, user_id)
+    if lots:
+        summary = _summarize_lots(lots)
+        return BalanceView(
+            balance_credits=int(summary["balance_total"]),
+            reserved_credits=int(summary["reserved_total"]),
+            available_credits=int(summary["available_total"]),
+        )
+
     r = await conn.fetchrow(
         "select balance_credits, reserved_credits from pricing_credit_accounts where user_id = $1",
         user_id,
@@ -242,6 +687,164 @@ async def get_balance(conn: asyncpg.Connection, user_id: UUID) -> BalanceView:
     bal = int(r["balance_credits"])
     res = int(r["reserved_credits"])
     return BalanceView(balance_credits=bal, reserved_credits=res, available_credits=max(0, bal - res))
+
+
+def _allocations_summary(allocations: list[dict]) -> dict:
+    out = {
+        "included": 0,
+        "promo": 0,
+        "purchased": 0,
+        "total": 0,
+    }
+    for item in allocations:
+        bucket = str(item.get("bucket_type") or "").strip().lower()
+        amt = _as_int(item.get("amount"), 0)
+        if bucket in out:
+            out[bucket] += amt
+        out["total"] += amt
+    return out
+
+
+async def _reserve_lot_allocations(
+    conn: asyncpg.Connection,
+    *,
+    user_id: UUID,
+    requested_credits: int,
+) -> list[dict]:
+    lots = await _fetch_active_lots(conn, user_id)
+    remaining_need = max(0, int(requested_credits))
+    allocations: list[dict] = []
+    if remaining_need <= 0:
+        return allocations
+
+    for lot in lots:
+        if remaining_need <= 0:
+            break
+        remaining = _as_decimal(lot.get("remaining_amount"), "0")
+        reserved = _as_decimal(lot.get("reserved_amount"), "0")
+        available = int(max(Decimal("0"), remaining - reserved))
+        if available <= 0:
+            continue
+        take = min(available, remaining_need)
+        if take <= 0:
+            continue
+        await conn.execute(
+            """
+            update pricing_credit_lots
+            set reserved_amount = reserved_amount + $2,
+                updated_at = now()
+            where id = $1
+            """,
+            lot["id"],
+            Decimal(str(take)),
+        )
+        allocations.append(
+            {
+                "lot_id": str(lot["id"]),
+                "bucket_type": str(lot.get("bucket_type") or ""),
+                "amount": take,
+            }
+        )
+        remaining_need -= take
+
+    if remaining_need > 0:
+        raise ValueError("PRICING_INSUFFICIENT_CREDITS")
+    return allocations
+
+
+async def _release_lot_allocations(
+    conn: asyncpg.Connection,
+    *,
+    allocations: list[dict],
+) -> None:
+    for item in allocations:
+        lot_id = _as_uuid_or_none(item.get("lot_id"))
+        amt = max(0, _as_int(item.get("amount"), 0))
+        if not lot_id or amt <= 0:
+            continue
+        await conn.execute(
+            """
+            update pricing_credit_lots
+            set reserved_amount = greatest(0, reserved_amount - $2),
+                updated_at = now()
+            where id = $1
+            """,
+            lot_id,
+            Decimal(str(amt)),
+        )
+
+
+async def _commit_lot_allocations(
+    conn: asyncpg.Connection,
+    *,
+    allocations: list[dict],
+    charged_credits: int,
+) -> dict:
+    remaining_to_commit = max(0, int(charged_credits))
+    consumed: list[dict] = []
+    released: list[dict] = []
+
+    for item in allocations:
+        lot_id = _as_uuid_or_none(item.get("lot_id"))
+        bucket_type = str(item.get("bucket_type") or "")
+        amt = max(0, _as_int(item.get("amount"), 0))
+        if not lot_id or amt <= 0:
+            continue
+
+        charge_here = min(amt, remaining_to_commit)
+        release_here = max(0, amt - charge_here)
+
+        if charge_here > 0:
+            await conn.execute(
+                """
+                update pricing_credit_lots
+                set
+                  reserved_amount = greatest(0, reserved_amount - $2),
+                  remaining_amount = greatest(0, remaining_amount - $2),
+                  updated_at = now()
+                where id = $1
+                """,
+                lot_id,
+                Decimal(str(charge_here)),
+            )
+            consumed.append(
+                {
+                    "lot_id": str(lot_id),
+                    "bucket_type": bucket_type,
+                    "amount": charge_here,
+                }
+            )
+            remaining_to_commit -= charge_here
+
+        if release_here > 0:
+            await conn.execute(
+                """
+                update pricing_credit_lots
+                set
+                  reserved_amount = greatest(0, reserved_amount - $2),
+                  updated_at = now()
+                where id = $1
+                """,
+                lot_id,
+                Decimal(str(release_here)),
+            )
+            released.append(
+                {
+                    "lot_id": str(lot_id),
+                    "bucket_type": bucket_type,
+                    "amount": release_here,
+                }
+            )
+
+    if remaining_to_commit > 0:
+        raise ValueError("PRICING_INSUFFICIENT_CREDITS_OVERAGE")
+
+    return {
+        "consumed": consumed,
+        "released": released,
+        "consumed_summary": _allocations_summary(consumed),
+        "released_summary": _allocations_summary(released),
+    }
 
 
 async def _ledger_event(
@@ -266,8 +869,19 @@ async def _ledger_event(
     service_name: Optional[str] = None,
     service_action: Optional[str] = None,
 ) -> None:
-    md = metadata or {}
+    md = _as_dict_loose(metadata)
     normalized_settlement_mode = _normalize_settlement_mode(settlement_mode) or None
+    normalized_country_code = _clean_country_code(country_code)
+    normalized_currency = _clean_currency(currency, default="USD")
+    normalized_channel = _clean_text(channel, default="service")
+
+    normalized_studio_job_id, md = await _normalize_ledger_target(
+        conn,
+        studio_job_id=studio_job_id,
+        metadata=md,
+        service_name=service_name,
+        service_action=service_action,
+    )
 
     # First attempt: new schema with billing-account / invoice-ready fields.
     try:
@@ -294,17 +908,17 @@ async def _ledger_event(
                 billing_account_id,
                 normalized_settlement_mode,
                 reservation_id,
-                studio_job_id,
+                normalized_studio_job_id,
                 event_type,
                 int(credits_delta),
                 sku_code,
                 quantity,
                 unit_credits,
                 idempotency_key,
-                country_code,
-                currency,
+                normalized_country_code,
+                normalized_currency,
                 money_amount,
-                channel,
+                normalized_channel,
                 service_name,
                 service_action,
                 md,
@@ -331,10 +945,10 @@ async def _ledger_event(
             quantity,
             unit_credits,
             idempotency_key,
-            country_code,
-            currency,
+            normalized_country_code,
+            normalized_currency,
             money_amount,
-            channel,
+            normalized_channel,
             md,
         )
 
@@ -542,6 +1156,7 @@ async def _compute_economics_for_quote(
 # -------------------------
 # Reserve / Release / Finalize
 # -------------------------
+
 async def reserve(
     conn: asyncpg.Connection,
     *,
@@ -569,6 +1184,24 @@ async def reserve(
     ttl = max(30, min(ttl, settings.MAX_RESERVATION_TTL_S))
     expires_at = _now() + timedelta(seconds=ttl)
 
+    normalized_channel = _clean_text(channel, default="service")
+    normalized_country_code = _clean_country_code(country_code)
+    normalized_currency_input = _clean_currency(currency)
+    effective_settlement_mode = _normalize_settlement_mode(settlement_mode) or "prepaid"
+    normalized_tier_code = _derive_tier_code(
+        tier_code,
+        billing_account_id=billing_account_id,
+        settlement_mode=effective_settlement_mode,
+    )
+    normalized_entitlement_source = _derive_entitlement_source(
+        entitlement_source,
+        billing_account_id=billing_account_id,
+        settlement_mode=effective_settlement_mode,
+    )
+    effective_service_name = _clean_text(service_name) or None
+    effective_service_action = _clean_text(service_action) or None
+    effective_sku_code = _clean_text(sku_code) or variant_code
+
     existing = await conn.fetchrow(
         """
         select id, status, reserved_credits, expires_at, currency, estimated_money, quote_json
@@ -595,9 +1228,9 @@ async def reserve(
         user_id=user_id,
         variant_code=variant_code,
         params=params,
-        channel=channel,
-        country_code=country_code,
-        currency=currency,
+        channel=normalized_channel,
+        country_code=normalized_country_code,
+        currency=normalized_currency_input or None,
         billing_mode=pricing_mode,
     )
 
@@ -608,9 +1241,7 @@ async def reserve(
     if isinstance(max_need, int) and max_need > 0 and quoted_credits > max_need:
         raise ValueError("PRICING_RESERVATION_TOO_LARGE")
 
-    effective_settlement_mode = _normalize_settlement_mode(settlement_mode) or "prepaid"
     normalized_billing_mode = str((billing_mode_snapshot or pricing_mode or "")).strip().lower()
-
     hold_applied = bool(
         normalized_billing_mode == "bill"
         and effective_settlement_mode == "prepaid"
@@ -618,6 +1249,7 @@ async def reserve(
     )
     held_credits = quoted_credits if hold_applied else 0
     pbid = _as_uuid_or_none(getattr(quote, "pricebook_id", None))
+    effective_currency = _clean_currency(getattr(quote, "currency", None), default=normalized_currency_input or "USD")
 
     lines_json = [
         {
@@ -636,25 +1268,25 @@ async def reserve(
     ]
 
     quote_json_full: dict = {
-        "pricing_engine_version": "1",
+        "pricing_engine_version": "2",
         "variant_code": quote.variant_code,
-        "sku_code": sku_code or variant_code,
+        "sku_code": effective_sku_code,
         "category": quote.category,
         "billing_mode": quote.billing_mode,
         "pricing_mode_used": pricing_mode,
         "billing_mode_snapshot": billing_mode_snapshot or pricing_mode,
-        "entitlement_source": entitlement_source,
+        "entitlement_source": normalized_entitlement_source,
         "entitlement_reason": entitlement_reason,
-        "tier_code": tier_code,
+        "tier_code": normalized_tier_code,
         "billing_account_id": str(billing_account_id) if billing_account_id else None,
         "settlement_mode": effective_settlement_mode,
-        "service_name": service_name,
-        "service_action": service_action,
+        "service_name": effective_service_name,
+        "service_action": effective_service_action,
         "hold_applied": hold_applied,
         "reserved_hold_credits": held_credits,
         "pricebook_id": str(pbid) if pbid else None,
         "pricebook_name": quote.pricebook_name,
-        "currency": quote.currency,
+        "currency": effective_currency,
         "total_credits": quote.total_credits,
         "total_money": str(quote.total_money),
         "shadow_total_credits": quote.shadow_total_credits,
@@ -662,8 +1294,8 @@ async def reserve(
         "rounding_mode": quote.rounding_mode,
         "alt_currency": quote.alt_currency,
         "alt_total_money": str(quote.alt_total_money) if quote.alt_total_money is not None else None,
-        "country_code": country_code or None,
-        "channel": channel,
+        "country_code": normalized_country_code,
+        "channel": normalized_channel,
         "params": params,
         "lines": lines_json,
     }
@@ -673,7 +1305,7 @@ async def reserve(
         revenue_shadow = _as_decimal(str(quote.shadow_total_money or quote.total_money), "0")
         econ = await _compute_economics_for_quote(
             conn,
-            currency=quote.currency,
+            currency=effective_currency,
             revenue_money_est=revenue_est,
             revenue_money_shadow=revenue_shadow,
             quote_lines=[{"sku_code": l.sku_code, "qty": l.qty} for l in quote.lines],
@@ -682,7 +1314,7 @@ async def reserve(
     except Exception:
         logger.exception("economics estimate failed; continuing without economics")
         quote_json_full["economics"] = {
-            "currency": quote.currency,
+            "currency": effective_currency,
             "has_costs_complete": False,
             "missing_cost_skus": [],
             "reason": "economics_estimate_failed",
@@ -691,107 +1323,146 @@ async def reserve(
 
     async with conn.transaction():
         await _ensure_account_row(conn, user_id)
+        await _backfill_legacy_lots_if_needed(conn, user_id)
 
         try:
-            async with conn.transaction():
-                await conn.execute(
-                    """
-                    update pricing_credit_accounts
-                    set
-                      billing_account_id = coalesce(billing_account_id, $2),
-                      settlement_mode = $3,
-                      updated_at = now()
-                    where user_id = $1
-                    """,
-                    user_id,
-                    billing_account_id,
-                    effective_settlement_mode,
-                )
+            await conn.execute(
+                """
+                update pricing_credit_accounts
+                set
+                  billing_account_id = coalesce(billing_account_id, $2),
+                  settlement_mode = $3,
+                  updated_at = now()
+                where user_id = $1
+                """,
+                user_id,
+                billing_account_id,
+                effective_settlement_mode,
+            )
         except Exception:
             pass
 
-        acc = await conn.fetchrow(
-            "select balance_credits, reserved_credits from pricing_credit_accounts where user_id = $1 for update",
-            user_id,
-        )
-        bal = int(acc["balance_credits"])
-        res = int(acc["reserved_credits"])
-        avail = bal - res
+        balance_before = await get_balance(conn, user_id)
+        allocations: list[dict] = []
+        funding_summary = {
+            "strategy": "postpaid_authorization" if effective_settlement_mode == "postpaid" else "credit_lots",
+            "hold_applied": hold_applied,
+            "held_credits": held_credits,
+            "allocations": [],
+            "allocations_summary": {"included": 0, "promo": 0, "purchased": 0, "total": 0},
+            "balance_before": {
+                "balance_credits": balance_before.balance_credits,
+                "reserved_credits": balance_before.reserved_credits,
+                "available_credits": balance_before.available_credits,
+            },
+        }
 
-        if held_credits > 0 and avail < held_credits:
-            raise ValueError("PRICING_INSUFFICIENT_CREDITS")
+        if held_credits > 0:
+            allocations = await _reserve_lot_allocations(
+                conn,
+                user_id=user_id,
+                requested_credits=held_credits,
+            )
+            funding_summary["allocations"] = allocations
+            funding_summary["allocations_summary"] = _allocations_summary(allocations)
 
+        balance_after = await get_balance(conn, user_id)
+        funding_summary["balance_after"] = {
+            "balance_credits": balance_after.balance_credits,
+            "reserved_credits": balance_after.reserved_credits,
+            "available_credits": balance_after.available_credits,
+        }
+        quote_json_full["funding_summary"] = funding_summary
+
+        rid = None
         try:
-            async with conn.transaction():
-                rid_row = await conn.fetchrow(
-                    """
-                    insert into pricing_credit_reservations
-                      (
-                        id, user_id, billing_account_id, settlement_mode, status,
-                        pricebook_id, country_code, currency, channel, tier_code,
-                        service_name, service_action, sku_code,
-                        quote_json, reserved_credits, estimated_money, idempotency_key, job_ref,
-                        expires_at, finalized_at, created_at, updated_at
-                      )
-                    values
-                      (
-                        gen_random_uuid(), $1, $2, $3, 'reserved',
-                        $4, $5, $6, $7, $8,
-                        $9, $10, $11,
-                        $12::jsonb, $13, $14, $15, $16,
-                        $17, null, now(), now()
-                      )
-                    on conflict (user_id, idempotency_key) do nothing
-                    returning id
-                    """,
-                    user_id,
-                    billing_account_id,
-                    effective_settlement_mode,
-                    pbid,
-                    country_code or None,
-                    quote.currency,
-                    channel,
-                    tier_code,
-                    service_name,
-                    service_action,
-                    sku_code or variant_code,
-                    quote_json_full,
-                    held_credits,
-                    est_money,
-                    idempotency_key,
-                    job_ref,
-                    expires_at,
-                )
+            row = await conn.fetchrow(
+                """
+                insert into pricing_credit_reservations
+                  (
+                    id, user_id, billing_account_id, settlement_mode, status,
+                    pricebook_id, country_code, currency, channel, tier_code,
+                    service_name, service_action, sku_code,
+                    quote_json, reserved_credits, estimated_money, idempotency_key, job_ref,
+                    allocations_json, funding_summary_json,
+                    expires_at, finalized_at, created_at, updated_at
+                  )
+                values
+                  (
+                    gen_random_uuid(), $1, $2, $3, 'reserved',
+                    $4, $5, $6, $7, $8,
+                    $9, $10, $11,
+                    $12::jsonb, $13, $14, $15, $16,
+                    $17::jsonb, $18::jsonb,
+                    $19, null, now(), now()
+                  )
+                on conflict (user_id, idempotency_key) do nothing
+                returning id
+                """,
+                user_id,
+                billing_account_id,
+                effective_settlement_mode,
+                pbid,
+                normalized_country_code,
+                effective_currency,
+                normalized_channel,
+                normalized_tier_code,
+                effective_service_name,
+                effective_service_action,
+                effective_sku_code,
+                quote_json_full,
+                held_credits,
+                est_money,
+                idempotency_key,
+                job_ref,
+                json.dumps({"allocations": allocations}, default=str),
+                json.dumps(funding_summary, default=str),
+                expires_at,
+            )
+            rid = row["id"] if row else None
         except Exception:
-            async with conn.transaction():
-                rid_row = await conn.fetchrow(
-                    """
-                    insert into pricing_credit_reservations
-                      (id, user_id, status, pricebook_id, country_code, currency, channel, tier_code,
-                       quote_json, reserved_credits, estimated_money, idempotency_key, job_ref,
-                       expires_at, finalized_at, created_at, updated_at)
-                    values
-                      (gen_random_uuid(), $1, 'reserved', $2, $3, $4, $5, $6,
-                       $7::jsonb, $8, $9, $10, $11,
-                       $12, null, now(), now())
-                    on conflict (user_id, idempotency_key) do nothing
-                    returning id
-                    """,
-                    user_id,
-                    pbid,
-                    country_code or None,
-                    quote.currency,
-                    channel,
-                    tier_code,
-                    quote_json_full,
-                    held_credits,
-                    est_money,
-                    idempotency_key,
-                    job_ref,
-                    expires_at,
-                )
+            row = await conn.fetchrow(
+                """
+                insert into pricing_credit_reservations
+                  (
+                    id, user_id, billing_account_id, settlement_mode, status,
+                    pricebook_id, country_code, currency, channel, tier_code,
+                    service_name, service_action, sku_code,
+                    quote_json, reserved_credits, estimated_money, idempotency_key, job_ref,
+                    expires_at, finalized_at, created_at, updated_at
+                  )
+                values
+                  (
+                    gen_random_uuid(), $1, $2, $3, 'reserved',
+                    $4, $5, $6, $7, $8,
+                    $9, $10, $11,
+                    $12::jsonb, $13, $14, $15, $16,
+                    $17, null, now(), now()
+                  )
+                on conflict (user_id, idempotency_key) do nothing
+                returning id
+                """,
+                user_id,
+                billing_account_id,
+                effective_settlement_mode,
+                pbid,
+                normalized_country_code,
+                effective_currency,
+                normalized_channel,
+                normalized_tier_code,
+                effective_service_name,
+                effective_service_action,
+                effective_sku_code,
+                quote_json_full,
+                held_credits,
+                est_money,
+                idempotency_key,
+                job_ref,
+                expires_at,
+            )
+            rid = row["id"] if row else None
 
-        if not rid_row:
+        if not rid:
             existing2 = await conn.fetchrow(
                 """
                 select id, status, reserved_credits, expires_at, currency, estimated_money, quote_json
@@ -814,20 +1485,7 @@ async def reserve(
                 quote=q2,
             )
 
-        rid = UUID(str(rid_row["id"]))
-
-        if held_credits > 0:
-            await conn.execute(
-                """
-                update pricing_credit_accounts
-                set reserved_credits = reserved_credits + $2,
-                    updated_at = now()
-                where user_id = $1
-                """,
-                user_id,
-                held_credits,
-            )
-
+        rid_uuid = UUID(str(rid))
         ledger_sku_code = _ledger_leaf_sku_code_from_quote(quote_json_full)
 
         await _ledger_event(
@@ -838,44 +1496,54 @@ async def reserve(
             idempotency_key=f"reserve_hold:{idempotency_key}",
             sku_code=ledger_sku_code,
             quantity=_as_decimal(params.get("requested_units"), "0"),
-            country_code=country_code or None,
-            currency=quote.currency,
-            channel=channel,
+            country_code=normalized_country_code,
+            currency=effective_currency,
+            channel=normalized_channel,
             money_amount=est_money,
-            metadata={
-                "reservation_id": str(rid),
-                "variant_code": variant_code,
-                "requested_code": sku_code or variant_code,
-                "ledger_sku_code": ledger_sku_code,
-                "billing_mode_snapshot": billing_mode_snapshot or pricing_mode,
-                "settlement_mode": effective_settlement_mode,
-                "hold_applied": hold_applied,
-                "quoted_credits": quoted_credits,
-                "held_credits": held_credits,
-                "reserved_delta_applied": held_credits,
-                "reserved_delta_intended": held_credits,
-                "balance_before": bal,
-                "reserved_before": res,
-                "available_before": avail,
-                "reserved_after": (res + held_credits),
-            },
+            metadata=_ledger_metadata_with_service_job_hints(
+                {
+                    "reservation_id": str(rid_uuid),
+                    "variant_code": variant_code,
+                    "requested_code": effective_sku_code,
+                    "ledger_sku_code": ledger_sku_code,
+                    "billing_mode_snapshot": billing_mode_snapshot or pricing_mode,
+                    "settlement_mode": effective_settlement_mode,
+                    "hold_applied": hold_applied,
+                    "quoted_credits": quoted_credits,
+                    "held_credits": held_credits,
+                    "balance_before": balance_before.balance_credits,
+                    "reserved_before": balance_before.reserved_credits,
+                    "available_before": balance_before.available_credits,
+                    "balance_after": balance_after.balance_credits,
+                    "reserved_after": balance_after.reserved_credits,
+                    "available_after": balance_after.available_credits,
+                    "funding_summary": funding_summary,
+                },
+                service_name=effective_service_name,
+                service_action=effective_service_action,
+                params=params,
+                studio_job_id=_as_uuid_or_none(job_ref),
+            ),
             billing_account_id=billing_account_id,
             settlement_mode=effective_settlement_mode,
-            reservation_id=rid,
+            reservation_id=rid_uuid,
             studio_job_id=_as_uuid_or_none(job_ref),
-            service_name=service_name,
-            service_action=service_action,
+            service_name=effective_service_name,
+            service_action=effective_service_action,
         )
 
+        await _sync_legacy_credit_account_summary(conn, user_id)
+
     return ReservationView(
-        reservation_id=rid,
+        reservation_id=rid_uuid,
         status="reserved",
         reserved_credits=held_credits,
         expires_at=expires_at,
-        currency=quote.currency,
+        currency=effective_currency,
         estimated_money=est_money,
         quote=quote_json_full,
     )
+
 
 
 async def release(
@@ -893,11 +1561,12 @@ async def release(
 
     async with conn.transaction():
         await _ensure_account_row(conn, user_id)
+        await _backfill_legacy_lots_if_needed(conn, user_id)
 
         if reservation_id:
             r = await conn.fetchrow(
                 """
-                select id, status, reserved_credits, expires_at, currency, estimated_money, quote_json
+                select id, status, reserved_credits, expires_at, currency, estimated_money, quote_json, allocations_json
                 from pricing_credit_reservations
                 where user_id = $1 and id = $2
                 for update
@@ -908,7 +1577,7 @@ async def release(
         else:
             r = await conn.fetchrow(
                 """
-                select id, status, reserved_credits, expires_at, currency, estimated_money, quote_json
+                select id, status, reserved_credits, expires_at, currency, estimated_money, quote_json, allocations_json
                 from pricing_credit_reservations
                 where user_id = $1 and idempotency_key = $2
                 for update
@@ -923,7 +1592,11 @@ async def release(
         st = str(r["status"])
         row_reserved = int(r["reserved_credits"] or 0)
         quote = _as_dict_loose(r["quote_json"])
-        currency = str(r["currency"] or quote.get("currency") or "")
+        allocations_json = _as_dict_loose(_row_get(r, "allocations_json"))
+        allocations = allocations_json.get("allocations") or []
+        currency = _clean_currency(r["currency"] or quote.get("currency"), default="USD")
+        effective_channel = _clean_text(channel) or _clean_text(quote.get("channel"), default="service")
+        effective_country_code = _clean_country_code(country_code) or _clean_country_code(quote.get("country_code"))
 
         held_effective = _held_credits_from_reservation(row_reserved, quote)
         hold_applied = held_effective > 0
@@ -942,30 +1615,45 @@ async def release(
         if st == "committed":
             raise ValueError("PRICING_RESERVATION_ALREADY_COMMITTED")
 
-        acc = await conn.fetchrow(
-            "select balance_credits, reserved_credits from pricing_credit_accounts where user_id=$1 for update",
-            user_id,
-        )
-        bal = int(acc["balance_credits"])
-        res = int(acc["reserved_credits"])
+        balance_before = await get_balance(conn, user_id)
 
-        new_res = res
-        if held_effective > 0:
-            new_res = max(0, res - held_effective)
+        if allocations:
+            await _release_lot_allocations(conn, allocations=allocations)
+            await _sync_legacy_credit_account_summary(conn, user_id)
+        elif held_effective > 0:
+            acc = await conn.fetchrow(
+                "select balance_credits, reserved_credits from pricing_credit_accounts where user_id=$1 for update",
+                user_id,
+            )
+            res = int(acc["reserved_credits"])
+            await conn.execute(
+                "update pricing_credit_accounts set reserved_credits=$2, updated_at=now() where user_id=$1",
+                user_id,
+                max(0, res - held_effective),
+            )
 
-        await conn.execute(
-            "update pricing_credit_accounts set reserved_credits=$2, updated_at=now() where user_id=$1",
-            user_id,
-            new_res,
-        )
+        balance_after = await get_balance(conn, user_id)
+
         await conn.execute(
             """
             update pricing_credit_reservations
-            set status='released', finalized_at=coalesce(finalized_at, now()), updated_at=now()
+            set
+              status='released',
+              finalized_at=coalesce(finalized_at, now()),
+              updated_at=now(),
+              funding_summary_json = coalesce(funding_summary_json, '{}'::jsonb) || $3::jsonb
             where user_id=$1 and id=$2
             """,
             user_id,
             rid,
+            json.dumps(
+                {
+                    "released_reason": reason,
+                    "released_at": _now().isoformat(),
+                    "released_summary": _allocations_summary(allocations),
+                },
+                default=str,
+            ),
         )
 
         ledger_sku_code = _ledger_leaf_sku_code_from_quote(quote)
@@ -977,29 +1665,37 @@ async def release(
             credits_delta=0,
             idempotency_key=f"reserve_release:{rid}",
             sku_code=ledger_sku_code,
-            country_code=country_code or None,
-            currency=currency or None,
-            channel=channel,
-            metadata={
-                "reservation_id": str(rid),
-                "reason": reason,
-                "requested_code": str(quote.get("sku_code") or quote.get("variant_code") or "") or None,
-                "ledger_sku_code": ledger_sku_code,
-                "settlement_mode": _normalize_settlement_mode(quote.get("settlement_mode")) or "prepaid",
-                "hold_applied": hold_applied,
-                "held_credits": held_effective,
-                "reserved_delta_applied": (-held_effective) if hold_applied else 0,
-                "reserved_delta_intended": (-held_effective) if held_effective > 0 else 0,
-                "balance_before": bal,
-                "reserved_before": res,
-                "reserved_after": new_res,
-            },
+            country_code=effective_country_code,
+            currency=currency,
+            channel=effective_channel,
+            metadata=_ledger_metadata_with_service_job_hints(
+                {
+                    "reservation_id": str(rid),
+                    "reason": reason,
+                    "requested_code": str(quote.get("sku_code") or quote.get("variant_code") or "") or None,
+                    "ledger_sku_code": ledger_sku_code,
+                    "settlement_mode": _normalize_settlement_mode(quote.get("settlement_mode")) or "prepaid",
+                    "hold_applied": hold_applied,
+                    "held_credits": held_effective,
+                    "balance_before": balance_before.balance_credits,
+                    "reserved_before": balance_before.reserved_credits,
+                    "available_before": balance_before.available_credits,
+                    "balance_after": balance_after.balance_credits,
+                    "reserved_after": balance_after.reserved_credits,
+                    "available_after": balance_after.available_credits,
+                    "released_allocations": allocations,
+                },
+                service_name=_clean_text(quote.get("service_name")) or None,
+                service_action=_clean_text(quote.get("service_action")) or None,
+                params=_as_dict_loose(quote.get("params")),
+                studio_job_id=_as_uuid_or_none(_as_dict_loose(quote.get("params")).get("service_job_id")),
+            ),
             billing_account_id=_as_uuid_or_none(quote.get("billing_account_id")),
             settlement_mode=_normalize_settlement_mode(quote.get("settlement_mode")) or "prepaid",
             reservation_id=rid,
-            studio_job_id=_as_uuid_or_none(_as_dict_loose(quote.get("params")).get("external_ref_id")),
-            service_name=str(quote.get("service_name") or "") or None,
-            service_action=str(quote.get("service_action") or "") or None,
+            studio_job_id=_as_uuid_or_none(_as_dict_loose(quote.get("params")).get("service_job_id")),
+            service_name=_clean_text(quote.get("service_name")) or None,
+            service_action=_clean_text(quote.get("service_action")) or None,
         )
 
         return ReservationView(
@@ -1011,6 +1707,7 @@ async def release(
             estimated_money=_as_decimal(r["estimated_money"], "0"),
             quote=quote,
         )
+
 
 
 async def finalize(
@@ -1032,13 +1729,15 @@ async def finalize(
 ) -> FinalizeReceipt:
     async with conn.transaction():
         await _ensure_account_row(conn, user_id)
+        await _backfill_legacy_lots_if_needed(conn, user_id)
 
         try:
             r = await conn.fetchrow(
                 """
                 select
                   id, status, reserved_credits, currency, estimated_money, quote_json,
-                  billing_account_id, settlement_mode, service_name, service_action, sku_code
+                  billing_account_id, settlement_mode, service_name, service_action, sku_code,
+                  allocations_json, funding_summary_json
                 from pricing_credit_reservations
                 where user_id=$1 and id=$2
                 for update
@@ -1049,7 +1748,7 @@ async def finalize(
         except Exception:
             r = await conn.fetchrow(
                 """
-                select id, status, reserved_credits, currency, estimated_money, quote_json
+                select id, status, reserved_credits, currency, estimated_money, quote_json, allocations_json
                 from pricing_credit_reservations
                 where user_id=$1 and id=$2
                 for update
@@ -1063,7 +1762,12 @@ async def finalize(
         st = str(r["status"])
         row_reserved = int(r["reserved_credits"] or 0)
         quote = _as_dict_loose(r["quote_json"])
-        currency = str(r["currency"] or quote.get("currency") or "")
+        allocations_json = _as_dict_loose(_row_get(r, "allocations_json"))
+        funding_summary_json = _as_dict_loose(_row_get(r, "funding_summary_json"))
+        allocations = allocations_json.get("allocations") or []
+        currency = _clean_currency(r["currency"] or quote.get("currency"), default="USD")
+        effective_channel = _clean_text(channel) or _clean_text(quote.get("channel"), default="service")
+        effective_country_code = _clean_country_code(country_code) or _clean_country_code(quote.get("country_code"))
 
         effective_billing_account_id = (
             _as_uuid_or_none(_row_get(r, "billing_account_id"))
@@ -1077,35 +1781,35 @@ async def finalize(
             or "prepaid"
         )
         effective_service_name = (
-            str(_row_get(r, "service_name") or "").strip()
-            or str(quote.get("service_name") or "").strip()
-            or str(service_name or "").strip()
+            _clean_text(_row_get(r, "service_name"))
+            or _clean_text(quote.get("service_name"))
+            or _clean_text(service_name)
             or None
         )
         effective_service_action = (
-            str(_row_get(r, "service_action") or "").strip()
-            or str(quote.get("service_action") or "").strip()
-            or str(service_action or "").strip()
+            _clean_text(_row_get(r, "service_action"))
+            or _clean_text(quote.get("service_action"))
+            or _clean_text(service_action)
             or None
         )
         effective_sku_code = (
-            str(_row_get(r, "sku_code") or "").strip()
-            or str(quote.get("sku_code") or quote.get("variant_code") or "").strip()
-            or str(sku_code or "").strip()
+            _clean_text(_row_get(r, "sku_code"))
+            or _clean_text(quote.get("sku_code") or quote.get("variant_code"))
+            or _clean_text(sku_code)
             or None
         )
         effective_job_id = (
             studio_job_id
+            or _as_uuid_or_none(_as_dict_loose(quote.get("params")).get("service_job_id"))
+            or _as_uuid_or_none(_as_dict_loose(quote.get("params")).get("longform_job_id"))
             or _as_uuid_or_none(_as_dict_loose(quote.get("params")).get("external_ref_id"))
+            or _as_uuid_or_none(actuals.get("service_job_id"))
             or _as_uuid_or_none(actuals.get("external_ref_id"))
         )
 
-        acc = await conn.fetchrow(
-            "select balance_credits, reserved_credits from pricing_credit_accounts where user_id=$1 for update",
-            user_id,
-        )
-        bal_before = int(acc["balance_credits"])
-        res_before = int(acc["reserved_credits"])
+        balance_before = await get_balance(conn, user_id)
+        bal_before = balance_before.balance_credits
+        res_before = balance_before.reserved_credits
 
         if st == "committed":
             avail_after = max(0, bal_before - res_before)
@@ -1147,28 +1851,43 @@ async def finalize(
             final_credits = quoted_credits
             final_money = quoted_money
 
-        available_effective = bal_before - res_before + held_effective
-        if final_credits > 0 and available_effective < final_credits:
+        if effective_settlement_mode != "postpaid" and final_credits > balance_before.available_credits + held_effective:
             raise ValueError("PRICING_INSUFFICIENT_CREDITS_OVERAGE")
 
-        new_reserved = res_before
-        if held_effective > 0:
-            new_reserved = max(0, res_before - held_effective)
+        commit_result = {"consumed": [], "released": [], "consumed_summary": {"included": 0, "promo": 0, "purchased": 0, "total": 0}, "released_summary": {"included": 0, "promo": 0, "purchased": 0, "total": 0}}
+        if allocations:
+            commit_result = await _commit_lot_allocations(
+                conn,
+                allocations=allocations,
+                charged_credits=final_credits,
+            )
+            await _sync_legacy_credit_account_summary(conn, user_id)
+        elif held_effective > 0:
+            # Legacy fallback for pre-lots reservations.
+            acc = await conn.fetchrow(
+                "select balance_credits, reserved_credits from pricing_credit_accounts where user_id=$1 for update",
+                user_id,
+            )
+            legacy_balance = int(acc["balance_credits"])
+            legacy_reserved = int(acc["reserved_credits"])
+            new_reserved = max(0, legacy_reserved - held_effective)
+            new_balance = legacy_balance - final_credits
+            if new_balance < 0:
+                raise ValueError("PRICING_NEGATIVE_BALANCE_GUARD")
+            await conn.execute(
+                """
+                update pricing_credit_accounts
+                set balance_credits=$2, reserved_credits=$3, updated_at=now()
+                where user_id=$1
+                """,
+                user_id,
+                new_balance,
+                new_reserved,
+            )
 
-        new_balance = bal_before - final_credits
-        if new_balance < 0:
-            raise ValueError("PRICING_NEGATIVE_BALANCE_GUARD")
-
-        await conn.execute(
-            """
-            update pricing_credit_accounts
-            set balance_credits=$2, reserved_credits=$3, updated_at=now()
-            where user_id=$1
-            """,
-            user_id,
-            new_balance,
-            new_reserved,
-        )
+        balance_after = await get_balance(conn, user_id)
+        new_balance = balance_after.balance_credits
+        new_reserved = balance_after.reserved_credits
 
         try:
             econ = _as_dict_loose(quote.get("economics"))
@@ -1219,14 +1938,24 @@ async def finalize(
             "held_credits_effective": held_effective,
             "hold_applied": hold_applied,
             "timestamp": _now().isoformat(),
+            "funding_summary_before": funding_summary_json,
+            "funding_summary_final": {
+                "consumed": commit_result.get("consumed"),
+                "released": commit_result.get("released"),
+                "consumed_summary": commit_result.get("consumed_summary"),
+                "released_summary": commit_result.get("released_summary"),
+            },
         }
         quote["final_charged_credits"] = final_credits
         quote["final_charged_money"] = str(final_money)
-        quote["reserved_hold_credits"] = held_effective
+        quote["reserved_hold_credits"] = max(0, row_reserved - final_credits if hold_applied else 0)
         quote["billing_account_id"] = (
             str(effective_billing_account_id) if effective_billing_account_id else quote.get("billing_account_id")
         )
         quote["settlement_mode"] = effective_settlement_mode
+        quote["currency"] = currency
+        quote["country_code"] = effective_country_code
+        quote["channel"] = effective_channel
         if effective_service_name:
             quote["service_name"] = effective_service_name
         if effective_service_action:
@@ -1235,43 +1964,55 @@ async def finalize(
             quote["sku_code"] = effective_sku_code
 
         try:
-            async with conn.transaction():
-                await conn.execute(
-                    """
-                    update pricing_credit_reservations
-                    set
-                      status='committed',
-                      finalized_at=now(),
-                      updated_at=now(),
-                      billing_account_id=coalesce(billing_account_id, $3),
-                      settlement_mode=$4,
-                      service_name=coalesce(service_name, $5),
-                      service_action=coalesce(service_action, $6),
-                      sku_code=coalesce(sku_code, $7),
-                      quote_json=$8::jsonb
-                    where user_id=$1 and id=$2
-                    """,
-                    user_id,
-                    reservation_id,
-                    effective_billing_account_id,
-                    effective_settlement_mode,
-                    effective_service_name,
-                    effective_service_action,
-                    effective_sku_code,
-                    quote,
-                )
+            await conn.execute(
+                """
+                update pricing_credit_reservations
+                set
+                  status='committed',
+                  finalized_at=now(),
+                  updated_at=now(),
+                  billing_account_id=coalesce(billing_account_id, $3),
+                  settlement_mode=$4,
+                  service_name=coalesce(service_name, $5),
+                  service_action=coalesce(service_action, $6),
+                  sku_code=coalesce(sku_code, $7),
+                  quote_json=$8::jsonb,
+                  allocations_json=$9::jsonb,
+                  funding_summary_json=$10::jsonb
+                where user_id=$1 and id=$2
+                """,
+                user_id,
+                reservation_id,
+                effective_billing_account_id,
+                effective_settlement_mode,
+                effective_service_name,
+                effective_service_action,
+                effective_sku_code,
+                quote,
+                json.dumps({"allocations": allocations}, default=str),
+                json.dumps(
+                    {
+                        **funding_summary_json,
+                        "committed_at": _now().isoformat(),
+                        "consumed": commit_result.get("consumed"),
+                        "released": commit_result.get("released"),
+                        "consumed_summary": commit_result.get("consumed_summary"),
+                        "released_summary": commit_result.get("released_summary"),
+                    },
+                    default=str,
+                ),
+            )
         except Exception:
-            async with conn.transaction():
-                await conn.execute(
-                    """
-                    update pricing_credit_reservations
-                    set status='committed', finalized_at=now(), updated_at=now(), quote_json=$3::jsonb
-                    where user_id=$1 and id=$2
-                    """,
-                    user_id,
-                    reservation_id,
-                    quote,
-                )
+            await conn.execute(
+                """
+                update pricing_credit_reservations
+                set status='committed', finalized_at=now(), updated_at=now(), quote_json=$3::jsonb
+                where user_id=$1 and id=$2
+                """,
+                user_id,
+                reservation_id,
+                quote,
+            )
 
         ledger_sku_code = _ledger_leaf_sku_code_from_quote(quote)
 
@@ -1283,25 +2024,32 @@ async def finalize(
             idempotency_key=f"consume:{finalize_idempotency_key}",
             sku_code=ledger_sku_code,
             quantity=_as_decimal(actuals.get("actual_units"), "0"),
-            country_code=country_code or None,
-            currency=currency or None,
-            channel=channel,
+            country_code=effective_country_code,
+            currency=currency,
+            channel=effective_channel,
             money_amount=final_money,
-            metadata={
-                "reservation_id": str(reservation_id),
-                "variant_code": quote.get("variant_code"),
-                "requested_code": effective_sku_code,
-                "ledger_sku_code": ledger_sku_code,
-                "billing_mode_effective": effective_billing_mode,
-                "settlement_mode_effective": effective_settlement_mode,
-                "hold_applied": hold_applied,
-                "held_credits": held_effective,
-                "charged_credits": final_credits,
-                "balance_before": bal_before,
-                "reserved_before": res_before,
-                "balance_after": new_balance,
-                "reserved_after": new_reserved,
-            },
+            metadata=_ledger_metadata_with_service_job_hints(
+                {
+                    "reservation_id": str(reservation_id),
+                    "variant_code": quote.get("variant_code"),
+                    "requested_code": effective_sku_code,
+                    "ledger_sku_code": ledger_sku_code,
+                    "billing_mode_effective": effective_billing_mode,
+                    "settlement_mode_effective": effective_settlement_mode,
+                    "hold_applied": hold_applied,
+                    "held_credits": held_effective,
+                    "charged_credits": final_credits,
+                    "balance_before": bal_before,
+                    "reserved_before": res_before,
+                    "balance_after": new_balance,
+                    "reserved_after": new_reserved,
+                    "funding_summary_final": commit_result,
+                },
+                service_name=effective_service_name,
+                service_action=effective_service_action,
+                params=_as_dict_loose(quote.get("params")),
+                studio_job_id=effective_job_id,
+            ),
             billing_account_id=effective_billing_account_id,
             settlement_mode=effective_settlement_mode,
             reservation_id=reservation_id,
@@ -1317,24 +2065,29 @@ async def finalize(
             credits_delta=0,
             idempotency_key=f"reserve_release_finalize:{finalize_idempotency_key}",
             sku_code=ledger_sku_code,
-            country_code=country_code or None,
-            currency=currency or None,
-            channel=channel,
-            metadata={
-                "reservation_id": str(reservation_id),
-                "reason": "finalize",
-                "requested_code": effective_sku_code,
-                "ledger_sku_code": ledger_sku_code,
-                "settlement_mode_effective": effective_settlement_mode,
-                "hold_applied": hold_applied,
-                "held_credits": held_effective,
-                "reserved_delta_applied": (-held_effective) if hold_applied else 0,
-                "reserved_delta_intended": (-held_effective) if held_effective > 0 else 0,
-                "balance_before": bal_before,
-                "reserved_before": res_before,
-                "balance_after": new_balance,
-                "reserved_after": new_reserved,
-            },
+            country_code=effective_country_code,
+            currency=currency,
+            channel=effective_channel,
+            metadata=_ledger_metadata_with_service_job_hints(
+                {
+                    "reservation_id": str(reservation_id),
+                    "reason": "finalize",
+                    "requested_code": effective_sku_code,
+                    "ledger_sku_code": ledger_sku_code,
+                    "settlement_mode_effective": effective_settlement_mode,
+                    "hold_applied": hold_applied,
+                    "held_credits": held_effective,
+                    "balance_before": bal_before,
+                    "reserved_before": res_before,
+                    "balance_after": new_balance,
+                    "reserved_after": new_reserved,
+                    "released_summary": commit_result.get("released_summary"),
+                },
+                service_name=effective_service_name,
+                service_action=effective_service_action,
+                params=_as_dict_loose(quote.get("params")),
+                studio_job_id=effective_job_id,
+            ),
             billing_account_id=effective_billing_account_id,
             settlement_mode=effective_settlement_mode,
             reservation_id=reservation_id,
@@ -1356,3 +2109,4 @@ async def finalize(
             reserved_after=new_reserved,
             available_after=avail_after,
         )
+
