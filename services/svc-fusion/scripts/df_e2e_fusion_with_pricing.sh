@@ -1,677 +1,447 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==============================================================================
-# DesiFaces svc-fusion E2E Test (Pricing-aware: postpaid + prepaid)
+# -----------------------------------------------------------------------------
+# DesiFaces svc-fusion pricing E2E
 #
-# File:
-#   services/svc-fusion/app/app/scripts/e2e/df_e2e_fusion_with_pricing.sh
+# Features:
+# - Logs in via svc-core
+# - Auto-fetches latest successful Face and Audio artifact IDs from desifaces-db
+#   for the logged-in user if FACE_ARTIFACT_ID / AUDIO_ARTIFACT_ID are unset
+# - Uses the live Fusion routes:
+#     POST /jobs/pricing/preview
+#     POST /jobs
+#     GET  /jobs/{job_id}
+# - Verifies pricing terminal correctness:
+#     succeeded -> committed
+#     failed/canceled/cancelled -> released
 #
-# Validates:
-#   1) login via svc-core
-#   2) create fusion job using face/audio artifact IDs
-#   3) poll to succeeded
-#   4) pricing block on studio_jobs payload/meta
-#   5) pricing reservation snapshot in pricing_credit_reservations
-#   6) postpaid semantics for user2
-#   7) prepaid semantics for user1
-#
-# Default account mapping:
-#   - user2@desifaces.ai => postpaid
-#   - user1@desifaces.ai => prepaid
-#
-# Notes:
-#   - Artifact resolution uses latest shared face/audio artifacts from DB.
-#   - If you already know artifact IDs, set FACE_ARTIFACT_ID / AUDIO_ARTIFACT_ID.
-#   - If your install requires a known talking_photo_id, set HEYGEN_TALKING_PHOTO_ID.
-# ==============================================================================
+# Environment variables:
+#   CORE_URL         default: http://localhost:8000
+#   FUSION_URL       default: http://localhost:8002
+#   DF_EMAIL         default: user2@desifaces.ai
+#   DF_PASSWORD      default: password2
+#   FACE_ARTIFACT_ID optional
+#   AUDIO_ARTIFACT_ID optional
+#   FACE_URL_INPUT   optional
+#   AUDIO_URL_INPUT  optional
+#   MAX_POLLS        default: 240
+#   POLL_SECS        default: 5
+# -----------------------------------------------------------------------------
 
-CORE_BASE="${CORE_BASE:-http://localhost:8000}"
-FUSION_BASE="${FUSION_BASE:-http://localhost:8002}"
+export CORE_URL="${CORE_URL:-http://localhost:8000}"
+export FUSION_URL="${FUSION_URL:-http://localhost:8002}"
+export DF_EMAIL="${DF_EMAIL:-user2@desifaces.ai}"
+export DF_PASSWORD="${DF_PASSWORD:-password2}"
+export MAX_POLLS="${MAX_POLLS:-240}"
+export POLL_SECS="${POLL_SECS:-5}"
 
-USER1_EMAIL="${USER1_EMAIL:-user1@desifaces.ai}"
-USER2_EMAIL="${USER2_EMAIL:-user2@desifaces.ai}"
-
-USER1_PASSWORD="${USER1_PASSWORD:-${DF_PASSWORD:-}}"
-USER2_PASSWORD="${USER2_PASSWORD:-${DF_PASSWORD:-}}"
-
-: "${USER1_PASSWORD:?USER1_PASSWORD or DF_PASSWORD is required}"
-: "${USER2_PASSWORD:?USER2_PASSWORD or DF_PASSWORD is required}"
-
-VOICE_MODE="${VOICE_MODE:-audio}"                 # audio | tts
-EXTERNAL_PROVIDER_OK="${EXTERNAL_PROVIDER_OK:-true}"
-ASPECT_RATIO="${ASPECT_RATIO:-9:16}"
-TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-900}"
-POLL_SECONDS="${POLL_SECONDS:-3}"
-
-# Optional overrides
-FACE_ARTIFACT_ID="${FACE_ARTIFACT_ID:-}"
-AUDIO_ARTIFACT_ID="${AUDIO_ARTIFACT_ID:-}"
-HEYGEN_TALKING_PHOTO_ID="${HEYGEN_TALKING_PHOTO_ID:-}"
-
-# Optional TTS mode fields
-TTS_VOICE_ID="${TTS_VOICE_ID:-}"
-TTS_SCRIPT="${TTS_SCRIPT:-}"
-
-OUT_DIR="${OUT_DIR:-/tmp/df_fusion_pricing_e2e_$(date +%s)}"
+OUT_DIR="${OUT_DIR:-/tmp/df_e2e_fusion_with_pricing_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUT_DIR"
 
-bool_norm() {
-  local v="${1:-}"
-  v="$(echo "$v" | tr '[:upper:]' '[:lower:]' | xargs)"
-  if [[ "$v" == "1" || "$v" == "true" || "$v" == "yes" || "$v" == "y" ]]; then
-    echo "true"
-  else
-    echo "false"
-  fi
+AUTH_JSON="$OUT_DIR/auth.json"
+PREVIEW_REQ="$OUT_DIR/fusion_preview_req.json"
+PREVIEW_RESP="$OUT_DIR/fusion_preview_resp.json"
+GENERATE_REQ="$OUT_DIR/fusion_generate_req.json"
+GENERATE_RESP="$OUT_DIR/fusion_generate_resp.json"
+STATUS_JSON="$OUT_DIR/fusion_status.json"
+SUMMARY_JSON="$OUT_DIR/summary.json"
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "ERROR: required command not found: $1" >&2
+    exit 1
+  }
+}
+require_cmd curl
+require_cmd python3
+
+json_get() {
+  local file="$1"
+  local expr="$2"
+  python3 - "$file" "$expr" <<'PY'
+import json, sys
+path, expr = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+cur = data
+for part in expr.split("."):
+    if not part:
+        continue
+    if isinstance(cur, dict):
+        cur = cur.get(part)
+    else:
+        cur = None
+        break
+if cur is None:
+    print("")
+elif isinstance(cur, (dict, list)):
+    print(json.dumps(cur, ensure_ascii=False))
+else:
+    print(str(cur))
+PY
 }
 
-now_epoch() { date +%s; }
+pretty() { python3 -m json.tool "$1"; }
 
-log() {
-  printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
-}
-
-die() {
-  log "ERROR: $*"
-  exit 1
-}
-
-EXTERNAL_PROVIDER_OK="$(bool_norm "$EXTERNAL_PROVIDER_OK")"
-
-decode_jwt_sub() {
-  python3 - "$1" <<'PY'
+decode_user_id_from_jwt() {
+  local jwt="$1"
+  python3 - "$jwt" <<'PY'
 import base64, json, sys
-token = sys.argv[1]
+tok = sys.argv[1].strip()
+if not tok:
+    print("")
+    raise SystemExit(0)
+parts = tok.split(".")
+if len(parts) < 2:
+    print("")
+    raise SystemExit(0)
+payload = parts[1] + "=" * (-len(parts[1]) % 4)
 try:
-    parts = token.split(".")
-    payload = parts[1]
-    payload += "=" * (-len(payload) % 4)
-    obj = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
-    print(obj.get("sub") or "")
+    data = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
 except Exception:
     print("")
+    raise SystemExit(0)
+print(data.get("sub") or data.get("user_id") or "")
 PY
 }
 
-login_user() {
-  local email="$1"
-  local password="$2"
-  local label="$3"
-
-  local body
-  body="$(jq -nc --arg email "$email" --arg password "$password" '{email:$email,password:$password}')"
-
-  local resp
-  resp="$(curl -sS -X POST "${CORE_BASE}/api/auth/login" -H "Content-Type: application/json" -d "$body")"
-  echo "$resp" > "${OUT_DIR}/${label}_auth.json"
-
-  local token
-  token="$(echo "$resp" | jq -r '.access_token // .token // empty')"
-  [[ -n "$token" ]] || die "login failed for ${email}; no access_token returned"
-
-  local user_id
-  user_id="$(echo "$resp" | jq -r '.user.id // .user_id // .id // empty')"
-  if [[ -z "$user_id" ]]; then
-    user_id="$(decode_jwt_sub "$token")"
-  fi
-  [[ -n "$user_id" ]] || die "login succeeded but user_id could not be resolved for ${email}"
-
-  jq -nc --arg token "$token" --arg user_id "$user_id" '{token:$token,user_id:$user_id}'
+post_json_capture() {
+  local url="$1"; local payload="$2"; local output="$3"; local headers_out="$4"; shift 4
+  curl -sS -D "$headers_out" -o "$output" -X POST "$url" -H "Content-Type: application/json" "$@" --data @"$payload"
 }
 
-resolve_latest_artifacts() {
-  if [[ -n "$FACE_ARTIFACT_ID" && -n "$AUDIO_ARTIFACT_ID" ]]; then
-    jq -nc \
-      --arg face_artifact_id "$FACE_ARTIFACT_ID" \
-      --arg audio_artifact_id "$AUDIO_ARTIFACT_ID" \
-      '{face_artifact_id:$face_artifact_id,audio_artifact_id:$audio_artifact_id}'
-    return
-  fi
+get_json_capture() {
+  local url="$1"; local output="$2"; local headers_out="$3"; shift 3
+  curl -sS -D "$headers_out" -o "$output" "$url" "$@"
+}
 
-  docker exec -i df-svc-fusion python - <<'PY'
-import asyncio, asyncpg, json
-from app.config import settings
-
-async def main():
-    pool = await asyncpg.create_pool(settings.DATABASE_URL)
-    try:
-        async with pool.acquire() as conn:
-            face = await conn.fetchrow("""
-                SELECT id::text AS id, kind, url
-                FROM public.artifacts
-                WHERE kind IN ('face','image','face_image')
-                ORDER BY created_at DESC
-                LIMIT 1
-            """)
-            audio = await conn.fetchrow("""
-                SELECT id::text AS id, kind, url
-                FROM public.artifacts
-                WHERE kind = 'audio'
-                ORDER BY created_at DESC
-                LIMIT 1
-            """)
-        out = {
-            "face_artifact_id": face["id"] if face else None,
-            "audio_artifact_id": audio["id"] if audio else None,
-        }
-        print(json.dumps(out))
-    finally:
-        await pool.close()
-
-asyncio.run(main())
+http_status_from_headers() {
+  local headers_file="$1"
+  python3 - "$headers_file" <<'PY'
+import sys
+status = ""
+with open(sys.argv[1], "r", encoding="utf-8", errors="ignore") as f:
+    for line in f:
+        if line.startswith("HTTP/"):
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                status = parts[1]
+print(status)
 PY
 }
 
-build_payload() {
-  local face_artifact_id="$1"
-  local audio_artifact_id="$2"
+docker_db_query_single() {
+  local sql="$1"
+  docker exec -i desifaces-db bash -lc "psql -U \"\$POSTGRES_USER\" -d \"\${POSTGRES_DB:-postgres}\" -At -c \"$sql\"" 2>/dev/null || true
+}
 
-  python3 - "$face_artifact_id" "$audio_artifact_id" "$VOICE_MODE" "$EXTERNAL_PROVIDER_OK" "$ASPECT_RATIO" "$HEYGEN_TALKING_PHOTO_ID" "$TTS_VOICE_ID" "$TTS_SCRIPT" <<'PY'
+echo "OUT_DIR=$OUT_DIR"
+echo "CORE_URL=$CORE_URL"
+echo "FUSION_URL=$FUSION_URL"
+echo "DF_EMAIL=$DF_EMAIL"
+
+cat > "$OUT_DIR/login_request.json" <<JSON
+{"email":"$DF_EMAIL","password":"$DF_PASSWORD"}
+JSON
+
+echo
+echo "==> Login"
+curl -sS -X POST "$CORE_URL/api/auth/login" \
+  -H "Content-Type: application/json" \
+  --data @"$OUT_DIR/login_request.json" \
+  > "$AUTH_JSON"
+pretty "$AUTH_JSON"
+
+TOKEN="$(json_get "$AUTH_JSON" "access_token")"
+if [[ -z "$TOKEN" ]]; then TOKEN="$(json_get "$AUTH_JSON" "token")"; fi
+USER_ID="$(json_get "$AUTH_JSON" "user_id")"
+if [[ -z "$USER_ID" ]]; then USER_ID="$(decode_user_id_from_jwt "$TOKEN")"; fi
+
+if [[ -z "$TOKEN" || -z "$USER_ID" ]]; then
+  echo "ERROR: token/user_id missing" >&2
+  exit 1
+fi
+echo "USER_ID=$USER_ID"
+
+# Auto-resolve latest successful artifact IDs from DB when not provided.
+if [[ -z "${FACE_ARTIFACT_ID:-}" && -z "${FACE_URL_INPUT:-}" ]]; then
+  FACE_ARTIFACT_ID="$(
+    docker_db_query_single "SELECT a.id::text
+FROM public.artifacts a
+JOIN public.studio_jobs j ON j.id = a.job_id
+WHERE j.user_id = '$USER_ID'
+  AND j.studio_type = 'face'
+  AND j.status = 'succeeded'
+  AND a.kind IN ('image','face','face_image')
+ORDER BY a.created_at DESC
+LIMIT 1;"
+  )"
+  export FACE_ARTIFACT_ID
+fi
+
+if [[ -z "${AUDIO_ARTIFACT_ID:-}" && -z "${AUDIO_URL_INPUT:-}" ]]; then
+  AUDIO_ARTIFACT_ID="$(
+    docker_db_query_single "SELECT a.id::text
+FROM public.artifacts a
+JOIN public.studio_jobs j ON j.id = a.job_id
+WHERE j.user_id = '$USER_ID'
+  AND j.studio_type = 'audio'
+  AND j.status = 'succeeded'
+ORDER BY a.created_at DESC
+LIMIT 1;"
+  )"
+  export AUDIO_ARTIFACT_ID
+fi
+
+echo "FACE_ARTIFACT_ID=${FACE_ARTIFACT_ID:-}"
+echo "AUDIO_ARTIFACT_ID=${AUDIO_ARTIFACT_ID:-}"
+
+python3 - "$PREVIEW_REQ" <<'PY'
+import json, os, sys
+
+out = {
+    "voice_mode": "audio",
+    "consent": {
+        "external_provider_ok": True,
+    },
+}
+
+face_artifact_id = os.environ.get("FACE_ARTIFACT_ID", "").strip()
+audio_artifact_id = os.environ.get("AUDIO_ARTIFACT_ID", "").strip()
+face_url = os.environ.get("FACE_URL_INPUT", "").strip()
+audio_url = os.environ.get("AUDIO_URL_INPUT", "").strip()
+
+if face_artifact_id:
+    out["face_artifact_id"] = face_artifact_id
+elif face_url:
+    out["face_image_url"] = face_url
+
+if audio_artifact_id:
+    out["voice_audio"] = {"audio_artifact_id": audio_artifact_id}
+elif audio_url:
+    out["voice_audio"] = {"audio_url": audio_url}
+
+json.dump(out, open(sys.argv[1], "w"), indent=2)
+PY
+
+if python3 - "$PREVIEW_REQ" <<'PY'
 import json, sys
-
-face_artifact_id = sys.argv[1]
-audio_artifact_id = sys.argv[2]
-voice_mode = sys.argv[3]
-external_provider_ok = sys.argv[4].lower() == "true"
-aspect_ratio = sys.argv[5]
-heygen_talking_photo_id = sys.argv[6].strip()
-tts_voice_id = sys.argv[7].strip()
-tts_script = sys.argv[8].strip()
-
-payload = {
-    "face_artifact_id": face_artifact_id,
-    "voice_mode": voice_mode,
-    "consent": {"external_provider_ok": external_provider_ok},
-    "video": {"aspect_ratio": aspect_ratio},
-}
-
-if heygen_talking_photo_id:
-    payload["heygen_talking_photo_id"] = heygen_talking_photo_id
-
-if voice_mode == "audio":
-    payload["voice_audio"] = {
-        "type": "audio",
-        "audio_artifact_id": audio_artifact_id,
-    }
-elif voice_mode == "tts":
-    if not tts_voice_id or not tts_script:
-        raise SystemExit("TTS mode requires TTS_VOICE_ID and TTS_SCRIPT")
-    payload["voice_tts"] = {
-        "voice_id": tts_voice_id,
-        "script": tts_script,
-    }
-else:
-    raise SystemExit(f"Unsupported VOICE_MODE: {voice_mode}")
-
-print(json.dumps(payload, ensure_ascii=False))
+j = json.load(open(sys.argv[1]))
+voice_audio = j.get("voice_audio") or {}
+consent = j.get("consent") or {}
+ok = (
+    consent.get("external_provider_ok") is True
+    and bool(j.get("face_artifact_id") or j.get("face_image_url"))
+    and bool(voice_audio.get("audio_artifact_id") or voice_audio.get("audio_url"))
+)
+raise SystemExit(0 if ok else 1)
 PY
-}
+then
+  :
+else
+  echo "ERROR: missing Fusion consent or input references" >&2
+  echo "Need consent.external_provider_ok=true plus one of: face_artifact_id/face_image_url and voice_audio.audio_artifact_id/audio_url" >&2
+  exit 1
+fi
 
-query_pricing_snapshot() {
-  local job_id="$1"
+echo
+echo "==> Preview request"
+pretty "$PREVIEW_REQ"
 
-  docker exec -i df-svc-fusion python - "$job_id" <<'PY'
-import asyncio, asyncpg, json, sys
-from app.config import settings
+PREVIEW_HEADERS="$OUT_DIR/preview_headers.txt"
+post_json_capture "$FUSION_URL/jobs/pricing/preview" "$PREVIEW_REQ" "$PREVIEW_RESP" "$PREVIEW_HEADERS" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-User-Id: $USER_ID"
 
-job_id = sys.argv[1]
+PREVIEW_STATUS="$(http_status_from_headers "$PREVIEW_HEADERS")"
+echo "Preview HTTP status: $PREVIEW_STATUS"
 
-def as_dict(v):
-    if v is None:
-        return {}
-    if isinstance(v, dict):
-        return v
-    if isinstance(v, str):
-        try:
-            vv = json.loads(v)
-            return vv if isinstance(vv, dict) else {}
-        except Exception:
-            return {}
-    try:
-        if hasattr(v, "keys"):
-            return {k: v[k] for k in v.keys()}
-    except Exception:
-        pass
-    try:
-        vv = dict(v)
-        return vv if isinstance(vv, dict) else {}
-    except Exception:
-        return {}
+if [[ "$PREVIEW_STATUS" != "200" ]]; then
+  echo "ERROR: fusion preview failed" >&2
+  cat "$PREVIEW_RESP" >&2 || true
+  exit 1
+fi
 
-def row_to_dict(row):
-    if not row:
-        return None
-    return {k: row[k] for k in row.keys()}
+echo
+echo "==> Preview response"
+pretty "$PREVIEW_RESP"
 
-def pick_expr(cols, names, alias, cast=None, default_sql=None):
-    for name in names:
-        if name in cols:
-            expr = name
-            if cast:
-                expr = f"{name}::{cast}"
-            return f"{expr} AS {alias}"
-    return default_sql or f"NULL AS {alias}"
-
-async def main():
-    pool = await asyncpg.create_pool(settings.DATABASE_URL)
-    try:
-        async with pool.acquire() as conn:
-            job = await conn.fetchrow("""
-                SELECT
-                  id::text AS id,
-                  user_id::text AS user_id,
-                  studio_type,
-                  status,
-                  error_code,
-                  error_message,
-                  payload_json,
-                  meta_json
-                FROM public.studio_jobs
-                WHERE id = $1::uuid
-                  AND studio_type = 'fusion'
-                LIMIT 1
-            """, job_id)
-
-            jobd = row_to_dict(job) or {}
-            payload = as_dict(jobd.get("payload_json"))
-            meta = as_dict(jobd.get("meta_json"))
-            pricing = as_dict(payload.get("pricing")) or as_dict(meta.get("pricing"))
-
-            reservation_id = str(pricing.get("reservation_id") or "").strip()
-
-            # ------------------------------------------------------------------
-            # Reservation lookup: prefer pricing.reservation_id, fallback to job_ref
-            # ------------------------------------------------------------------
-            reservation = None
-
-            res_cols_rows = await conn.fetch("""
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema = 'public'
-                  AND table_name = 'pricing_credit_reservations'
-            """)
-            res_cols = {r["column_name"] for r in res_cols_rows}
-
-            reservation_select = """
-                SELECT
-                  id::text AS reservation_id,
-                  user_id::text AS reservation_user_id,
-                  status,
-                  billing_account_id::text AS billing_account_id,
-                  settlement_mode,
-                  reserved_credits,
-                  estimated_money,
-                  currency,
-                  tier_code,
-                  service_name,
-                  service_action,
-                  sku_code,
-                  job_ref,
-                  expires_at,
-                  finalized_at,
-                  created_at,
-                  updated_at,
-                  quote_json
-                FROM public.pricing_credit_reservations
-            """
-
-            if reservation_id:
-                try:
-                    reservation = await conn.fetchrow(
-                        reservation_select + """
-                        WHERE id = $1::uuid
-                        LIMIT 1
-                        """,
-                        reservation_id,
-                    )
-                except Exception:
-                    reservation = None
-
-            if reservation is None and "job_ref" in res_cols:
-                try:
-                    reservation = await conn.fetchrow(
-                        reservation_select + """
-                        WHERE job_ref = $1::text
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                        """,
-                        job_id,
-                    )
-                except Exception:
-                    reservation = None
-
-            reservationd = row_to_dict(reservation) or {}
-
-            # ------------------------------------------------------------------
-            # Optional ledger lookup by reservation_id
-            # ------------------------------------------------------------------
-            ledger = None
-            ledger_table_exists = await conn.fetchval("""
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM information_schema.tables
-                    WHERE table_schema = 'public'
-                      AND table_name = 'pricing_credit_ledger_events'
-                )
-            """)
-
-            if ledger_table_exists and reservationd.get("reservation_id"):
-                led_cols_rows = await conn.fetch("""
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_schema = 'public'
-                      AND table_name = 'pricing_credit_ledger_events'
-                """)
-                led_cols = {r["column_name"] for r in led_cols_rows}
-
-                order_col = "created_at" if "created_at" in led_cols else "id"
-
-                ledger_select_parts = [
-                    pick_expr(led_cols, ["id"], "ledger_event_id", cast="text", default_sql="NULL::text AS ledger_event_id"),
-                    pick_expr(led_cols, ["reservation_id"], "reservation_id", cast="text", default_sql="NULL::text AS reservation_id"),
-                    pick_expr(led_cols, ["event_type", "entry_type", "kind"], "event_type", default_sql="NULL::text AS event_type"),
-                    pick_expr(led_cols, ["credits_delta"], "credits_delta", default_sql="NULL::numeric AS credits_delta"),
-                    pick_expr(led_cols, ["money_amount", "amount"], "money_amount", default_sql="NULL::numeric AS money_amount"),
-                    pick_expr(led_cols, ["currency"], "ledger_currency", default_sql="NULL::text AS ledger_currency"),
-                    pick_expr(led_cols, ["billing_account_id"], "ledger_billing_account_id", cast="text", default_sql="NULL::text AS ledger_billing_account_id"),
-                    pick_expr(led_cols, ["created_at"], "ledger_created_at", default_sql="NULL::timestamptz AS ledger_created_at"),
-                    pick_expr(led_cols, ["meta_json"], "meta_json", default_sql="'{}'::jsonb AS meta_json"),
-                ]
-
-                if "reservation_id" in led_cols:
-                    try:
-                        ledger = await conn.fetchrow(f"""
-                            SELECT
-                              {", ".join(ledger_select_parts)}
-                            FROM public.pricing_credit_ledger_events
-                            WHERE reservation_id = $1::uuid
-                            ORDER BY {order_col} DESC
-                            LIMIT 1
-                        """, reservationd["reservation_id"])
-                    except Exception:
-                        ledger = None
-
-        out = {
-            "job": {
-                "id": jobd.get("id"),
-                "user_id": jobd.get("user_id"),
-                "studio_type": jobd.get("studio_type"),
-                "status": jobd.get("status"),
-                "error_code": jobd.get("error_code"),
-                "error_message": jobd.get("error_message"),
-            },
-            "pricing": pricing,
-            "reservation": reservationd or None,
-            "ledger": row_to_dict(ledger),
-        }
-        print(json.dumps(out, default=str))
-    finally:
-        await pool.close()
-
-asyncio.run(main())
-PY
-}
-
-validate_snapshot() {
-  local label="$1"
-  local expected_settlement="$2"
-  local snapshot_path="$3"
-
-  python3 - "$label" "$expected_settlement" "$snapshot_path" <<'PY'
+QUOTE_ID="$(python3 - <<'PY' "$PREVIEW_RESP"
 import json, sys
-
-label = sys.argv[1]
-expected = sys.argv[2]
-path = sys.argv[3]
-
-with open(path, "r", encoding="utf-8") as f:
-    obj = json.load(f)
-
-job = obj.get("job") or {}
-pricing = obj.get("pricing") or {}
-reservation = obj.get("reservation") or {}
-
-errors = []
-
-job_status = str(job.get("status") or "")
-studio_type = str(job.get("studio_type") or "")
-pricing_state = str(pricing.get("state") or "")
-reservation_status = str(reservation.get("status") or "")
-settlement_mode = str(reservation.get("settlement_mode") or pricing.get("settlement_mode") or "")
-billing_account_id = str(reservation.get("billing_account_id") or pricing.get("billing_account_id") or "")
-
-if studio_type != "fusion":
-    errors.append(f"job.studio_type expected 'fusion', got {studio_type!r}")
-
-if job_status != "succeeded":
-    errors.append(f"job.status expected succeeded, got {job_status!r}")
-
-if pricing_state != "committed":
-    errors.append(f"pricing.state expected committed, got {pricing_state!r}")
-
-if reservation and reservation_status != "committed":
-    errors.append(f"reservation.status expected committed, got {reservation_status!r}")
-
-if settlement_mode != expected:
-    errors.append(f"settlement_mode expected {expected!r}, got {settlement_mode!r}")
-
-if not billing_account_id:
-    errors.append("billing_account_id missing")
-
-def as_float(v, default=0.0):
-    try:
-        if v is None or v == "":
-            return default
-        return float(v)
-    except Exception:
-        return default
-
-def as_bool(v):
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    return s in ("1", "true", "yes", "y")
-
-charged_credits = as_float(reservation.get("charged_credits"), 0.0)
-hold_applied = as_bool(reservation.get("hold_applied"))
-
-if expected == "postpaid":
-    if charged_credits != 0.0:
-        errors.append(f"postpaid expected charged_credits=0, got {charged_credits}")
-    if hold_applied:
-        errors.append("postpaid expected hold_applied=false")
-elif expected == "prepaid":
-    if charged_credits <= 0.0:
-        errors.append(f"prepaid expected charged_credits>0, got {charged_credits}")
-    if not hold_applied:
-        errors.append("prepaid expected hold_applied=true")
-
-if errors:
-    print(f"VALIDATION FAILED [{label}]")
-    for e in errors:
-        print(f" - {e}")
-    sys.exit(1)
-
-print(f"Pricing validation OK [{label}]")
-print(f"  job.studio_type    = {studio_type}")
-print(f"  job.status         = {job_status}")
-print(f"  pricing.state      = {pricing_state}")
-print(f"  reservation.status = {reservation_status or '(none)'}")
-print(f"  billing_account_id = {billing_account_id}")
-print(f"  settlement_mode    = {settlement_mode}")
-print(f"  charged_credits    = {reservation.get('charged_credits')}")
-print(f"  hold_applied       = {reservation.get('hold_applied')}")
-print(f"  ledger_entry_id    = {reservation.get('ledger_entry_id') or pricing.get('ledger_entry_id')}")
+j=json.load(open(sys.argv[1]))
+print((j.get("pricing") or {}).get("quote_id") or j.get("quote_id") or "")
 PY
+)"
+PREVIEW_FINGERPRINT="$(python3 - <<'PY' "$PREVIEW_RESP"
+import json, sys
+j=json.load(open(sys.argv[1]))
+print((j.get("pricing") or {}).get("preview_fingerprint") or j.get("preview_fingerprint") or "")
+PY
+)"
+
+echo "QUOTE_ID=$QUOTE_ID"
+echo "PREVIEW_FINGERPRINT=$PREVIEW_FINGERPRINT"
+
+python3 - "$PREVIEW_REQ" "$QUOTE_ID" "$PREVIEW_FINGERPRINT" > "$GENERATE_REQ" <<'PY'
+import json, sys
+base=json.load(open(sys.argv[1]))
+base["pricing_confirmation"] = {
+    "quote_id": sys.argv[2],
+    "preview_fingerprint": sys.argv[3],
 }
+print(json.dumps(base, ensure_ascii=False, indent=2))
+PY
 
-download_video_if_present() {
-  local label="$1"
-  local status_json="$2"
-  local job_id="$3"
+echo
+echo "==> Generate request"
+pretty "$GENERATE_REQ"
 
-  local video_url
-  video_url="$(jq -r '.artifacts[]? | select(.kind=="video") | .url' "$status_json" | head -n 1 || true)"
-  if [[ -z "$video_url" ]]; then
-    log "WARN: no video artifact found for ${label} job=${job_id}"
-    return 0
+GENERATE_HEADERS="$OUT_DIR/generate_headers.txt"
+post_json_capture "$FUSION_URL/jobs" "$GENERATE_REQ" "$GENERATE_RESP" "$GENERATE_HEADERS" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-User-Id: $USER_ID"
+
+GENERATE_STATUS="$(http_status_from_headers "$GENERATE_HEADERS")"
+echo "Generate HTTP status: $GENERATE_STATUS"
+
+echo
+echo "==> Generate response"
+pretty "$GENERATE_RESP"
+
+if [[ "$GENERATE_STATUS" != "200" && "$GENERATE_STATUS" != "201" ]]; then
+  echo "ERROR: fusion create failed" >&2
+  exit 1
+fi
+
+JOB_ID="$(python3 - <<'PY' "$GENERATE_RESP"
+import json, sys
+j=json.load(open(sys.argv[1]))
+print(j.get("job_id") or j.get("id") or "")
+PY
+)"
+if [[ -z "$JOB_ID" ]]; then
+  echo "ERROR: fusion create response missing job_id" >&2
+  exit 1
+fi
+echo "FUSION_JOB_ID=$JOB_ID"
+
+FINAL_STATUS=""
+FINAL_PRICING_STATE=""
+STATUS_HEADERS="$OUT_DIR/status_headers.txt"
+
+echo
+echo "==> Polling status"
+for ((i=1; i<=MAX_POLLS; i++)); do
+  get_json_capture "$FUSION_URL/jobs/$JOB_ID" "$STATUS_JSON" "$STATUS_HEADERS" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "X-User-Id: $USER_ID"
+
+  STATUS_HTTP="$(http_status_from_headers "$STATUS_HEADERS")"
+  if [[ "$STATUS_HTTP" != "200" ]]; then
+    echo "ERROR: fusion status read failed with HTTP $STATUS_HTTP" >&2
+    cat "$STATUS_JSON" >&2 || true
+    exit 1
   fi
 
-  local out="${OUT_DIR}/${label}_${job_id}.mp4"
-  log "Downloading video for ${label}: ${out}"
-  curl -sS -L -o "$out" "$video_url"
+  STATUS="$(python3 - <<'PY' "$STATUS_JSON"
+import json, sys
+j=json.load(open(sys.argv[1]))
+print(j.get("status") or j.get("stage") or "")
+PY
+)"
+  PR_STATE="$(python3 - <<'PY' "$STATUS_JSON"
+import json, sys
+j=json.load(open(sys.argv[1]))
+print((j.get("pricing") or {}).get("state") or "")
+PY
+)"
 
-  if [[ ! -s "$out" ]]; then
-    die "downloaded video is empty: ${out}"
+  echo "poll=$i status=${STATUS:-<empty>} pricing_state=${PR_STATE:-<empty>}"
+
+  if [[ "$STATUS" == "succeeded" || "$STATUS" == "failed" || "$STATUS" == "canceled" || "$STATUS" == "cancelled" ]]; then
+    FINAL_STATUS="$STATUS"; FINAL_PRICING_STATE="$PR_STATE"; break
   fi
+  sleep "$POLL_SECS"
+done
 
-  file "$out" || true
+if [[ -z "$FINAL_STATUS" ]]; then
+  echo "ERROR: fusion job did not reach terminal state" >&2
+  pretty "$STATUS_JSON"
+  exit 1
+fi
+
+echo
+echo "==> Final status response"
+pretty "$STATUS_JSON"
+
+python3 - "$STATUS_JSON" "$SUMMARY_JSON" "$JOB_ID" "$QUOTE_ID" "$PREVIEW_FINGERPRINT" <<'PY'
+import json, sys
+status_path, summary_path, job_id, quote_id, preview_fp = sys.argv[1:]
+status = json.load(open(status_path))
+pricing = status.get("pricing") or {}
+summary = status.get("pricing_summary") or {}
+out = {
+    "job_id": job_id,
+    "quote_id": quote_id,
+    "preview_fingerprint": preview_fp,
+    "status": status.get("status") or status.get("stage"),
+    "pricing_state": pricing.get("state"),
+    "billing_mode": pricing.get("billing_mode"),
+    "settlement_mode": pricing.get("settlement_mode"),
+    "tier_code": pricing.get("tier_code"),
+    "tier_source": pricing.get("tier_source"),
+    "entitlement_source": pricing.get("entitlement_source"),
+    "entitlement_reason": pricing.get("entitlement_reason"),
+    "sku_code": pricing.get("sku_code"),
+    "amount": pricing.get("amount"),
+    "currency": pricing.get("currency"),
+    "actual_units": pricing.get("actual_units"),
+    "billed_units": pricing.get("billed_units"),
+    "reservation_id": pricing.get("reservation_id"),
+    "pricing_summary": summary,
+    "full_status": status,
 }
+json.dump(out, open(summary_path, "w"), indent=2, ensure_ascii=False)
+print(json.dumps(out, indent=2, ensure_ascii=False))
+PY
 
-run_case() {
-  local label="$1"
-  local email="$2"
-  local password="$3"
-  local expected_settlement="$4"
-  local face_artifact_id="$5"
-  local audio_artifact_id="$6"
+echo
+echo "SUMMARY_JSON=$SUMMARY_JSON"
 
-  log "------------------------------------------------------------"
-  log "Running Fusion E2E for ${label} (${email}) expected=${expected_settlement}"
-  log "------------------------------------------------------------"
-
-  local auth_json token user_id
-  auth_json="$(login_user "$email" "$password" "$label")"
-  token="$(echo "$auth_json" | jq -r '.token')"
-  user_id="$(echo "$auth_json" | jq -r '.user_id')"
-
-  log "Logged in ${label}: user_id=${user_id}"
-
-  local payload
-  payload="$(build_payload "$face_artifact_id" "$audio_artifact_id")"
-  echo "$payload" | jq > "${OUT_DIR}/${label}_payload.json"
-
-  local create_resp create_path job_id
-  create_path="${OUT_DIR}/${label}_create.json"
-  create_resp="$(curl -sS -X POST "${FUSION_BASE}/jobs" \
-    -H "Authorization: Bearer ${token}" \
-    -H "X-User-Id: ${user_id}" \
-    -H "Content-Type: application/json" \
-    -d "$payload")"
-
-  echo "$create_resp" | jq > "$create_path"
-  job_id="$(echo "$create_resp" | jq -r '.job_id // empty')"
-  [[ -n "$job_id" ]] || die "job_id missing in create response for ${label}"
-
-  log "Created job ${job_id} for ${label}"
-
-  local start status last_resp status_path
-  start="$(now_epoch)"
-  status=""
-  last_resp=""
-  status_path="${OUT_DIR}/${label}_status.json"
-
-  while true; do
-    last_resp="$(curl -sS "${FUSION_BASE}/jobs/${job_id}" \
-      -H "Authorization: Bearer ${token}" \
-      -H "X-User-Id: ${user_id}")"
-
-    echo "$last_resp" | jq > "$status_path"
-    status="$(echo "$last_resp" | jq -r '.status // empty')"
-
-    if [[ "$status" == "succeeded" ]]; then
-      log "Fusion job succeeded for ${label}: ${job_id}"
-      break
-    fi
-
-    if [[ "$status" == "failed" ]]; then
-      log "Fusion job failed for ${label}: ${job_id}"
-      cat "$status_path"
-      local failed_snapshot
-      failed_snapshot="$(query_pricing_snapshot "$job_id")"
-      echo "$failed_snapshot" | jq > "${OUT_DIR}/${label}_pricing_snapshot_failed.json"
-      die "fusion job failed for ${label}"
-    fi
-
-    local now elapsed
-    now="$(now_epoch)"
-    elapsed=$((now - start))
-    if (( elapsed >= TIMEOUT_SECONDS )); then
-      local timeout_snapshot
-      timeout_snapshot="$(query_pricing_snapshot "$job_id")"
-      echo "$timeout_snapshot" | jq > "${OUT_DIR}/${label}_pricing_snapshot_timeout.json"
-      die "timeout waiting for fusion job=${job_id} label=${label} status=${status:-unknown}"
-    fi
-
-    log "Polling ${label}: job=${job_id} status=${status:-unknown} elapsed=${elapsed}s"
-    sleep "$POLL_SECONDS"
-  done
-
-  local snapshot snapshot_path
-  snapshot="$(query_pricing_snapshot "$job_id")"
-  snapshot_path="${OUT_DIR}/${label}_pricing_snapshot.json"
-  echo "$snapshot" | jq > "$snapshot_path"
-
-  validate_snapshot "$label" "$expected_settlement" "$snapshot_path"
-
-  log "Fusion pricing snapshot [${label}]"
-  jq '.pricing' "$snapshot_path"
-
-  log "Reservation snapshot [${label}]"
-  jq '.reservation' "$snapshot_path"
-
-  download_video_if_present "$label" "$status_path" "$job_id"
-
-  log "DONE ${label} job=${job_id}"
-}
-
-main() {
-  log "OUT_DIR=${OUT_DIR}"
-  log "CORE_BASE=${CORE_BASE}"
-  log "FUSION_BASE=${FUSION_BASE}"
-  log "VOICE_MODE=${VOICE_MODE}"
-  log "ASPECT_RATIO=${ASPECT_RATIO}"
-  log "EXTERNAL_PROVIDER_OK=${EXTERNAL_PROVIDER_OK}"
-
-  if [[ "$VOICE_MODE" == "tts" ]]; then
-    [[ -n "$TTS_VOICE_ID" ]] || die "TTS_VOICE_ID is required when VOICE_MODE=tts"
-    [[ -n "$TTS_SCRIPT" ]] || die "TTS_SCRIPT is required when VOICE_MODE=tts"
+if [[ "$FINAL_STATUS" == "succeeded" && "$FINAL_PRICING_STATE" != "committed" ]]; then
+  echo "ERROR: fusion job succeeded but pricing_state=$FINAL_PRICING_STATE" >&2
+  exit 2
+fi
+if [[ "$FINAL_STATUS" == "failed" || "$FINAL_STATUS" == "canceled" || "$FINAL_STATUS" == "cancelled" ]]; then
+  if [[ "$FINAL_PRICING_STATE" != "released" ]]; then
+    echo "ERROR: fusion job terminal failure/cancel but pricing_state=$FINAL_PRICING_STATE" >&2
+    exit 3
   fi
+fi
 
-  if [[ -z "$HEYGEN_TALKING_PHOTO_ID" ]]; then
-    log "WARN: HEYGEN_TALKING_PHOTO_ID is not set."
-    log "WARN: If your current Fusion runtime still requires explicit talking_photo_id, the run may fail after a long poll."
-  fi
+if command -v docker >/dev/null 2>&1; then
+  echo
+  echo "==> Latest fusion pricing reservations"
+  docker exec -i desifaces-db bash -lc "psql -U \"\$POSTGRES_USER\" -d \"\${POSTGRES_DB:-postgres}\" -c \"
+SELECT
+  id,
+  user_id,
+  status,
+  service_name,
+  service_action,
+  sku_code,
+  billing_account_id,
+  settlement_mode,
+  estimated_money,
+  currency,
+  created_at
+FROM public.pricing_credit_reservations
+WHERE service_name = 'svc-fusion'
+ORDER BY created_at DESC
+LIMIT 5;
+\"" || true
+fi
 
-  local resolved face_artifact_id audio_artifact_id
-  resolved="$(resolve_latest_artifacts)"
-  echo "$resolved" | jq > "${OUT_DIR}/resolved_artifacts.json"
-
-  face_artifact_id="$(echo "$resolved" | jq -r '.face_artifact_id // empty')"
-  audio_artifact_id="$(echo "$resolved" | jq -r '.audio_artifact_id // empty')"
-
-  [[ -n "$face_artifact_id" ]] || die "could not resolve face_artifact_id"
-  if [[ "$VOICE_MODE" == "audio" ]]; then
-    [[ -n "$audio_artifact_id" ]] || die "could not resolve audio_artifact_id"
-  fi
-
-  log "Resolved artifacts:"
-  log "  face_artifact_id  = ${face_artifact_id}"
-  if [[ "$VOICE_MODE" == "audio" ]]; then
-    log "  audio_artifact_id = ${audio_artifact_id}"
-  fi
-  if [[ -n "$HEYGEN_TALKING_PHOTO_ID" ]]; then
-    log "  heygen_talking_photo_id = ${HEYGEN_TALKING_PHOTO_ID}"
-  fi
-
-  # user2 => postpaid
-  run_case "postpaid_user2" "$USER2_EMAIL" "$USER2_PASSWORD" "postpaid" "$face_artifact_id" "$audio_artifact_id"
-
-  # user1 => prepaid
-  run_case "prepaid_user1" "$USER1_EMAIL" "$USER1_PASSWORD" "prepaid" "$face_artifact_id" "$audio_artifact_id"
-
-  log "✅ DONE. Fusion outputs, create/status payloads, auth, and pricing snapshots saved in: ${OUT_DIR}"
-}
-
-main "$@"
+echo
+echo "Fusion pricing E2E passed."

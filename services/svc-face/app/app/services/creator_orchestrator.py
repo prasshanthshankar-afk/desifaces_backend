@@ -4,10 +4,13 @@ import asyncio
 import hashlib
 import hmac
 import json
+import inspect
 import logging
 import os
 import re
 import secrets
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
@@ -119,6 +122,89 @@ from app.services.translation_service import TranslationService
 
 logger = logging.getLogger(__name__)
 JsonDict = Dict[str, Any]
+
+
+def _notifications_base_url() -> str:
+    return str(
+        os.getenv("DF_NOTIFICATIONS_URL")
+        or os.getenv("DF_CORE_URL")
+        or os.getenv("SVC_CORE_URL")
+        or ""
+    ).strip().rstrip("/")
+
+
+def _notifications_internal_events_url() -> str:
+    base = _notifications_base_url()
+    if not base:
+        return ""
+    if base.endswith("/api/internal/notifications/events"):
+        return base
+    if base.endswith("/api"):
+        return f"{base}/internal/notifications/events"
+    return f"{base}/api/internal/notifications/events"
+
+
+def _notifications_bearer() -> str:
+    return str(
+        os.getenv("DF_NOTIFICATIONS_BEARER")
+        or os.getenv("SVC_TO_SVC_BEARER")
+        or os.getenv("DF_PRICING_INTERNAL_BEARER")
+        or ""
+    ).strip()
+
+
+async def _emit_notification_best_effort(payload: Dict[str, Any], *, context: Dict[str, Any]) -> None:
+    url = _notifications_internal_events_url()
+    token = _notifications_bearer()
+    if not url or not token:
+        return
+
+    body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+
+    def _send() -> None:
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+
+    try:
+        await asyncio.to_thread(_send)
+    except Exception:
+        logger.exception("face_notification_emit_failed", extra=context)
+
+
+def _patch_pricing_client_service_headers(client: Any, *, service_name: str = "svc-face"):
+    if client is None:
+        return client
+
+    if getattr(client, "_df_service_header_patched", False):
+        return client
+
+    headers_fn = getattr(client, "_headers", None)
+    if not callable(headers_fn):
+        setattr(client, "_df_service_header_patched", True)
+        return client
+
+    def _headers_with_service_name(*args, **kwargs):
+        headers = headers_fn(*args, **kwargs)
+        if not isinstance(headers, dict):
+            headers = dict(headers or {})
+        else:
+            headers = dict(headers)
+        headers["X-Service-Name"] = service_name
+        return headers
+
+    setattr(client, "_headers", _headers_with_service_name)
+    setattr(client, "_df_service_header_patched", True)
+    return client
 
 
 class CreatorOrchestrator:
@@ -249,7 +335,10 @@ class CreatorOrchestrator:
         self.fal_client = FalClient()
         self.safety_service = SafetyService()
         self.translation_service = TranslationService()
-        self.pricing_client = SvcPricingClient.from_env(service_name="svc-face")
+        self.pricing_client = _patch_pricing_client_service_headers(
+            SvcPricingClient.from_env(service_name="svc-face"),
+            service_name="svc-face",
+        )
 
         self.prompt_service = CreatorPromptService(
             db_pool=db_pool,
@@ -332,6 +421,86 @@ class CreatorOrchestrator:
         return max(0.10, min(0.60, f))
 
     @staticmethod
+    def _normalize_aspect_ratio(v: Any) -> str:
+        s = str(v or "").strip().lower()
+        if s in {"16:9", "landscape", "horizontal"}:
+            return "16:9"
+        if s in {"1:1", "square"}:
+            return "1:1"
+        return "9:16"
+
+    @classmethod
+    def _default_image_size_hint_for_ratio(cls, aspect_ratio: Any) -> str:
+        ar = cls._normalize_aspect_ratio(aspect_ratio)
+        if ar == "1:1":
+            return "1024x1024"
+        if ar == "16:9":
+            return "1536x1024"
+        return "1024x1536"
+
+    @classmethod
+    def _normalize_image_size_hint(cls, aspect_ratio: Any, size_hint: Any) -> str:
+        s = str(size_hint or "").strip().lower()
+        normalized = {
+            "1024x1024": "1024x1024",
+            "square": "1024x1024",
+            "1024": "1024x1024",
+            "1024x1536": "1024x1536",
+            "portrait": "1024x1536",
+            "vertical": "1024x1536",
+            "1536x1024": "1536x1024",
+            "landscape": "1536x1024",
+            "horizontal": "1536x1024",
+            "auto": cls._default_image_size_hint_for_ratio(aspect_ratio),
+        }
+        return normalized.get(s, cls._default_image_size_hint_for_ratio(aspect_ratio))
+
+    @classmethod
+    def _size_hint_to_dimensions(cls, aspect_ratio: Any, size_hint: Any) -> Tuple[int, int, str]:
+        ar = cls._normalize_aspect_ratio(aspect_ratio)
+        hint = cls._normalize_image_size_hint(ar, size_hint)
+
+        compatibility = {
+            "1:1": {"1024x1024"},
+            "16:9": {"1536x1024"},
+            "9:16": {"1024x1536"},
+        }
+        if hint not in compatibility.get(ar, {"1024x1536"}):
+            hint = cls._default_image_size_hint_for_ratio(ar)
+
+        dims = {
+            "1024x1024": (1024, 1024),
+            "1024x1536": (1024, 1536),
+            "1536x1024": (1536, 1024),
+        }
+        width, height = dims[hint]
+        return width, height, hint
+
+    @classmethod
+    def _normalize_request_framing(cls, request_dict: Dict[str, Any]) -> Dict[str, Any]:
+        rd = dict(request_dict or {})
+
+        if not (rd.get("use_case_code") or "").strip() and (rd.get("use_case") or "").strip():
+            rd["use_case_code"] = str(rd.get("use_case") or "").strip()
+
+        if not (rd.get("shot_type_code") or "").strip() and (rd.get("shot_type") or "").strip():
+            rd["shot_type_code"] = str(rd.get("shot_type") or "").strip()
+
+        aspect_ratio = cls._normalize_aspect_ratio(rd.get("aspect_ratio"))
+        width, height, image_size_hint = cls._size_hint_to_dimensions(
+            aspect_ratio,
+            rd.get("image_size_hint") or rd.get("size"),
+        )
+
+        rd["aspect_ratio"] = aspect_ratio
+        rd["image_size_hint"] = image_size_hint
+        rd["size"] = image_size_hint
+        rd["width"] = int(width)
+        rd["height"] = int(height)
+
+        return rd
+
+    @staticmethod
     def _row_get(obj: Any, key: str, default: Any = None) -> Any:
         if obj is None:
             return default
@@ -365,6 +534,87 @@ class CreatorOrchestrator:
             except Exception:
                 return default if value is None else value
         return value
+
+    @staticmethod
+    def _normalize_settlement_mode(v: Any) -> str:
+        s = str(v or "").strip().lower()
+        if s in {"postpaid", "invoice", "bill", "billed"}:
+            return "postpaid"
+        if s in {"prepaid", "credit", "credits", "wallet", "payg"}:
+            return "prepaid"
+        if s in {"hybrid", "mixed"}:
+            return "hybrid"
+        return s
+
+    def _canonicalize_pricing_entitlement(
+        self,
+        pricing: Optional[Dict[str, Any]],
+        *,
+        resp: Any = None,
+    ) -> Dict[str, Any]:
+        out = dict(pricing or {})
+
+        billing_account_id = self._string_or_none(
+            self._pricing_resp_get(resp, "billing_account_id") if resp is not None else None
+        ) or self._string_or_none(out.get("billing_account_id"))
+        settlement_mode = self._normalize_settlement_mode(
+            self._pricing_resp_get(resp, "settlement_mode") if resp is not None else out.get("settlement_mode")
+        ) or self._normalize_settlement_mode(out.get("settlement_mode"))
+        billing_mode = self._string_or_none(
+            self._pricing_resp_get(resp, "billing_mode") if resp is not None else None
+        ) or self._string_or_none(out.get("billing_mode"))
+        pricing_mode = self._string_or_none(
+            self._pricing_resp_get(resp, "pricing_mode") if resp is not None else None
+        ) or self._string_or_none(out.get("pricing_mode"))
+
+        explicit_tier = self._clean_text(
+            self._pricing_resp_get(resp, "tier_code") if resp is not None else out.get("tier_code")
+        )
+        explicit_source = self._clean_text(
+            self._pricing_resp_get(resp, "entitlement_source") if resp is not None else out.get("entitlement_source")
+        )
+        explicit_reason = self._clean_text(
+            self._pricing_resp_get(resp, "entitlement_reason") if resp is not None else out.get("entitlement_reason")
+        )
+
+        weak_tier = bool(billing_account_id and explicit_tier.lower() == "free")
+        weak_source = bool(billing_account_id and explicit_source.lower() == "module_gate_fallback")
+
+        if billing_account_id:
+            out["billing_account_id"] = billing_account_id
+        if settlement_mode:
+            out["settlement_mode"] = settlement_mode
+        if billing_mode:
+            out["billing_mode"] = billing_mode
+        if pricing_mode:
+            out["pricing_mode"] = pricing_mode
+
+        if explicit_tier and not weak_tier:
+            out["tier_code"] = explicit_tier
+        elif billing_account_id and settlement_mode == "postpaid":
+            out["tier_code"] = "enterprise"
+        elif billing_account_id and settlement_mode == "hybrid":
+            out["tier_code"] = "business"
+        elif explicit_tier:
+            out["tier_code"] = explicit_tier
+
+        if explicit_source and not weak_source:
+            out["entitlement_source"] = explicit_source
+        elif billing_account_id and settlement_mode == "postpaid":
+            out["entitlement_source"] = "credit_account"
+        elif billing_account_id:
+            out["entitlement_source"] = "billing_account"
+        elif explicit_source:
+            out["entitlement_source"] = explicit_source
+
+        if explicit_reason:
+            out["entitlement_reason"] = explicit_reason
+        elif billing_account_id and (weak_tier or weak_source):
+            out["entitlement_reason"] = "billing_account_context_override"
+        elif billing_account_id and not self._clean_text(out.get("entitlement_reason")):
+            out["entitlement_reason"] = "billing_account_context_fallback"
+
+        return out
 
     @classmethod
     def _stable_source_url_for_hash(cls, url: str) -> str:
@@ -573,6 +823,12 @@ class CreatorOrchestrator:
             self._coerce_int(request_dict.get("num_outputs"), 0),
         )
 
+        aspect_ratio = self._normalize_aspect_ratio(request_dict.get("aspect_ratio"))
+        _, _, image_size_hint = self._size_hint_to_dimensions(
+            aspect_ratio,
+            request_dict.get("image_size_hint") or request_dict.get("size"),
+        )
+
         is_i2i = mode == "image-to-image"
         sku_code = (
             os.getenv("DF_PRICING_SKU_FACE_I2I", "face.creator.generate.i2i")
@@ -590,6 +846,7 @@ class CreatorOrchestrator:
             "service_name": "svc-face",
             "service_action": f"face.creator.generate.{'i2i' if is_i2i else 't2i'}",
             "sku_code": sku_code,
+            "variant_code": "FACE_I2I" if is_i2i else "FACE_T2I",
             "estimated_units": str(requested_variants),
             "unit_type": "image",
             "mode": mode,
@@ -625,6 +882,11 @@ class CreatorOrchestrator:
                 "mode": mode,
                 "image_format_code": request_dict.get("image_format_code"),
                 "use_case_code": request_dict.get("use_case_code"),
+                "shot_type_code": request_dict.get("shot_type_code"),
+                "aspect_ratio": aspect_ratio,
+                "image_size_hint": image_size_hint,
+                "width": request_dict.get("width"),
+                "height": request_dict.get("height"),
                 "platform_code": request_dict.get("platform_code"),
                 "provider_hint": "openai",
             },
@@ -648,15 +910,16 @@ class CreatorOrchestrator:
 
         pricing = self._coerce_dict(payload.get("pricing"))
         if pricing:
-            return pricing
+            return self._canonicalize_pricing_entitlement(pricing)
 
         pricing = self._coerce_dict(meta.get("pricing"))
         if pricing:
-            return pricing
+            return self._canonicalize_pricing_entitlement(pricing)
 
         return {}
 
     async def _persist_pricing_block(self, job_id: str, pricing: Dict[str, Any]) -> None:
+        pricing = self._canonicalize_pricing_entitlement(pricing)
         q = """
         UPDATE public.studio_jobs
         SET
@@ -745,6 +1008,14 @@ class CreatorOrchestrator:
         if not pricing.get("enabled"):
             return pricing
 
+        quote_id = self._string_or_none(pricing.get("quote_id"))
+        if self._is_local_preview_quote_id(quote_id):
+            quote_id = None
+
+        preview_fingerprint = self._string_or_none(pricing.get("preview_fingerprint"))
+        if self._is_local_preview_fingerprint(preview_fingerprint):
+            preview_fingerprint = None
+
         req = PricingReserveRequest(
             user_id=str(user_id),
             service_name="svc-face",
@@ -754,13 +1025,17 @@ class CreatorOrchestrator:
             external_ref_type="studio_job",
             external_ref_id=str(job_id),
             idempotency_key=f"svc-face:job:{job_id}:reserve",
-            quote_id=self._string_or_none(pricing.get("quote_id")),
-            preview_fingerprint=self._string_or_none(pricing.get("preview_fingerprint")),
+            quote_id=quote_id,
+            preview_fingerprint=preview_fingerprint,
             meta=self._coerce_dict(pricing.get("meta")),
         )
 
         try:
-            resp = await self.pricing_client.reserve(req)
+            resp = await self._call_pricing_client(
+                "reserve",
+                req,
+                timeout_s=self._pricing_rpc_timeout_s(),
+            )
             reserve_status = str(self._pricing_resp_get(resp, "status", "reserved") or "reserved")
 
             reserve_amount = self._pricing_resp_get(resp, "amount")
@@ -777,10 +1052,12 @@ class CreatorOrchestrator:
 
             pricing = self._merge_pricing_block(
                 pricing,
+                enabled=True,
                 state="reserved",
                 reservation_id=self._pricing_resp_get(resp, "reservation_id"),
                 quote_id=quote_id,
                 preview_fingerprint=preview_fingerprint,
+                variant_code=self._pricing_resp_get(resp, "variant_code") or pricing.get("variant_code"),
                 reserved_units=normalized_reserved_units,
                 reservation_status=reserve_status,
                 estimated_amount=reserve_amount or pricing.get("estimated_amount"),
@@ -794,6 +1071,7 @@ class CreatorOrchestrator:
                 entitlement_reason=self._pricing_resp_get(resp, "entitlement_reason"),
                 tier_code=self._pricing_resp_get(resp, "tier_code"),
             )
+            pricing = self._canonicalize_pricing_entitlement(pricing, resp=resp)
             await self._persist_pricing_block(job_id, pricing)
             return pricing
         except Exception as e:
@@ -850,7 +1128,8 @@ class CreatorOrchestrator:
             return pricing
 
         try:
-            resp = await self.pricing_client.commit(
+            resp = await self._call_pricing_client(
+                "commit",
                 PricingCommitRequest(
                     user_id=str(user_id),
                     reservation_id=reservation_id,
@@ -863,13 +1142,17 @@ class CreatorOrchestrator:
                         "service_action": pricing.get("service_action"),
                         "requested_units": pricing.get("estimated_units"),
                     },
-                )
+                ),
+                timeout_s=self._pricing_rpc_timeout_s(),
             )
             commit_status = str(self._pricing_resp_get(resp, "status", "committed") or "committed")
             committed_amount = self._pricing_resp_get(resp, "amount")
             pricing = self._merge_pricing_block(
                 pricing,
+                enabled=True,
                 state="committed",
+                quote_id=self._pricing_resp_get(resp, "quote_id") or pricing.get("quote_id"),
+                variant_code=self._pricing_resp_get(resp, "variant_code") or pricing.get("variant_code"),
                 actual_units=str(max(1, int(actual_units))),
                 commit_status=commit_status,
                 reservation_status=commit_status,
@@ -881,8 +1164,12 @@ class CreatorOrchestrator:
                 billing_mode=self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
                 billing_account_id=self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
                 settlement_mode=self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
+                pricing_mode=self._pricing_resp_get(resp, "pricing_mode") or pricing.get("pricing_mode"),
                 entitlement_source=self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
+                entitlement_reason=self._pricing_resp_get(resp, "entitlement_reason") or pricing.get("entitlement_reason"),
+                tier_code=self._pricing_resp_get(resp, "tier_code") or pricing.get("tier_code"),
             )
+            pricing = self._canonicalize_pricing_entitlement(pricing, resp=resp)
             await self._persist_pricing_block(job_id, pricing)
             return pricing
         except Exception as e:
@@ -931,7 +1218,8 @@ class CreatorOrchestrator:
             return pricing
 
         try:
-            resp = await self.pricing_client.release(
+            resp = await self._call_pricing_client(
+                "release",
                 PricingReleaseRequest(
                     user_id=str(user_id),
                     reservation_id=reservation_id,
@@ -943,12 +1231,16 @@ class CreatorOrchestrator:
                         "sku_code": pricing.get("sku_code"),
                         "service_action": pricing.get("service_action"),
                     },
-                )
+                ),
+                timeout_s=self._pricing_rpc_timeout_s(),
             )
             release_status = str(self._pricing_resp_get(resp, "status", "released") or "released")
             pricing = self._merge_pricing_block(
                 pricing,
+                enabled=bool(pricing.get("enabled", True)),
                 state="released",
+                quote_id=self._pricing_resp_get(resp, "quote_id") or pricing.get("quote_id"),
+                variant_code=self._pricing_resp_get(resp, "variant_code") or pricing.get("variant_code"),
                 release_status=release_status,
                 reservation_status=release_status,
                 released_units=self._pricing_resp_get(resp, "released_units"),
@@ -956,8 +1248,12 @@ class CreatorOrchestrator:
                 billing_mode=self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
                 billing_account_id=self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
                 settlement_mode=self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
+                pricing_mode=self._pricing_resp_get(resp, "pricing_mode") or pricing.get("pricing_mode"),
                 entitlement_source=self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
+                entitlement_reason=self._pricing_resp_get(resp, "entitlement_reason") or pricing.get("entitlement_reason"),
+                tier_code=self._pricing_resp_get(resp, "tier_code") or pricing.get("tier_code"),
             )
+            pricing = self._canonicalize_pricing_entitlement(pricing, resp=resp)
             await self._persist_pricing_block(job_id, pricing)
             return pricing
         except Exception as e:
@@ -996,6 +1292,27 @@ class CreatorOrchestrator:
                 "failed",
                 error_code=error_code,
                 error_message=error_message,
+            )
+            await _emit_notification_best_effort(
+                {
+                    "event_type": "FACE_FAILED",
+                    "category": "jobs",
+                    "priority": "important",
+                    "source_service": "svc-face",
+                    "source_ref_type": "job",
+                    "source_ref_id": str(job_id),
+                    "actor_user_id": None,
+                    "title": "Your Face job needs attention",
+                    "body": error_message or "Your desifaces.ai Face generation failed.",
+                    "action_route": "/notifications",
+                    "action_label": "Review issue",
+                    "image_url": None,
+                    "payload_json": {"job_id": str(job_id), "error_code": error_code},
+                    "metadata_json": {"job_id": str(job_id), "error_code": error_code},
+                    "dedupe_key": f"face-failed:{job_id}:{error_code}",
+                    "recipients": [{"user_id": str(user_id), "channels": {"in_app": True, "push": True, "email": True}}],
+                },
+                context={"job_id": str(job_id), "user_id": str(user_id), "event_type": "FACE_FAILED", "error_code": error_code},
             )
 
     # -------------------------
@@ -1422,6 +1739,8 @@ class CreatorOrchestrator:
         if not pricing:
             return None
 
+        pricing = self._canonicalize_pricing_entitlement(pricing)
+
         final_amount = pricing.get("final_amount")
         if final_amount in (None, "") and str(pricing.get("state") or "").lower() == "committed":
             final_amount = pricing.get("amount")
@@ -1436,10 +1755,12 @@ class CreatorOrchestrator:
 
         return PricingStateView(
             state=str(pricing.get("state") or ""),
+            enabled=bool(pricing.get("enabled", False)),
             quote_id=self._string_or_none(pricing.get("quote_id")),
             quote_expires_at=self._string_or_none(pricing.get("quote_expires_at")),
             preview_fingerprint=self._string_or_none(pricing.get("preview_fingerprint")),
             reservation_id=self._string_or_none(pricing.get("reservation_id")),
+            variant_code=self._string_or_none(pricing.get("variant_code")),
             service_name=self._string_or_none(pricing.get("service_name")),
             service_action=self._string_or_none(pricing.get("service_action")),
             sku_code=self._string_or_none(pricing.get("sku_code")),
@@ -1461,6 +1782,9 @@ class CreatorOrchestrator:
             entitlement_source=self._string_or_none(pricing.get("entitlement_source")),
             entitlement_reason=self._string_or_none(pricing.get("entitlement_reason")),
             tier_code=self._string_or_none(pricing.get("tier_code")),
+            source=self._string_or_none(pricing.get("source")),
+            reason=self._string_or_none(pricing.get("reason")),
+            summary=self._coerce_dict(pricing.get("summary")),
             meta=self._coerce_dict(pricing.get("meta")),
         )
 
@@ -1514,12 +1838,20 @@ class CreatorOrchestrator:
                 display_note="No charge because the reservation was released.",
             )
 
-        if state in {"quoted", "reserved", "pending_reservation"}:
+        if state == "quoted":
             return PricingSummaryView(
                 display_estimate=_fmt(estimated_amount),
-                display_final=None,
-                display_delta=None,
-                display_note="Estimated amount reserved pending execution.",
+                display_final=_fmt(estimated_amount),
+                display_delta=_fmt("0.00"),
+                display_note="Estimated price before execution.",
+            )
+
+        if state in {"reserved", "pending_reservation"}:
+            return PricingSummaryView(
+                display_estimate=_fmt(estimated_amount),
+                display_final=_fmt(estimated_amount),
+                display_delta=_fmt("0.00"),
+                display_note="Estimated charge reserved before execution.",
             )
 
         if state == "disabled":
@@ -1542,6 +1874,7 @@ class CreatorOrchestrator:
         request: CreatorPlatformRequest,
     ) -> Tuple[JsonDict, Dict[str, Any], str]:
         request_dict: JsonDict = request.model_dump(mode="json")
+        request_dict = self._normalize_request_framing(request_dict)
 
         if not (request_dict.get("user_prompt") or "").strip():
             p = str(request_dict.get("prompt") or "").strip()
@@ -1579,7 +1912,109 @@ class CreatorOrchestrator:
             request_dict.update(translation_meta)
 
         request_dict = await self._ensure_required_config_codes(request_dict)
+        request_dict = self._normalize_request_framing(request_dict)
         return request_dict, translation_meta, mode
+
+
+    def _pricing_rpc_timeout_s(self) -> float:
+        try:
+            return max(3.0, min(60.0, float(os.getenv("DF_FACE_PRICING_RPC_TIMEOUT_S", "15"))))
+        except Exception:
+            return 15.0
+
+    async def _call_pricing_client(self, method_name: str, req: Any, *, timeout_s: float) -> Any:
+        method = getattr(self.pricing_client, method_name, None)
+        if not callable(method):
+            raise PricingClientError(f"pricing_client_missing_method:{method_name}")
+
+        def _invoke():
+            result = method(req)
+            if inspect.isawaitable(result):
+                return asyncio.run(result)
+            return result
+
+        return await asyncio.wait_for(
+            asyncio.to_thread(_invoke),
+            timeout=timeout_s,
+        )
+
+    def _pricing_preview_timeout_s(self) -> float:
+        try:
+            return max(2.0, min(30.0, float(os.getenv("DF_FACE_PRICING_PREVIEW_TIMEOUT_S", "8"))))
+        except Exception:
+            return 8.0
+
+    @staticmethod
+    def _is_local_preview_quote_id(value: Any) -> bool:
+        return str(value or "").strip().startswith("qt_local_")
+
+    @staticmethod
+    def _is_local_preview_fingerprint(value: Any) -> bool:
+        return str(value or "").strip().startswith("local_preview_")
+
+    def _build_local_preview_response(
+        self,
+        *,
+        pricing: Dict[str, Any],
+        preview_ref: str,
+        mode: str,
+        reason: str,
+    ) -> PricingPreviewResponseModel:
+        quote_id = f"qt_local_{preview_ref[:24]}"
+        preview_fingerprint = "local_preview_" + hashlib.sha256(
+            f"{preview_ref}|{mode}|{reason}".encode("utf-8")
+        ).hexdigest()[:40]
+
+        summary = {
+            "display_estimate": None,
+            "display_final": None,
+            "display_delta": None,
+            "display_note": (
+                "Live pricing preview is temporarily unavailable. "
+                "You can continue, and the final reservation will be calculated during Create Face."
+            ),
+        }
+
+        pricing = self._merge_pricing_block(
+            pricing,
+            enabled=True,
+            state="quoted",
+            quote_id=quote_id,
+            quote_expires_at=None,
+            preview_fingerprint=preview_fingerprint,
+            estimated_amount=None,
+            amount=None,
+            currency=None,
+            source="local_fallback",
+            reason=reason,
+            summary=summary,
+        )
+        pricing = self._canonicalize_pricing_entitlement(pricing)
+
+        pricing_view = self._pricing_to_view(pricing) or PricingStateView(
+            state="quoted",
+            enabled=True,
+            quote_id=quote_id,
+            preview_fingerprint=preview_fingerprint,
+            source="local_fallback",
+            reason=reason,
+        )
+
+        return PricingPreviewResponseModel(
+            studio="face",
+            action="generate",
+            quote_id=quote_id,
+            quote_expires_at=None,
+            preview_fingerprint=preview_fingerprint,
+            pricing=pricing_view,
+            balance={
+                "before_credits": None,
+                "after_estimated_credits": None,
+                "before_money": None,
+                "after_estimated_money": None,
+            },
+            summary=summary,
+        )
 
     async def preview_pricing(
         self,
@@ -1608,6 +2043,7 @@ class CreatorOrchestrator:
             quote_id = f"qt_{preview_fingerprint[:24]}"
             pricing = self._merge_pricing_block(
                 pricing,
+                enabled=False,
                 state="quoted",
                 quote_id=quote_id,
                 preview_fingerprint=preview_fingerprint,
@@ -1615,9 +2051,10 @@ class CreatorOrchestrator:
                 estimated_amount="0.00",
                 currency="USD",
                 summary={
-                    "display_total": "USD 0.00",
-                    "display_unit_rate": None,
-                    "display_estimate_note": "Pricing is currently disabled.",
+                    "display_estimate": "USD 0.00",
+                    "display_final": "USD 0.00",
+                    "display_delta": "USD 0.00",
+                    "display_note": "Pricing is currently disabled.",
                 },
             )
             return PricingPreviewResponseModel(
@@ -1648,6 +2085,11 @@ class CreatorOrchestrator:
             "gender": request_dict.get("gender"),
             "image_format_code": request_dict.get("image_format_code"),
             "use_case_code": request_dict.get("use_case_code"),
+            "shot_type_code": request_dict.get("shot_type_code"),
+            "aspect_ratio": request_dict.get("aspect_ratio"),
+            "image_size_hint": request_dict.get("image_size_hint"),
+            "width": request_dict.get("width"),
+            "height": request_dict.get("height"),
             "style_code": request_dict.get("style_code"),
             "context_code": request_dict.get("context_code"),
             "clothing_style_code": request_dict.get("clothing_style_code"),
@@ -1674,21 +2116,69 @@ class CreatorOrchestrator:
             "client_context": client_context or {},
             "request_hash": preview_ref,
             "mode": mode,
+            "shot_type_code": request_dict.get("shot_type_code"),
+            "aspect_ratio": request_dict.get("aspect_ratio"),
+            "image_size_hint": request_dict.get("image_size_hint"),
+            "width": request_dict.get("width"),
+            "height": request_dict.get("height"),
         }
 
-        resp = await self.pricing_client.preview(
-            PricingPreviewRequest(
-                user_id=str(user_id),
-                service_name=str(pricing.get("service_name") or "svc-face"),
-                service_action=str(pricing.get("service_action") or ""),
-                sku_code=str(pricing.get("sku_code") or ""),
-                units=str(pricing.get("estimated_units") or "1"),
-                external_ref_type="studio_job_preview",
-                external_ref_id=preview_ref,
-                idempotency_key=f"svc-face:preview:{preview_ref}",
-                meta=preview_meta,
+        try:
+            resp = await self._call_pricing_client(
+                "preview",
+                PricingPreviewRequest(
+                    user_id=str(user_id),
+                    service_name=str(pricing.get("service_name") or "svc-face"),
+                    service_action=str(pricing.get("service_action") or ""),
+                    sku_code=str(pricing.get("sku_code") or ""),
+                    units=str(pricing.get("estimated_units") or "1"),
+                    external_ref_type="studio_job_preview",
+                    external_ref_id=preview_ref,
+                    idempotency_key=f"svc-face:preview:{preview_ref}",
+                    meta=preview_meta,
+                ),
+                timeout_s=self._pricing_preview_timeout_s(),
             )
-        )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "face_preview_pricing_timeout user_id=%s preview_ref=%s mode=%s",
+                user_id,
+                preview_ref,
+                mode,
+            )
+            return self._build_local_preview_response(
+                pricing=pricing,
+                preview_ref=preview_ref,
+                mode=mode,
+                reason="pricing_preview_timeout",
+            )
+        except PricingClientError as e:
+            logger.warning(
+                "face_preview_pricing_client_error user_id=%s preview_ref=%s mode=%s err=%s",
+                user_id,
+                preview_ref,
+                mode,
+                str(e),
+            )
+            return self._build_local_preview_response(
+                pricing=pricing,
+                preview_ref=preview_ref,
+                mode=mode,
+                reason="pricing_preview_unavailable",
+            )
+        except Exception:
+            logger.exception(
+                "face_preview_pricing_unexpected_error user_id=%s preview_ref=%s mode=%s",
+                user_id,
+                preview_ref,
+                mode,
+            )
+            return self._build_local_preview_response(
+                pricing=pricing,
+                preview_ref=preview_ref,
+                mode=mode,
+                reason="pricing_preview_error",
+            )
 
         quote_id = self._clean_text(self._pricing_resp_get(resp, "quote_id")) or f"qt_{preview_ref}"
         preview_fingerprint = self._clean_text(self._pricing_resp_get(resp, "preview_fingerprint")) or hashlib.sha256(
@@ -1700,6 +2190,7 @@ class CreatorOrchestrator:
 
         pricing = self._merge_pricing_block(
             pricing,
+            enabled=True,
             state=str(self._pricing_resp_get(resp, "status", "quoted") or "quoted"),
             quote_id=quote_id,
             quote_expires_at=self._pricing_resp_get(resp, "quote_expires_at"),
@@ -1717,8 +2208,18 @@ class CreatorOrchestrator:
             quote_breakdown=quote_breakdown,
             summary=summary,
         )
+        pricing = self._canonicalize_pricing_entitlement(pricing, resp=resp)
 
-        pricing_view = self._pricing_to_view(pricing) or PricingStateView(state="quoted")
+        if not summary:
+            summary_view = self._pricing_summary_view(pricing)
+            if summary_view is not None:
+                summary = summary_view.model_dump(exclude_none=True)
+                pricing["summary"] = summary
+
+        pricing_view = self._pricing_to_view(pricing) or PricingStateView(
+            state="quoted",
+            enabled=bool(pricing.get("enabled", False)),
+        )
 
         return PricingPreviewResponseModel(
             studio="face",
@@ -1735,6 +2236,231 @@ class CreatorOrchestrator:
             },
             summary=summary,
         )
+
+    def _face_variant_concurrency(self) -> int:
+        try:
+            return max(1, min(8, int(os.getenv("DF_FACE_VARIANT_CONCURRENCY", "3"))))
+        except Exception:
+            return 3
+
+    async def _prepare_shared_variant_inputs(self, request_dict: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
+        if mode != "image-to-image":
+            return {}
+
+        source_image_ref = (
+            (request_dict.get("source_image_ref") or "").strip()
+            or (request_dict.get("source_image_asset_id") or "").strip()
+            or (request_dict.get("source_image_url") or "").strip()
+        )
+        if not source_image_ref:
+            return {}
+
+        source_image_url = await self._resolve_source_image_ref(source_image_ref)
+        preservation_strength = self._clamp_strength(request_dict.get("preservation_strength"), 0.25)
+
+        out: Dict[str, Any] = {
+            "source_image_ref": source_image_ref,
+            "source_image_url": source_image_url,
+            "preservation_strength": preservation_strength,
+        }
+
+        parsed = urlparse(source_image_url)
+        if parsed.scheme in ("http", "https"):
+            self._validate_remote_http_url(source_image_url)
+        elif parsed.scheme != "file":
+            raise ValueError(f"unsupported_source_image_scheme:{parsed.scheme or 'missing'}")
+
+        tmp_src_path = f"/tmp/df_face_shared_src_{uuid4().hex}.png"
+        if parsed.scheme == "file":
+            local_path = parsed.path
+            if not local_path or not os.path.exists(local_path):
+                raise ValueError(f"source_image_file_not_found:{local_path}")
+            with open(local_path, "rb") as rf, open(tmp_src_path, "wb") as wf:
+                wf.write(rf.read())
+        else:
+            import httpx
+            async with httpx.AsyncClient(timeout=120.0, follow_redirects=True, trust_env=False) as client:
+                r = await client.get(source_image_url)
+                r.raise_for_status()
+                with open(tmp_src_path, "wb") as f:
+                    f.write(r.content)
+
+        out["tmp_src_path"] = tmp_src_path
+        return out
+
+    async def _mark_variant_running(self, job_id: str, variant_number: int, seed: int, *, variants_requested: int) -> None:
+        await self.jobs_repo.update_variant_state(
+            job_id,
+            variant_number,
+            {
+                "status": "running",
+                "seed": int(seed),
+                "started_at": asyncio.get_running_loop().time(),
+            },
+            variants_requested=variants_requested,
+        )
+
+    async def _mark_variant_succeeded(
+        self,
+        job_id: str,
+        variant_number: int,
+        *,
+        image_url: str,
+        media_asset_id: str,
+        face_profile_id: str,
+        variants_requested: int,
+    ) -> None:
+        await self.jobs_repo.update_variant_state(
+            job_id,
+            variant_number,
+            {
+                "status": "succeeded",
+                "image_url": image_url,
+                "media_asset_id": media_asset_id,
+                "face_profile_id": face_profile_id,
+            },
+            variants_requested=variants_requested,
+        )
+
+    async def _mark_variant_failed(
+        self,
+        job_id: str,
+        variant_number: int,
+        error_message: str,
+        *,
+        variants_requested: int,
+    ) -> None:
+        await self.jobs_repo.update_variant_state(
+            job_id,
+            variant_number,
+            {
+                "status": "failed",
+                "error_message": str(error_message or "variant_failed")[:500],
+            },
+            variants_requested=variants_requested,
+        )
+
+    async def _count_completed_variants(self, job_id: str) -> int:
+        q = "SELECT COUNT(*)::int AS n FROM face_job_outputs WHERE job_id = $1::uuid"
+        rows = await self.jobs_repo.execute_queries(q, job_id)
+        if not rows:
+            return 0
+        row = self.jobs_repo.convert_db_row(rows[0])
+        return int(row.get("n") or 0)
+
+    async def _load_variants_state(self, job_id: str) -> Dict[str, Any]:
+        job = await self.jobs_repo.get_job(job_id)
+        if not job:
+            return {}
+        meta = self._coerce_dict(self._row_get(job, "meta_json", None))
+        variants_state = self._coerce_dict(meta.get("variants_state"))
+        return variants_state if isinstance(variants_state, dict) else {}
+
+    async def _run_variant_task(
+        self,
+        *,
+        sem: asyncio.Semaphore,
+        job_id: str,
+        user_id: str,
+        request_dict: Dict[str, Any],
+        resolved_config: Dict[str, Any],
+        variant: Dict[str, Any],
+        mode: str,
+        shared_inputs: Dict[str, Any],
+        variants_requested: int,
+    ) -> Optional[GeneratedVariant]:
+        variant_number = int(variant.get("variant_number") or 1)
+        seed = int(variant.get("seed") or 0)
+        async with sem:
+            await self._mark_variant_running(
+                job_id,
+                variant_number,
+                seed,
+                variants_requested=variants_requested,
+            )
+            try:
+                return await self._process_variant(
+                    job_id=job_id,
+                    user_id=user_id,
+                    request_dict=request_dict,
+                    resolved_config=resolved_config,
+                    variant=variant,
+                    mode=mode,
+                    shared_inputs=shared_inputs,
+                    variants_requested=variants_requested,
+                )
+            except Exception as e:
+                await self._mark_variant_failed(
+                    job_id,
+                    variant_number,
+                    str(e),
+                    variants_requested=variants_requested,
+                )
+                logger.exception(
+                    "Variant failed",
+                    extra={"job_id": job_id, "variant": variant_number, "error": str(e)},
+                )
+                return None
+
+    async def get_job_status_light(self, job_id: str) -> Dict[str, Any]:
+        job = await self.jobs_repo.get_job(job_id)
+        if not job:
+            raise ValueError(f"Job not found: {job_id}")
+
+        meta = self._coerce_dict(self._row_get(job, "meta_json", None))
+        payload = self._coerce_dict(self._row_get(job, "payload_json", None))
+        pricing = self._pricing_from_job(job, payload)
+        variants_state = self._coerce_dict(meta.get("variants_state"))
+
+        pricing_view = self._pricing_to_view(pricing)
+        return {
+            "job_id": job_id,
+            "status": self._job_status_str(self._row_get(job, "status", "queued")),
+            "variants_requested": int(meta.get("variants_requested") or payload.get("num_variants") or 1),
+            "variants_completed": int(meta.get("variants_completed") or 0),
+            "variants_failed": int(meta.get("variants_failed") or 0),
+            "variants_running": int(meta.get("variants_running") or 0),
+            "variants": [
+                {
+                    "variant_number": int(k),
+                    "status": str(self._coerce_dict(v).get("status") or "queued"),
+                    "image_url": self._string_or_none(self._coerce_dict(v).get("image_url")),
+                    "media_asset_id": self._string_or_none(self._coerce_dict(v).get("media_asset_id")),
+                    "face_profile_id": self._string_or_none(self._coerce_dict(v).get("face_profile_id")),
+                    "error_message": self._string_or_none(self._coerce_dict(v).get("error_message")),
+                }
+                for k, v in sorted(variants_state.items(), key=lambda item: int(item[0]))
+            ],
+            "updated_at": self._row_get(job, "updated_at", None),
+            "error_code": self._row_get(job, "error_code", None),
+            "error_message": self._row_get(job, "error_message", None),
+            "pricing": pricing_view.model_dump(exclude_none=True) if pricing_view else None,
+        }
+
+    async def recover_job(self, job_id: str) -> None:
+        job = await self.jobs_repo.get_job(job_id)
+        if not job:
+            return
+        status = self._job_status_str(self._row_get(job, "status", None))
+        if status in {"succeeded", "failed", "cancelled"}:
+            return
+        await self.jobs_repo.update_status(
+            job_id,
+            "running",
+            meta_patch={"recovered_at": str(asyncio.get_running_loop().time())},
+        )
+        await self.process_job(job_id)
+
+    async def recover_stale_running_jobs_once(self, *, limit: int = 5, stale_seconds: int = 120) -> int:
+        job_ids = await self.jobs_repo.claim_stale_running_jobs(
+            studio_type="face",
+            limit=limit,
+            stale_seconds=stale_seconds,
+        )
+        if not job_ids:
+            return 0
+        await asyncio.gather(*(self.recover_job(job_id) for job_id in job_ids), return_exceptions=True)
+        return len(job_ids)
 
     # -------------------------
     # Public API
@@ -1779,6 +2505,11 @@ class CreatorOrchestrator:
             "gender": request_dict.get("gender"),
             "image_format_code": request_dict.get("image_format_code"),
             "use_case_code": request_dict.get("use_case_code"),
+            "shot_type_code": request_dict.get("shot_type_code"),
+            "aspect_ratio": request_dict.get("aspect_ratio"),
+            "image_size_hint": request_dict.get("image_size_hint"),
+            "width": request_dict.get("width"),
+            "height": request_dict.get("height"),
             "style_code": request_dict.get("style_code"),
             "context_code": request_dict.get("context_code"),
             "clothing_style_code": request_dict.get("clothing_style_code"),
@@ -1858,6 +2589,11 @@ class CreatorOrchestrator:
                 "job_seed": int(job_seed),
                 "request_nonce": request_dict.get("request_nonce"),
                 "mode": mode,
+                "shot_type_code": request_dict.get("shot_type_code"),
+                "aspect_ratio": request_dict.get("aspect_ratio"),
+                "image_size_hint": request_dict.get("image_size_hint"),
+                "width": request_dict.get("width"),
+                "height": request_dict.get("height"),
                 "source_image_ref": request_dict.get("source_image_ref") if mode == "image-to-image" else None,
                 "source_image_asset_id": request_dict.get("source_image_asset_id") if mode == "image-to-image" else None,
                 "source_image_url": request_dict.get("source_image_url") if mode == "image-to-image" else None,
@@ -1890,6 +2626,28 @@ class CreatorOrchestrator:
                 )
                 raise
 
+        await _emit_notification_best_effort(
+            {
+                "event_type": "FACE_JOB_SUBMITTED",
+                "category": "jobs",
+                "priority": "info",
+                "source_service": "svc-face",
+                "source_ref_type": "job",
+                "source_ref_id": str(job_id),
+                "actor_user_id": None,
+                "title": "Face generation started",
+                "body": "Your desifaces.ai Face job has been queued.",
+                "action_route": "/notifications",
+                "action_label": "View job",
+                "image_url": None,
+                "payload_json": {"job_id": str(job_id), "mode": mode},
+                "metadata_json": {"job_id": str(job_id), "mode": mode},
+                "dedupe_key": f"face-submitted:{job_id}",
+                "recipients": [{"user_id": str(user_id), "channels": {"in_app": True, "push": False, "email": False}}],
+            },
+            context={"job_id": str(job_id), "user_id": str(user_id), "event_type": "FACE_JOB_SUBMITTED"},
+        )
+
         return JobCreatedResponse(
             job_id=job_id,
             status="queued",
@@ -1903,6 +2661,9 @@ class CreatorOrchestrator:
                 "demographics_fixed": explicit_demographics,
                 "creativity_varied": True,
                 "mode": mode,
+                "shot_type_code": request_dict.get("shot_type_code"),
+                "aspect_ratio": request_dict.get("aspect_ratio"),
+                "image_size_hint": request_dict.get("image_size_hint"),
                 "pricing_state": pricing.get("state"),
                 "pricing_enabled": bool(pricing.get("enabled")),
             },
@@ -1914,6 +2675,7 @@ class CreatorOrchestrator:
 
         user_id = ""
         pricing: Dict[str, Any] = {}
+        shared_inputs: Dict[str, Any] = {}
 
         try:
             job = await self.jobs_repo.get_job(job_id)
@@ -1945,6 +2707,7 @@ class CreatorOrchestrator:
                 return
 
             payload_json = await self._ensure_required_config_codes(payload_json)
+            payload_json = self._normalize_request_framing(payload_json)
 
             user_id = str(self._row_get(job, "user_id", "") or "")
             pricing = self._pricing_from_job(job, payload_json)
@@ -2008,7 +2771,6 @@ class CreatorOrchestrator:
                         payload_json["source_image_ref"] = ref
                         if self._UUID_RE.match(ref) and not payload_json.get("source_image_asset_id"):
                             payload_json["source_image_asset_id"] = ref
-                        source_image_url = resolved
                     except Exception as e:
                         await self._fail_job(
                             job_id=job_id,
@@ -2034,6 +2796,19 @@ class CreatorOrchestrator:
                 request_dict=payload_json,
                 job_seed=int(job_seed),
             )
+            variants_requested = max(1, len(variants))
+            await self.jobs_repo.patch_job_meta(job_id, {"variants_requested": variants_requested})
+
+            aspect_ratio = self._normalize_aspect_ratio(payload_json.get("aspect_ratio"))
+            width, height, image_size_hint = self._size_hint_to_dimensions(
+                aspect_ratio,
+                payload_json.get("image_size_hint") or payload_json.get("size"),
+            )
+            payload_json["aspect_ratio"] = aspect_ratio
+            payload_json["image_size_hint"] = image_size_hint
+            payload_json["size"] = image_size_hint
+            payload_json["width"] = int(width)
+            payload_json["height"] = int(height)
 
             for v in variants:
                 vn = int(v.get("variant_number") or 1)
@@ -2041,6 +2816,15 @@ class CreatorOrchestrator:
                 v["job_seed"] = int(job_seed)
                 v["mode"] = mode
                 v["request_hash"] = request_hash
+                v["shot_type_code"] = payload_json.get("shot_type_code")
+                v["aspect_ratio"] = aspect_ratio
+                v["image_size_hint"] = image_size_hint
+                tech = self._coerce_dict(v.get("technical_specs"))
+                tech["width"] = int(width)
+                tech["height"] = int(height)
+                tech["aspect_ratio"] = aspect_ratio
+                tech["image_size_hint"] = image_size_hint
+                v["technical_specs"] = tech
                 v["seed"] = self._derive_variant_seed_hmac(
                     job_seed=int(job_seed),
                     variant_number=vn,
@@ -2070,35 +2854,75 @@ class CreatorOrchestrator:
                         f"{n}, {ident['negative_tokens']}" if n else ident["negative_tokens"]
                     )
 
-            generated: List[GeneratedVariant] = []
+            shared_inputs = await self._prepare_shared_variant_inputs(payload_json, mode=mode)
 
-            for v in variants:
-                try:
-                    out = await self._process_variant(
-                        job_id=job_id,
-                        user_id=user_id,
-                        request_dict=payload_json,
-                        resolved_config=resolved,
-                        variant=v,
-                        mode=mode,
-                    )
-                    generated.append(out)
-                except Exception as e:
-                    logger.error(
-                        "Variant failed",
-                        extra={"job_id": job_id, "variant": v.get("variant_number"), "error": str(e)},
-                        exc_info=True,
-                    )
-                    continue
+            variants_state = await self._load_variants_state(job_id)
+            completed_variant_numbers = {
+                int(k)
+                for k, vv in variants_state.items()
+                if str(self._coerce_dict(vv).get("status") or "").strip().lower() == "succeeded"
+            }
+            pending_variants = [
+                v for v in variants if int(v.get("variant_number") or 1) not in completed_variant_numbers
+            ]
 
-            if generated:
+            if pending_variants:
+                sem = asyncio.Semaphore(self._face_variant_concurrency())
+                await asyncio.gather(
+                    *(
+                        self._run_variant_task(
+                            sem=sem,
+                            job_id=job_id,
+                            user_id=user_id,
+                            request_dict=payload_json,
+                            resolved_config=resolved,
+                            variant=v,
+                            mode=mode,
+                            shared_inputs=shared_inputs,
+                            variants_requested=variants_requested,
+                        )
+                        for v in pending_variants
+                    ),
+                    return_exceptions=False,
+                )
+
+            completed_count = await self._count_completed_variants(job_id)
+            if completed_count > 0:
                 pricing = await self._commit_pricing_for_job(
                     job_id=job_id,
                     user_id=user_id,
                     pricing=pricing,
-                    actual_units=len(generated),
+                    actual_units=completed_count,
                 )
-                await self.jobs_repo.update_status(job_id, "succeeded")
+                await self.jobs_repo.update_status(
+                    job_id,
+                    "succeeded",
+                    meta_patch={
+                        "variants_completed": completed_count,
+                        "variants_requested": variants_requested,
+                    },
+                )
+                await _emit_notification_best_effort(
+                    {
+                        "event_type": "FACE_READY",
+                        "category": "jobs",
+                        "priority": "important",
+                        "source_service": "svc-face",
+                        "source_ref_type": "job",
+                        "source_ref_id": str(job_id),
+                        "actor_user_id": None,
+                        "title": "Your Face output is ready",
+                        "body": "Your desifaces.ai Face generation completed successfully.",
+                        "action_route": "/notifications",
+                        "action_label": "View result",
+                        "image_url": None,
+                        "payload_json": {"job_id": str(job_id), "completed_variants": int(completed_count)},
+                        "metadata_json": {"job_id": str(job_id), "completed_variants": int(completed_count)},
+                        "dedupe_key": f"face-ready:{job_id}",
+                        "recipients": [{"user_id": str(user_id), "channels": {"in_app": True, "push": True, "email": True}}],
+                    },
+                    context={"job_id": str(job_id), "user_id": str(user_id), "event_type": "FACE_READY"},
+                )
             else:
                 await self._fail_job(
                     job_id=job_id,
@@ -2128,6 +2952,35 @@ class CreatorOrchestrator:
                 error_code="PROCESSING_ERROR",
                 error_message=str(e),
             )
+            if user_id:
+                await _emit_notification_best_effort(
+                    {
+                        "event_type": "FACE_FAILED",
+                        "category": "jobs",
+                        "priority": "important",
+                        "source_service": "svc-face",
+                        "source_ref_type": "job",
+                        "source_ref_id": str(job_id),
+                        "actor_user_id": None,
+                        "title": "Your Face job needs attention",
+                        "body": str(e),
+                        "action_route": "/notifications",
+                        "action_label": "Review issue",
+                        "image_url": None,
+                        "payload_json": {"job_id": str(job_id), "error_code": "PROCESSING_ERROR"},
+                        "metadata_json": {"job_id": str(job_id), "error_code": "PROCESSING_ERROR"},
+                        "dedupe_key": f"face-failed:{job_id}:PROCESSING_ERROR",
+                        "recipients": [{"user_id": str(user_id), "channels": {"in_app": True, "push": True, "email": True}}],
+                    },
+                    context={"job_id": str(job_id), "user_id": str(user_id), "event_type": "FACE_FAILED", "error_code": "PROCESSING_ERROR"},
+                )
+        finally:
+            tmp_src_path = str(shared_inputs.get("tmp_src_path") or "").strip()
+            if tmp_src_path and os.path.exists(tmp_src_path):
+                try:
+                    os.remove(tmp_src_path)
+                except Exception:
+                    pass
 
     # ============================================================================
     # PRIVATE METHODS
@@ -2140,6 +2993,8 @@ class CreatorOrchestrator:
         resolved_config: Dict[str, Any],
         variant: Dict[str, Any],
         mode: str,
+        shared_inputs: Optional[Dict[str, Any]] = None,
+        variants_requested: Optional[int] = None,
     ) -> GeneratedVariant:
         import httpx
         import uuid
@@ -2153,10 +3008,24 @@ class CreatorOrchestrator:
         neg = (variant.get("negative_prompt") or "").strip()
 
         technical = self._coerce_dict(variant.get("technical_specs"))
-        width = int(technical.get("width") or 512)
-        height = int(technical.get("height") or 512)
+        aspect_ratio = self._normalize_aspect_ratio(
+            technical.get("aspect_ratio") or variant.get("aspect_ratio") or request_dict.get("aspect_ratio")
+        )
+        req_width, req_height, image_size_hint = self._size_hint_to_dimensions(
+            aspect_ratio,
+            technical.get("image_size_hint")
+            or variant.get("image_size_hint")
+            or request_dict.get("image_size_hint")
+            or request_dict.get("size"),
+        )
+        width = int(technical.get("width") or request_dict.get("width") or req_width)
+        height = int(technical.get("height") or request_dict.get("height") or req_height)
         num_steps = int(technical.get("num_inference_steps") or 28)
         guidance = float(technical.get("guidance_scale") or 3.5)
+        technical["width"] = width
+        technical["height"] = height
+        technical["aspect_ratio"] = aspect_ratio
+        technical["image_size_hint"] = image_size_hint
 
         source_image_ref: Optional[str] = None
         source_image_url: Optional[str] = None
@@ -2199,6 +3068,9 @@ class CreatorOrchestrator:
                 "height": height,
                 "num_inference_steps": num_steps,
                 "guidance_scale": guidance,
+                "aspect_ratio": aspect_ratio,
+                "image_size_hint": image_size_hint,
+                "shot_type_code": request_dict.get("shot_type_code"),
                 "preservation_strength": None,
             },
             response_json={},
@@ -2209,15 +3081,17 @@ class CreatorOrchestrator:
             if mode == "image-to-image":
                 payload_json = request_dict
 
+                shared_inputs = shared_inputs or {}
                 source_image_ref = (
-                    (payload_json.get("source_image_ref") or "").strip()
+                    self._string_or_none(shared_inputs.get("source_image_ref"))
+                    or (payload_json.get("source_image_ref") or "").strip()
                     or (payload_json.get("source_image_asset_id") or "").strip()
                     or (payload_json.get("source_image_url") or "").strip()
                 )
                 if not source_image_ref:
                     raise ValueError("missing_source_image_url")
 
-                source_image_url = await self._resolve_source_image_ref(source_image_ref)
+                source_image_url = self._string_or_none(shared_inputs.get("source_image_url")) or await self._resolve_source_image_ref(source_image_ref)
                 if not source_image_url:
                     raise RuntimeError(f"unresolvable_source_image_ref:{source_image_ref}")
 
@@ -2227,7 +3101,7 @@ class CreatorOrchestrator:
                 elif parsed.scheme != "file":
                     raise ValueError(f"unsupported_source_image_scheme:{parsed.scheme or 'missing'}")
 
-                strength = self._clamp_strength(payload_json.get("preservation_strength"), 0.25)
+                strength = self._clamp_strength(shared_inputs.get("preservation_strength"), payload_json.get("preservation_strength") or 0.25)
 
                 await self._provider_runs_upsert(
                     job_id=job_id,
@@ -2243,6 +3117,9 @@ class CreatorOrchestrator:
                         "height": height,
                         "num_inference_steps": num_steps,
                         "guidance_scale": guidance,
+                        "aspect_ratio": aspect_ratio,
+                        "image_size_hint": image_size_hint,
+                        "shot_type_code": request_dict.get("shot_type_code"),
                         "preservation_strength": float(strength),
                         "source_image_url": source_image_url,
                     },
@@ -2250,16 +3127,20 @@ class CreatorOrchestrator:
                     meta_json={"request_hash": base_rh, "rh_variant": rh_variant},
                 )
 
-                tmp_src_path = f"/tmp/df_i2i_src_{uuid.uuid4().hex}.png"
-
-                if parsed.scheme == "file":
-                    local_path = parsed.path
-                    if not local_path or not os.path.exists(local_path):
-                        raise ValueError(f"source_image_file_not_found:{local_path}")
-                    with open(local_path, "rb") as rf, open(tmp_src_path, "wb") as wf:
-                        wf.write(rf.read())
+                shared_tmp_src_path = self._string_or_none(shared_inputs.get("tmp_src_path"))
+                if shared_tmp_src_path and os.path.exists(shared_tmp_src_path):
+                    tmp_src_path = shared_tmp_src_path
                 else:
-                    await _download_to_tmp(source_image_url, tmp_src_path)
+                    tmp_src_path = f"/tmp/df_i2i_src_{uuid.uuid4().hex}.png"
+
+                    if parsed.scheme == "file":
+                        local_path = parsed.path
+                        if not local_path or not os.path.exists(local_path):
+                            raise ValueError(f"source_image_file_not_found:{local_path}")
+                        with open(local_path, "rb") as rf, open(tmp_src_path, "wb") as wf:
+                            wf.write(rf.read())
+                    else:
+                        await _download_to_tmp(source_image_url, tmp_src_path)
 
                 out = await router.generate_i2i_bytes(
                     prompt=prompt,
@@ -2301,6 +3182,9 @@ class CreatorOrchestrator:
                     "height": height,
                     "num_inference_steps": num_steps,
                     "guidance_scale": guidance,
+                    "aspect_ratio": aspect_ratio,
+                    "image_size_hint": image_size_hint,
+                    "shot_type_code": request_dict.get("shot_type_code"),
                     "preservation_strength": float(strength) if strength is not None else None,
                 },
                 response_json={
@@ -2378,6 +3262,9 @@ class CreatorOrchestrator:
                     "seed": seed,
                     "mode": mode,
                     "identity_signature": identity_signature,
+                    "aspect_ratio": aspect_ratio,
+                    "image_size_hint": image_size_hint,
+                    "shot_type_code": request_dict.get("shot_type_code"),
                     "prompt": prompt[:500],
                     "technical_specs": technical,
                     "creative_variations": creative_variations,
@@ -2411,6 +3298,7 @@ class CreatorOrchestrator:
                     "skin_tone_code": request_dict.get("skin_tone_code"),
                     "image_format_code": request_dict.get("image_format_code"),
                     "use_case_code": request_dict.get("use_case_code"),
+                    "shot_type_code": request_dict.get("shot_type_code"),
                     "style_code": request_dict.get("style_code"),
                     "context_code": request_dict.get("context_code"),
                     "clothing_style_code": request_dict.get("clothing_style_code"),
@@ -2424,6 +3312,9 @@ class CreatorOrchestrator:
                     "seed": seed,
                     "mode": mode,
                     "identity_signature": identity_signature,
+                    "aspect_ratio": aspect_ratio,
+                    "image_size_hint": image_size_hint,
+                    "shot_type_code": request_dict.get("shot_type_code"),
                     "generation_prompt": prompt[:2000],
                     "negative_prompt": neg[:2000],
                     "demographic_base": variant.get("demographic_base"),
@@ -2470,6 +3361,9 @@ class CreatorOrchestrator:
                     "seed": seed,
                     "mode": mode,
                     "identity_signature": identity_signature,
+                    "aspect_ratio": aspect_ratio,
+                    "image_size_hint": image_size_hint,
+                    "shot_type_code": request_dict.get("shot_type_code"),
                     "output_asset_id": asset_id,
                     "face_profile_id": profile_id,
                     "storage_path": storage_path,
@@ -2484,6 +3378,15 @@ class CreatorOrchestrator:
                     "source_image_asset_id": (request_dict.get("source_image_asset_id") or None),
                     "preservation_strength": float(strength) if strength is not None else None,
                 },
+            )
+
+            await self._mark_variant_succeeded(
+                job_id,
+                variant_num,
+                image_url=image_url,
+                media_asset_id=str(asset_id),
+                face_profile_id=str(profile_id),
+                variants_requested=variants_requested or 1,
             )
 
             return GeneratedVariant(
@@ -2511,6 +3414,9 @@ class CreatorOrchestrator:
                     "height": height,
                     "num_inference_steps": num_steps,
                     "guidance_scale": guidance,
+                    "aspect_ratio": aspect_ratio,
+                    "image_size_hint": image_size_hint,
+                    "shot_type_code": request_dict.get("shot_type_code"),
                     "preservation_strength": float(strength) if strength is not None else None,
                 },
                 response_json={"error": str(e)[:500]},
@@ -2518,8 +3424,9 @@ class CreatorOrchestrator:
             )
             raise
         finally:
+            shared_tmp_src_path = self._string_or_none((shared_inputs or {}).get("tmp_src_path"))
             for p in (tmp_src_path, tmp_out_path):
-                if p and os.path.exists(p):
+                if p and p != shared_tmp_src_path and os.path.exists(p):
                     try:
                         os.remove(p)
                     except Exception:
@@ -2538,22 +3445,33 @@ class CreatorOrchestrator:
     ) -> None:
         q = """
         INSERT INTO face_job_outputs (
-          job_id, face_profile_id, output_asset_id, variant_number,
-          prompt_used, negative_prompt, technical_specs, creative_variations
+            job_id,
+            face_profile_id,
+            output_asset_id,
+            variant_number,
+            prompt_used,
+            negative_prompt,
+            technical_specs,
+            creative_variations
         )
         VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4,
-          $5, $6, $7::jsonb, $8::jsonb
+            $1::uuid,
+            $2::uuid,
+            $3::uuid,
+            $4,
+            $5,
+            $6,
+            $7::jsonb,
+            $8::jsonb
         )
         ON CONFLICT (job_id, variant_number)
         DO UPDATE SET
-          face_profile_id = EXCLUDED.face_profile_id,
-          output_asset_id = EXCLUDED.output_asset_id,
-          prompt_used = EXCLUDED.prompt_used,
-          negative_prompt = EXCLUDED.negative_prompt,
-          technical_specs = EXCLUDED.technical_specs,
-          creative_variations = EXCLUDED.creative_variations
-        )
+            face_profile_id = EXCLUDED.face_profile_id,
+            output_asset_id = EXCLUDED.output_asset_id,
+            prompt_used = EXCLUDED.prompt_used,
+            negative_prompt = EXCLUDED.negative_prompt,
+            technical_specs = EXCLUDED.technical_specs,
+            creative_variations = EXCLUDED.creative_variations
         """
         await self.jobs_repo.execute_command(
             q,
@@ -2655,9 +3573,12 @@ class CreatorOrchestrator:
             )
 
         payload_json = self._coerce_dict(self._row_get(job, "payload_json", None))
+        meta_json = self._coerce_dict(self._row_get(job, "meta_json", None))
         requested: Optional[int] = None
         try:
-            if payload_json.get("num_variants") is not None:
+            if meta_json.get("variants_requested") is not None:
+                requested = int(meta_json.get("variants_requested"))
+            elif payload_json.get("num_variants") is not None:
                 requested = int(payload_json.get("num_variants"))
         except Exception:
             requested = None
@@ -2669,6 +3590,11 @@ class CreatorOrchestrator:
             status_enum = JobStatus.QUEUED
 
         progress = self._get_progress_info(status_enum, len(variants), requested)
+        if progress is not None:
+            if meta_json.get("variants_failed") is not None:
+                progress["variants_failed"] = int(meta_json.get("variants_failed") or 0)
+            if meta_json.get("variants_running") is not None:
+                progress["variants_running"] = int(meta_json.get("variants_running") or 0)
 
         pricing = self._pricing_from_job(job, payload_json)
         pricing_state = str(pricing.get("state") or "").strip()

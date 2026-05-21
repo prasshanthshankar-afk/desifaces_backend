@@ -1,28 +1,41 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import List
 
 
 @dataclass(frozen=True)
-class ScriptChunk:
+class ScriptSegment:
     index: int
     text: str
     duration_sec: int
+    word_count: int
 
 
-_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
-_WS = re.compile(r"\s+")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_WS_RE = re.compile(r"\s+")
 
 
-def _estimate_duration_seconds(text: str, wpm: int) -> int:
-    words = len([w for w in _WS.split(text.strip()) if w])
+def _normalize_text(text: str) -> str:
+    return _WS_RE.sub(" ", (text or "").strip())
+
+
+def _split_sentences(text: str) -> List[str]:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return []
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(normalized) if p.strip()]
+    return parts or [normalized]
+
+
+def _estimate_duration_sec(text: str, wpm: int) -> int:
+    words = len(text.split())
     if words <= 0:
-        return 0
-    # seconds = words / (wpm/60)
-    sec = int(round(words * 60.0 / float(wpm)))
-    return max(1, sec)
+        return 1
+    minutes = words / max(1, wpm)
+    return max(1, int(math.ceil(minutes * 60.0)))
 
 
 def split_script_into_segments(
@@ -31,68 +44,117 @@ def split_script_into_segments(
     target_segment_seconds: int = 60,
     max_segment_seconds: int = 120,
     wpm: int = 150,
-) -> List[ScriptChunk]:
+) -> List[ScriptSegment]:
     """
-    Splits longform script into segments suitable for svc-fusion where
-    VideoSettings.duration_sec <= 120.
+    Split a script into sentence-aware chunks sized for downstream fusion limits.
 
-    Strategy:
-      - sentence-ish splitting (.,!,?)
-      - greedy pack sentences into a segment until target reached
-      - hard cap at max_segment_seconds (will flush current segment)
+    Returns ScriptSegment objects with:
+      - index
+      - text
+      - duration_sec
+      - word_count
     """
-    s = (script_text or "").strip()
-    if not s:
+    script_text = _normalize_text(script_text)
+    if not script_text:
         return []
 
-    # Normalize whitespace
-    s = _WS.sub(" ", s)
+    target_segment_seconds = max(1, int(target_segment_seconds))
+    max_segment_seconds = max(1, int(max_segment_seconds))
+    wpm = max(1, int(wpm))
 
-    # Split into sentences; if no punctuation, treat as one block
-    parts = _SENT_SPLIT.split(s)
-    parts = [p.strip() for p in parts if p and p.strip()]
-    if not parts:
-        return []
+    # Convert duration targets into approximate word budgets.
+    target_words = max(1, int(round((target_segment_seconds / 60.0) * wpm)))
+    max_words = max(target_words, int(round((max_segment_seconds / 60.0) * wpm)))
 
-    # Guardrails
-    target = max(10, int(target_segment_seconds))
-    cap = max(10, int(max_segment_seconds))
-    if cap < target:
-        cap = target
-    cap = min(cap, 120)   # hard svc-fusion limit
-    target = min(target, cap)
+    sentences = _split_sentences(script_text)
 
-    chunks: List[ScriptChunk] = []
-    cur: List[str] = []
-    cur_sec = 0
+    segments: List[ScriptSegment] = []
+    current_sentences: List[str] = []
+    current_words = 0
 
-    def flush():
-        nonlocal cur, cur_sec
-        if not cur:
+    def flush() -> None:
+        nonlocal current_sentences, current_words
+        if not current_sentences:
             return
-        text = " ".join(cur).strip()
-        dur = _estimate_duration_seconds(text, wpm)
-        dur = max(1, min(cap, dur))
-        chunks.append(ScriptChunk(index=len(chunks), text=text, duration_sec=dur))
-        cur = []
-        cur_sec = 0
+        text = " ".join(current_sentences).strip()
+        segments.append(
+            ScriptSegment(
+                index=len(segments),
+                text=text,
+                duration_sec=min(max_segment_seconds, _estimate_duration_sec(text, wpm)),
+                word_count=len(text.split()),
+            )
+        )
+        current_sentences = []
+        current_words = 0
 
-    for sent in parts:
-        sent_sec = _estimate_duration_seconds(sent, wpm)
-        sent_sec = max(1, sent_sec)
+    for sentence in sentences:
+        sent_words = len(sentence.split())
 
-        # If adding this sentence would exceed hard cap, flush current first
-        if cur and (cur_sec + sent_sec) > cap:
+        # Very long single sentence: split directly by max_words.
+        if sent_words > max_words:
+            flush()
+            words = sentence.split()
+            for i in range(0, len(words), max_words):
+                chunk_words = words[i : i + max_words]
+                chunk_text = " ".join(chunk_words).strip()
+                if not chunk_text:
+                    continue
+                segments.append(
+                    ScriptSegment(
+                        index=len(segments),
+                        text=chunk_text,
+                        duration_sec=min(max_segment_seconds, _estimate_duration_sec(chunk_text, wpm)),
+                        word_count=len(chunk_text.split()),
+                    )
+                )
+            continue
+
+        proposed_words = current_words + sent_words
+
+        # If adding this sentence would exceed target and we already have content, flush first.
+        if current_sentences and proposed_words > target_words:
             flush()
 
-        # If a single sentence is longer than cap, we still accept it as its own chunk (duration will clamp)
-        cur.append(sent)
-        cur_sec = _estimate_duration_seconds(" ".join(cur), wpm)
+        current_sentences.append(sentence)
+        current_words += sent_words
 
-        # If we've reached target, flush
-        if cur_sec >= target:
+        # Safety flush if we somehow hit/exceed max_words.
+        if current_words >= max_words:
             flush()
 
     flush()
+    return segments
 
-    return chunks
+
+class ChunkingService:
+    """
+    Backward-compatible helper wrapper.
+    """
+
+    def split_spoken_text(self, text: str, max_words_per_chunk: int = 28) -> List[str]:
+        words = (text or "").split()
+        if not words:
+            return []
+
+        chunks: List[str] = []
+        for idx in range(0, len(words), max(1, int(max_words_per_chunk))):
+            chunk = " ".join(words[idx : idx + max(1, int(max_words_per_chunk))]).strip()
+            if chunk:
+                chunks.append(chunk)
+        return chunks
+
+    def split_script_into_segments(
+        self,
+        script_text: str,
+        *,
+        target_segment_seconds: int = 60,
+        max_segment_seconds: int = 120,
+        wpm: int = 150,
+    ) -> List[ScriptSegment]:
+        return split_script_into_segments(
+            script_text,
+            target_segment_seconds=target_segment_seconds,
+            max_segment_seconds=max_segment_seconds,
+            wpm=wpm,
+        )

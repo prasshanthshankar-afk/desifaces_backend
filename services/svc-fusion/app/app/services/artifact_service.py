@@ -1,21 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import os
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
-import asyncio
-import hashlib
-import os
-import tempfile
-
 import httpx
-from azure.storage.blob import ContentSettings
-
-from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from azure.storage.blob import BlobSasPermissions, BlobServiceClient, ContentSettings, generate_blob_sas
 
 from app.config import settings
 
@@ -43,7 +40,8 @@ def _json_to_dict(val: Any) -> Dict[str, Any]:
 
 def _parse_container_blob_from_url(url: str) -> Tuple[str, str]:
     """
-    Parse: https://<acct>.blob.core.windows.net/<container>/<blobpath>?...
+    Parse:
+      https://<acct>.blob.core.windows.net/<container>/<blobpath>?...
     -> (container, blobpath)
     """
     p = urlparse(url)
@@ -57,7 +55,7 @@ def _parse_container_blob_from_url(url: str) -> Tuple[str, str]:
 
 def _parse_storage_path(storage_path: str) -> Tuple[str, str]:
     """
-    Accepts either:
+    Accepts:
       - "<container>/<blobpath>"
       - "az://<container>/<blobpath>"
       - "/<container>/<blobpath>"
@@ -92,14 +90,10 @@ class SasConfig:
 
 class ArtifactService:
     """
-    Phase-1:
-      - store provider URLs directly as artifacts.
-    Phase-2:
-      - copy provider video into Azure Blob and store az:// ref + SAS.
-
-    Extended:
-      - mint fresh read SAS URLs for existing blob artifacts using artifact.meta_json.storage_path
-        or by parsing artifact.url.
+    Extended artifact service:
+    - persist provider videos into Azure Blob
+    - mint fresh read SAS URLs for existing Azure Blob artifacts
+    - refresh stale Azure Blob SAS URLs directly from an existing blob URL
     """
 
     def __init__(self) -> None:
@@ -111,7 +105,9 @@ class ArtifactService:
             return self._bsc
         conn_str = getattr(settings, "AZURE_STORAGE_CONNECTION_STRING", None)
         if not conn_str:
-            raise RuntimeError("azure_storage_not_configured: AZURE_STORAGE_CONNECTION_STRING is not set")
+            raise RuntimeError(
+                "azure_storage_not_configured: AZURE_STORAGE_CONNECTION_STRING is not set"
+            )
         self._bsc = BlobServiceClient.from_connection_string(conn_str)
         return self._bsc
 
@@ -128,15 +124,12 @@ class ArtifactService:
         if not account_name or not account_key:
             raise RuntimeError(
                 "azure_storage_sas_not_configured: unable to derive account_name/account_key from "
-                "DF_AZURE_STORAGE_CONNECTION_STRING"
+                "AZURE_STORAGE_CONNECTION_STRING"
             )
 
         self._sas_cfg = SasConfig(account_name=str(account_name), account_key=str(account_key))
         return self._sas_cfg
 
-    # -----------------------------
-    # Video artifact persistence
-    # -----------------------------
     async def persist_video_artifact(
         self,
         provider_video_url: str,
@@ -147,21 +140,8 @@ class ArtifactService:
         ttl_hours: Optional[int] = None,
     ) -> str:
         """
-        Download provider video (HeyGen mp4 URL) and persist into Azure Blob.
-        Returns an Azure Blob READ SAS URL.
-
-        Container:
-          - settings.AZURE_VIDEO_OUTPUT_CONTAINER if set
-          - else defaults to "video-output"
-
-        Blob path:
-          - if user_id + job_id are provided:
-              <user_id>/<job_id>/<provider_job_id or uuid>.mp4
-          - else:
-              misc/<provider_job_id or uuid>.mp4
-
-        NOTE:
-          - Uses sync BlobServiceClient under the hood; upload runs in a thread to avoid blocking event loop.
+        Download provider video and persist into Azure Blob.
+        Returns a fresh Azure Blob READ SAS URL.
         """
         url = (provider_video_url or "").strip()
         if not url:
@@ -169,25 +149,22 @@ class ArtifactService:
 
         container = getattr(settings, "AZURE_VIDEO_OUTPUT_CONTAINER", None) or "video-output"
 
-        # build blob name
         pj = (provider_job_id or "").strip() or uuid.uuid4().hex
         if user_id and job_id:
             blob = f"{str(user_id).strip()}/{str(job_id).strip()}/{pj}.mp4"
         else:
             blob = f"misc/{pj}.mp4"
 
-        # download to temp file (streaming) + compute sha256/bytes (useful later if you want to store)
-        tmp_path = None
+        tmp_path: Optional[str] = None
         size_bytes = 0
-        sha256_hex = None
 
         try:
             fd, tmp_path = tempfile.mkstemp(prefix="df_video_", suffix=".mp4")
             os.close(fd)
 
             h = hashlib.sha256()
-
             timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
+
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
                 async with client.stream("GET", url) as resp:
                     resp.raise_for_status()
@@ -202,9 +179,8 @@ class ArtifactService:
             if size_bytes <= 0:
                 raise ValueError("downloaded_video_is_empty")
 
-            sha256_hex = h.hexdigest()
+            _ = h.hexdigest()
 
-            # upload to blob (run sync SDK call in a thread)
             bsc = self._get_blob_service()
             blob_client = bsc.get_blob_client(container=container, blob=blob)
 
@@ -218,7 +194,6 @@ class ArtifactService:
 
             await asyncio.to_thread(_upload_sync)
 
-            # mint SAS
             cfg = self._get_sas_cfg()
             ttl = int(ttl_hours or getattr(settings, "AZURE_SAS_EXPIRY_HOURS", 2))
             expiry = datetime.now(timezone.utc) + timedelta(hours=ttl)
@@ -232,7 +207,6 @@ class ArtifactService:
                 expiry=expiry,
             )
 
-            # SAS URL to persisted Azure video
             return f"https://{cfg.account_name}.blob.core.windows.net/{container}/{blob}?{sas}"
 
         finally:
@@ -242,10 +216,6 @@ class ArtifactService:
                 except Exception:
                     pass
 
-
-    # -----------------------------
-    # Azure Blob SAS minting
-    # -----------------------------
     async def mint_read_sas_for_artifact(
         self,
         artifact_row: Dict[str, Any],
@@ -255,17 +225,12 @@ class ArtifactService:
         Mint a fresh read SAS URL for an artifact that lives in Azure Blob.
 
         Priority:
-          1) meta_json.storage_path (preferred)
-          2) artifact.url (fallback)
-
-        Handles legacy/buggy storage_path missing container:
-          storage_path like "<user_uuid>/<job_uuid>/file.mp3"
-          -> container derived from artifact.url, blob derived from storage_path
+          1) meta_json.storage_path
+          2) artifact.url
         """
         meta = _json_to_dict(artifact_row.get("meta_json"))
         storage_path = meta.get("storage_path")
 
-        # Parse URL once (may be needed for fallback / legacy fixups)
         url = str(artifact_row.get("url") or "").strip()
         url_container: Optional[str] = None
         url_blob: Optional[str] = None
@@ -278,29 +243,55 @@ class ArtifactService:
         container: Optional[str] = None
         blob: Optional[str] = None
 
-        # 1) Try storage_path first
         if isinstance(storage_path, str) and storage_path.strip():
             try:
                 c, b = _parse_storage_path(storage_path)
 
-                # If "container" looks like UUID, it's probably actually blob prefix.
-                # Use container from URL, and blob = "<uuid>/<rest>"
                 if _looks_like_uuid(c):
                     if not url_container:
-                        raise ValueError(f"storage_path_missing_container_and_url_unparseable: {storage_path}")
+                        raise ValueError(
+                            f"storage_path_missing_container_and_url_unparseable: {storage_path}"
+                        )
                     container = url_container
                     blob = f"{c}/{b}"
                 else:
                     container, blob = c, b
-
             except Exception:
                 container, blob = None, None
 
-        # 2) Fallback: parse from URL
         if not container or not blob:
             if not url_container or not url_blob:
                 raise ValueError("artifact_missing_url_and_storage_path")
             container, blob = url_container, url_blob
+
+        cfg = self._get_sas_cfg()
+        ttl = int(ttl_hours or getattr(settings, "AZURE_SAS_EXPIRY_HOURS", 2))
+        expiry = datetime.now(timezone.utc) + timedelta(hours=ttl)
+
+        sas = generate_blob_sas(
+            account_name=cfg.account_name,
+            container_name=container,
+            blob_name=blob,
+            account_key=cfg.account_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=expiry,
+        )
+
+        return f"https://{cfg.account_name}.blob.core.windows.net/{container}/{blob}?{sas}"
+
+    async def mint_read_sas_for_url(
+        self,
+        url: str,
+        ttl_hours: Optional[int] = None,
+    ) -> str:
+        """
+        Mint a fresh read SAS URL directly from an existing Azure Blob URL.
+        """
+        source_url = str(url or "").strip()
+        if not source_url:
+            raise ValueError("artifact_url_empty")
+
+        container, blob = _parse_container_blob_from_url(source_url)
 
         cfg = self._get_sas_cfg()
         ttl = int(ttl_hours or getattr(settings, "AZURE_SAS_EXPIRY_HOURS", 2))

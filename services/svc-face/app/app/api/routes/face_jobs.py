@@ -7,7 +7,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 try:
     from desifaces_shared.pricing.client import PricingClientError
@@ -16,6 +16,171 @@ except Exception:
         """Fallback so svc-face can still boot if shared pricing package
         is missing from the container image."""
         pass
+
+try:
+    from desifaces_shared.llm.prompt_enhancer import (
+        PromptEnhanceRequest,
+        PromptEnhanceResponse,
+        enhance_prompt,
+    )
+    from desifaces_shared.llm.studio_coach import (
+        StudioCoachRequest,
+        StudioCoachResponse,
+        generate_studio_tips,
+    )
+    SHARED_LLM_AVAILABLE = True
+except Exception:
+    SHARED_LLM_AVAILABLE = False
+
+    class PromptEnhanceRequest(BaseModel):
+        studio: str = "face"
+        mode: Optional[str] = None
+        user_input: str
+        locked_fields: Dict[str, Any] = Field(default_factory=dict)
+        context: Dict[str, Any] = Field(default_factory=dict)
+        locale: str = "en"
+        max_alternatives: int = 3
+
+    class PromptEnhanceResponse(BaseModel):
+        original_input: str
+        enhanced_input: str
+        alternatives: List[Dict[str, str]] = Field(default_factory=list)
+        tips: List[str] = Field(default_factory=list)
+        source: str = "fallback"
+        fallback_used: bool = True
+
+    class StudioCoachRequest(BaseModel):
+        studio: str = "face"
+        mode: Optional[str] = None
+        prompt: Optional[str] = None
+        form_state: Dict[str, Any] = Field(default_factory=dict)
+        context: Dict[str, Any] = Field(default_factory=dict)
+        locale: str = "en"
+        limit: int = 4
+
+    class StudioCoachResponse(BaseModel):
+        studio: str
+        tips: List[Dict[str, str]] = Field(default_factory=list)
+        source: str = "fallback"
+        fallback_used: bool = True
+        ttl_seconds: int = 180
+
+    async def enhance_prompt(
+        req: PromptEnhanceRequest,
+        force_fallback: bool = False,
+    ) -> PromptEnhanceResponse:
+        original = (req.user_input or "").strip()
+        if not original:
+            return PromptEnhanceResponse(
+                original_input="",
+                enhanced_input="",
+                alternatives=[],
+                tips=["Start with the subject, attire, mood, and lighting."],
+                source="fallback",
+                fallback_used=True,
+            )
+
+        region = str(req.locked_fields.get("region") or req.context.get("region") or "").strip()
+        gender = str(req.locked_fields.get("gender") or req.context.get("gender") or "").strip()
+        shot = str(req.context.get("shot_type") or req.context.get("shot_type_code") or "").strip()
+        use_case = str(req.context.get("use_case") or req.context.get("use_case_code") or "").strip()
+        context_label = str(req.context.get("context_code") or req.context.get("context_label") or "").strip()
+
+        parts = [original]
+        if region:
+            parts.append(f"authentic {region} context")
+        if gender:
+            parts.append(f"{gender} presentation")
+        if shot:
+            parts.append(shot.replace("_", " "))
+        if use_case:
+            parts.append(use_case.replace("_", " "))
+        if context_label:
+            parts.append(context_label.replace("_", " "))
+
+        parts.extend(
+            [
+                "high-quality portrait photography",
+                "family-friendly",
+                "culturally respectful",
+                "clean composition",
+                "natural realistic details",
+            ]
+        )
+
+        enhanced = ", ".join([part for part in parts if part])
+
+        alternatives = [
+            {"label": "Commercial", "text": enhanced + ", polished commercial look"},
+            {"label": "Natural", "text": enhanced + ", natural lifestyle look"},
+        ][: max(1, min(int(req.max_alternatives or 3), 4))]
+
+        tips = [
+            "Add attire details for stronger consistency.",
+            "Add framing like close-up, medium shot, or full-body.",
+            "Describe mood and lighting to reduce generic outputs.",
+        ]
+
+        return PromptEnhanceResponse(
+            original_input=original,
+            enhanced_input=enhanced,
+            alternatives=alternatives,
+            tips=tips,
+            source="fallback",
+            fallback_used=True,
+        )
+
+    async def generate_studio_tips(
+        req: StudioCoachRequest,
+        force_fallback: bool = False,
+    ) -> StudioCoachResponse:
+        mode = str(req.mode or "text-to-image")
+        form_state = req.form_state or {}
+        tips: List[Dict[str, str]] = []
+
+        if mode == "image-to-image":
+            tips.append(
+                {
+                    "title": "Keep identity stable",
+                    "body": "Use a clean front-facing source image and moderate preservation strength.",
+                }
+            )
+        else:
+            tips.append(
+                {
+                    "title": "Use stronger framing",
+                    "body": "Add clear framing like close-up, medium shot, or full-body for more consistent composition.",
+                }
+            )
+
+        if not form_state.get("shot_type_code"):
+            tips.append(
+                {
+                    "title": "Specify image type",
+                    "body": "Choosing a shot type improves composition reliability.",
+                }
+            )
+
+        tips.append(
+            {
+                "title": "Improve realism",
+                "body": "Mention attire, lighting, and background explicitly instead of using only broad mood words.",
+            }
+        )
+        tips.append(
+            {
+                "title": "Save credits",
+                "body": "Start with fewer variants to validate direction before larger runs.",
+            }
+        )
+
+        return StudioCoachResponse(
+            studio="face",
+            tips=tips[: max(1, min(int(req.limit or 4), 6))],
+            source="fallback",
+            fallback_used=True,
+            ttl_seconds=180,
+        )
 
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.storage.blob import BlobSasPermissions, generate_blob_sas
@@ -42,6 +207,12 @@ from app.repos.face_jobs_repo import FaceJobsRepo
 from app.repos.face_profiles_repo import FaceProfilesRepo
 from app.repos.media_assets_repo import MediaAssetsRepo
 from app.services.creator_orchestrator import CreatorOrchestrator
+from app.services.safety_service import (
+    ImageSafetyUnavailableError,
+    ImageTooLargeError,
+    SafetyService,
+    UnsupportedImageFormatError,
+)
 
 router = APIRouter()
 logger = logging.getLogger("api.face_jobs")
@@ -143,8 +314,16 @@ def _normalize_creator_generate_payload(
         wrapped = CreatorGenerateRequest.model_validate(payload)
         return wrapped.studio_input, wrapped.pricing_confirmation
 
-    legacy = CreatorPlatformRequest.model_validate(payload)
-    return legacy, None
+    pricing_confirmation = None
+    if "pricing_confirmation" in payload and payload.get("pricing_confirmation") is not None:
+        pricing_confirmation = PricingConfirmationModel.model_validate(payload.get("pricing_confirmation"))
+
+    legacy_payload = dict(payload)
+    legacy_payload.pop("pricing_confirmation", None)
+    legacy_payload.pop("studio", None)
+
+    legacy = CreatorPlatformRequest.model_validate(legacy_payload)
+    return legacy, pricing_confirmation
 
 
 class UploadImageResponse(BaseModel):
@@ -153,6 +332,30 @@ class UploadImageResponse(BaseModel):
     content_type: str
     size_bytes: int
     storage_path: str
+
+
+class ImageSafetyCheckResponse(BaseModel):
+    allow: bool
+    status: str
+    reason: Optional[str] = None
+
+
+class FacePromptEnhanceRequestModel(BaseModel):
+    mode: Optional[str] = None
+    user_input: str
+    locked_fields: Dict[str, Any] = Field(default_factory=dict)
+    context: Dict[str, Any] = Field(default_factory=dict)
+    locale: str = "en"
+    max_alternatives: int = 3
+
+
+class FaceTipsRequestModel(BaseModel):
+    mode: Optional[str] = None
+    prompt: Optional[str] = None
+    form_state: Dict[str, Any] = Field(default_factory=dict)
+    context: Dict[str, Any] = Field(default_factory=dict)
+    locale: str = "en"
+    limit: int = 4
 
 
 def _azure_clients() -> tuple[BlobServiceClient, str, str, str]:
@@ -221,6 +424,122 @@ def _make_read_sas_url(
 
 
 # ------------------------------------------------------------------------------
+# I2I Content Safety Precheck
+# ------------------------------------------------------------------------------
+
+@router.post("/creator/i2i/content-safety/check", response_model=ImageSafetyCheckResponse)
+async def creator_i2i_content_safety_check(
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+) -> ImageSafetyCheckResponse:
+    """
+    Pre-flight content safety check for I2I source images.
+
+    Frontend flow:
+      1) user selects image
+      2) call this endpoint
+      3) only if allow=true continue to upload / pricing preview / generate
+    """
+    _ = user_id
+
+    if not file:
+        raise HTTPException(status_code=400, detail="missing_file")
+
+    content_type = (file.content_type or "").strip().lower()
+    if not content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=415,
+            detail=f"unsupported_content_type:{content_type or 'unknown'}",
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty_file")
+
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"file_too_large:max={MAX_UPLOAD_BYTES}",
+        )
+
+    try:
+        safety = SafetyService()
+        allow, reason = await safety.validate_image(
+            data,
+            filename=getattr(file, "filename", None),
+            content_type=content_type,
+            fail_open=False,
+        )
+
+        return ImageSafetyCheckResponse(
+            allow=bool(allow),
+            status="passed" if allow else "blocked",
+            reason=(reason or None),
+        )
+
+    except UnsupportedImageFormatError as exc:
+        logger.info(
+            "creator_i2i_content_safety_check unsupported_format user_id=%s filename=%s reason=%s",
+            user_id,
+            getattr(file, "filename", None),
+            str(exc),
+        )
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "error": "content_safety_unsupported_format",
+                "code": "DF_CONTENT_SAFETY_UNSUPPORTED_FORMAT",
+                "message": str(exc),
+            },
+        )
+    except ImageTooLargeError as exc:
+        logger.info(
+            "creator_i2i_content_safety_check image_too_large user_id=%s filename=%s reason=%s",
+            user_id,
+            getattr(file, "filename", None),
+            str(exc),
+        )
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error": "content_safety_image_too_large",
+                "code": "DF_CONTENT_SAFETY_IMAGE_TOO_LARGE",
+                "message": str(exc),
+            },
+        )
+    except ImageSafetyUnavailableError as exc:
+        logger.exception(
+            "creator_i2i_content_safety_check unavailable user_id=%s filename=%s",
+            user_id,
+            getattr(file, "filename", None),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "content_safety_unavailable",
+                "code": "DF_CONTENT_SAFETY_UNAVAILABLE",
+                "message": str(exc),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception(
+            "creator_i2i_content_safety_check failed user_id=%s filename=%s",
+            user_id,
+            getattr(file, "filename", None),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "content_safety_check_failed",
+                "code": "DF_CONTENT_SAFETY_CHECK_FAILED",
+                "message": "Failed to validate source image safety.",
+            },
+        )
+
+
+# ------------------------------------------------------------------------------
 # Upload (NEW) — for image-to-image identity lock
 # ------------------------------------------------------------------------------
 
@@ -261,9 +580,35 @@ async def upload_source_image(
             detail=f"file_too_large:max={MAX_UPLOAD_BYTES}",
         )
 
+    safety = SafetyService()
+    try:
+        normalized_data, normalized_filename, normalized_content_type, normalized_meta = await safety.normalize_image_for_storage_and_generation(
+            data,
+            filename=getattr(file, "filename", None),
+            content_type=content_type,
+        )
+    except UnsupportedImageFormatError as exc:
+        logger.info(
+            "upload_source_image unsupported_format user_id=%s filename=%s reason=%s",
+            user_id,
+            getattr(file, "filename", None),
+            str(exc),
+        )
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "error": "unsupported_image_format",
+                "code": "DF_UNSUPPORTED_IMAGE_FORMAT",
+                "message": str(exc),
+            },
+        )
+
+    data = normalized_data
+    content_type = normalized_content_type
+
     ext = ""
-    if file.filename and "." in file.filename:
-        ext = "." + file.filename.rsplit(".", 1)[-1].lower()
+    if normalized_filename and "." in normalized_filename:
+        ext = "." + normalized_filename.rsplit(".", 1)[-1].lower()
         if len(ext) > 8:
             ext = ""
 
@@ -324,12 +669,15 @@ async def upload_source_image(
         size_bytes=int(len(data)),
         meta={
             "purpose": "face_i2i_source",
-            "filename": file.filename,
+            "filename": normalized_filename,
+            "original_filename": file.filename,
+            "original_content_type": getattr(file, "content_type", None),
             "storage_container": UPLOAD_CONTAINER,
             "blob_name": blob_name,
             "storage_path": storage_path,
             "stable_blob_url": stable_blob_url,
             "uploaded_via": "api.face.assets.upload",
+            "normalization": normalized_meta,
         },
     )
 
@@ -447,12 +795,27 @@ async def creator_preview_pricing(
     pool = await get_pool()
     orch = CreatorOrchestrator(pool)
 
+    logger.info(
+        "creator_preview_pricing start user_id=%s mode=%s variants=%s",
+        user_id,
+        getattr(req.studio_input, "mode", None),
+        getattr(req.studio_input, "num_variants", None),
+    )
+
     try:
-        return await orch.preview_pricing(
+        resp = await orch.preview_pricing(
             user_id=user_id,
             request=req.studio_input,
             client_context=req.client_context,
         )
+        logger.info(
+            "creator_preview_pricing done user_id=%s quote_id=%s pricing_source=%s pricing_reason=%s",
+            user_id,
+            getattr(resp, "quote_id", None),
+            getattr(getattr(resp, "pricing", None), "source", None),
+            getattr(getattr(resp, "pricing", None), "reason", None),
+        )
+        return resp
 
     except PricingClientError as e:
         logger.warning(
@@ -492,6 +855,114 @@ async def creator_preview_pricing(
                 "code": "DF_FACE_PRICING_PREVIEW_FAILED",
                 "message": "Failed to preview pricing.",
             },
+        )
+
+
+@router.post("/creator/prompt/enhance", response_model=PromptEnhanceResponse)
+async def creator_enhance_prompt(
+    req: FacePromptEnhanceRequestModel,
+    user_id: str = Depends(get_current_user_id),
+) -> PromptEnhanceResponse:
+    """
+    Face Studio prompt enhancement.
+    Never blocks the studio: if the shared LLM path fails or is unavailable,
+    this route falls back deterministically.
+    """
+    try:
+        return await enhance_prompt(
+            PromptEnhanceRequest(
+                studio="face",
+                mode=req.mode,
+                user_input=req.user_input,
+                locked_fields=req.locked_fields or {},
+                context={
+                    **(req.context or {}),
+                    "user_id": str(user_id),
+                    "surface": "svc-face",
+                },
+                locale=req.locale,
+                max_alternatives=max(1, min(req.max_alternatives, 4)),
+            )
+        )
+
+    except ValueError as e:
+        logger.warning("creator_enhance_prompt bad request user_id=%s err=%s", user_id, str(e))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "bad_request",
+                "code": "DF_FACE_PROMPT_ENHANCE_BAD_REQUEST",
+                "message": str(e),
+            },
+        )
+
+    except Exception:
+        logger.exception("creator_enhance_prompt failed user_id=%s", user_id)
+        return await enhance_prompt(
+            PromptEnhanceRequest(
+                studio="face",
+                mode=req.mode,
+                user_input=req.user_input,
+                locked_fields=req.locked_fields or {},
+                context=req.context or {},
+                locale=req.locale,
+                max_alternatives=max(1, min(req.max_alternatives, 4)),
+            ),
+            force_fallback=True,
+        )
+
+
+@router.post("/creator/tips", response_model=StudioCoachResponse)
+async def creator_face_tips(
+    req: FaceTipsRequestModel,
+    user_id: str = Depends(get_current_user_id),
+) -> StudioCoachResponse:
+    """
+    Rolling Face Studio tips.
+    Uses shared logic when available, with deterministic fallback on any
+    unexpected failure.
+    """
+    try:
+        return await generate_studio_tips(
+            StudioCoachRequest(
+                studio="face",
+                mode=req.mode,
+                prompt=req.prompt,
+                form_state=req.form_state or {},
+                context={
+                    **(req.context or {}),
+                    "user_id": str(user_id),
+                    "surface": "svc-face",
+                },
+                locale=req.locale,
+                limit=max(1, min(req.limit, 6)),
+            )
+        )
+
+    except ValueError as e:
+        logger.warning("creator_face_tips bad request user_id=%s err=%s", user_id, str(e))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "bad_request",
+                "code": "DF_FACE_TIPS_BAD_REQUEST",
+                "message": str(e),
+            },
+        )
+
+    except Exception:
+        logger.exception("creator_face_tips failed user_id=%s", user_id)
+        return await generate_studio_tips(
+            StudioCoachRequest(
+                studio="face",
+                mode=req.mode,
+                prompt=req.prompt,
+                form_state=req.form_state or {},
+                context=req.context or {},
+                locale=req.locale,
+                limit=max(1, min(req.limit, 6)),
+            ),
+            force_fallback=True,
         )
 
 
@@ -575,6 +1046,44 @@ async def creator_generate_faces(
                 "message": "Failed to create face job.",
             },
         )
+
+
+@router.get("/creator/jobs/{job_id}/status-light")
+async def creator_get_job_status_light(
+    job_id: str,
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    """
+    Creator platform: cheap polling endpoint for multi-variant face jobs.
+    Returns only top-level status + per-variant light state.
+    """
+    pool = await get_pool()
+    jobs_repo = FaceJobsRepo(pool)
+
+    job = await jobs_repo.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    _assert_owner(job, user_id)
+
+    orch = CreatorOrchestrator(pool)
+    return await orch.get_job_status_light(job_id)
+
+
+@router.post("/creator/internal/recovery/sweep")
+async def creator_recovery_sweep(
+    limit: int = 5,
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    """
+    Manual recovery trigger for stale running creator jobs.
+    Intended for operational testing / admin use.
+    """
+    _ = user_id
+    pool = await get_pool()
+    orch = CreatorOrchestrator(pool)
+    recovered = await orch.recover_stale_running_jobs_once(limit=max(1, min(limit, 20)), stale_seconds=120)
+    return {"recovered": recovered}
 
 
 @router.get("/creator/jobs/{job_id}/status", response_model=JobStatusResponse)

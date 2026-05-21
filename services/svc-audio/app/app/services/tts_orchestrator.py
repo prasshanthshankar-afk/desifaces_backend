@@ -6,7 +6,11 @@ import json
 import logging
 import math
 import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from decimal import Decimal
+from enum import Enum
 from typing import Any, Dict, Optional, Tuple
 
 import asyncpg
@@ -19,6 +23,19 @@ try:
         PricingReserveRequest,
         PricingCommitRequest,
         PricingReleaseRequest,
+    )
+    from desifaces_shared.pricing.orchestration import (
+        PricingReserveSpec,
+        PricingCommitSpec,
+        PricingReleaseSpec,
+        apply_pricing_snapshot,
+        build_commit_request,
+        build_pricing_summary,
+        build_release_request,
+        build_reserve_request,
+        make_committed_artifact,
+        make_released_artifact,
+        make_reserved_artifact,
     )
 except Exception as pricing_import_error:
     PRICING_IMPORT_ERROR = str(pricing_import_error)
@@ -62,6 +79,97 @@ except Exception as pricing_import_error:
         idempotency_key: str
         meta: Dict[str, Any]
 
+    @dataclass
+    class PricingReserveSpec:
+        user_id: str
+        service_name: str
+        service_action: str
+        sku_code: str
+        units: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+        quote_id: Optional[str] = None
+        preview_fingerprint: Optional[str] = None
+        external_ref_type: str = "studio_job"
+
+    @dataclass
+    class PricingCommitSpec:
+        user_id: str
+        reservation_id: str
+        actual_units: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+        external_ref_type: str = "studio_job"
+
+    @dataclass
+    class PricingReleaseSpec:
+        user_id: str
+        reservation_id: str
+        reason: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+        external_ref_type: str = "studio_job"
+
+    def build_reserve_request(spec: PricingReserveSpec) -> PricingReserveRequest:
+        return PricingReserveRequest(
+            user_id=spec.user_id,
+            service_name=spec.service_name,
+            service_action=spec.service_action,
+            sku_code=spec.sku_code,
+            units=spec.units,
+            external_ref_type=spec.external_ref_type,
+            external_ref_id=spec.external_ref_id,
+            idempotency_key=spec.idempotency_key,
+            meta=spec.meta,
+        )
+
+    def build_commit_request(spec: PricingCommitSpec) -> PricingCommitRequest:
+        return PricingCommitRequest(
+            user_id=spec.user_id,
+            reservation_id=spec.reservation_id,
+            actual_units=spec.actual_units,
+            external_ref_type=spec.external_ref_type,
+            external_ref_id=spec.external_ref_id,
+            idempotency_key=spec.idempotency_key,
+            meta=spec.meta,
+        )
+
+    def build_release_request(spec: PricingReleaseSpec) -> PricingReleaseRequest:
+        return PricingReleaseRequest(
+            user_id=spec.user_id,
+            reservation_id=spec.reservation_id,
+            reason=spec.reason,
+            external_ref_type=spec.external_ref_type,
+            external_ref_id=spec.external_ref_id,
+            idempotency_key=spec.idempotency_key,
+            meta=spec.meta,
+        )
+
+    def build_pricing_summary(pricing: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        return {}
+
+    def apply_pricing_snapshot(
+        target: Dict[str, Any],
+        *,
+        pricing: Optional[Dict[str, Any]] = None,
+        pricing_summary: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        target["pricing"] = dict(pricing or {})
+        target["pricing_summary"] = dict(pricing_summary or {})
+        return target
+
+    def make_reserved_artifact(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return {"pricing": {}, "pricing_summary": {}}
+
+    def make_committed_artifact(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return {"pricing": {}, "pricing_summary": {}}
+
+    def make_released_artifact(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return {"pricing": {}, "pricing_summary": {}}
+
     class SvcPricingClient:
         enabled = False
 
@@ -80,10 +188,68 @@ except Exception as pricing_import_error:
 
 
 from app.repos.tts_jobs_repo import TTSJobsRepo
-from app.services.tts_service import TTSService
+from app.services.tts_service import TTSService, TerminalTTSValidationError, _normalize_speech_locale, _normalize_translation_target
 from app.services.azure_storage_service import AzureStorageService
 
 logger = logging.getLogger("tts_orchestrator")
+
+
+def _notifications_base_url() -> str:
+    return str(
+        os.getenv("DF_NOTIFICATIONS_URL")
+        or os.getenv("DF_CORE_URL")
+        or os.getenv("SVC_CORE_URL")
+        or ""
+    ).strip().rstrip("/")
+
+
+def _notifications_internal_events_url() -> str:
+    base = _notifications_base_url()
+    if not base:
+        return ""
+    if base.endswith("/api/internal/notifications/events"):
+        return base
+    if base.endswith("/api"):
+        return f"{base}/internal/notifications/events"
+    return f"{base}/api/internal/notifications/events"
+
+
+def _notifications_bearer() -> str:
+    return str(
+        os.getenv("DF_NOTIFICATIONS_BEARER")
+        or os.getenv("SVC_TO_SVC_BEARER")
+        or os.getenv("DF_PRICING_INTERNAL_BEARER")
+        or ""
+    ).strip()
+
+
+async def _emit_notification_best_effort(payload: Dict[str, Any], *, context: Dict[str, Any]) -> None:
+    url = _notifications_internal_events_url()
+    token = _notifications_bearer()
+    if not url or not token:
+        return
+
+    body = _json_dumps(payload).encode("utf-8")
+
+    def _send() -> None:
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+
+    try:
+        await asyncio.to_thread(_send)
+    except Exception:
+        logger.exception("audio_notification_emit_failed", extra=context)
+
 
 
 class _DisabledPricingClient:
@@ -139,6 +305,46 @@ def _safe_float(val: Any, default: float) -> float:
         return default
 
 
+def _json_safe(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Enum):
+        try:
+            return value.value
+        except Exception:
+            return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _json_safe(model_dump(exclude_none=True))
+        except Exception:
+            pass
+    dict_method = getattr(value, "dict", None)
+    if callable(dict_method):
+        try:
+            return _json_safe(dict_method(exclude_none=True))
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        try:
+            return _json_safe(vars(value))
+        except Exception:
+            pass
+    return str(value)
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(_json_safe(value), ensure_ascii=False, default=str)
+
+
 def _upload_fields(upload: Any) -> Tuple[str, str, str, int]:
     """
     Returns: (sas_url, storage_path, sha256, bytes)
@@ -180,6 +386,16 @@ def _chars_1k_units(text: str) -> int:
 
 
 def _classify_error(e: Exception) -> str:
+    if isinstance(e, TerminalTTSValidationError):
+        msg = str(e or "").lower()
+        if "invalid_target_language" in msg:
+            return "INVALID_TARGET_LANGUAGE"
+        if "no_voice_for_locale" in msg:
+            return "LOCALE_NOT_SUPPORTED"
+        if "missing_target_locale" in msg:
+            return "MISSING_TARGET_LOCALE"
+        return "INVALID_TTS_REQUEST"
+
     msg = str(e or "").lower()
 
     if "insufficient" in msg and "credit" in msg:
@@ -188,9 +404,11 @@ def _classify_error(e: Exception) -> str:
         return "PRICING_ERROR"
     if "voice" in msg and "not found" in msg:
         return "VOICE_NOT_FOUND"
-    if "locale" in msg and "not found" in msg:
+    if "no_voice_for_locale" in msg or ("locale" in msg and "not found" in msg):
         return "LOCALE_NOT_SUPPORTED"
-    if "translate" in msg:
+    if "invalid_target_language" in msg or ('code":400036' in msg) or ("target language is not valid" in msg):
+        return "INVALID_TARGET_LANGUAGE"
+    if "translate" in msg or "translator_failed" in msg:
         return "TRANSLATION_FAILED"
     return "tts_failed"
 
@@ -249,11 +467,124 @@ class TTSOrchestrator:
         return value
 
     @staticmethod
+    def _string_or_none(v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    @staticmethod
+    def _normalize_settlement_mode(v: Any) -> str:
+        s = str(v or "").strip().lower()
+        if s in {"postpaid", "invoice", "bill", "billed"}:
+            return "postpaid"
+        if s in {"prepaid", "credit", "credits", "wallet", "payg"}:
+            return "prepaid"
+        if s in {"hybrid", "mixed"}:
+            return "hybrid"
+        return s
+
+    def _canonicalize_pricing_entitlement(
+        self,
+        pricing: Optional[Dict[str, Any]],
+        *,
+        resp: Any = None,
+    ) -> Dict[str, Any]:
+        out = dict(pricing or {})
+
+        billing_account_id = self._string_or_none(
+            self._pricing_resp_get(resp, "billing_account_id") if resp is not None else None
+        ) or self._string_or_none(out.get("billing_account_id"))
+        settlement_mode = self._normalize_settlement_mode(
+            self._pricing_resp_get(resp, "settlement_mode") if resp is not None else out.get("settlement_mode")
+        ) or self._normalize_settlement_mode(out.get("settlement_mode"))
+        billing_mode = self._string_or_none(
+            self._pricing_resp_get(resp, "billing_mode") if resp is not None else None
+        ) or self._string_or_none(out.get("billing_mode"))
+        pricing_mode = self._string_or_none(
+            self._pricing_resp_get(resp, "pricing_mode") if resp is not None else None
+        ) or self._string_or_none(out.get("pricing_mode"))
+
+        explicit_tier = self._string_or_none(
+            self._pricing_resp_get(resp, "tier_code") if resp is not None else out.get("tier_code")
+        ) or ""
+        explicit_tier_source = self._string_or_none(
+            self._pricing_resp_get(resp, "tier_source") if resp is not None else out.get("tier_source")
+        ) or ""
+        explicit_source = self._string_or_none(
+            self._pricing_resp_get(resp, "entitlement_source") if resp is not None else out.get("entitlement_source")
+        ) or ""
+        explicit_reason = self._string_or_none(
+            self._pricing_resp_get(resp, "entitlement_reason") if resp is not None else out.get("entitlement_reason")
+        ) or ""
+
+        weak_tier = bool(billing_account_id and explicit_tier.lower() == "free")
+        weak_tier_source = bool(
+            billing_account_id and explicit_tier_source.lower() in {"module_gate_fallback", "module_fallback", "default_free"}
+        )
+        weak_source = bool(billing_account_id and explicit_source.lower() == "module_gate_fallback")
+
+        if billing_account_id:
+            out["billing_account_id"] = billing_account_id
+        if settlement_mode:
+            out["settlement_mode"] = settlement_mode
+        if billing_mode:
+            out["billing_mode"] = billing_mode
+        if pricing_mode:
+            out["pricing_mode"] = pricing_mode
+
+        if explicit_tier and not weak_tier:
+            out["tier_code"] = explicit_tier
+        elif billing_account_id and settlement_mode == "postpaid":
+            out["tier_code"] = "enterprise"
+        elif billing_account_id and settlement_mode == "hybrid":
+            out["tier_code"] = "business"
+        elif explicit_tier:
+            out["tier_code"] = explicit_tier
+
+        if explicit_tier_source and not weak_tier_source:
+            out["tier_source"] = explicit_tier_source
+        elif billing_account_id:
+            out["tier_source"] = "billing_account"
+        elif explicit_tier_source:
+            out["tier_source"] = explicit_tier_source
+        elif self._string_or_none(out.get("tier_code")):
+            out["tier_source"] = "pricing_snapshot"
+
+        if explicit_source and not weak_source:
+            out["entitlement_source"] = explicit_source
+        elif billing_account_id and settlement_mode == "postpaid":
+            out["entitlement_source"] = "credit_account"
+        elif billing_account_id:
+            out["entitlement_source"] = "billing_account"
+        elif explicit_source:
+            out["entitlement_source"] = explicit_source
+
+        if explicit_reason:
+            out["entitlement_reason"] = explicit_reason
+        elif billing_account_id and (weak_tier or weak_source):
+            out["entitlement_reason"] = "billing_account_context_override"
+        elif billing_account_id and not self._string_or_none(out.get("entitlement_reason")):
+            out["entitlement_reason"] = "billing_account_context_fallback"
+
+        return out
+
+    @staticmethod
     def _merge_pricing_block(current: Optional[Dict[str, Any]], **updates: Any) -> Dict[str, Any]:
         out = dict(current or {})
         for key, value in updates.items():
             if value is not None:
                 out[key] = value
+        return out
+
+    @staticmethod
+    def _pricing_artifact_overrides(
+        artifact: Optional[Dict[str, Any]],
+        *drop_keys: str,
+    ) -> Dict[str, Any]:
+        out = dict(_jsonb_to_dict((artifact or {}).get("pricing")))
+        for k in drop_keys:
+            out.pop(k, None)
         return out
 
     def _pricing_from_payload_meta(
@@ -266,43 +597,61 @@ class TTSOrchestrator:
 
         pricing = _jsonb_to_dict(payload.get("pricing"))
         if pricing:
-            return pricing
+            return self._canonicalize_pricing_entitlement(pricing)
 
         pricing = _jsonb_to_dict(meta.get("pricing"))
         if pricing:
-            return pricing
+            return self._canonicalize_pricing_entitlement(pricing)
 
         return {}
 
-    async def _persist_pricing_block(self, job_id: str, pricing: Dict[str, Any]) -> None:
+    async def _persist_pricing_block(
+        self,
+        job_id: str,
+        pricing: Dict[str, Any],
+        pricing_summary: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        pricing = _json_safe(self._canonicalize_pricing_entitlement(dict(pricing or {}))) or {}
+        pricing_summary = _json_safe(dict(pricing_summary or build_pricing_summary(pricing))) or {}
+
         q = """
         UPDATE public.studio_jobs
         SET
-          payload_json = COALESCE(payload_json, '{}'::jsonb) || jsonb_build_object('pricing', $2::jsonb),
+          payload_json = COALESCE(payload_json, '{}'::jsonb)
+                         || jsonb_build_object(
+                              'pricing', $2::jsonb,
+                              'pricing_summary', $3::jsonb
+                            ),
           meta_json = COALESCE(meta_json, '{}'::jsonb)
                       || jsonb_build_object(
                            'pricing', $2::jsonb,
-                           'pricing_state', COALESCE($3::text, ''),
-                           'pricing_enabled', $4::bool,
-                           'pricing_billing_mode', NULLIF($5::text, ''),
-                           'pricing_settlement_mode', NULLIF($6::text, ''),
-                           'pricing_billing_account_id', NULLIF($7::text, '')
+                           'pricing_summary', $3::jsonb,
+                           'pricing_state', COALESCE($4::text, ''),
+                           'pricing_enabled', $5::bool,
+                           'pricing_billing_mode', NULLIF($6::text, ''),
+                           'pricing_settlement_mode', NULLIF($7::text, ''),
+                           'pricing_billing_account_id', NULLIF($8::text, ''),
+                           'pricing_tier_code', NULLIF($9::text, ''),
+                           'pricing_tier_source', NULLIF($10::text, '')
                          ),
           updated_at = now()
         WHERE id = $1::uuid
-          AND studio_type = $8::text
+          AND studio_type = $11::text
         """
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute(
                     q,
                     job_id,
-                    json.dumps(pricing or {}),
+                    _json_dumps(pricing),
+                    _json_dumps(pricing_summary),
                     str(pricing.get("state") or ""),
                     bool(pricing.get("enabled", False)),
                     str(pricing.get("billing_mode") or ""),
                     str(pricing.get("settlement_mode") or ""),
                     str(pricing.get("billing_account_id") or ""),
+                    str(pricing.get("tier_code") or ""),
+                    str(pricing.get("tier_source") or ""),
                     self.STUDIO_TYPE,
                 )
         except Exception:
@@ -327,6 +676,29 @@ class TTSOrchestrator:
             )
         except Exception:
             logger.exception("audio_pricing_load_failed", extra={"job_id": job_id})
+            return {}
+
+    async def _load_latest_pricing_summary(self, job_id: str) -> Dict[str, Any]:
+        q = """
+        SELECT payload_json, meta_json
+        FROM public.studio_jobs
+        WHERE id = $1::uuid
+          AND studio_type = $2::text
+        LIMIT 1
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(q, job_id, self.STUDIO_TYPE)
+            if not row:
+                return {}
+            payload = _jsonb_to_dict(row["payload_json"])
+            meta = _jsonb_to_dict(row["meta_json"])
+            summary = _jsonb_to_dict(payload.get("pricing_summary"))
+            if summary:
+                return summary
+            return _jsonb_to_dict(meta.get("pricing_summary"))
+        except Exception:
+            logger.exception("audio_pricing_summary_load_failed", extra={"job_id": job_id})
             return {}
 
     async def _await_reserved_pricing(
@@ -405,7 +777,7 @@ class TTSOrchestrator:
                 state="commit_failed",
                 error="missing_reservation_id_at_commit",
             )
-            await self._persist_pricing_block(job_id, pricing)
+            await self._persist_pricing_block(job_id, pricing, build_pricing_summary(pricing))
             return pricing
 
         if state not in {"reserved", "commit_failed"}:
@@ -435,41 +807,62 @@ class TTSOrchestrator:
             commit_meta["leaf_sku_code"] = leaf_sku_code
 
         try:
-            resp = await self.pricing_client.commit(
-                PricingCommitRequest(
-                    user_id=str(user_id),
-                    reservation_id=reservation_id,
-                    actual_units=str(actual_units),
-                    external_ref_type="studio_job",
-                    external_ref_id=str(job_id),
-                    idempotency_key=f"svc-audio:job:{job_id}:commit",
-                    meta=commit_meta,
-                )
+            commit_spec = PricingCommitSpec(
+                user_id=str(user_id),
+                reservation_id=reservation_id,
+                actual_units=str(actual_units),
+                external_ref_id=str(job_id),
+                idempotency_key=f"svc-audio:job:{job_id}:commit",
+                meta=commit_meta,
+            )
+            resp = await self.pricing_client.commit(build_commit_request(commit_spec))
+            commit_artifact = make_committed_artifact(
+                resp,
+                base_pricing=pricing,
+                actual_units=str(actual_units),
+                meta=commit_meta,
             )
             commit_status = str(self._pricing_resp_get(resp, "status", "committed") or "committed")
-            pricing = self._merge_pricing_block(
+
+            pricing = dict(pricing or {})
+            artifact_pricing = dict(_jsonb_to_dict(commit_artifact.get("pricing")))
+            artifact_summary = dict(_jsonb_to_dict(commit_artifact.get("pricing_summary")))
+            pricing.update(artifact_pricing)
+
+            pricing["enabled"] = True
+            pricing["state"] = "committed"
+            pricing["variant_code"] = self._pricing_resp_get(resp, "variant_code") or variant_code
+            pricing["sku_code"] = self._pricing_resp_get(resp, "variant_code") or variant_code
+            pricing["leaf_sku_code"] = self._pricing_resp_get(resp, "sku_code") or leaf_sku_code
+            pricing["commit_status"] = commit_status
+            pricing["reservation_status"] = commit_status
+            pricing["actual_units"] = str(actual_units)
+            pricing["amount"] = self._pricing_resp_get(resp, "amount") or pricing.get("amount")
+            pricing["currency"] = self._pricing_resp_get(resp, "currency") or pricing.get("currency")
+            pricing["billing_mode"] = self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode")
+            pricing["billing_account_id"] = self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id")
+            pricing["settlement_mode"] = self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode")
+            pricing["pricing_mode"] = self._pricing_resp_get(resp, "pricing_mode") or pricing.get("pricing_mode")
+            pricing["tier_source"] = self._pricing_resp_get(resp, "tier_source") or pricing.get("tier_source")
+            pricing["entitlement_source"] = self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source")
+            pricing["entitlement_reason"] = self._pricing_resp_get(resp, "entitlement_reason") or pricing.get("entitlement_reason")
+            pricing["tier_code"] = self._pricing_resp_get(resp, "tier_code") or pricing.get("tier_code")
+            pricing["ledger_entry_id"] = self._pricing_resp_get(resp, "ledger_entry_id") or pricing.get("ledger_entry_id")
+            pricing["invoice_id"] = self._pricing_resp_get(resp, "invoice_id") or pricing.get("invoice_id")
+            pricing["disabled_reason"] = None
+            pricing["error"] = None
+            pricing["error_code"] = None
+
+            meta_block = dict(_jsonb_to_dict(pricing.get("meta")))
+            meta_block.update(commit_meta)
+            pricing["meta"] = meta_block
+            pricing = self._canonicalize_pricing_entitlement(pricing, resp=resp)
+
+            await self._persist_pricing_block(
+                job_id,
                 pricing,
-                state="committed",
-                variant_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
-                sku_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
-                leaf_sku_code=self._pricing_resp_get(resp, "sku_code") or leaf_sku_code,
-                actual_units=str(actual_units),
-                billed_units=self._pricing_resp_get(resp, "billed_units") or str(actual_units),
-                commit_status=commit_status,
-                reservation_status=commit_status,
-                ledger_entry_id=self._pricing_resp_get(resp, "ledger_entry_id"),
-                amount=self._pricing_resp_get(resp, "amount"),
-                currency=self._pricing_resp_get(resp, "currency"),
-                billing_mode=self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
-                billing_account_id=self._pricing_resp_get(resp, "billing_account_id")
-                or pricing.get("billing_account_id"),
-                settlement_mode=self._pricing_resp_get(resp, "settlement_mode")
-                or pricing.get("settlement_mode"),
-                entitlement_source=self._pricing_resp_get(resp, "entitlement_source")
-                or pricing.get("entitlement_source"),
-                disabled_reason=None,
+                artifact_summary or build_pricing_summary(pricing),
             )
-            await self._persist_pricing_block(job_id, pricing)
             return pricing
         except Exception as e:
             logger.exception(
@@ -532,37 +925,58 @@ class TTSOrchestrator:
             release_meta["leaf_sku_code"] = leaf_sku_code
 
         try:
-            resp = await self.pricing_client.release(
-                PricingReleaseRequest(
-                    user_id=str(user_id),
-                    reservation_id=reservation_id,
-                    reason=reason,
-                    external_ref_type="studio_job",
-                    external_ref_id=str(job_id),
-                    idempotency_key=f"svc-audio:job:{job_id}:release",
-                    meta=release_meta,
-                )
+            release_spec = PricingReleaseSpec(
+                user_id=str(user_id),
+                reservation_id=reservation_id,
+                reason=reason,
+                external_ref_id=str(job_id),
+                idempotency_key=f"svc-audio:job:{job_id}:release",
+                meta=release_meta,
+            )
+            resp = await self.pricing_client.release(build_release_request(release_spec))
+            release_artifact = make_released_artifact(
+                resp,
+                base_pricing=pricing,
+                meta=release_meta,
             )
             release_status = str(self._pricing_resp_get(resp, "status", "released") or "released")
-            pricing = self._merge_pricing_block(
+
+            pricing = dict(pricing or {})
+            artifact_pricing = dict(_jsonb_to_dict(release_artifact.get("pricing")))
+            artifact_summary = dict(_jsonb_to_dict(release_artifact.get("pricing_summary")))
+            pricing.update(artifact_pricing)
+
+            pricing["enabled"] = True
+            pricing["state"] = "released"
+            pricing["variant_code"] = self._pricing_resp_get(resp, "variant_code") or variant_code
+            pricing["sku_code"] = self._pricing_resp_get(resp, "variant_code") or variant_code
+            pricing["leaf_sku_code"] = self._pricing_resp_get(resp, "sku_code") or leaf_sku_code
+            pricing["release_status"] = release_status
+            pricing["reservation_status"] = release_status
+            pricing["amount"] = self._pricing_resp_get(resp, "amount") or pricing.get("amount")
+            pricing["currency"] = self._pricing_resp_get(resp, "currency") or pricing.get("currency")
+            pricing["billing_mode"] = self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode")
+            pricing["billing_account_id"] = self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id")
+            pricing["settlement_mode"] = self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode")
+            pricing["pricing_mode"] = self._pricing_resp_get(resp, "pricing_mode") or pricing.get("pricing_mode")
+            pricing["tier_source"] = self._pricing_resp_get(resp, "tier_source") or pricing.get("tier_source")
+            pricing["entitlement_source"] = self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source")
+            pricing["entitlement_reason"] = self._pricing_resp_get(resp, "entitlement_reason") or pricing.get("entitlement_reason")
+            pricing["tier_code"] = self._pricing_resp_get(resp, "tier_code") or pricing.get("tier_code")
+            pricing["disabled_reason"] = None
+            pricing["error"] = None
+            pricing["error_code"] = None
+
+            meta_block = dict(_jsonb_to_dict(pricing.get("meta")))
+            meta_block.update(release_meta)
+            pricing["meta"] = meta_block
+            pricing = self._canonicalize_pricing_entitlement(pricing, resp=resp)
+
+            await self._persist_pricing_block(
+                job_id,
                 pricing,
-                state="released",
-                variant_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
-                sku_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
-                leaf_sku_code=self._pricing_resp_get(resp, "sku_code") or leaf_sku_code,
-                release_status=release_status,
-                reservation_status=release_status,
-                released_units=self._pricing_resp_get(resp, "released_units"),
-                billing_mode=self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
-                billing_account_id=self._pricing_resp_get(resp, "billing_account_id")
-                or pricing.get("billing_account_id"),
-                settlement_mode=self._pricing_resp_get(resp, "settlement_mode")
-                or pricing.get("settlement_mode"),
-                entitlement_source=self._pricing_resp_get(resp, "entitlement_source")
-                or pricing.get("entitlement_source"),
-                disabled_reason=None,
+                artifact_summary or build_pricing_summary(pricing),
             )
-            await self._persist_pricing_block(job_id, pricing)
             return pricing
         except Exception as e:
             logger.exception(
@@ -577,14 +991,15 @@ class TTSOrchestrator:
             await self._persist_pricing_block(job_id, pricing)
             return pricing
 
-    # -------------------------------------------------------------------------
-    # Create job + reserve pricing
-    # -------------------------------------------------------------------------
     async def create_job(self, *, user_id: str, payload: Dict[str, Any]) -> str:
         payload = dict(payload or {})
 
         text = str(payload.get("text") or "").strip()
         target_locale = str(payload.get("target_locale") or "").strip()
+        try:
+            normalized_target_locale = _normalize_speech_locale(target_locale) if target_locale else target_locale
+        except Exception:
+            normalized_target_locale = target_locale
         input_language = str(payload.get("input_language") or payload.get("source_language") or "en")
         output_format = str(payload.get("output_format") or "mp3")
 
@@ -594,6 +1009,10 @@ class TTSOrchestrator:
             raise ValueError("payload.text is required")
         if not target_locale:
             raise ValueError("payload.target_locale is required")
+        if normalized_target_locale and normalized_target_locale != target_locale:
+            payload["target_locale_original"] = target_locale
+            payload["target_locale"] = normalized_target_locale
+            target_locale = normalized_target_locale
 
         request_hash_src = {
             "studio_type": self.STUDIO_TYPE,
@@ -624,8 +1043,17 @@ class TTSOrchestrator:
             "sku_code": self.VARIANT_CODE,
             "estimated_units": str(estimated_units),
             "units_kind": "chars_1k",
+            "billing_mode": None,
+            "billing_account_id": None,
+            "settlement_mode": None,
+            "pricing_mode": None,
+            "entitlement_source": None,
+            "entitlement_reason": None,
+            "tier_code": None,
+            "tier_source": None,
             "meta": {
-                "target_locale": target_locale,
+                "target_locale": normalized_target_locale or target_locale,
+                "target_locale_original": target_locale if (normalized_target_locale and normalized_target_locale != target_locale) else None,
                 "input_language": input_language,
                 "output_format": output_format,
                 "text_length": len(text),
@@ -644,6 +1072,27 @@ class TTSOrchestrator:
         )
 
         if not pricing_enabled:
+            await _emit_notification_best_effort(
+                {
+                    "event_type": "AUDIO_JOB_SUBMITTED",
+                    "category": "jobs",
+                    "priority": "info",
+                    "source_service": "svc-audio",
+                    "source_ref_type": "job",
+                    "source_ref_id": str(job_id),
+                    "actor_user_id": None,
+                    "title": "Audio generation started",
+                    "body": "Your desifaces.ai Audio job has been queued.",
+                    "action_route": "/notifications",
+                    "action_label": "View job",
+                    "image_url": None,
+                    "payload_json": {"job_id": str(job_id), "target_locale": normalized_target_locale or target_locale},
+                    "metadata_json": {"job_id": str(job_id), "target_locale": normalized_target_locale or target_locale},
+                    "dedupe_key": f"audio-submitted:{job_id}",
+                    "recipients": [{"user_id": str(user_id), "channels": {"in_app": True, "push": False, "email": False}}],
+                },
+                context={"job_id": str(job_id), "user_id": str(user_id), "event_type": "AUDIO_JOB_SUBMITTED"},
+            )
             return job_id
 
         existing = await self.jobs.get_job(job_id)
@@ -672,52 +1121,36 @@ class TTSOrchestrator:
 
         await self._persist_pricing_block(job_id, pricing)
 
+        pricing_confirmation = _jsonb_to_dict(payload.get("pricing_confirmation"))
+        quote_id = str(pricing_confirmation.get("quote_id") or "").strip() or None
+        preview_fingerprint = str(pricing_confirmation.get("preview_fingerprint") or "").strip() or None
+
+        reserve_meta = {
+            "variant_code": self.VARIANT_CODE,
+            "sku_code": self.VARIANT_CODE,
+            "chars_1k": str(estimated_units),
+            "text_length": len(text),
+            "target_locale": normalized_target_locale or target_locale,
+            "target_locale_original": target_locale if (normalized_target_locale and normalized_target_locale != target_locale) else None,
+            "input_language": input_language,
+            "output_format": output_format,
+        }
+
+        reserve_spec = PricingReserveSpec(
+            user_id=str(user_id),
+            service_name="svc-audio",
+            service_action="audio.tts.generate",
+            sku_code=self.VARIANT_CODE,
+            units=str(estimated_units),
+            external_ref_id=str(job_id),
+            idempotency_key=f"svc-audio:job:{job_id}:reserve",
+            meta=reserve_meta,
+            quote_id=quote_id,
+            preview_fingerprint=preview_fingerprint,
+        )
+
         try:
-            resp = await self.pricing_client.reserve(
-                PricingReserveRequest(
-                    user_id=str(user_id),
-                    service_name="svc-audio",
-                    service_action="audio.tts.generate",
-                    sku_code=self.VARIANT_CODE,
-                    units=str(estimated_units),
-                    external_ref_type="studio_job",
-                    external_ref_id=str(job_id),
-                    idempotency_key=f"svc-audio:job:{job_id}:reserve",
-                    meta={
-                        "variant_code": self.VARIANT_CODE,
-                        "sku_code": self.VARIANT_CODE,
-                        "chars_1k": str(estimated_units),
-                        "text_length": len(text),
-                        "target_locale": target_locale,
-                        "input_language": input_language,
-                        "output_format": output_format,
-                    },
-                )
-            )
-
-            reserve_status = str(self._pricing_resp_get(resp, "status", "reserved") or "reserved")
-            pricing = self._merge_pricing_block(
-                pricing,
-                state="reserved",
-                reservation_status=reserve_status,
-                reservation_id=self._pricing_resp_get(resp, "reservation_id"),
-                variant_code=self._pricing_resp_get(resp, "variant_code") or self.VARIANT_CODE,
-                sku_code=self._pricing_resp_get(resp, "variant_code") or self.VARIANT_CODE,
-                leaf_sku_code=self._pricing_resp_get(resp, "sku_code"),
-                billing_mode=self._pricing_resp_get(resp, "billing_mode"),
-                billing_account_id=self._pricing_resp_get(resp, "billing_account_id"),
-                settlement_mode=self._pricing_resp_get(resp, "settlement_mode"),
-                entitlement_source=self._pricing_resp_get(resp, "entitlement_source"),
-                amount=self._pricing_resp_get(resp, "amount"),
-                currency=self._pricing_resp_get(resp, "currency"),
-                disabled_reason=None,
-                error=None,
-                error_code=None,
-            )
-            await self._persist_pricing_block(job_id, pricing)
-            await self.jobs.set_status(job_id, "queued")
-            return job_id
-
+            resp = await self.pricing_client.reserve(build_reserve_request(reserve_spec))
         except Exception as e:
             code = _classify_error(e)
             failed_status = "blocked" if code == "PRICING_INSUFFICIENT_CREDITS" else "failed"
@@ -728,7 +1161,11 @@ class TTSOrchestrator:
                 error=str(e),
                 error_code=code,
             )
-            await self._persist_pricing_block(job_id, pricing)
+            await self._persist_pricing_block(
+                job_id,
+                pricing,
+                build_pricing_summary(pricing),
+            )
             await self.jobs.set_status(
                 job_id,
                 failed_status,
@@ -739,6 +1176,127 @@ class TTSOrchestrator:
             if isinstance(e, PricingClientError):
                 raise
             raise PricingClientError(str(e))
+
+        try:
+            reserve_artifact = make_reserved_artifact(
+                resp,
+                service_name="svc-audio",
+                service_action="audio.tts.generate",
+                sku_code=self.VARIANT_CODE,
+                estimated_units=str(estimated_units),
+                unit_type="chars_1k",
+                meta=reserve_meta,
+            )
+
+            pricing = dict(pricing or {})
+            artifact_pricing = dict(_jsonb_to_dict(reserve_artifact.get("pricing")))
+            artifact_summary = dict(_jsonb_to_dict(reserve_artifact.get("pricing_summary")))
+
+            # Root-cause fix: helper-generated pricing already contains canonical fields
+            # like amount/currency/quote_id. Update one dict in order instead of mixing
+            # **artifact_pricing with overlapping explicit kwargs in one Python call.
+            pricing.update(artifact_pricing)
+
+            pricing["enabled"] = True
+            pricing["state"] = "reserved"
+            pricing["variant_code"] = self._pricing_resp_get(resp, "variant_code") or self.VARIANT_CODE
+            pricing["sku_code"] = self._pricing_resp_get(resp, "variant_code") or self.VARIANT_CODE
+            pricing["leaf_sku_code"] = self._pricing_resp_get(resp, "sku_code")
+            pricing["reservation_id"] = self._pricing_resp_get(resp, "reservation_id")
+            pricing["reservation_status"] = self._pricing_resp_get(resp, "status") or pricing.get("state")
+            pricing["reserved_units"] = self._pricing_resp_get(resp, "reserved_units") or str(estimated_units)
+            pricing["amount"] = self._pricing_resp_get(resp, "amount") or pricing.get("amount")
+            pricing["currency"] = self._pricing_resp_get(resp, "currency") or pricing.get("currency")
+            pricing["billing_mode"] = self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode")
+            pricing["billing_account_id"] = self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id")
+            pricing["settlement_mode"] = self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode")
+            pricing["pricing_mode"] = self._pricing_resp_get(resp, "pricing_mode") or pricing.get("pricing_mode")
+            pricing["tier_source"] = self._pricing_resp_get(resp, "tier_source") or pricing.get("tier_source")
+            pricing["entitlement_source"] = self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source")
+            pricing["entitlement_reason"] = self._pricing_resp_get(resp, "entitlement_reason") or pricing.get("entitlement_reason")
+            pricing["tier_code"] = self._pricing_resp_get(resp, "tier_code") or pricing.get("tier_code")
+            pricing["disabled_reason"] = None
+            pricing["error"] = None
+            pricing["error_code"] = None
+            pricing["units_kind"] = "chars_1k"
+            pricing["quote_id"] = quote_id or self._pricing_resp_get(resp, "quote_id")
+            pricing["preview_fingerprint"] = preview_fingerprint or self._pricing_resp_get(resp, "preview_fingerprint")
+
+            meta_block = dict(_jsonb_to_dict(pricing.get("meta")))
+            meta_block.update(reserve_meta)
+            pricing["meta"] = meta_block
+
+            pricing = self._canonicalize_pricing_entitlement(pricing, resp=resp)
+            pricing_summary = artifact_summary or build_pricing_summary(pricing)
+
+            await self._persist_pricing_block(job_id, pricing, pricing_summary)
+            await self.jobs.set_status(job_id, "queued")
+            await _emit_notification_best_effort(
+                {
+                    "event_type": "AUDIO_JOB_SUBMITTED",
+                    "category": "jobs",
+                    "priority": "info",
+                    "source_service": "svc-audio",
+                    "source_ref_type": "job",
+                    "source_ref_id": str(job_id),
+                    "actor_user_id": None,
+                    "title": "Audio generation started",
+                    "body": "Your desifaces.ai Audio job has been queued.",
+                    "action_route": "/notifications",
+                    "action_label": "View job",
+                    "image_url": None,
+                    "payload_json": {"job_id": str(job_id), "target_locale": normalized_target_locale or target_locale},
+                    "metadata_json": {"job_id": str(job_id), "target_locale": normalized_target_locale or target_locale},
+                    "dedupe_key": f"audio-submitted:{job_id}",
+                    "recipients": [{"user_id": str(user_id), "channels": {"in_app": True, "push": False, "email": False}}],
+                },
+                context={"job_id": str(job_id), "user_id": str(user_id), "event_type": "AUDIO_JOB_SUBMITTED"},
+            )
+            return job_id
+
+        except Exception as e:
+            logger.exception(
+                "audio_pricing_reserve_postprocess_failed",
+                extra={"job_id": job_id, "user_id": user_id},
+            )
+
+            reservation_id = str(self._pricing_resp_get(resp, "reservation_id") or "").strip()
+            if reservation_id:
+                try:
+                    release_spec = PricingReleaseSpec(
+                        user_id=str(user_id),
+                        reservation_id=reservation_id,
+                        reason="audio_reserve_postprocess_failed",
+                        external_ref_id=str(job_id),
+                        idempotency_key=f"svc-audio:job:{job_id}:release-after-reserve-postprocess",
+                        meta=reserve_meta,
+                    )
+                    await self.pricing_client.release(build_release_request(release_spec))
+                except Exception:
+                    logger.exception(
+                        "audio_pricing_release_after_postprocess_failed",
+                        extra={"job_id": job_id, "reservation_id": reservation_id},
+                    )
+
+            code = "PRICING_RESERVE_POSTPROCESS_FAILED"
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="reservation_failed",
+                error=str(e),
+                error_code=code,
+            )
+            await self._persist_pricing_block(
+                job_id,
+                pricing,
+                build_pricing_summary(pricing),
+            )
+            await self.jobs.set_status(
+                job_id,
+                "failed",
+                error_code=code,
+                error_message=str(e),
+            )
+            raise
 
     # -------------------------------------------------------------------------
     # Main job execution
@@ -963,13 +1521,58 @@ class TTSOrchestrator:
             input_language = (payload.get("input_language") or payload.get("source_language") or "en")
             output_format = (payload.get("output_format") or "mp3")
 
+            original_target_locale = target_locale
+            normalized_target_locale = _normalize_speech_locale(target_locale)
+            normalized_translation_target = _normalize_translation_target(
+                normalized_target_locale,
+                input_language=input_language,
+            )
+            locale_auto_repaired = normalized_target_locale != original_target_locale
+
+            if locale_auto_repaired:
+                payload = dict(payload)
+                payload["target_locale_original"] = original_target_locale
+                payload["target_locale"] = normalized_target_locale
+                payload["translation_target_language"] = normalized_translation_target
+
+                async with self.pool.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.execute(
+                            """
+                            UPDATE studio_jobs
+                               SET payload_json = COALESCE(payload_json, '{}'::jsonb)
+                                                 || $2::jsonb,
+                                   meta_json = COALESCE(meta_json, '{}'::jsonb)
+                                               || jsonb_build_object(
+                                                    'locale_auto_repaired', true,
+                                                    'target_locale_original', $3::text,
+                                                    'target_locale_normalized', $4::text,
+                                                    'translation_target_language', $5::text
+                                                  ),
+                                   updated_at = now()
+                             WHERE id = $1::uuid
+                            """,
+                            job_id,
+                            _json_dumps(
+                                {
+                                    "target_locale": normalized_target_locale,
+                                    "target_locale_original": original_target_locale,
+                                    "translation_target_language": normalized_translation_target,
+                                }
+                            ),
+                            original_target_locale,
+                            normalized_target_locale,
+                            normalized_translation_target,
+                        )
+
+
             rate = _safe_float(payload.get("speed") or payload.get("rate"), 1.0)
             pitch = _safe_float(payload.get("pitch"), 0.0)
 
             audio_bytes, final_text, chosen_voice, content_type, ext, meta = await self.tts.synthesize(
                 text=text,
                 input_language=input_language,
-                target_locale=target_locale,
+                target_locale=normalized_target_locale,
                 voice=payload.get("voice"),
                 style=payload.get("style"),
                 emotion=payload.get("emotion"),
@@ -1000,6 +1603,9 @@ class TTSOrchestrator:
             payload_updates: Dict[str, Any] = {
                 "voice": chosen_voice,
                 "final_synthesis_text": final_text,
+                "target_locale": normalized_target_locale,
+                "target_locale_original": original_target_locale,
+                "translation_target_language": normalized_translation_target,
             }
             if translated_text:
                 payload_updates["translated_text"] = translated_text
@@ -1031,7 +1637,7 @@ class TTSOrchestrator:
                          WHERE id=$1::uuid
                         """,
                         job_id,
-                        json.dumps(payload_merged),
+                        _json_dumps(payload_merged),
                     )
 
                     await conn.execute(
@@ -1044,7 +1650,7 @@ class TTSOrchestrator:
                         content_type,
                         sha256,
                         nbytes,
-                        json.dumps(artifact_meta),
+                        _json_dumps(artifact_meta),
                     )
 
                     await conn.execute(
@@ -1079,10 +1685,42 @@ class TTSOrchestrator:
                 final_text=final_text,
             )
 
+            await _emit_notification_best_effort(
+                {
+                    "event_type": "AUDIO_READY",
+                    "category": "jobs",
+                    "priority": "important",
+                    "source_service": "svc-audio",
+                    "source_ref_type": "job",
+                    "source_ref_id": str(job_id),
+                    "actor_user_id": None,
+                    "title": "Your Audio output is ready",
+                    "body": "Your desifaces.ai audio generation completed successfully.",
+                    "action_route": "/notifications",
+                    "action_label": "Play audio",
+                    "image_url": None,
+                    "payload_json": {"job_id": str(job_id), "audio_url": sas_url, "voice": chosen_voice},
+                    "metadata_json": {"job_id": str(job_id), "audio_url": sas_url, "voice": chosen_voice},
+                    "dedupe_key": f"audio-ready:{job_id}",
+                    "recipients": [{"user_id": str(user_id), "channels": {"in_app": True, "push": True, "email": True}}],
+                },
+                context={"job_id": str(job_id), "user_id": str(user_id), "event_type": "AUDIO_READY"},
+            )
+
         except Exception as e:
             msg = str(e)
             code = _classify_error(e)
-            logger.exception("TTS job failed job_id=%s err=%s", job_id, msg)
+            terminal_validation_error = isinstance(e, TerminalTTSValidationError) or code in {
+                "INVALID_TARGET_LANGUAGE",
+                "LOCALE_NOT_SUPPORTED",
+                "MISSING_TARGET_LOCALE",
+                "INVALID_TTS_REQUEST",
+            }
+
+            if terminal_validation_error:
+                logger.warning("TTS terminal validation failure job_id=%s err=%s", job_id, msg)
+            else:
+                logger.exception("TTS job failed job_id=%s err=%s", job_id, msg)
 
             try:
                 pricing = await self._release_pricing_for_job(
@@ -1096,25 +1734,36 @@ class TTSOrchestrator:
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
+                    meta_err = {"error": msg}
+                    if terminal_validation_error:
+                        meta_err["terminal"] = True
+                        meta_err["retryable"] = False
                     await conn.execute(
                         """
                         UPDATE studio_jobs
                            SET status='failed',
                                updated_at=now(),
                                error_code=$2::text,
-                               error_message=$3::text
+                               error_message=$3::text,
+                               meta_json = COALESCE(meta_json, '{}'::jsonb)
+                                           || jsonb_build_object(
+                                                'last_failure_retryable', $4::bool,
+                                                'last_failure_terminal', $5::bool
+                                              )
                          WHERE id=$1::uuid
                         """,
                         job_id,
                         code,
                         msg,
+                        False if terminal_validation_error else True,
+                        True if terminal_validation_error else False,
                     )
 
                     await conn.execute(
                         """
                         INSERT INTO studio_job_steps(job_id, step_code, status, attempt, error_code, error_message, meta_json)
                         VALUES($1::uuid, $2::text, 'failed', $3::int, $4::text, $5::text,
-                               jsonb_build_object('error', $5::text))
+                               $6::jsonb)
                         ON CONFLICT (job_id, step_code)
                         DO UPDATE SET
                           status='failed',
@@ -1129,7 +1778,32 @@ class TTSOrchestrator:
                         attempt_i,
                         code,
                         msg,
+                        _json_dumps(meta_err),
                     )
+            if user_id:
+                await _emit_notification_best_effort(
+                    {
+                        "event_type": "AUDIO_FAILED",
+                        "category": "jobs",
+                        "priority": "important",
+                        "source_service": "svc-audio",
+                        "source_ref_type": "job",
+                        "source_ref_id": str(job_id),
+                        "actor_user_id": None,
+                        "title": "Your Audio job needs attention",
+                        "body": msg,
+                        "action_route": "/notifications",
+                        "action_label": "Review issue",
+                        "image_url": None,
+                        "payload_json": {"job_id": str(job_id), "error_code": code},
+                        "metadata_json": {"job_id": str(job_id), "error_code": code},
+                        "dedupe_key": f"audio-failed:{job_id}:{code}",
+                        "recipients": [{"user_id": str(user_id), "channels": {"in_app": True, "push": True, "email": True}}],
+                    },
+                    context={"job_id": str(job_id), "user_id": str(user_id), "event_type": "AUDIO_FAILED", "error_code": code},
+                )
+            if terminal_validation_error:
+                return
             raise
 
     async def _block_job_and_step(

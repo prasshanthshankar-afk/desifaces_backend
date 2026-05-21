@@ -47,11 +47,21 @@ class Settings(BaseSettings):
 
     # Azure storage for FINAL stitched output
     AZURE_STORAGE_CONNECTION_STRING: str = Field(...)
-    # default keep existing container; can switch later to "longform-output" without code changes
+    # Backward-compatible aliases for longform internal render uploads.
+    # stitch_service.py reads AZURE_VIDEO_OUTPUT_CONTAINER directly.
     AZURE_FINAL_VIDEO_CONTAINER: str = Field(default="video-output")
+    AZURE_VIDEO_OUTPUT_CONTAINER: str = Field(default="video-output")
     FINAL_SAS_TTL_SECONDS: int = Field(default=15 * 24 * 3600)
 
     LOG_LEVEL: str = Field(default="INFO")
+
+    def model_post_init(self, __context) -> None:
+        final_container = str(getattr(self, "AZURE_FINAL_VIDEO_CONTAINER", "") or "").strip()
+        output_container = str(getattr(self, "AZURE_VIDEO_OUTPUT_CONTAINER", "") or "").strip()
+        if final_container and not output_container:
+            object.__setattr__(self, "AZURE_VIDEO_OUTPUT_CONTAINER", final_container)
+        elif output_container and not final_container:
+            object.__setattr__(self, "AZURE_FINAL_VIDEO_CONTAINER", output_container)
 
     class Config:
         env_file = ".env"

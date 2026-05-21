@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -50,8 +51,6 @@ def _auth_headers(token_or_header: str, *, actor_user_id: Optional[str] = None) 
       - raw user JWT (normal user flow), OR
       - raw service secret (Option A), OR
       - full 'Bearer <...>' value
-
-    For service calls that write to DB, svc-audio requires X-Actor-User-Id (UUID).
     """
     auth = _normalize_auth_value(token_or_header)
     if not auth:
@@ -62,7 +61,6 @@ def _auth_headers(token_or_header: str, *, actor_user_id: Optional[str] = None) 
     if actor_user_id:
         headers["X-Actor-User-Id"] = str(actor_user_id)
 
-    # Optional but useful for auditing
     headers["X-Actor-Source"] = "svc-fusion-extension"
     return headers
 
@@ -80,7 +78,7 @@ async def create_tts_job(
     Request: TTSCreateRequest
     Response: JobCreatedResponse { job_id, status }
     """
-    url = settings.SVC_AUDIO_BASE_URL.rstrip("/") + settings.SVC_AUDIO_TTS_PATH  # /api/audio/tts
+    url = settings.SVC_AUDIO_BASE_URL.rstrip("/") + settings.SVC_AUDIO_TTS_PATH
 
     payload: Dict[str, Any] = {
         "text": text,
@@ -168,3 +166,36 @@ async def create_tts_audio_blocking(
             raise TimeoutError(f"svc-audio job {job_id} timed out")
 
         await asyncio.sleep(poll_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Compatibility wrapper for older orchestrator code
+# ---------------------------------------------------------------------------
+
+async def create_tts_audio(
+    token_or_header: str,
+    text: str,
+    voice_cfg: Dict[str, Any],
+    *,
+    actor_user_id: Optional[str] = None,
+    poll_seconds: float = 1.5,
+    timeout_seconds: int = 240,
+) -> Dict[str, Any]:
+    """
+    Back-compat wrapper. Returns a shape compatible with older callers.
+    """
+    res = await create_tts_audio_blocking(
+        token_or_header=token_or_header,
+        text=text,
+        voice_cfg=voice_cfg,
+        actor_user_id=actor_user_id,
+        poll_seconds=poll_seconds,
+        timeout_seconds=timeout_seconds,
+    )
+    return {
+        "job_id": res["job_id"],
+        "audio_url": res["audio_url"],
+        "audio_artifact_id": res.get("audio_artifact_id"),
+        "storage_path": None,
+        "raw": res.get("raw"),
+    }

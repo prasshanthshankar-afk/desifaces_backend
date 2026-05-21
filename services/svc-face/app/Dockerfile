@@ -12,6 +12,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    libheif-dev \
   && rm -rf /var/lib/apt/lists/*
 
 COPY services/svc-face/app/app/requirements.txt /app/requirements.txt
