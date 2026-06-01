@@ -14,6 +14,9 @@ from app.db import ensure_db_pool
 from app.services.gateways.stripe_gateway import StripeGateway, StripeSignatureError
 from app.services.payments.wallet_fulfillment_service import fulfill_wallet_topup_order
 from app.services.entitlement_sync_service import sync_subscription_and_entitlement
+from app.services.entitlements.plan_credit_reconciliation_service import (
+    reconcile_included_plan_credits,
+)
 
 router = APIRouter(tags=["payment-webhooks"])
 
@@ -53,6 +56,34 @@ def _to_int_credits(x: Any) -> int:
     if d <= 0:
         return 0
     return int(d)
+
+
+def _to_decimal_or_none(x: Any) -> Optional[Decimal]:
+    if x is None or x == "":
+        return None
+    try:
+        return Decimal(str(x))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _stripe_cycle_key(*, plan_code: Optional[str], period_start: Any, period_end: Any) -> str:
+    anchor = period_start or period_end
+    if not anchor:
+        from datetime import datetime, timezone
+
+        anchor = datetime.now(timezone.utc)
+    interval = "yearly" if "year" in str(plan_code or "").strip().lower() else "monthly"
+    if interval == "yearly":
+        return f"{anchor.year:04d}"
+    return f"{anchor.year:04d}-{anchor.month:02d}"
+
+
+def _metadata_cycle_key(value: Any) -> Optional[str]:
+    md = _as_dict_loose(value)
+    cycle_key = str(md.get("cycle_key") or "").strip()
+    return cycle_key or None
+
 
 def _notifications_base_url() -> str:
     return str(
@@ -344,6 +375,167 @@ def _extract_invoice_subscription_context(invoice_obj: Dict[str, Any]) -> tuple[
     return subscription_id, fallback_user_id
 
 
+async def _fetch_plan_credit_reconciliation_context(
+    conn,
+    *,
+    subscription_id: Optional[str],
+    fallback_user_id: Optional[str],
+) -> Dict[str, Any]:
+    """Read the canonical post-sync entitlement state for plan-credit reconciliation.
+
+    Stripe webhooks may arrive as checkout, subscription, or invoice events.
+    After sync_subscription_and_entitlement has written the subscription and
+    entitlement rows, this function intentionally reads the database state back
+    rather than trusting a particular Stripe payload shape. That keeps the
+    reconciler aligned with the same plan identity surfaced by
+    /api/payments/overview.
+    """
+    sub = None
+    if subscription_id:
+        sub = await conn.fetchrow(
+            '''
+            select
+              user_id,
+              gateway_subscription_id,
+              plan_code,
+              subscription_state,
+              entitlement_state,
+              current_period_start,
+              current_period_end,
+              metadata_json,
+              updated_at
+            from public.payment_plan_subscriptions
+            where gateway_subscription_id = $1
+            order by updated_at desc, created_at desc
+            limit 1
+            ''',
+            subscription_id,
+        )
+    if not sub and fallback_user_id:
+        sub = await conn.fetchrow(
+            '''
+            select
+              user_id,
+              gateway_subscription_id,
+              plan_code,
+              subscription_state,
+              entitlement_state,
+              current_period_start,
+              current_period_end,
+              metadata_json,
+              updated_at
+            from public.payment_plan_subscriptions
+            where user_id = $1::uuid
+            order by updated_at desc, created_at desc
+            limit 1
+            ''',
+            fallback_user_id,
+        )
+
+    sub_dict = _as_dict_loose(sub)
+    user_id = _to_uuid_or_none(sub_dict.get("user_id") or fallback_user_id)
+    if user_id is None:
+        raise RuntimeError("stripe_plan_credit_reconcile_user_missing")
+
+    ent = await conn.fetchrow(
+        '''
+        select
+          user_id,
+          tier_code,
+          plan_code,
+          included_credits_total,
+          included_credits_remaining,
+          metadata_json,
+          effective_from,
+          effective_to,
+          updated_at
+        from public.billing_entitlements
+        where user_id = $1
+          and effective_from <= now()
+          and (effective_to is null or effective_to > now())
+        order by effective_from desc, updated_at desc
+        limit 1
+        ''',
+        user_id,
+    )
+    ent_dict = _as_dict_loose(ent)
+
+    plan_code = str(ent_dict.get("plan_code") or sub_dict.get("plan_code") or "free").strip().lower() or "free"
+    tier_code = str(ent_dict.get("tier_code") or "").strip().lower()
+    if not tier_code:
+        if plan_code.startswith("enterprise"):
+            tier_code = "enterprise"
+        elif plan_code.startswith("business") or plan_code.startswith("team"):
+            tier_code = "business"
+        elif plan_code.startswith("pro"):
+            tier_code = "pro"
+        else:
+            tier_code = "free"
+
+    included_cap = _to_decimal_or_none(ent_dict.get("included_credits_total"))
+    if included_cap is not None and included_cap <= 0 and plan_code != "free":
+        included_cap = None
+
+    period_start = sub_dict.get("current_period_start")
+    period_end = sub_dict.get("current_period_end")
+    cycle_key = (
+        _metadata_cycle_key(ent_dict.get("metadata_json"))
+        or _metadata_cycle_key(sub_dict.get("metadata_json"))
+        or _stripe_cycle_key(plan_code=plan_code, period_start=period_start, period_end=period_end)
+    )
+
+    return {
+        "user_id": user_id,
+        "plan_code": plan_code,
+        "tier_code": tier_code,
+        "included_credit_cap": included_cap,
+        "cycle_key": cycle_key,
+        "current_period_start": period_start,
+        "current_period_end": period_end,
+        "subscription": sub_dict,
+        "entitlement": ent_dict,
+    }
+
+
+async def _reconcile_stripe_plan_credits_after_sync(
+    conn,
+    *,
+    subscription_id: Optional[str],
+    fallback_user_id: Optional[str],
+    source: str,
+    latest_invoice_status: Optional[str],
+) -> Dict[str, Any]:
+    ctx = await _fetch_plan_credit_reconciliation_context(
+        conn,
+        subscription_id=subscription_id,
+        fallback_user_id=fallback_user_id,
+    )
+    sub = ctx.get("subscription") or {}
+    ent = ctx.get("entitlement") or {}
+    metadata_json = {
+        "provider": "stripe",
+        "source": source,
+        "latest_invoice_status": latest_invoice_status,
+        "gateway_subscription_id": str(sub.get("gateway_subscription_id") or subscription_id or ""),
+        "subscription_state": str(sub.get("subscription_state") or ""),
+        "entitlement_state": str(sub.get("entitlement_state") or ""),
+        "entitlement_plan_code": str(ent.get("plan_code") or ""),
+        "entitlement_tier_code": str(ent.get("tier_code") or ""),
+    }
+    return await reconcile_included_plan_credits(
+        conn,
+        user_id=ctx["user_id"],
+        plan_code=ctx["plan_code"],
+        tier_code=ctx["tier_code"],
+        included_credit_cap=ctx["included_credit_cap"],
+        cycle_key=ctx["cycle_key"],
+        current_period_start=ctx["current_period_start"],
+        current_period_end=ctx["current_period_end"],
+        source=source,
+        metadata_json=metadata_json,
+    )
+
+
 async def _sync_hydrated_subscription_or_raise(
     conn,
     *,
@@ -353,7 +545,9 @@ async def _sync_hydrated_subscription_or_raise(
     fallback_user_id: Optional[str] = None,
     latest_invoice_status: Optional[str] = None,
     require_full: bool = True,
-) -> None:
+    source: str = "stripe_webhook",
+    reconcile_plan_credits: bool = True,
+) -> Dict[str, Any]:
     hydrated = await _hydrate_subscription(
         gw,
         subscription_id=subscription_id,
@@ -370,6 +564,22 @@ async def _sync_hydrated_subscription_or_raise(
         latest_invoice_status=latest_invoice_status,
     )
 
+    effective_subscription_id = str(hydrated.get("id") or subscription_id or "").strip() or subscription_id
+    if not reconcile_plan_credits:
+        return {
+            "action": "plan_credit_reconcile_skipped",
+            "reason": "non_granting_subscription_event",
+            "subscription_id": effective_subscription_id,
+            "latest_invoice_status": latest_invoice_status,
+        }
+
+    return await _reconcile_stripe_plan_credits_after_sync(
+        conn,
+        subscription_id=effective_subscription_id,
+        fallback_user_id=fallback_user_id,
+        source=source,
+        latest_invoice_status=latest_invoice_status,
+    )
 
 
 async def _fulfill_wallet_topup(conn, *, session: Dict[str, Any], gateway_event_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -518,6 +728,7 @@ async def stripe_webhook(
                         fallback_user_id=fallback_user_id,
                         latest_invoice_status="checkout_completed",
                         require_full=True,
+                        source="stripe_checkout_subscription",
                     )
                     await _attach_local_subscription_id(
                         conn,
@@ -584,6 +795,7 @@ async def stripe_webhook(
                     fallback_user_id=fallback_user_id,
                     latest_invoice_status=None,
                     require_full=True,
+                    source=f"stripe_{event_type}",
                 )
                 sub_ctx = await _fetch_subscription_notification_context(
                     conn,
@@ -663,6 +875,7 @@ async def stripe_webhook(
                     fallback_user_id=fallback_user_id,
                     latest_invoice_status="paid",
                     require_full=True,
+                    source="stripe_invoice_paid",
                 )
                 sub_ctx = await _fetch_subscription_notification_context(
                     conn,
@@ -727,6 +940,8 @@ async def stripe_webhook(
                     fallback_user_id=fallback_user_id,
                     latest_invoice_status="payment_failed",
                     require_full=True,
+                    source="stripe_invoice_payment_failed",
+                    reconcile_plan_credits=False,
                 )
                 sub_ctx = await _fetch_subscription_notification_context(
                     conn,

@@ -24,6 +24,7 @@ from app.repo.apple_iap_repo import (
     upsert_apple_transaction_audit,
 )
 from app.services.payments.wallet_fulfillment_service import fulfill_wallet_topup_order
+from app.services.entitlements.plan_credit_reconciliation_service import reconcile_included_plan_credits
 from app.schemas.apple_iap import (
     AppleCreditsConfirmIn,
     AppleCreditsConfirmOut,
@@ -343,18 +344,31 @@ async def confirm_subscription_purchase(
             metadata_json=metadata_json,
         )
 
+        cycle_key = apple_cycle_key(
+            interval_code=interval_code,
+            period_start=purchase_date,
+            period_end=expires_date,
+        )
         await apply_subscription_entitlement(
             conn,
             user_id=user_id,
             tier_code=tier_code,
             internal_plan_code=internal_plan_code,
-            cycle_key=apple_cycle_key(
-                interval_code=interval_code,
-                period_start=purchase_date,
-                period_end=expires_date,
-            ),
+            cycle_key=cycle_key,
             monthly_grant_credits=monthly_grant_credits,
             current_period_start=purchase_date,
+            source="apple_iap",
+            metadata_json=metadata_json,
+        )
+        await reconcile_included_plan_credits(
+            conn,
+            user_id=user_id,
+            plan_code=internal_plan_code,
+            tier_code=tier_code,
+            included_credit_cap=monthly_grant_credits,
+            cycle_key=cycle_key,
+            current_period_start=purchase_date,
+            current_period_end=expires_date,
             source="apple_iap",
             metadata_json=metadata_json,
         )
@@ -607,25 +621,55 @@ async def process_notification(
                     )
 
                     if bool(state.get("revert_to_free")):
+                        cycle_key = apple_cycle_key(
+                            interval_code=interval_code,
+                            period_start=purchase_date,
+                            period_end=expires_date,
+                        )
                         await revert_user_to_free_entitlement(
                             conn,
                             user_id=resolved_user_id,
                             source="apple_iap_notification",
                             metadata_json=metadata_json,
                         )
+                        await reconcile_included_plan_credits(
+                            conn,
+                            user_id=resolved_user_id,
+                            plan_code="free",
+                            tier_code="free",
+                            included_credit_cap=None,
+                            cycle_key=cycle_key,
+                            current_period_start=purchase_date,
+                            current_period_end=expires_date,
+                            source="apple_iap_notification_revert_to_free",
+                            metadata_json=metadata_json,
+                        )
                     else:
+                        cycle_key = apple_cycle_key(
+                            interval_code=interval_code,
+                            period_start=purchase_date,
+                            period_end=expires_date,
+                        )
                         await apply_subscription_entitlement(
                             conn,
                             user_id=resolved_user_id,
                             tier_code=tier_code,
                             internal_plan_code=internal_plan_code,
-                            cycle_key=apple_cycle_key(
-                                interval_code=interval_code,
-                                period_start=purchase_date,
-                                period_end=expires_date,
-                            ),
+                            cycle_key=cycle_key,
                             monthly_grant_credits=monthly_grant_credits,
                             current_period_start=purchase_date,
+                            source="apple_iap_notification",
+                            metadata_json=metadata_json,
+                        )
+                        await reconcile_included_plan_credits(
+                            conn,
+                            user_id=resolved_user_id,
+                            plan_code=internal_plan_code,
+                            tier_code=tier_code,
+                            included_credit_cap=monthly_grant_credits,
+                            cycle_key=cycle_key,
+                            current_period_start=purchase_date,
+                            current_period_end=expires_date,
                             source="apple_iap_notification",
                             metadata_json=metadata_json,
                         )

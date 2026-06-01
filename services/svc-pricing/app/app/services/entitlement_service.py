@@ -361,12 +361,23 @@ async def resolve_entitlement(
     channel: str,
     country_code: str,
 ) -> ResolvedEntitlement:
-    tier_code = await _ENTITLEMENTS_REPO.resolve_tier_code(
+    # Canonical production rule:
+    # billing_entitlements is the source of truth for the user's current paid/free
+    # tier after Stripe, Apple, Google Play, or admin subscription changes.
+    # pricing_user_entitlements is retained as a compatibility cache only.
+    # Feature flags and module gates must evaluate with this canonical tier;
+    # otherwise paid users can show Pro/Business in the header while studios are
+    # still blocked by a stale legacy tier.
+    billing_ent_row = await _BILLING_ENTITLEMENTS_REPO.get_active_by_user_id(conn, user_id=user_id)
+
+    legacy_tier_code = await _ENTITLEMENTS_REPO.resolve_tier_code(
         conn,
         user_id=user_id,
         fallback_to_core_user_tier=True,
         ensure_default_free=False,
     )
+    canonical_billing_tier = str(getattr(billing_ent_row, "tier_code", "") or "").strip().lower() if billing_ent_row else ""
+    tier_code = canonical_billing_tier or str(legacy_tier_code or "free").strip().lower() or "free"
 
     feature_code = _feature_code_for_request(
         service_name=service_name,
@@ -394,7 +405,12 @@ async def resolve_entitlement(
                     module_code="",
                     category="",
                     reason="ENTITLEMENT_BLOCKED_FEATURE_FLAG",
-                    meta={"feature_code": feature_code},
+                    meta={
+                        "feature_code": feature_code,
+                        "tier_source": "billing_entitlements" if canonical_billing_tier else "legacy_entitlements",
+                        "legacy_tier_code": str(legacy_tier_code or ""),
+                        "billing_plan_code": (billing_ent_row.plan_code if billing_ent_row else None),
+                    },
                 )
 
     category = await _variant_category(conn, sku_code)
@@ -455,7 +471,6 @@ async def resolve_entitlement(
             feature_flag=feature_flag,
         )
 
-    billing_ent_row = await _BILLING_ENTITLEMENTS_REPO.get_active_by_user_id(conn, user_id=user_id)
     if billing_ent_row:
         return _from_billing_entitlement(
             billing_ent_row,
@@ -502,5 +517,8 @@ async def resolve_entitlement(
             "feature_code": feature_code or None,
             "feature_flag_billing_mode": (feature_flag.billing_mode if feature_flag else None),
             "gate_billing_mode": gate_billing_mode,
+            "tier_source": "billing_entitlements" if canonical_billing_tier else "legacy_entitlements",
+            "legacy_tier_code": str(legacy_tier_code or ""),
+            "billing_plan_code": (billing_ent_row.plan_code if billing_ent_row else None),
         },
     )

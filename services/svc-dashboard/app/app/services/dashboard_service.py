@@ -108,14 +108,18 @@ def _public_plan_name(plan_code: Any, tier_code: Any = None) -> str:
     code = _clean_text(plan_code).lower()
     if code in {"free", ""}:
         return "Free"
-    if code in {"pro", "pro_monthly", "pro_monthly_v1"}:
-        return "Pro"
+    if code in {"pro_monthly", "pro_monthly_v1"}:
+        return "Pro Monthly"
     if code == "pro_yearly_v1":
         return "Pro Yearly"
-    if code in {"business", "business_monthly", "business_monthly_v1"}:
-        return "Business"
+    if code == "pro":
+        return "Pro"
+    if code in {"business_monthly", "business_monthly_v1"}:
+        return "Business Monthly"
     if code == "business_yearly_v1":
         return "Business Yearly"
+    if code == "business":
+        return "Business"
     if code.startswith("enterprise"):
         return "Enterprise"
     tier = _clean_text(tier_code).lower()
@@ -758,28 +762,67 @@ async def _augment_with_live_pricing(
         pricing_account_overview_row=pricing_account_overview_row,
     )
 
-    available = _as_number((resp.get("credits") or {}).get("total_available"))
-    reserved = _as_number((resp.get("credits") or {}).get("total_reserved"))
-    used = _as_number((resp.get("credits") or {}).get("included_used"))
-    total_credits = _as_number((resp.get("credits") or {}).get("total_credits"))
+    credits = resp.get("credits") or {}
+    available = _as_number(credits.get("total_available"))
+    reserved = _as_number(credits.get("total_reserved"))
+    used = _as_number(credits.get("included_used"))
+    total_credits = _as_number(credits.get("total_credits"))
+    included_available = _as_number(credits.get("included_available"))
+    included_reserved = _as_number(credits.get("included_reserved"))
+    wallet_available = _as_number(credits.get("wallet_available"))
+    wallet_reserved = _as_number(credits.get("wallet_reserved"))
+    promo_available = _as_number(credits.get("promo_available"))
+    promo_reserved = _as_number(credits.get("promo_reserved"))
     display = resp.get("display") or {}
     plan = resp.get("plan") or {}
     plan_name = str(plan.get("plan_name") or "Free")
 
-    resp.setdefault("gauges", {})
-    fuel = (resp["gauges"] or {}).get("fuel") or {}
-    fuel["label"] = fuel.get("label") or "Credits"
-    fuel["credits_remaining"] = available or 0
-    fuel["reserved_credits"] = reserved or 0
-    fuel["total_credits"] = total_credits or 0
-    fuel["credit_cap"] = total_credits or 0
-    if total_credits and total_credits > 0 and available is not None:
-        fuel["value_norm"] = max(min(float(available) / float(total_credits), 1.0), 0.0)
+    available_i = int(available or 0)
+    reserved_i = int(reserved or 0)
+    used_i = int(used or 0)
+    total_credits_i = int(total_credits or 0)
+    included_available_i = int(included_available or 0)
+    included_reserved_i = int(included_reserved or 0)
+    wallet_available_i = int(wallet_available or 0)
+    wallet_reserved_i = int(wallet_reserved or 0)
+    promo_available_i = int(promo_available or 0)
+    promo_reserved_i = int(promo_reserved or 0)
+
+    # Rebuild fuel from the canonical live credit contract. Do not preserve
+    # stale cached v_dashboard_home.header_json/gauges_json values here; older
+    # cached rows can contain fuel.credits_remaining=0 even when live credits
+    # and pricing_summary are correct.
+    if total_credits_i > 0:
+        value_norm = max(min(float(included_available_i) / float(total_credits_i), 1.0), 0.0)
     else:
-        fuel["value_norm"] = fuel.get("value_norm") if fuel.get("value_norm") not in (None, "") else 0
-    resp["gauges"]["fuel"] = fuel
+        value_norm = 0.0
+
+    fuel = {
+        "label": "Credits",
+        "credits_remaining": available_i,
+        "available_credits": available_i,
+        "reserved_credits": reserved_i,
+        "used_credits": used_i,
+        "total_credits": total_credits_i,
+        "credit_cap": total_credits_i,
+        "included_available": included_available_i,
+        "included_reserved": included_reserved_i,
+        "wallet_available": wallet_available_i,
+        "wallet_reserved": wallet_reserved_i,
+        "promo_available": promo_available_i,
+        "promo_reserved": promo_reserved_i,
+        "total_available": available_i,
+        "total_reserved": reserved_i,
+        "total_spendable": available_i,
+        "value_norm": value_norm,
+        "source": "canonical_credit_contract",
+    }
+
+    resp.setdefault("gauges", {})
+    resp["gauges"]["fuel"] = dict(fuel)
 
     resp["gauges"].update(await _fetch_realtime_operational_gauges(conn))
+    resp["gauges"]["fuel"] = dict(fuel)
 
     resp.setdefault("header", {})
     resp["header"].update(
@@ -789,11 +832,15 @@ async def _augment_with_live_pricing(
             "usage_label": display.get("header_label"),
             "billing_value_label": display.get("header_label"),
             "header_label": display.get("header_label"),
-            "available_credits": int(available or 0),
-            "reserved_credits": int(reserved or 0),
-            "used_credits": int(used or 0),
-            "total_credits": int(total_credits or 0),
+            "available_credits": available_i,
+            "reserved_credits": reserved_i,
+            "used_credits": used_i,
+            "total_credits": total_credits_i,
+            "included_available": included_available_i,
+            "wallet_available": wallet_available_i,
+            "promo_available": promo_available_i,
             "billing_model": resp.get("billing_model"),
+            "fuel": dict(fuel),
         }
     )
 
@@ -923,6 +970,74 @@ def _build_face_library_title(item: Dict[str, Any], meta: Dict[str, Any], reuse:
     return label
 
 
+# Dashboard video display policy:
+# - Regular non-longform videos are displayable.
+# - Longform/fusion-extension child segment renders are internal implementation details
+#   and must never appear in dashboard carousels or Saved Work.
+# - Final/stitch/share longform outputs are displayable, but current DB data must
+#   actually expose those final rows in v_dashboard_asset_library.
+_DASHBOARD_VIDEO_CHILD_MARKER_SQL = """
+(
+  lower(coalesce(studio, '')) <> 'video'
+  OR NOT (
+    coalesce(metadata_json #>> '{job_meta,pricing,meta,render_kind}', '') = 'child_render'
+    OR coalesce(metadata_json #>> '{job_meta,pricing,meta,child_role}', '') <> ''
+    OR coalesce(metadata_json #>> '{job_meta,pricing,meta,billing_context,mode}', '') = 'internal_child'
+    OR coalesce(metadata_json::text, '') ~* '"render_kind"\s*:\s*"child_render"'
+    OR coalesce(metadata_json::text, '') ~* '"child_role"\s*:'
+    OR coalesce(metadata_json::text, '') ~* '"internal_child"'
+    OR coalesce(metadata_json::text, '') ~* '"child_job_of_billable_longform_parent"'
+    OR coalesce(metadata_json::text, '') ~* '"suppress_pricing"\s*:\s*true'
+    OR coalesce(metadata_json::text, '') ~* '"pricing_suppressed"\s*:\s*true'
+    OR coalesce(metadata_json::text, '') ~* '"parent_longform_job_id"\s*:'
+    OR coalesce(metadata_json::text, '') ~* '"billing_parent_job_id"\s*:'
+    OR coalesce(metadata_json::text, '') ~* '"parent_story_job_id"\s*:'
+    OR (
+      coalesce(metadata_json::text, '') ~* '"(segment_id|segment_index|segment_number|scene_id|scene_index|shot_id|shot_index)"\s*:'
+      AND NOT (
+        metadata_json ? 'share_url'
+        OR coalesce(metadata_json::text, '') ~* 'final_video|final_output|stitched_video|composed_video|timeline_output'
+        OR coalesce(metadata_json::text, '') ~* '"render_kind"\s*:\s*"final"'
+        OR coalesce(metadata_json::text, '') ~* '"output_role"\s*:\s*"final"'
+      )
+    )
+  )
+)
+"""
+
+_FINAL_VIDEO_MARKER_RE = (
+    'share_url|final_video|final_output|stitched_video|composed_video|timeline_output|'
+    '"render_kind"\\s*:\\s*"final"|"output_role"\\s*:\\s*"final"'
+)
+_CHILD_VIDEO_MARKER_RE = (
+    'child_render|child_role|internal_child|child_job_of_billable_longform_parent|'
+    'suppress_pricing|pricing_suppressed|parent_longform_job_id|billing_parent_job_id|parent_story_job_id'
+)
+_SEGMENT_VIDEO_MARKER_RE = 'segment_id|segment_index|segment_number|scene_id|scene_index|shot_id|shot_index'
+
+
+def _json_text_for_marker_scan(value: Any) -> str:
+    try:
+        return json.dumps(value, default=str, sort_keys=True)
+    except Exception:
+        return str(value or "")
+
+
+def _has_final_video_marker(value: Any) -> bool:
+    import re
+    return bool(re.search(_FINAL_VIDEO_MARKER_RE, _json_text_for_marker_scan(value), flags=re.IGNORECASE))
+
+
+def _is_internal_child_video_payload(value: Any) -> bool:
+    import re
+    text = _json_text_for_marker_scan(value)
+    if re.search(_CHILD_VIDEO_MARKER_RE, text, flags=re.IGNORECASE):
+        return True
+    if re.search(_SEGMENT_VIDEO_MARKER_RE, text, flags=re.IGNORECASE) and not _has_final_video_marker(value):
+        return True
+    return False
+
+
 async def _fetch_library_view_columns(conn: asyncpg.Connection) -> List[str]:
     try:
         rows = await conn.fetch(
@@ -950,40 +1065,290 @@ async def _fetch_library_view_rows(
     if not columns or "user_id" not in columns:
         return [], None
 
-    where_sql = ["user_id = $1::uuid"]
-    params: List[Any] = [user_id]
+    # For non-video requests, keep the original low-blast-radius behavior.
+    # For video/all requests, use one displayable-assets query that:
+    #   1) keeps normal rows from public.v_dashboard_asset_library,
+    #   2) excludes longform child/internal segment renders,
+    #   3) adds completed final longform parent rows from public.longform_jobs when
+    #      the dashboard view has not yet indexed the final stitched output.
+    if asset_type not in {"all", "video"}:
+        where_sql = ["user_id = $1::uuid"]
+        params: List[Any] = [user_id]
 
-    can_filter_by_studio = "studio" in columns
-    if asset_type != "all" and can_filter_by_studio:
-        params.append(asset_type)
-        where_sql.append(f"lower(coalesce(studio, '')) = lower(${len(params)})")
+        can_filter_by_studio = "studio" in columns
+        if can_filter_by_studio:
+            params.append(asset_type)
+            where_sql.append(f"lower(coalesce(studio, '')) = lower(${len(params)})")
 
-    order_column = "created_at" if "created_at" in columns else ("updated_at" if "updated_at" in columns else None)
-    base_sql = f"from public.v_dashboard_asset_library where {' and '.join(where_sql)}"
+        order_column = "created_at" if "created_at" in columns else ("updated_at" if "updated_at" in columns else None)
+        base_sql = f"from public.v_dashboard_asset_library where {' and '.join(where_sql)}"
+
+        total_count: Optional[int] = None
+        try:
+            total_row = await conn.fetchrow(f"select count(*)::int as total_count {base_sql}", *params)
+            total_count = int(total_row["total_count"] or 0) if total_row else 0
+        except Exception:
+            total_count = None
+
+        query_sql = f"select * {base_sql}"
+        if order_column:
+            query_sql += f" order by {order_column} desc nulls last"
+        query_sql += f" limit ${len(params)+1} offset ${len(params)+2}"
+
+        try:
+            rows = await conn.fetch(query_sql, *params, limit, offset)
+            return [dict(r) for r in rows], total_count
+        except Exception:
+            return [], total_count
+
+    want_video_only = asset_type == "video"
+
+    child_marker_sql = r'''
+      coalesce(v.metadata_json #>> '{job_meta,pricing,meta,render_kind}', '') = 'child_render'
+      OR coalesce(v.metadata_json #>> '{job_meta,pricing,meta,child_role}', '') <> ''
+      OR coalesce(v.metadata_json #>> '{job_meta,pricing,meta,billing_context,mode}', '') = 'internal_child'
+      OR coalesce(v.metadata_json::text, '') ~* '"render_kind"\s*:\s*"child_render"'
+      OR coalesce(v.metadata_json::text, '') ~* '"child_role"\s*:'
+      OR coalesce(v.metadata_json::text, '') ~* '"internal_child"'
+      OR coalesce(v.metadata_json::text, '') ~* '"child_job_of_billable_longform_parent"'
+      OR coalesce(v.metadata_json::text, '') ~* '"suppress_pricing"\s*:\s*true'
+      OR coalesce(v.metadata_json::text, '') ~* '"pricing_suppressed"\s*:\s*true'
+      OR coalesce(v.metadata_json::text, '') ~* '"parent_longform_job_id"\s*:'
+      OR coalesce(v.metadata_json::text, '') ~* '"billing_parent_job_id"\s*:'
+      OR coalesce(v.metadata_json::text, '') ~* '"parent_story_job_id"\s*:'
+      OR (
+        coalesce(v.metadata_json::text, '') ~* '"(segment_id|segment_index|segment_number|scene_id|scene_index|shot_id|shot_index)"\s*:'
+        AND NOT (
+          v.metadata_json ? 'share_url'
+          OR coalesce(v.metadata_json::text, '') ~* 'final_video|final_output|stitched_video|composed_video|timeline_output'
+          OR coalesce(v.metadata_json::text, '') ~* '"render_kind"\s*:\s*"final"'
+          OR coalesce(v.metadata_json::text, '') ~* '"output_role"\s*:\s*"final"'
+        )
+      )
+    '''
+
+    studio_filter_sql = "lower(coalesce(v.studio, '')) = 'video'" if want_video_only else "true"
+
+    combined_sql = f'''
+    with view_rows as (
+      select
+        v.library_id,
+        v.user_id,
+        v.studio,
+        v.asset_type,
+        v.title,
+        v.status,
+        v.created_at,
+        v.thumbnail_url,
+        v.preview_url,
+        v.download_url,
+        v.artifact_id,
+        v.media_asset_id,
+        v.source_job_id,
+        v.reuse_payload_json,
+        v.metadata_json
+      from public.v_dashboard_asset_library v
+      where v.user_id = $1::uuid
+        and {studio_filter_sql}
+        and (
+          lower(coalesce(v.studio, '')) <> 'video'
+          or not ({child_marker_sql})
+        )
+    ), longform_source as (
+      select to_jsonb(lj) as j
+      from public.longform_jobs lj
+      where to_jsonb(lj)::text like '%' || $1::text || '%'
+    ), longform_scored as (
+      select
+        j,
+        coalesce(j->>'id', j->>'job_id') as longform_job_id,
+        coalesce(j->>'status', j->>'state', j->>'job_status') as job_status,
+        substring(j::text from '(https?://[^" ]+\\.mp4[^" ]*)') as video_url,
+        coalesce(
+          nullif(substring(coalesce(j->>'thumbnail_url', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j->>'poster_url', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j->>'cover_url', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j->>'image_url', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{output_json,thumbnail_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{output_json,poster_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{output_json,cover_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{output,thumbnail_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{output,poster_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{result,thumbnail_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{result,poster_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{tags,thumbnail_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{tags,poster_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{tags,cover_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{tags,face_image_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{tags,start_image_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(coalesce(j #>> '{{tags,image_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
+          nullif(substring(j::text from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), '')
+        ) as thumbnail_url,
+        (j::text ~* 'final_video|final_output|stitched_video|composed_video|timeline_output|share_url|stitch|stitched|compose|composed') as has_final_signal,
+        (j::text ~* 'child_render|internal_child|child_job_of_billable_longform_parent|segment_id|suppress_pricing|pricing_suppressed') as has_child_signal
+      from longform_source
+    ), longform_final_rows as (
+      select
+        ('video:' || longform_job_id)::text as library_id,
+        $1::uuid as user_id,
+        'video'::text as studio,
+        'video'::text as asset_type,
+        case
+          when j::text ~* 'cinematic_video_direction' then 'Cinematic Video'
+          when j::text ~* 'talking_video' then 'Talking Video'
+          else 'Video'
+        end::text as title,
+        coalesce(nullif(job_status, ''), 'ready')::text as status,
+        coalesce(
+          case when coalesce(j->>'completed_at', '') ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}' then (j->>'completed_at')::timestamptz else null end,
+          case when coalesce(j->>'updated_at', '') ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}' then (j->>'updated_at')::timestamptz else null end,
+          case when coalesce(j->>'created_at', '') ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}' then (j->>'created_at')::timestamptz else null end,
+          now()
+        ) as created_at,
+        thumbnail_url::text as thumbnail_url,
+        video_url::text as preview_url,
+        video_url::text as download_url,
+        null::uuid as artifact_id,
+        null::uuid as media_asset_id,
+        case
+          when coalesce(longform_job_id, '') ~* '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
+          then longform_job_id::uuid
+          else null::uuid
+        end as source_job_id,
+        jsonb_strip_nulls(jsonb_build_object(
+          'video_url', video_url,
+          'thumbnail_url', thumbnail_url,
+          'poster_url', thumbnail_url,
+          'source_job_id', longform_job_id,
+          'longform_job_id', longform_job_id,
+          'output_role', 'final',
+          'render_kind', 'final'
+        )) as reuse_payload_json,
+        jsonb_strip_nulls(jsonb_build_object(
+          'provider', 'svc-fusion-extension',
+          'source_table', 'longform_jobs',
+          'longform_job_id', longform_job_id,
+          'job_id', longform_job_id,
+          'job_status', job_status,
+          'render_kind', 'final',
+          'output_role', 'final',
+          'share_url', video_url,
+          'thumbnail_url', thumbnail_url,
+          'poster_url', thumbnail_url,
+          'artifact_content_type', 'video/mp4',
+          'job_meta', j,
+          'performance_meta', jsonb_build_object('video_url', video_url, 'thumbnail_url', thumbnail_url, 'poster_url', thumbnail_url, 'status', job_status)
+        )) as metadata_json
+      from longform_scored lf
+      where video_url is not null
+        and has_final_signal
+        and not has_child_signal
+        and coalesce(job_status, '') ~* 'ready|succeeded|success|complete|completed'
+        and coalesce(longform_job_id, '') <> ''
+        and not exists (
+          select 1
+          from view_rows vr
+          where lower(coalesce(vr.studio, '')) = 'video'
+            and (
+              coalesce(vr.source_job_id::text, '') = lf.longform_job_id
+              or coalesce(vr.metadata_json::text, '') like '%' || lf.longform_job_id || '%'
+              or coalesce(vr.preview_url, vr.download_url, '') = lf.video_url
+            )
+        )
+    ), combined as (
+      select * from view_rows
+      union all
+      select * from longform_final_rows
+    )
+    select *
+    from combined
+    order by created_at desc nulls last
+    limit $2 offset $3
+    '''
+
+    count_sql = f'''
+    with view_rows as (
+      select
+        v.library_id,
+        v.user_id,
+        v.studio,
+        v.asset_type,
+        v.title,
+        v.status,
+        v.created_at,
+        v.thumbnail_url,
+        v.preview_url,
+        v.download_url,
+        v.artifact_id,
+        v.media_asset_id,
+        v.source_job_id,
+        v.reuse_payload_json,
+        v.metadata_json
+      from public.v_dashboard_asset_library v
+      where v.user_id = $1::uuid
+        and {studio_filter_sql}
+        and (
+          lower(coalesce(v.studio, '')) <> 'video'
+          or not ({child_marker_sql})
+        )
+    ), longform_source as (
+      select to_jsonb(lj) as j
+      from public.longform_jobs lj
+      where to_jsonb(lj)::text like '%' || $1::text || '%'
+    ), longform_scored as (
+      select
+        j,
+        coalesce(j->>'id', j->>'job_id') as longform_job_id,
+        coalesce(j->>'status', j->>'state', j->>'job_status') as job_status,
+        substring(j::text from '(https?://[^" ]+\\.mp4[^" ]*)') as video_url,
+        (j::text ~* 'final_video|final_output|stitched_video|composed_video|timeline_output|share_url|stitch|stitched|compose|composed') as has_final_signal,
+        (j::text ~* 'child_render|internal_child|child_job_of_billable_longform_parent|segment_id|suppress_pricing|pricing_suppressed') as has_child_signal
+      from longform_source
+    ), longform_final_rows as (
+      select 1
+      from longform_scored lf
+      where video_url is not null
+        and has_final_signal
+        and not has_child_signal
+        and coalesce(job_status, '') ~* 'ready|succeeded|success|complete|completed'
+        and coalesce(longform_job_id, '') <> ''
+        and not exists (
+          select 1
+          from view_rows vr
+          where lower(coalesce(vr.studio, '')) = 'video'
+            and (
+              coalesce(vr.source_job_id::text, '') = lf.longform_job_id
+              or coalesce(vr.metadata_json::text, '') like '%' || lf.longform_job_id || '%'
+              or coalesce(vr.preview_url, vr.download_url, '') = lf.video_url
+            )
+        )
+    )
+    select ((select count(*) from view_rows) + (select count(*) from longform_final_rows))::int as total_count
+    '''
 
     total_count: Optional[int] = None
     try:
-        total_row = await conn.fetchrow(f"select count(*)::int as total_count {base_sql}", *params)
+        total_row = await conn.fetchrow(count_sql, user_id)
         total_count = int(total_row["total_count"] or 0) if total_row else 0
     except Exception:
         total_count = None
 
-    query_sql = f"select * {base_sql}"
-    if order_column:
-        query_sql += f" order by {order_column} desc nulls last"
-    query_sql += f" limit ${len(params)+1} offset ${len(params)+2}"
-
     try:
-        rows = await conn.fetch(query_sql, *params, limit, offset)
+        rows = await conn.fetch(combined_sql, user_id, limit, offset)
         items = [dict(r) for r in rows]
     except Exception:
         return [], total_count
 
-    if asset_type != "all" and not can_filter_by_studio:
-        items = [r for r in items if _clean_text(r.get("studio")).lower() == asset_type]
+    filtered: List[Dict[str, Any]] = []
+    for r in items:
+        studio = _clean_text(r.get("studio")).lower()
+        if studio == "fusion":
+            studio = "video"
+        if studio == "video" and _is_internal_child_video_payload(r.get("metadata_json") or r):
+            continue
+        filtered.append(r)
 
-    return items, total_count
-
+    return filtered, total_count
 
 def _signed_url_from_parts(
     signer: AzureBlobSasSigner,
@@ -1102,10 +1467,13 @@ def _normalize_library_item(
         asset_type = _clean_text(_pick_first(item, "asset_type")) or "audio"
     else:
         resolved_video_url = _clean_text(_pick_first(reuse, "video_url")) or _clean_text(preview_url) or _clean_text(download_url)
+        resolved_thumbnail_url = _clean_text(_pick_first(reuse, "thumbnail_url", "poster_url")) or _clean_text(thumbnail_url)
         reuse_payload = {
             "video_artifact_id": _clean_text(_pick_first(reuse, "video_artifact_id", "artifact_id")) or artifact_id or None,
             "media_asset_id": _clean_text(_pick_first(reuse, "media_asset_id", "video_media_asset_id")) or media_asset_id or None,
             "video_url": resolved_video_url or None,
+            "thumbnail_url": resolved_thumbnail_url or None,
+            "poster_url": resolved_thumbnail_url or None,
         }
         title = _clean_text(_pick_first(item, "title", "name")) or "Video"
         asset_type = _clean_text(_pick_first(item, "asset_type")) or "video"
@@ -1126,6 +1494,66 @@ def _normalize_library_item(
         "media_asset_id": media_asset_id or None,
         "reuse_payload": {k: v for k, v in reuse_payload.items() if v not in (None, "")},
     }
+
+
+async def _fetch_home_video_carousel_from_library(
+    conn: asyncpg.Connection,
+    user_id: str,
+    signer: AzureBlobSasSigner,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Build dashboard home video carousel from the same final-only source as Saved Work.
+
+    We intentionally do not trust v_dashboard_home.video_carousel_json for videos because
+    it can contain stale internal child artifact ids without enough metadata to classify them.
+    """
+    rows, _ = await _fetch_library_view_rows(conn, user_id, "video", max(1, min(limit, 25)), 0)
+    carousel: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for row in rows:
+        item = _normalize_library_item(row, signer)
+        if not item:
+            continue
+        reuse = _as_dict_deep_loose(item.get("reuse_payload"))
+        video_url = _clean_text(reuse.get("video_url") or item.get("preview_url") or item.get("download_url"))
+        if not video_url:
+            continue
+
+        key = _clean_text(item.get("artifact_id") or item.get("media_asset_id") or item.get("library_id") or video_url)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+
+        carousel.append({
+            "id": item.get("artifact_id") or item.get("media_asset_id") or item.get("library_id"),
+            "library_id": item.get("library_id"),
+            "title": item.get("title") or "Video",
+            "created_at": item.get("created_at"),
+            "status": item.get("status") or "ready",
+            "video_url": video_url,
+            "url": video_url,
+            "thumbnail_url": item.get("thumbnail_url"),
+            "poster_url": item.get("thumbnail_url"),
+            "preview_url": item.get("preview_url"),
+            "download_url": item.get("download_url"),
+            "artifact_id": item.get("artifact_id"),
+            "media_asset_id": item.get("media_asset_id"),
+            "source_job_id": item.get("source_job_id"),
+            "meta": {
+                "artifact_id": item.get("artifact_id"),
+                "media_asset_id": item.get("media_asset_id"),
+                "source_job_id": item.get("source_job_id"),
+                "video_url": video_url,
+                "thumbnail_url": item.get("thumbnail_url"),
+                "poster_url": item.get("thumbnail_url"),
+                "display_scope": "final_outputs",
+            },
+        })
+        if len(carousel) >= limit:
+            break
+
+    return carousel
 
 
 def _fallback_library_from_home(resp: Dict[str, Any], asset_type: str = "all") -> List[Dict[str, Any]]:
@@ -1163,34 +1591,12 @@ def _fallback_library_from_home(resp: Dict[str, Any], asset_type: str = "all") -
                 },
             })
 
-    if asset_type in ("all", "video"):
-        for it in (resp.get("video_carousel") or []):
-            if not isinstance(it, dict):
-                continue
-            video_url = _clean_text(it.get("video_url") or it.get("url") or ((it.get("meta") or {}).get("video_url")))
-            if not video_url:
-                continue
-            meta = it.get("meta") or {}
-            artifact_id = _clean_text(it.get("artifact_id") or meta.get("artifact_id"))
-            media_asset_id = _clean_text(it.get("media_asset_id") or meta.get("media_asset_id"))
-            items.append({
-                "library_id": f"video:{artifact_id or media_asset_id or video_url}",
-                "studio": "video",
-                "asset_type": "video",
-                "title": "Video",
-                "status": "ready",
-                "created_at": it.get("created_at"),
-                "thumbnail_url": None,
-                "preview_url": video_url,
-                "download_url": video_url,
-                "artifact_id": artifact_id or None,
-                "media_asset_id": media_asset_id or None,
-                "reuse_payload": {
-                    "video_artifact_id": artifact_id or None,
-                    "media_asset_id": media_asset_id or None,
-                    "video_url": video_url,
-                },
-            })
+    # Do not synthesize video library rows from cached dashboard_home.video_carousel_json.
+    # That cache can contain stale longform child artifact ids without metadata, which is
+    # exactly what caused Saved Work / Videos to show child segments after the backend
+    # final-only query returned no displayable video rows. Video rows must come only
+    # from _fetch_library_view_rows(), which applies the final-output classifier.
+
 
     return items
 
@@ -1223,6 +1629,17 @@ async def get_dashboard_library(
                 "offset": safe_offset,
                 "source": "v_dashboard_asset_library",
                 "partial": False,
+            }
+
+        if asset_type == "video":
+            return {
+                "items": [],
+                "total": total_count if total_count is not None else 0,
+                "limit": safe_limit,
+                "offset": safe_offset,
+                "source": "v_dashboard_asset_library",
+                "partial": False,
+                "note": "No displayable final videos found. Internal longform child segments are intentionally hidden.",
             }
 
         home = await get_dashboard_home(pool, user_id, force_refresh=False)
@@ -1261,6 +1678,8 @@ async def get_dashboard_home(pool: asyncpg.Pool, user_id: str, force_refresh: bo
                 "runway_summary": {},
             }
             resp = await _augment_with_live_pricing(conn, resp, user_id)
+            signer = AzureBlobSasSigner.from_connection_string(settings.AZURE_STORAGE_CONNECTION_STRING)
+            resp["video_carousel"] = await _fetch_home_video_carousel_from_library(conn, user_id, signer)
             return _enrich_carousels_with_sas(resp)
 
         if force_refresh:
@@ -1288,6 +1707,8 @@ async def get_dashboard_home(pool: asyncpg.Pool, user_id: str, force_refresh: bo
             "runway_summary": {},
         }
         resp = await _augment_with_live_pricing(conn, resp, user_id)
+        signer = AzureBlobSasSigner.from_connection_string(settings.AZURE_STORAGE_CONNECTION_STRING)
+        resp["video_carousel"] = await _fetch_home_video_carousel_from_library(conn, user_id, signer)
         return _enrich_carousels_with_sas(resp)
 
 

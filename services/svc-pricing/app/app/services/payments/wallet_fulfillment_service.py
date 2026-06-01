@@ -229,7 +229,7 @@ async def _ensure_wallet_topup_ledger(
         country_code=str(source_metadata.get("country_code") or "") or None,
         currency=currency,
         money_amount=None,
-        channel="mobile" if str(gateway_provider or "").strip().lower() == "apple_iap" else "web",
+        channel="mobile" if str(gateway_provider or "").strip().lower() in {"apple_iap", "google_play"} else "web",
         metadata={
             "wallet_order_id": str(wallet_order_id),
             "credit_lot_id": credit_lot_id,

@@ -13,6 +13,7 @@ from app.repo.billing_entitlements_repo import BillingEntitlementsRepo
 from app.repo.entitlements_repo import EntitlementsRepo
 from app.repo.payment_plan_subscriptions_repo import PaymentPlanSubscriptionsRepo
 from app.services.reservations.reservation_service import _ensure_account_row, _ledger_event
+from app.services.entitlements.plan_credit_reconciliation_service import reconcile_included_plan_credits
 
 
 _BILLING_ENTITLEMENTS_REPO = BillingEntitlementsRepo()
@@ -298,9 +299,9 @@ async def _load_plan_from_guardrails(
             return IncludedCreditsPlan(
                 tier_code="free",
                 plan_code="free",
-                included_credits_total=0,
+                included_credits_total=100,
                 overage_allowed=False,
-                wallet_topup_allowed=False,
+                wallet_topup_allowed=True,
                 hard_stop_on_insufficient_balance=True,
             )
         raise RuntimeError(f"pricing_plan_credit_guardrails_missing:{normalized_code}")
@@ -497,6 +498,16 @@ async def sync_subscription_and_entitlement(
     fallback_user_id: Optional[str] = None,
     latest_invoice_status: Optional[str] = None,
 ) -> Optional[UUID]:
+    """Synchronize Stripe subscription state and canonical account entitlements.
+
+    Production ownership rules:
+    - payment_plan_subscriptions records the provider subscription lifecycle.
+    - billing_entitlements is the canonical current plan/tier source.
+    - pricing_user_entitlements is updated only as a compatibility cache.
+    - pricing_credit_lots is the source of truth for spendable credits.
+    - plan-credit true-ups/renewals/downgrades are delegated to
+      reconcile_included_plan_credits so top-up lots are never touched.
+    """
     metadata = _as_dict_loose(subscription.get("metadata"))
     user_id = _to_uuid_or_none(metadata.get("df_user_id") or fallback_user_id)
     if not user_id:
@@ -529,6 +540,7 @@ async def sync_subscription_and_entitlement(
 
     incoming_plan_code = _resolve_plan_code(subscription, metadata)
     incoming_plan = await _load_plan_from_guardrails(conn, plan_code=incoming_plan_code)
+    free_plan = await _load_plan_from_guardrails(conn, plan_code="free")
 
     cycle_key = None
     if current_period_start_raw is not None and current_period_end_raw is not None:
@@ -554,9 +566,40 @@ async def sync_subscription_and_entitlement(
     existing_plan_rank = _plan_rank_value(existing_plan_code)
     incoming_plan_rank = _plan_rank_value(incoming_plan.plan_code)
 
-    effective_plan = incoming_plan
+    def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            if raw.endswith("Z"):
+                raw = raw[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(raw)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+    def _pending_change_has_taken_effect() -> bool:
+        if not existing_pending_change:
+            return False
+        target = _normalize_plan_code(existing_pending_change.get("target_plan_code"))
+        if target != incoming_plan.plan_code:
+            return False
+        effective_at = _parse_iso_datetime(existing_pending_change.get("effective_at"))
+        if effective_at is None:
+            return False
+        if current_period_start_dt is not None and current_period_start_dt >= effective_at:
+            return True
+        return _now() >= effective_at
+
+    pending_change_effective = _pending_change_has_taken_effect()
+
+    effective_plan = incoming_plan if entitlement_state in {"active", "grace"} else free_plan
     pending_change: Optional[Dict[str, Any]] = None
 
+    # Default downgrade policy: period-end downgrade. If the downgrade was
+    # previously scheduled and the new billing period has begun, accept the new
+    # lower plan. Otherwise keep current paid access until period end and expose
+    # the pending change in metadata.
     if (
         entitlement_state in {"active", "grace"}
         and existing_ent
@@ -564,6 +607,7 @@ async def sync_subscription_and_entitlement(
         and existing_plan_rank > incoming_plan_rank
         and current_period_end_dt is not None
         and current_period_end_dt > _now()
+        and not pending_change_effective
     ):
         effective_plan = await _load_plan_from_guardrails(conn, plan_code=existing_plan_code)
         pending_change = _build_pending_change(
@@ -572,9 +616,9 @@ async def sync_subscription_and_entitlement(
             target_total_credits=incoming_plan.included_credits_total,
         )
 
-    if cancel_at_period_end:
+    if cancel_at_period_end and entitlement_state in {"active", "grace"}:
         specific_existing_target = _normalize_plan_code(existing_pending_change.get("target_plan_code")) if existing_pending_change else ""
-        if specific_existing_target and specific_existing_target != "free":
+        if specific_existing_target and specific_existing_target != "free" and not pending_change_effective:
             pending_change = _strip_none_values({
                 "target_plan_code": specific_existing_target,
                 "effective_at": existing_pending_change.get("effective_at") or (current_period_end_dt.isoformat() if current_period_end_dt else None),
@@ -587,12 +631,14 @@ async def sync_subscription_and_entitlement(
                 ),
             })
         elif pending_change is None:
-            pending_change = _build_pending_change("free", current_period_end_dt, target_total_credits=100)
+            pending_change = _build_pending_change("free", current_period_end_dt, target_total_credits=free_plan.included_credits_total)
+
+    effective_tier_code = _effective_tier_code(effective_plan, entitlement_state)
 
     subscription_md = {
         **_as_dict_loose(subscription),
-        "effective_plan_code": effective_plan.plan_code if entitlement_state in {"active", "grace"} else "free",
-        "effective_tier_code": _effective_tier_code(effective_plan, entitlement_state),
+        "effective_plan_code": effective_plan.plan_code,
+        "effective_tier_code": effective_tier_code,
         "latest_invoice_status": latest_invoice_status,
     }
     if pending_change is not None:
@@ -620,11 +666,10 @@ async def sync_subscription_and_entitlement(
     if entitlement_state in {"active", "grace"} and canonical_subscription_id and canonical_subscription_id != gateway_subscription_id:
         return user_id
 
-    effective_tier_code = _effective_tier_code(effective_plan, entitlement_state)
     previous_remaining = int(existing_ent.included_credits_remaining) if existing_ent else 0
     same_plan = bool(existing_ent and existing_ent.plan_code == effective_plan.plan_code)
 
-    pregrant_md = {
+    base_md = {
         **ent_md,
         "gateway_provider": "stripe",
         "gateway_subscription_id": gateway_subscription_id,
@@ -638,119 +683,37 @@ async def sync_subscription_and_entitlement(
         "current_period_end": _to_iso_or_none(current_period_end_raw),
         "cycle_key": cycle_key,
         "plan_credit_source": "pricing_plan_credit_guardrails",
-        "sync_stage": "pregrant",
+        "pending_change_effective": pending_change_effective,
+        "sync_stage": "pre_reconcile",
     }
     if pending_change is not None:
-        pregrant_md["pending_change"] = pending_change
+        base_md["pending_change"] = pending_change
 
-    if entitlement_state in {"active", "grace"}:
-        await _BILLING_ENTITLEMENTS_REPO.upsert_billing_entitlement(
-            conn,
-            user_id=user_id,
-            tier_code=effective_tier_code,
-            plan_code=effective_plan.plan_code,
-            billing_mode="subscription",
-            settlement_mode="credits",
-            included_credits_total=effective_plan.included_credits_total,
-            included_credits_remaining=max(0, int(previous_remaining if same_plan else 0)),
-            overage_allowed=effective_plan.overage_allowed,
-            wallet_topup_allowed=effective_plan.wallet_topup_allowed,
-            hard_stop_on_insufficient_balance=effective_plan.hard_stop_on_insufficient_balance,
-            source="stripe_subscription",
-            metadata_json=pregrant_md,
-        )
-        merged_user_md = {
-            **(existing_user_ent.metadata_json if existing_user_ent else {}),
-            "source": "stripe_subscription",
-            "entitlement_state": entitlement_state,
-            "plan_code": effective_plan.plan_code,
-            "gateway_provider": "stripe",
-            "gateway_subscription_id": gateway_subscription_id,
-            "gateway_customer_id": gateway_customer_id,
-            "latest_invoice_status": latest_invoice_status,
-            "plan_credit_source": "pricing_plan_credit_guardrails",
-        }
-        if pending_change is not None:
-            merged_user_md["pending_change"] = pending_change
-        await _ENTITLEMENTS_REPO.upsert_user_entitlement(
-            conn,
-            user_id=user_id,
-            tier_code=effective_tier_code,
-            billing_account_id=(existing_user_ent.billing_account_id if existing_user_ent else None),
-            metadata_json=merged_user_md,
-        )
-        await _best_effort_sync_core_user_tier(conn, user_id=user_id, tier_code=effective_tier_code)
-
-    granted_credits = 0
-    ledger_entry_id = None
-    if entitlement_state == "active":
-        granted_credits, ledger_entry_id = await _grant_cycle_credits_once(
-            conn,
-            user_id=user_id,
-            plan=effective_plan,
-            cycle_key=cycle_key,
-            gateway_subscription_id=gateway_subscription_id,
-            billing_entitlement_metadata=ent_md,
-        )
-
-    updated_md = {
-        **ent_md,
-        "gateway_provider": "stripe",
-        "gateway_subscription_id": gateway_subscription_id,
-        "gateway_customer_id": gateway_customer_id,
-        "subscription_state": status,
-        "entitlement_state": entitlement_state,
-        "plan_code": effective_plan.plan_code if entitlement_state in {"active", "grace"} else None,
-        "price_id": price_id,
-        "latest_invoice_status": latest_invoice_status,
-        "current_period_start": _to_iso_or_none(current_period_start_raw),
-        "current_period_end": _to_iso_or_none(current_period_end_raw),
-        "cycle_key": cycle_key,
-        "plan_credit_source": "pricing_plan_credit_guardrails",
-        "sync_stage": "final",
-    }
-    if pending_change is not None:
-        updated_md["pending_change"] = pending_change
-    if granted_credits > 0:
-        updated_md["last_granted_cycle_key"] = cycle_key
-        updated_md["last_granted_at"] = _now().isoformat()
-        updated_md["last_granted_credits"] = granted_credits
-        updated_md["last_grant_ledger_entry_id"] = ledger_entry_id
-
-    if entitlement_state == "active":
-        if granted_credits > 0:
-            included_remaining = effective_plan.included_credits_total
-        elif existing_ent and same_plan:
-            included_remaining = previous_remaining
-        else:
-            included_remaining = previous_remaining
-            updated_md["grant_status"] = "pending_sync"
-    elif entitlement_state == "grace":
-        included_remaining = previous_remaining
-    else:
-        included_remaining = 0
+    seed_remaining = previous_remaining if same_plan else 0
+    if entitlement_state == "grace":
+        seed_remaining = previous_remaining
 
     await _BILLING_ENTITLEMENTS_REPO.upsert_billing_entitlement(
         conn,
         user_id=user_id,
         tier_code=effective_tier_code,
-        plan_code=effective_plan.plan_code if entitlement_state in {"active", "grace"} else None,
+        plan_code=effective_plan.plan_code,
         billing_mode="subscription" if entitlement_state in {"active", "grace"} else "free",
         settlement_mode="credits",
-        included_credits_total=effective_plan.included_credits_total if entitlement_state in {"active", "grace"} else 0,
-        included_credits_remaining=max(0, int(included_remaining)),
+        included_credits_total=effective_plan.included_credits_total,
+        included_credits_remaining=max(0, int(seed_remaining)),
         overage_allowed=effective_plan.overage_allowed if entitlement_state in {"active", "grace"} else False,
-        wallet_topup_allowed=effective_plan.wallet_topup_allowed if entitlement_state in {"active", "grace"} else True,
-        hard_stop_on_insufficient_balance=effective_plan.hard_stop_on_insufficient_balance if entitlement_state in {"active", "grace"} else True,
-        source="stripe_subscription",
-        metadata_json=updated_md,
+        wallet_topup_allowed=effective_plan.wallet_topup_allowed,
+        hard_stop_on_insufficient_balance=effective_plan.hard_stop_on_insufficient_balance,
+        source="stripe_subscription" if entitlement_state in {"active", "grace"} else "stripe_subscription_inactive",
+        metadata_json=base_md,
     )
 
     merged_user_md = {
         **(existing_user_ent.metadata_json if existing_user_ent else {}),
         "source": "stripe_subscription",
         "entitlement_state": entitlement_state,
-        "plan_code": effective_plan.plan_code if entitlement_state in {"active", "grace"} else "free",
+        "plan_code": effective_plan.plan_code,
         "gateway_provider": "stripe",
         "gateway_subscription_id": gateway_subscription_id,
         "gateway_customer_id": gateway_customer_id,
@@ -759,6 +722,7 @@ async def sync_subscription_and_entitlement(
     }
     if pending_change is not None:
         merged_user_md["pending_change"] = pending_change
+
     await _ENTITLEMENTS_REPO.upsert_user_entitlement(
         conn,
         user_id=user_id,
@@ -766,160 +730,59 @@ async def sync_subscription_and_entitlement(
         billing_account_id=(existing_user_ent.billing_account_id if existing_user_ent else None),
         metadata_json=merged_user_md,
     )
-
     await _best_effort_sync_core_user_tier(conn, user_id=user_id, tier_code=effective_tier_code)
-    return user_id
 
+    # Reconcile only after the canonical billing entitlement has been persisted.
+    # Do not grant fresh included credits for invoice.payment_failed or grace states.
+    # Inactive/canceled subscriptions reconcile to the Free cap, reducing only
+    # unreserved included credits and never touching purchased/top-up lots.
+    should_reconcile = False
+    reconcile_source = "stripe_subscription"
+    if entitlement_state == "active" and str(latest_invoice_status or "").strip().lower() != "payment_failed":
+        should_reconcile = True
+    elif entitlement_state == "inactive":
+        should_reconcile = True
+        reconcile_source = "stripe_subscription_inactive"
 
-    status = _normalize_subscription_state(subscription.get("status"))
-    entitlement_state = _entitlement_state_from_subscription(status)
-    cancel_at_period_end = bool(subscription.get("cancel_at_period_end") or False)
-
-    current_period_start_raw, current_period_end_raw = _extract_subscription_period_bounds(subscription)
-    current_period_start_dt = _to_datetime_or_none(current_period_start_raw)
-    current_period_end_dt = _to_datetime_or_none(current_period_end_raw)
-
-    if entitlement_state == "active" and (
-        current_period_start_raw in (None, "") or current_period_end_raw in (None, "")
-    ):
-        raise RuntimeError(f"stripe_subscription_missing_billing_period:{gateway_subscription_id}")
-
-    price_id = None
-    items = _as_dict_loose(subscription.get("items"))
-    data = items.get("data") or []
-    if data:
-        price = _as_dict_loose(_as_dict_loose(data[0]).get("price"))
-        price_id = str(price.get("id") or "").strip() or None
-
-    plan_code = _resolve_plan_code(subscription, metadata)
-    plan = await _load_plan_from_guardrails(conn, plan_code=plan_code)
-
-    await _PAYMENT_PLAN_SUBSCRIPTIONS_REPO.upsert_from_gateway_subscription(
-        conn,
-        user_id=user_id,
-        gateway_provider="stripe",
-        gateway_customer_id=gateway_customer_id,
-        gateway_subscription_id=gateway_subscription_id,
-        gateway_price_id=price_id,
-        plan_code=plan.plan_code,
-        subscription_state=status,
-        current_period_start=current_period_start_dt,
-        current_period_end=current_period_end_dt,
-        cancel_at_period_end=cancel_at_period_end,
-        latest_invoice_id=_extract_latest_invoice_id(subscription),
-        latest_invoice_status=str(latest_invoice_status or "").strip() or None,
-        entitlement_state=entitlement_state,
-        metadata_json=subscription,
-    )
-
-    canonical_subscription_id = await _select_canonical_active_subscription_id(
-        conn,
-        user_id=user_id,
-    )
-
-    if entitlement_state in {"active", "grace"}:
-        if canonical_subscription_id and canonical_subscription_id != gateway_subscription_id:
-            return user_id
-
-    effective_tier_code = _effective_tier_code(plan, entitlement_state)
-
-    cycle_key = None
-    if current_period_start_raw is not None and current_period_end_raw is not None:
-        cycle_key = f"{gateway_subscription_id}:{current_period_start_raw}:{current_period_end_raw}"
-
-    existing_ent_row = await conn.fetchrow(
-        "select metadata_json from billing_entitlements where user_id = $1 for update",
-        user_id,
-    )
-    existing_ent = await _BILLING_ENTITLEMENTS_REPO.get_active_by_user_id(conn, user_id=user_id)
-    ent_md = _as_dict_loose(existing_ent_row["metadata_json"]) if existing_ent_row else (
-        existing_ent.metadata_json if existing_ent else {}
-    )
-
-    granted_credits = 0
-    ledger_entry_id = None
-    if entitlement_state == "active":
-        granted_credits, ledger_entry_id = await _grant_cycle_credits_once(
+    if should_reconcile:
+        reconcile_result = await reconcile_included_plan_credits(
             conn,
             user_id=user_id,
-            plan=plan,
-            cycle_key=cycle_key,
-            gateway_subscription_id=gateway_subscription_id,
-            billing_entitlement_metadata=ent_md,
+            plan_code=effective_plan.plan_code,
+            tier_code=effective_tier_code,
+            included_credit_cap=effective_plan.included_credits_total,
+            cycle_key=cycle_key or f"stripe:{gateway_subscription_id}:{effective_plan.plan_code}",
+            current_period_start=current_period_start_dt,
+            current_period_end=current_period_end_dt,
+            source=reconcile_source,
+            metadata_json={
+                "provider": "stripe",
+                "gateway_subscription_id": gateway_subscription_id,
+                "gateway_customer_id": gateway_customer_id,
+                "price_id": price_id,
+                "latest_invoice_status": latest_invoice_status,
+                "subscription_state": status,
+                "entitlement_state": entitlement_state,
+                "incoming_plan_code": incoming_plan.plan_code,
+                "effective_plan_code": effective_plan.plan_code,
+                "pending_change": pending_change,
+            },
+        )
+        await conn.execute(
+            """
+            update billing_entitlements
+            set metadata_json = coalesce(metadata_json, '{}'::jsonb)
+                  || jsonb_build_object(
+                       'sync_stage', 'final',
+                       'last_reconcile_result', $2::jsonb
+                     ),
+                updated_at = now()
+            where user_id = $1
+              and effective_from <= now()
+              and (effective_to is null or effective_to > now())
+            """,
+            user_id,
+            json.dumps(reconcile_result, default=str),
         )
 
-    updated_md = {
-        **ent_md,
-        "gateway_provider": "stripe",
-        "gateway_subscription_id": gateway_subscription_id,
-        "gateway_customer_id": gateway_customer_id,
-        "subscription_state": status,
-        "entitlement_state": entitlement_state,
-        "plan_code": plan.plan_code,
-        "price_id": price_id,
-        "latest_invoice_status": latest_invoice_status,
-        "current_period_start": _to_iso_or_none(current_period_start_raw),
-        "current_period_end": _to_iso_or_none(current_period_end_raw),
-        "cycle_key": cycle_key,
-        "plan_credit_source": "pricing_plan_credit_guardrails",
-    }
-    if granted_credits > 0:
-        updated_md["last_granted_cycle_key"] = cycle_key
-        updated_md["last_granted_at"] = _now().isoformat()
-        updated_md["last_granted_credits"] = granted_credits
-        updated_md["last_grant_ledger_entry_id"] = ledger_entry_id
-
-    previous_remaining = int(existing_ent.included_credits_remaining) if existing_ent else 0
-    same_plan = bool(existing_ent and existing_ent.plan_code == plan.plan_code)
-
-    if entitlement_state == "active":
-        if granted_credits > 0:
-            included_remaining = plan.included_credits_total
-        elif existing_ent and same_plan:
-            included_remaining = previous_remaining
-        else:
-            included_remaining = previous_remaining
-            updated_md["grant_status"] = "pending_sync"
-    elif entitlement_state == "grace":
-        included_remaining = previous_remaining
-    else:
-        included_remaining = 0
-
-    await _BILLING_ENTITLEMENTS_REPO.upsert_billing_entitlement(
-        conn,
-        user_id=user_id,
-        tier_code=effective_tier_code,
-        plan_code=plan.plan_code if entitlement_state in {"active", "grace"} else None,
-        billing_mode="subscription" if entitlement_state in {"active", "grace"} else "free",
-        settlement_mode="credits",
-        included_credits_total=plan.included_credits_total if entitlement_state in {"active", "grace"} else 0,
-        included_credits_remaining=max(0, int(included_remaining)),
-        overage_allowed=plan.overage_allowed if entitlement_state in {"active", "grace"} else False,
-        wallet_topup_allowed=plan.wallet_topup_allowed if entitlement_state in {"active", "grace"} else True,
-        hard_stop_on_insufficient_balance=plan.hard_stop_on_insufficient_balance if entitlement_state in {"active", "grace"} else True,
-        source="stripe_subscription",
-        metadata_json=updated_md,
-    )
-
-    existing_user_ent = await _ENTITLEMENTS_REPO.get_user_entitlement(conn, user_id=user_id)
-    merged_user_md = {
-        **(existing_user_ent.metadata_json if existing_user_ent else {}),
-        "source": "stripe_subscription",
-        "entitlement_state": entitlement_state,
-        "plan_code": plan.plan_code,
-        "gateway_provider": "stripe",
-        "gateway_subscription_id": gateway_subscription_id,
-        "gateway_customer_id": gateway_customer_id,
-        "latest_invoice_status": latest_invoice_status,
-        "plan_credit_source": "pricing_plan_credit_guardrails",
-    }
-    await _ENTITLEMENTS_REPO.upsert_user_entitlement(
-        conn,
-        user_id=user_id,
-        tier_code=effective_tier_code,
-        billing_account_id=(existing_user_ent.billing_account_id if existing_user_ent else None),
-        metadata_json=merged_user_md,
-    )
-
-    await _best_effort_sync_core_user_tier(conn, user_id=user_id, tier_code=effective_tier_code)
     return user_id

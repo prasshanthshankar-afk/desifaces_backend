@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -95,6 +96,121 @@ def _as_dict_loose(value: Any) -> Dict[str, Any]:
             return {}
     return {}
 
+
+
+
+def _pricing_resp_as_dict(resp: Any) -> Dict[str, Any]:
+    if resp is None:
+        return {}
+    if isinstance(resp, dict):
+        return dict(resp)
+    for method_name in ("model_dump", "dict"):
+        method = getattr(resp, method_name, None)
+        if callable(method):
+            try:
+                data = method()
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+    out: Dict[str, Any] = {}
+    for key in (
+        "id",
+        "status",
+        "reservation_id",
+        "reservation_status",
+        "quote_id",
+        "variant_code",
+        "sku_code",
+        "leaf_sku_code",
+        "estimated_units",
+        "reserved_units",
+        "actual_units",
+        "billed_units",
+        "released_units",
+        "amount",
+        "estimated_amount",
+        "final_amount",
+        "currency",
+        "billing_mode",
+        "billing_account_id",
+        "settlement_mode",
+        "pricing_mode",
+        "entitlement_source",
+        "entitlement_reason",
+        "tier_code",
+        "ledger_entry_id",
+        "ledger_id",
+        "ledger_event_id",
+        "invoice_id",
+        "final_charged_credits",
+        "final_charged_money",
+        "charged_credits",
+        "money_amount",
+        "credits_delta",
+        "meta",
+        "metadata",
+    ):
+        if hasattr(resp, key):
+            try:
+                out[key] = getattr(resp, key)
+            except Exception:
+                pass
+    return out
+
+
+def _pricing_resp_get(resp: Any, key: str, default: Any = None) -> Any:
+    data = _pricing_resp_as_dict(resp)
+    candidates = [
+        data,
+        _as_dict_loose(data.get("pricing")),
+        _as_dict_loose(data.get("data")),
+        _as_dict_loose(data.get("reservation")),
+        _as_dict_loose(data.get("ledger")),
+        _as_dict_loose(data.get("meta")),
+        _as_dict_loose(data.get("metadata")),
+    ]
+    aliases = {
+        "ledger_entry_id": ("ledger_entry_id", "ledger_id", "ledger_event_id"),
+        "billed_units": ("billed_units", "final_charged_credits", "charged_credits", "credits_delta"),
+        "actual_units": ("actual_units", "billed_units", "final_charged_credits", "charged_credits", "credits_delta"),
+        "final_amount": ("final_amount", "final_charged_money", "money_amount", "amount"),
+        "amount": ("amount", "estimated_amount", "final_charged_money", "money_amount"),
+        "reservation_status": ("reservation_status", "status"),
+        "commit_status": ("commit_status", "status"),
+    }.get(key, (key,))
+    for src in candidates:
+        if not isinstance(src, dict):
+            continue
+        for alias in aliases:
+            value = src.get(alias)
+            if value not in (None, "", {}, []):
+                return value
+    return default
+
+
+async def _persist_reservation_receipt_snapshot(
+    conn,
+    *,
+    reservation_id: Optional[str],
+    receipt: Dict[str, Any],
+) -> None:
+    rid = _safe_str(reservation_id)
+    if not rid:
+        return
+    try:
+        await conn.execute(
+            """
+            UPDATE public.pricing_credit_reservations
+            SET quote_json = COALESCE(quote_json, '{}'::jsonb) || $2::jsonb,
+                updated_at = now()
+            WHERE id = $1::uuid
+            """,
+            rid,
+            _json_dumps(receipt or {}),
+        )
+    except Exception:
+        pricing_logger.exception("longform_reservation_receipt_snapshot_failed", extra={"reservation_id": rid})
 
 
 def _safe_int(v: Any, default: int = 0) -> int:
@@ -539,8 +655,9 @@ def _normalize_committed_summary(
     original_display_estimate: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    After a job is committed, the user-visible estimate must collapse to the
-    final billed amount. Preserve the original estimate only for audit/debug.
+    Build the user-visible run receipt from the committed pricing payload.
+    This summary is intentionally redundant with pricing because older frontend
+    cards read some fields from pricing_summary and some from pricing.
     """
     out = dict(summary or {})
     amount = _safe_str(committed.get("final_amount")) or _safe_str(committed.get("amount"))
@@ -550,11 +667,39 @@ def _normalize_committed_summary(
         out["display_final"] = display
         out["display_estimate"] = display
         out["display_delta"] = f"{currency} 0.00"
-        out["display_note"] = "Final charge recorded after execution."
         if original_display_estimate and original_display_estimate != display:
             out["original_display_estimate"] = original_display_estimate
-    return out
+    out["display_note"] = out.get("display_note") or "Final charge recorded after execution."
 
+    for key in (
+        "state",
+        "estimated_units",
+        "reserved_units",
+        "actual_units",
+        "billed_units",
+        "released_units",
+        "reservation_id",
+        "reservation_status",
+        "commit_status",
+        "ledger_entry_id",
+        "billing_mode",
+        "billing_account_id",
+        "settlement_mode",
+        "pricing_mode",
+        "currency",
+        "amount",
+        "estimated_amount",
+        "final_amount",
+        "variant_code",
+        "sku_code",
+        "leaf_sku_code",
+        "service_name",
+        "service_action",
+    ):
+        value = committed.get(key)
+        if value not in (None, "", {}, []):
+            out[key] = value
+    return out
 
 
 def _json_dumps(value: Any) -> str:
@@ -1355,22 +1500,121 @@ async def commit_longform_pricing_for_job(conn, *, job_row: Dict[str, Any], fina
         )
     )
     artifact = make_committed_artifact(resp, base_pricing=pricing, actual_units=units, meta=commit_meta)
-    committed = dict(artifact.get("pricing") or {})
+    artifact_pricing = _as_dict_loose(artifact.get("pricing"))
+    artifact_summary = _as_dict_loose(artifact.get("pricing_summary"))
+
+    committed = dict(pricing or {})
+    committed.update(artifact_pricing)
+
+    commit_status = _safe_str(_pricing_resp_get(resp, "commit_status")) or _safe_str(_pricing_resp_get(resp, "reservation_status")) or _safe_str(_pricing_resp_get(resp, "status")) or "committed"
+    actual_units = (
+        _safe_str(_pricing_resp_get(resp, "actual_units"))
+        or _safe_str(_pricing_resp_get(resp, "billed_units"))
+        or _safe_str(units)
+    )
+    billed_units = (
+        _safe_str(_pricing_resp_get(resp, "billed_units"))
+        or _safe_str(_pricing_resp_get(resp, "actual_units"))
+        or actual_units
+        or _safe_str(units)
+    )
+    final_amount = (
+        _safe_str(_pricing_resp_get(resp, "final_amount"))
+        or _safe_str(committed.get("final_amount"))
+        or _safe_str(committed.get("amount"))
+    )
+    amount = (
+        _safe_str(_pricing_resp_get(resp, "amount"))
+        or _safe_str(committed.get("amount"))
+        or final_amount
+    )
+    settlement_mode = (
+        _safe_str(_pricing_resp_get(resp, "settlement_mode"))
+        or _safe_str(committed.get("settlement_mode"))
+        or ("credits" if billed_units else None)
+    )
+
     committed["enabled"] = True
     committed["state"] = "committed"
-    committed["quote_id"] = committed.get("quote_id") or pricing.get("quote_id")
+    committed["reservation_id"] = _safe_str(_pricing_resp_get(resp, "reservation_id")) or reservation_id
+    committed["quote_id"] = _safe_str(_pricing_resp_get(resp, "quote_id")) or committed.get("quote_id") or pricing.get("quote_id")
     committed["preview_fingerprint"] = committed.get("preview_fingerprint") or pricing.get("preview_fingerprint")
-    committed["variant_code"] = effective_variant_code or pricing.get("variant_code")
-    committed["sku_code"] = effective_leaf_sku_code or pricing.get("leaf_sku_code") or pricing.get("sku_code")
-    committed["leaf_sku_code"] = effective_leaf_sku_code or pricing.get("leaf_sku_code")
+    committed["variant_code"] = _safe_str(_pricing_resp_get(resp, "variant_code")) or effective_variant_code or pricing.get("variant_code")
+    committed["sku_code"] = _safe_str(_pricing_resp_get(resp, "sku_code")) or effective_leaf_sku_code or pricing.get("leaf_sku_code") or pricing.get("sku_code")
+    committed["leaf_sku_code"] = _safe_str(_pricing_resp_get(resp, "leaf_sku_code")) or effective_leaf_sku_code or pricing.get("leaf_sku_code") or committed.get("sku_code")
+    committed["commit_status"] = commit_status
+    committed["reservation_status"] = commit_status
+    committed["estimated_units"] = _safe_str(committed.get("estimated_units")) or _safe_str(pricing.get("estimated_units")) or _safe_str(units)
+    committed["reserved_units"] = _safe_str(committed.get("reserved_units")) or _safe_str(pricing.get("reserved_units")) or committed["estimated_units"]
+    committed["actual_units"] = actual_units
+    committed["billed_units"] = billed_units
+    committed["amount"] = amount
+    committed["estimated_amount"] = _safe_str(committed.get("estimated_amount")) or amount
+    committed["final_amount"] = final_amount or amount
+    committed["currency"] = _safe_str(_pricing_resp_get(resp, "currency")) or _safe_str(committed.get("currency")) or "USD"
+    committed["billing_mode"] = _safe_str(_pricing_resp_get(resp, "billing_mode")) or _safe_str(committed.get("billing_mode"))
+    committed["billing_account_id"] = _safe_str(_pricing_resp_get(resp, "billing_account_id")) or _safe_str(committed.get("billing_account_id"))
+    committed["settlement_mode"] = settlement_mode
+    committed["pricing_mode"] = _safe_str(_pricing_resp_get(resp, "pricing_mode")) or _safe_str(committed.get("pricing_mode"))
+    committed["entitlement_source"] = _safe_str(_pricing_resp_get(resp, "entitlement_source")) or _safe_str(committed.get("entitlement_source"))
+    committed["entitlement_reason"] = _safe_str(_pricing_resp_get(resp, "entitlement_reason")) or _safe_str(committed.get("entitlement_reason"))
+    committed["tier_code"] = _safe_str(_pricing_resp_get(resp, "tier_code")) or _safe_str(committed.get("tier_code"))
+    committed["ledger_entry_id"] = _safe_str(_pricing_resp_get(resp, "ledger_entry_id")) or _safe_str(committed.get("ledger_entry_id"))
+    committed["service_name"] = "svc-fusion-extension"
+    committed["service_action"] = service_action
+
+    meta_block = dict(_as_dict_loose(committed.get("meta")))
+    meta_block.update(commit_meta)
+    committed["meta"] = meta_block
+
     original_display_estimate = _safe_str(_as_dict_loose(pricing.get("summary")).get("display_estimate")) or _safe_str(_extract_pricing_summary_view(tags).get("display_estimate"))
     summary = _normalize_committed_summary(
         committed,
-        artifact.get("pricing_summary") or build_pricing_summary(committed),
+        artifact_summary or build_pricing_summary(committed),
         original_display_estimate=original_display_estimate,
     )
     committed["summary"] = dict(summary)
-    committed["estimated_units"] = committed.get("actual_units") or committed.get("estimated_units")
+
+    await _persist_reservation_receipt_snapshot(
+        conn,
+        reservation_id=reservation_id,
+        receipt={
+            "state": "committed",
+            "status": commit_status,
+            "reservation_status": commit_status,
+            "commit_status": commit_status,
+            "reservation_id": reservation_id,
+            "actual_units": committed.get("actual_units"),
+            "billed_units": committed.get("billed_units"),
+            "estimated_units": committed.get("estimated_units"),
+            "reserved_units": committed.get("reserved_units"),
+            "settlement_mode": committed.get("settlement_mode"),
+            "billing_mode": committed.get("billing_mode"),
+            "billing_account_id": committed.get("billing_account_id"),
+            "pricing_mode": committed.get("pricing_mode"),
+            "ledger_entry_id": committed.get("ledger_entry_id"),
+            "final_amount": committed.get("final_amount"),
+            "amount": committed.get("amount"),
+            "currency": committed.get("currency"),
+            "variant_code": committed.get("variant_code"),
+            "sku_code": committed.get("sku_code"),
+            "leaf_sku_code": committed.get("leaf_sku_code"),
+            "service_name": committed.get("service_name"),
+            "service_action": committed.get("service_action"),
+            "summary": summary,
+        },
+    )
+
+    pricing_logger.info(
+        "longform_pricing_commit_receipt job_id=%s reservation_id=%s state=%s actual_units=%s billed_units=%s settlement=%s ledger_entry_id=%s",
+        job_row["id"],
+        reservation_id,
+        committed.get("state"),
+        committed.get("actual_units"),
+        committed.get("billed_units"),
+        committed.get("settlement_mode"),
+        committed.get("ledger_entry_id"),
+    )
     await _backfill_reservation_leaf_sku(
         conn,
         reservation_id=reservation_id,

@@ -618,24 +618,164 @@ class FusionOrchestrator:
         return f"Provider {provider_name} is not available."
 
 
-    def _is_internal_child_request_payload(self, payload_json: Dict[str, Any]) -> bool:
-        billing_context = self._coerce_dict(payload_json.get("billing_context"))
-        mode = str(billing_context.get("mode") or "").strip().lower()
-        if mode == "internal_child":
+    @staticmethod
+    def _truthy_internal_child_marker(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        s = str(value or "").strip().lower()
+        return s in {"1", "true", "yes", "y", "on", "internal", "internal_child", "suppressed"}
+
+    def _context_has_internal_child_marker(self, ctx: Optional[Dict[str, Any]]) -> bool:
+        ctx = self._coerce_dict(ctx)
+        if not ctx:
+            return False
+
+        mode = str(
+            ctx.get("mode")
+            or ctx.get("billing_mode")
+            or ctx.get("pricing_mode")
+            or ctx.get("state")
+            or ""
+        ).strip().lower()
+        if mode in {"internal_child", "internal", "suppressed"}:
             return True
-        return bool(billing_context.get("pricing_suppressed"))
+
+        marker_keys = (
+            "pricing_suppressed",
+            "suppress_pricing",
+            "skip_pricing",
+            "disable_pricing",
+            "is_internal_child",
+            "internal_child",
+            "child_job_of_billable_longform_parent",
+        )
+        if any(self._truthy_internal_child_marker(ctx.get(k)) for k in marker_keys):
+            return True
+
+        parent_ref = (
+            ctx.get("parent_longform_job_id")
+            or ctx.get("parent_story_job_id")
+            or ctx.get("billing_parent_job_id")
+            or ctx.get("parent_job_id")
+        )
+        child_ref = (
+            self._truthy_internal_child_marker(ctx.get("internal_job"))
+            or self._truthy_internal_child_marker(ctx.get("child_job"))
+            or self._truthy_internal_child_marker(ctx.get("bill_to_parent"))
+            or "child_job_of_billable_longform_parent" in str(ctx.get("reason") or "").lower()
+        )
+        if parent_ref and child_ref:
+            return True
+
+        if ctx.get("pricing_enabled") is False and parent_ref:
+            return True
+
+        return False
+
+    def _iter_internal_child_contexts(self, payload_json: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return all request sub-dicts that may carry internal-child pricing markers.
+
+        longform_worker intentionally duplicates suppression markers in provider_options
+        and tags because older svc-fusion API layers may strip unknown top-level fields.
+        The orchestrator must therefore inspect nested request blocks, not only the
+        top-level billing_context.
+        """
+        root = self._coerce_dict(payload_json)
+        out: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+
+        def visit(value: Any, depth: int = 0) -> None:
+            if depth > 5:
+                return
+            if isinstance(value, str):
+                value = self._coerce_dict(value)
+            if isinstance(value, dict):
+                ident = id(value)
+                if ident in seen:
+                    return
+                seen.add(ident)
+                out.append(value)
+                for key in (
+                    "billing_context",
+                    "pricing_context",
+                    "billing",
+                    "pricing",
+                    "pricing_confirmation",
+                    "provider_options",
+                    "tags",
+                    "meta",
+                    "metadata",
+                    "input_json",
+                ):
+                    if key in value:
+                        visit(value.get(key), depth + 1)
+                return
+            if isinstance(value, list):
+                for item in value[:20]:
+                    visit(item, depth + 1)
+
+        visit(root)
+        return out
+
+    def _extract_internal_child_billing_context(self, payload_json: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        allowed_keys = {
+            "mode",
+            "pricing_suppressed",
+            "suppress_pricing",
+            "skip_pricing",
+            "disable_pricing",
+            "pricing_enabled",
+            "internal_job",
+            "child_job",
+            "is_internal_child",
+            "child_job_of_billable_longform_parent",
+            "bill_to_parent",
+            "parent_service",
+            "parent_story_job_id",
+            "parent_longform_job_id",
+            "parent_job_id",
+            "billing_parent_job_id",
+            "segment_id",
+            "child_role",
+            "longform_profile",
+            "reason",
+            "state",
+            "billing_mode",
+            "settlement_mode",
+            "pricing_mode",
+        }
+        merged: Dict[str, Any] = {}
+        for ctx in self._iter_internal_child_contexts(payload_json):
+            if not self._context_has_internal_child_marker(ctx):
+                continue
+            for key in allowed_keys:
+                if key in ctx and key not in merged:
+                    merged[key] = ctx[key]
+            for nested_key in ("billing_context", "pricing_context", "billing", "pricing", "pricing_confirmation", "meta"):
+                nested = self._coerce_dict(ctx.get(nested_key))
+                if not nested:
+                    continue
+                for key in allowed_keys:
+                    if key in nested and key not in merged:
+                        merged[key] = nested[key]
+        return merged
+
+    def _is_internal_child_request_payload(self, payload_json: Dict[str, Any]) -> bool:
+        for ctx in self._iter_internal_child_contexts(payload_json):
+            if self._context_has_internal_child_marker(ctx):
+                return True
+        return False
 
     def _is_internal_child_pricing(self, pricing: Optional[Dict[str, Any]]) -> bool:
         pricing = self._coerce_dict(pricing)
-        mode = str(pricing.get("billing_mode") or "").strip().lower()
-        if mode == "internal_child":
-            return True
-        if bool(pricing.get("pricing_suppressed")):
+        if not pricing:
+            return False
+        if self._context_has_internal_child_marker(pricing):
             return True
         meta = self._coerce_dict(pricing.get("meta"))
-        billing_context = self._coerce_dict(meta.get("billing_context"))
-        child_mode = str(billing_context.get("mode") or "").strip().lower()
-        return child_mode == "internal_child" or bool(billing_context.get("pricing_suppressed"))
+        if meta and self._is_internal_child_request_payload(meta):
+            return True
+        return False
 
     def _build_internal_child_pricing_block(
         self,
@@ -645,17 +785,27 @@ class FusionOrchestrator:
         provider_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         provider_name = provider_name or self._resolve_provider_name(getattr(req, "provider", None))
-        billing_context = self._coerce_dict(payload_json.get("billing_context"))
+        billing_context = self._extract_internal_child_billing_context(payload_json)
         parent_story_job_id = str(
             billing_context.get("parent_story_job_id")
+            or billing_context.get("parent_longform_job_id")
+            or billing_context.get("billing_parent_job_id")
+            or billing_context.get("parent_job_id")
             or payload_json.get("parent_story_job_id")
+            or payload_json.get("parent_longform_job_id")
+            or payload_json.get("billing_parent_job_id")
+            or payload_json.get("parent_job_id")
             or ""
         ).strip() or None
+        segment_id = str(billing_context.get("segment_id") or payload_json.get("segment_id") or "").strip() or None
         render_kind = str(payload_json.get("render_kind") or "child_render").strip() or "child_render"
         return {
             "enabled": False,
             "pricing_suppressed": True,
-            "state": "internal_child",
+            "suppress_pricing": True,
+            "suppressed": True,
+            "pricing_enabled": False,
+            "state": "suppressed",
             "service_name": "svc-fusion",
             "service_action": "fusion.child.render",
             "variant_code": None,
@@ -681,6 +831,16 @@ class FusionOrchestrator:
             "entitlement_reason": "parent_storytelling_job",
             "tier_code": None,
             "disabled_reason": None,
+            "parent_story_job_id": parent_story_job_id,
+            "parent_longform_job_id": str(
+                billing_context.get("parent_longform_job_id")
+                or billing_context.get("billing_parent_job_id")
+                or parent_story_job_id
+                or ""
+            ) or None,
+            "billing_parent_job_id": str(billing_context.get("billing_parent_job_id") or parent_story_job_id or "") or None,
+            "segment_id": segment_id,
+            "child_role": str(billing_context.get("child_role") or "") or None,
             "meta": {
                 "provider": provider_name,
                 "voice_mode": req.voice_mode.value,
@@ -688,6 +848,15 @@ class FusionOrchestrator:
                 "render_kind": render_kind,
                 "parent_service": str(billing_context.get("parent_service") or "svc-fusion-extension"),
                 "parent_story_job_id": parent_story_job_id,
+                "parent_longform_job_id": str(
+                    billing_context.get("parent_longform_job_id")
+                    or billing_context.get("billing_parent_job_id")
+                    or parent_story_job_id
+                    or ""
+                ) or None,
+                "billing_parent_job_id": str(billing_context.get("billing_parent_job_id") or parent_story_job_id or "") or None,
+                "segment_id": segment_id,
+                "child_role": str(billing_context.get("child_role") or "") or None,
                 "billing_context": billing_context,
                 "has_face_artifact_id": bool(getattr(req, "face_artifact_id", None)),
                 "has_audio_artifact_id": bool(
@@ -2369,6 +2538,24 @@ class FusionOrchestrator:
         try:
             pricing = await self._load_latest_pricing(job_id)
             internal_child = self._is_internal_child_pricing(pricing) or self._is_internal_child_request_payload(payload_json)
+
+            # Backstop for longform child jobs created through older route/client shapes:
+            # if the payload carries nested suppression markers but the persisted pricing
+            # block is still a normal billable block, rewrite it before enforcing reserve.
+            if internal_child and not self._is_internal_child_pricing(pricing):
+                pricing = self._build_internal_child_pricing_block(
+                    req=req,
+                    payload_json=payload_json,
+                    provider_name=provider_name,
+                )
+                await self._persist_pricing_block(job_id, pricing)
+                logger.info(
+                    "fusion.run_job_internal_child_pricing_suppressed job_id=%s provider=%s parent_job_id=%s segment_id=%s",
+                    job_id,
+                    provider_name,
+                    pricing.get("parent_longform_job_id") or pricing.get("billing_parent_job_id"),
+                    pricing.get("segment_id"),
+                )
 
             if (not internal_child) and self._pricing_required() and not self._pricing_enabled():
                 reason = self._pricing_disabled_reason()

@@ -417,8 +417,19 @@ services:
       DF_APPLE_IAP_ENABLE: "true"
       DF_APPLE_IAP_VERIFICATION_MODE: "decode_only"
 
+      # Google Play Billing / Android IAP verification.
+      # The JSON file is mounted below as read-only and must never be committed to Git.
+      DF_GOOGLE_PLAY_IAP_ENABLE: "${DF_GOOGLE_PLAY_IAP_ENABLE:-1}"
+      GOOGLE_PLAY_PACKAGE_NAME: "${GOOGLE_PLAY_PACKAGE_NAME:-ai.desifaces.app}"
+      GOOGLE_PLAY_VALIDATE_PURCHASES: "${GOOGLE_PLAY_VALIDATE_PURCHASES:-1}"
+      GOOGLE_PLAY_ACKNOWLEDGE_PURCHASES: "${GOOGLE_PLAY_ACKNOWLEDGE_PURCHASES:-1}"
+      GOOGLE_PLAY_VERIFICATION_MODE: "${GOOGLE_PLAY_VERIFICATION_MODE:-google_api}"
+      GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH: "${GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH:-/run/secrets/google_play_service_account.json}"
+
       DF_PRICING_INTERNAL_BEARER: ${DF_PRICING_INTERNAL_BEARER}
       DF_PRICING_ALLOWED_SERVICES: ${DF_PRICING_ALLOWED_SERVICES:-svc-core,svc-face,svc-fusion,svc-fusion-extension,svc-audio,svc-commerce,svc-music,svc-marketing}
+    volumes:
+      - /opt/desifaces/secrets/google_play_service_account.json:/run/secrets/google_play_service_account.json:ro
     expose: ["8009"]
     ports: ["8009:8009"]
     command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8009}"]

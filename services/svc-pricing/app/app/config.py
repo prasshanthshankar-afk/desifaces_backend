@@ -88,6 +88,16 @@ class Settings(BaseSettings):
     DF_PAYMENT_SUCCESS_URL_BASE: str = Field(default="")
     DF_PAYMENT_CANCEL_URL_BASE: str = Field(default="")
 
+    # Google Play Billing / Android IAP.
+    DF_GOOGLE_PLAY_IAP_ENABLE: bool = Field(default=False)
+    GOOGLE_PLAY_PACKAGE_NAME: str = Field(default="ai.desifaces.app")
+    GOOGLE_PLAY_VALIDATE_PURCHASES: bool = Field(default=True)
+    GOOGLE_PLAY_ACKNOWLEDGE_PURCHASES: bool = Field(default=True)
+    GOOGLE_PLAY_VERIFICATION_MODE: str = Field(default="google_api")
+    GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH: str = Field(default="")
+    GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: str = Field(default="")
+    GOOGLE_PLAY_PUBSUB_AUDIENCE: str = Field(default="")
+
     def normalize_currency(self, value: Optional[str]) -> str:
         return (value or "").strip().upper()
 

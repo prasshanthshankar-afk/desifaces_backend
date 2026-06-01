@@ -28,6 +28,13 @@ from app.services.payments_catalog_service import (
     fetch_topup_pack_rows,
 )
 
+from app.services.payments_gateway_catalog import (
+    enrich_plan_catalog_item_for_gateways,
+    enrich_topup_catalog_item_for_gateways,
+    load_apple_subscription_product_map,
+    load_apple_topup_product_map,
+)
+
 from app.schemas.apple_iap import (
     AppleCreditsConfirmIn,
     AppleCreditsConfirmOut,
@@ -36,29 +43,26 @@ from app.schemas.apple_iap import (
     AppleSubscriptionConfirmIn,
     AppleSubscriptionConfirmOut,
 )
+from app.schemas.google_play import (
+    GoogleCreditsConfirmIn,
+    GoogleCreditsConfirmOut,
+    GoogleNotificationIn,
+    GoogleNotificationOut,
+    GoogleSubscriptionConfirmIn,
+    GoogleSubscriptionConfirmOut,
+)
 from app.services.apple_iap_service import (
     confirm_credit_purchase as apple_confirm_credit_purchase,
     confirm_subscription_purchase as apple_confirm_subscription_purchase,
     process_notification as apple_process_notification,
 )
-from app.services.payments_credit_display import build_canonical_billing_display
-from app.services.payments_guardrails import (
-    TopupGuardrailError,
-    fetch_plan_credit_guardrail,
-    fetch_purchased_wallet_totals,
-    validate_wallet_topup_allowed,
+from app.services.google_play_iap_service import (
+    confirm_credit_purchase as google_confirm_credit_purchase,
+    confirm_subscription_purchase as google_confirm_subscription_purchase,
+    process_notification as google_process_notification,
 )
 
 router = APIRouter(prefix="/api/payments", tags=["payments"])
-
-def _to_decimal_or_none(value: Any) -> Optional[Decimal]:
-    if value is None or value == "":
-        return None
-    try:
-        return Decimal(str(value))
-    except Exception:
-        return None
-
 
 def _notifications_base_url() -> str:
     return str(
@@ -180,6 +184,330 @@ def _as_dict_deep_loose(x: Any) -> Dict[str, Any]:
         return {}
 
 
+def _record_get(row: Any, key: str, default: Any = None) -> Any:
+    if row is None:
+        return default
+    try:
+        value = row.get(key)
+        return default if value is None else value
+    except Exception:
+        pass
+    try:
+        value = row[key]
+        return default if value is None else value
+    except Exception:
+        return default
+
+
+def _json_safe(value: Any) -> Any:
+    """Return a JSON-compatible copy for compatibility payload fields.
+
+    The public overview endpoint includes a few compatibility dictionaries for
+    older mobile builds. asyncpg rows, UUIDs, Decimals, and datetimes should not
+    leak directly into those dicts because FastAPI/Pydantic may preserve them
+    differently across versions.
+    """
+    if value is None:
+        return None
+    try:
+        if not isinstance(value, (dict, list, tuple, str, int, float, bool)):
+            value = dict(value)
+    except Exception:
+        pass
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except Exception:
+        return value
+
+
+def _to_decimal_or_none(value: Any) -> Optional[Decimal]:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _to_int_credits(value: Any, default: int = 0) -> int:
+    d = _to_decimal_or_none(value)
+    if d is None:
+        return default
+    try:
+        return max(int(d.to_integral_value(rounding="ROUND_HALF_UP")), 0)
+    except Exception:
+        return default
+
+
+def _first_decimal(*values: Any) -> Optional[Decimal]:
+    for value in values:
+        d = _to_decimal_or_none(value)
+        if d is not None:
+            return d
+    return None
+
+
+def _credit_label(value: Any) -> str:
+    return f"{_to_int_credits(value, 0)} credits"
+
+
+def _included_label(available: int, total: int) -> str:
+    return f"{max(int(available), 0)} / {max(int(total), 0)} credits"
+
+
+def _cycle_usage_label(used: int, total: int) -> str:
+    if total > 0:
+        return f"{max(int(used), 0)} / {int(total)} credits used"
+    return f"{max(int(used), 0)} credits used"
+
+
+def _canonical_plan_name(plan_code: Optional[str], tier_code: Optional[str] = None) -> str:
+    code = str(plan_code or "").strip()
+    if code:
+        return _public_plan_name(code) or _default_plan_name(code)
+    tier = str(tier_code or "").strip().lower()
+    if tier:
+        return _default_plan_name(_plan_code_from_tier(tier))
+    return "Free"
+
+
+def _build_canonical_billing_display(
+    *,
+    overview: Dict[str, Any],
+    current_ent: Any,
+    credit_account: Any,
+    pricing_account_overview: Any,
+    current_plan_code: str,
+    current_tier_code: str,
+) -> Dict[str, Any]:
+    """Apply the production credit display contract.
+
+    billing_entitlements is plan metadata only. Live spendable balance always
+    comes from v_pricing_account_overview lots/legacy account or the credit
+    account fallback. Customer-facing display is credits-only.
+    """
+    ent = _as_dict_deep_loose(current_ent)
+    overview_credits = _as_dict_deep_loose(overview.get("credits"))
+    overview_header = _as_dict_deep_loose(overview.get("header"))
+    pao = _as_dict_deep_loose(pricing_account_overview)
+    plan_json = _as_dict_deep_loose(pao.get("plan_json"))
+    lots_json = _as_dict_deep_loose(pao.get("lots_json"))
+    legacy_account = _as_dict_deep_loose(pao.get("legacy_account_json"))
+    account = _as_dict_deep_loose(credit_account)
+
+    normalized_plan_code = str(
+        current_plan_code
+        or ent.get("plan_code")
+        or plan_json.get("plan_code")
+        or overview.get("plan_code")
+        or "free"
+    ).strip().lower() or "free"
+    tier_code = str(
+        current_tier_code
+        or ent.get("tier_code")
+        or plan_json.get("tier_code")
+        or _tier_from_plan_code(normalized_plan_code)
+    ).strip().lower() or "free"
+
+    billing_mode = str(
+        ent.get("billing_mode")
+        or plan_json.get("billing_mode")
+        or overview.get("billing_mode")
+        or ""
+    ).strip().lower()
+    settlement_mode = str(
+        ent.get("settlement_mode")
+        or plan_json.get("settlement_mode")
+        or overview.get("settlement_mode")
+        or ""
+    ).strip().lower()
+
+    plan_total_decimal = _first_decimal(
+        plan_json.get("included_credits_total"),
+        ent.get("included_credits_total"),
+        overview_credits.get("total_credits"),
+    )
+    plan_total = _to_int_credits(plan_total_decimal, 0)
+
+    included_available = _to_int_credits(
+        _first_decimal(
+            lots_json.get("included_available"),
+            lots_json.get("included_credits_available"),
+        ),
+        default=-1,
+    )
+    if included_available < 0:
+        # Fallback only to live account/snapshot values. Do not use
+        # billing_entitlements.included_credits_remaining here.
+        included_available = _to_int_credits(
+            _first_decimal(
+                overview_credits.get("included_available"),
+                overview_credits.get("available_credits"),
+                legacy_account.get("legacy_balance_credits"),
+                account.get("balance_credits"),
+            ),
+            0,
+        )
+
+    included_reserved = _to_int_credits(
+        _first_decimal(
+            lots_json.get("included_reserved"),
+            lots_json.get("included_credits_reserved"),
+        ),
+        0,
+    )
+    wallet_available = _to_int_credits(
+        _first_decimal(
+            lots_json.get("purchased_available"),
+            lots_json.get("wallet_available"),
+            lots_json.get("topup_available"),
+        ),
+        0,
+    )
+    wallet_reserved = _to_int_credits(
+        _first_decimal(
+            lots_json.get("purchased_reserved"),
+            lots_json.get("wallet_reserved"),
+            lots_json.get("topup_reserved"),
+        ),
+        0,
+    )
+    promo_available = _to_int_credits(_first_decimal(lots_json.get("promo_available")), 0)
+    promo_reserved = _to_int_credits(_first_decimal(lots_json.get("promo_reserved")), 0)
+
+    total_available = _to_int_credits(
+        _first_decimal(
+            lots_json.get("total_spendable"),
+            lots_json.get("total_available"),
+            overview_credits.get("total_available"),
+            overview_credits.get("available_credits"),
+            legacy_account.get("legacy_balance_credits"),
+            account.get("balance_credits"),
+        ),
+        included_available + wallet_available + promo_available,
+    )
+    total_reserved = _to_int_credits(
+        _first_decimal(
+            lots_json.get("total_reserved"),
+            overview_credits.get("total_reserved"),
+            overview_credits.get("reserved_credits"),
+            legacy_account.get("legacy_reserved_credits"),
+            account.get("reserved_credits"),
+        ),
+        included_reserved + wallet_reserved + promo_reserved,
+    )
+
+    # For current-cycle usage, reserved credits are not available but also not
+    # committed usage yet.
+    included_used = _to_int_credits(
+        _first_decimal(
+            lots_json.get("included_used"),
+            overview_credits.get("included_used"),
+            overview_credits.get("used_credits"),
+        ),
+        max(plan_total - included_available - included_reserved, 0) if plan_total > 0 else 0,
+    )
+
+    usage_percent: Optional[float] = None
+    if plan_total > 0:
+        usage_percent = round(min(max(included_used / plan_total, 0.0), 1.0) * 100.0, 2)
+
+    is_enterprise = tier_code == "enterprise" or normalized_plan_code.startswith("enterprise")
+    is_postpaid = settlement_mode in {"postpaid", "money", "invoice"} or billing_mode in {"postpaid", "invoice"}
+
+    billing_model = "postpaid" if (is_enterprise or is_postpaid) else "prepaid"
+    plan_name = _canonical_plan_name(normalized_plan_code, tier_code)
+
+    if billing_model == "postpaid":
+        display = {
+            "header_label": f"{plan_name} • Postpaid" if plan_name else "Enterprise • Postpaid",
+            "billing_label": "Monthly usage in credits",
+            "included_label": "Postpaid credits",
+            "wallet_label": "Not needed",
+            "reserved_label": _credit_label(total_reserved),
+            "cycle_usage_label": _cycle_usage_label(included_used, plan_total),
+            "total_available_label": "Postpaid credits",
+        }
+    else:
+        display = {
+            "header_label": f"{total_available} available • {total_reserved} reserved",
+            "billing_label": "Credits",
+            "included_label": _included_label(included_available, plan_total),
+            "wallet_label": _credit_label(wallet_available),
+            "reserved_label": _credit_label(total_reserved),
+            "cycle_usage_label": _cycle_usage_label(included_used, plan_total),
+            "total_available_label": _credit_label(total_available),
+        }
+
+    canonical_plan = {
+        "plan_code": normalized_plan_code,
+        "plan_name": plan_name,
+        "tier_code": tier_code,
+        "billing_mode": billing_mode or ("invoice" if billing_model == "postpaid" else "subscription"),
+        "settlement_mode": settlement_mode or ("postpaid" if billing_model == "postpaid" else "credits"),
+        "included_credits_total": plan_total,
+        "source": "billing_entitlements+pricing_account_overview",
+    }
+
+    canonical_credits = {
+        # Backward-compatible fields consumed by existing frontend code.
+        "available_credits": total_available,
+        "reserved_credits": total_reserved,
+        "used_credits": included_used,
+        "total_credits": plan_total,
+
+        # New explicit split used by product surfaces.
+        "included_available": included_available,
+        "included_reserved": included_reserved,
+        "included_used": included_used,
+        "wallet_available": wallet_available,
+        "wallet_reserved": wallet_reserved,
+        "promo_available": promo_available,
+        "promo_reserved": promo_reserved,
+        "total_available": total_available,
+        "total_reserved": total_reserved,
+        "total_spendable": total_available,
+        "usage_percent": usage_percent,
+        "source": "v_pricing_account_overview",
+    }
+
+    header = dict(overview_header)
+    header.update(
+        {
+            "plan_label": plan_name,
+            "plan_name": plan_name,
+            "usage_label": display["header_label"],
+            "billing_value_label": display["header_label"],
+            "header_label": display["header_label"],
+            "available_credits": total_available,
+            "reserved_credits": total_reserved,
+            "total_credits": plan_total,
+            "billing_model": billing_model,
+        }
+    )
+
+    overview["billing_model"] = billing_model
+    overview["billing_mode"] = canonical_plan["billing_mode"]
+    overview["settlement_mode"] = canonical_plan["settlement_mode"]
+    overview["plan"] = canonical_plan
+    overview["plan_code"] = canonical_plan["plan_code"]
+    overview["plan_name"] = canonical_plan["plan_name"]
+    overview["tier_code"] = canonical_plan["tier_code"]
+    overview["credits"] = canonical_credits
+    overview["header"] = header
+    overview["display"] = display
+    overview["billing"] = {
+        "billing_model": billing_model,
+        "billing_mode": canonical_plan["billing_mode"],
+        "settlement_mode": canonical_plan["settlement_mode"],
+        "source": "canonical_credit_display",
+    }
+    overview["integrity"] = {
+        "source": "canonical_credit_display",
+        "entitlement_remaining_legacy": ent.get("included_credits_remaining"),
+        "live_total_available": total_available,
+    }
+    return overview
 
 
 def _sha256_hex(value: Optional[str]) -> Optional[str]:
@@ -218,6 +546,189 @@ def _country_code_from_auth(auth: AuthContext) -> Optional[str]:
 
 def _currency_for_auth(auth: AuthContext) -> str:
     return settings.currency_for_country(_country_code_from_auth(auth))
+
+
+async def _load_google_subscription_product_map(
+    conn,
+    *,
+    country_code: Optional[str],
+    currency: str,
+) -> Dict[str, Dict[str, str]]:
+    ccy = str(currency or "USD").strip().upper() or "USD"
+    cc = str(country_code or "").strip().upper()
+
+    try:
+        rows = await conn.fetch(
+            """
+            with ranked as (
+              select
+                lower(trim(internal_plan_code)) as plan_code,
+                trim(google_product_id) as google_product_id,
+                trim(base_plan_id) as base_plan_id,
+                row_number() over (
+                  partition by lower(trim(internal_plan_code))
+                  order by
+                    case
+                      when $2 <> '' and upper(coalesce(country_code, '')) = $2 then 0
+                      when coalesce(country_code, '') = '' then 1
+                      else 2
+                    end,
+                    case
+                      when upper(coalesce(currency, '')) = $1 then 0
+                      when coalesce(currency, '') = '' then 1
+                      else 2
+                    end,
+                    updated_at desc nulls last,
+                    created_at desc nulls last
+                ) as rn
+              from public.google_play_iap_product_mappings
+              where is_active = true
+                and product_type = 'subscription'
+                and coalesce(trim(internal_plan_code), '') <> ''
+                and coalesce(trim(google_product_id), '') <> ''
+                and (upper(coalesce(currency, '')) = $1 or coalesce(currency, '') = '')
+                and (upper(coalesce(country_code, '')) = $2 or coalesce(country_code, '') = '')
+            )
+            select plan_code, google_product_id, base_plan_id
+            from ranked
+            where rn = 1
+            """,
+            ccy,
+            cc,
+        )
+    except Exception:
+        return {}
+
+    out: Dict[str, Dict[str, str]] = {}
+    for r in rows:
+        plan_code = str(r["plan_code"] or "").strip().lower()
+        product_id = str(r["google_product_id"] or "").strip()
+        base_plan_id = str(r["base_plan_id"] or "").strip()
+        if plan_code and product_id:
+            out[plan_code] = {
+                "google_product_id": product_id,
+                "android_product_id": product_id,
+                "google_base_plan_id": base_plan_id,
+            }
+    return out
+
+
+async def _load_google_topup_product_map(
+    conn,
+    *,
+    country_code: Optional[str],
+    currency: str,
+) -> Dict[str, str]:
+    ccy = str(currency or "USD").strip().upper() or "USD"
+    cc = str(country_code or "").strip().upper()
+
+    try:
+        rows = await conn.fetch(
+            """
+            with ranked as (
+              select
+                upper(trim(internal_pack_code)) as pack_code,
+                trim(google_product_id) as google_product_id,
+                row_number() over (
+                  partition by upper(trim(internal_pack_code))
+                  order by
+                    case
+                      when $2 <> '' and upper(coalesce(country_code, '')) = $2 then 0
+                      when coalesce(country_code, '') = '' then 1
+                      else 2
+                    end,
+                    case
+                      when upper(coalesce(currency, '')) = $1 then 0
+                      when coalesce(currency, '') = '' then 1
+                      else 2
+                    end,
+                    updated_at desc nulls last,
+                    created_at desc nulls last
+                ) as rn
+              from public.google_play_iap_product_mappings
+              where is_active = true
+                and product_type = 'consumable'
+                and coalesce(trim(internal_pack_code), '') <> ''
+                and coalesce(trim(google_product_id), '') <> ''
+                and (upper(coalesce(currency, '')) = $1 or coalesce(currency, '') = '')
+                and (upper(coalesce(country_code, '')) = $2 or coalesce(country_code, '') = '')
+            )
+            select pack_code, google_product_id
+            from ranked
+            where rn = 1
+            """,
+            ccy,
+            cc,
+        )
+    except Exception:
+        return {}
+
+    return {
+        str(r["pack_code"] or "").strip().upper(): str(r["google_product_id"] or "").strip()
+        for r in rows
+        if str(r["pack_code"] or "").strip() and str(r["google_product_id"] or "").strip()
+    }
+
+
+def _enrich_plan_catalog_item_for_google_play(
+    item: Dict[str, Any],
+    *,
+    google_product_by_plan: Dict[str, Dict[str, str]],
+) -> Dict[str, Any]:
+    out = dict(item or {})
+    plan_code = str(out.get("plan_code") or "").strip().lower()
+    metadata = _as_dict_deep_loose(out.get("metadata") or out.get("metadata_json"))
+
+    google_info = google_product_by_plan.get(plan_code) or {}
+    google_product_id = (
+        str(out.get("google_product_id") or out.get("android_product_id") or metadata.get("google_product_id") or metadata.get("android_product_id") or "").strip()
+        or google_info.get("google_product_id")
+        or None
+    )
+    google_base_plan_id = (
+        str(out.get("google_base_plan_id") or metadata.get("google_base_plan_id") or "").strip()
+        or google_info.get("google_base_plan_id")
+        or None
+    )
+
+    out["google_product_id"] = google_product_id
+    out["android_product_id"] = google_product_id
+    out["google_base_plan_id"] = google_base_plan_id
+
+    if google_product_id:
+        metadata["google_product_id"] = google_product_id
+        metadata["android_product_id"] = google_product_id
+    if google_base_plan_id:
+        metadata["google_base_plan_id"] = google_base_plan_id
+
+    out["metadata"] = metadata
+    return out
+
+
+def _enrich_topup_catalog_item_for_google_play(
+    item: Dict[str, Any],
+    *,
+    google_product_by_pack: Dict[str, str],
+) -> Dict[str, Any]:
+    out = dict(item or {})
+    pack_code = str(out.get("pack_code") or "").strip().upper()
+    metadata = _as_dict_deep_loose(out.get("metadata") or out.get("metadata_json"))
+
+    google_product_id = (
+        str(out.get("google_product_id") or out.get("android_product_id") or metadata.get("google_product_id") or metadata.get("android_product_id") or "").strip()
+        or google_product_by_pack.get(pack_code)
+        or None
+    )
+
+    out["google_product_id"] = google_product_id
+    out["android_product_id"] = google_product_id
+
+    if google_product_id:
+        metadata["google_product_id"] = google_product_id
+        metadata["android_product_id"] = google_product_id
+
+    out["metadata"] = metadata
+    return out
 
 
 def _normalize_currency(x: Optional[str]) -> str:
@@ -492,176 +1003,6 @@ async def _fetch_public_recurring_plan_rows(conn, *, currency: str, country_code
 
     rows = await fetch_plan_catalog_rows(conn, currency=ccy, country_code=cc)
     return [dict(r) for r in rows]
-
-
-async def _load_apple_subscription_product_map(
-    conn,
-    *,
-    country_code: Optional[str],
-    currency: str,
-) -> Dict[str, str]:
-    ccy = str(currency or "USD").strip().upper() or "USD"
-    cc = str(country_code or "").strip().upper()
-
-    try:
-        rows = await conn.fetch(
-            """
-            with ranked as (
-              select
-                lower(trim(internal_plan_code)) as plan_code,
-                trim(apple_product_id) as apple_product_id,
-                row_number() over (
-                  partition by lower(trim(internal_plan_code))
-                  order by
-                    case
-                      when $2 <> '' and upper(coalesce(country_code, '')) = $2 then 0
-                      when coalesce(country_code, '') = '' then 1
-                      else 2
-                    end,
-                    case
-                      when upper(coalesce(currency, '')) = $1 then 0
-                      when coalesce(currency, '') = '' then 1
-                      else 2
-                    end,
-                    updated_at desc nulls last,
-                    created_at desc nulls last
-                ) as rn
-              from public.apple_iap_product_mappings
-              where is_active = true
-                and product_type = 'subscription'
-                and coalesce(trim(internal_plan_code), '') <> ''
-                and coalesce(trim(apple_product_id), '') <> ''
-                and (upper(coalesce(currency, '')) = $1 or coalesce(currency, '') = '')
-                and (upper(coalesce(country_code, '')) = $2 or coalesce(country_code, '') = '')
-            )
-            select plan_code, apple_product_id
-            from ranked
-            where rn = 1
-            """,
-            ccy,
-            cc,
-        )
-    except Exception:
-        return {}
-
-    return {
-        str(r["plan_code"] or "").strip().lower(): str(r["apple_product_id"] or "").strip()
-        for r in rows
-        if str(r["plan_code"] or "").strip() and str(r["apple_product_id"] or "").strip()
-    }
-
-
-async def _load_apple_topup_product_map(
-    conn,
-    *,
-    country_code: Optional[str],
-    currency: str,
-) -> Dict[str, str]:
-    ccy = str(currency or "USD").strip().upper() or "USD"
-    cc = str(country_code or "").strip().upper()
-
-    try:
-        rows = await conn.fetch(
-            """
-            with ranked as (
-              select
-                upper(trim(internal_pack_code)) as pack_code,
-                trim(apple_product_id) as apple_product_id,
-                row_number() over (
-                  partition by upper(trim(internal_pack_code))
-                  order by
-                    case
-                      when $2 <> '' and upper(coalesce(country_code, '')) = $2 then 0
-                      when coalesce(country_code, '') = '' then 1
-                      else 2
-                    end,
-                    case
-                      when upper(coalesce(currency, '')) = $1 then 0
-                      when coalesce(currency, '') = '' then 1
-                      else 2
-                    end,
-                    updated_at desc nulls last,
-                    created_at desc nulls last
-                ) as rn
-              from public.apple_iap_product_mappings
-              where is_active = true
-                and product_type = 'consumable'
-                and coalesce(trim(internal_pack_code), '') <> ''
-                and coalesce(trim(apple_product_id), '') <> ''
-                and (upper(coalesce(currency, '')) = $1 or coalesce(currency, '') = '')
-                and (upper(coalesce(country_code, '')) = $2 or coalesce(country_code, '') = '')
-            )
-            select pack_code, apple_product_id
-            from ranked
-            where rn = 1
-            """,
-            ccy,
-            cc,
-        )
-    except Exception:
-        return {}
-
-    return {
-        str(r["pack_code"] or "").strip().upper(): str(r["apple_product_id"] or "").strip()
-        for r in rows
-        if str(r["pack_code"] or "").strip() and str(r["apple_product_id"] or "").strip()
-    }
-
-
-def _enrich_plan_catalog_item_for_gateways(
-    item: Dict[str, Any],
-    *,
-    apple_product_by_plan: Dict[str, str],
-) -> Dict[str, Any]:
-    out = dict(item or {})
-    plan_code = str(out.get("plan_code") or "").strip().lower()
-    metadata = _as_dict_deep_loose(out.get("metadata") or out.get("metadata_json"))
-
-    stripe_price_id = str(out.get("stripe_price_id") or metadata.get("stripe_price_id") or "").strip() or None
-    apple_product_id = (
-        str(out.get("apple_product_id") or out.get("ios_product_id") or metadata.get("apple_product_id") or metadata.get("ios_product_id") or "").strip()
-        or apple_product_by_plan.get(plan_code)
-        or None
-    )
-
-    out["stripe_price_id"] = stripe_price_id
-    out["apple_product_id"] = apple_product_id
-    out["ios_product_id"] = apple_product_id
-
-    if stripe_price_id:
-        metadata["stripe_price_id"] = stripe_price_id
-    if apple_product_id:
-        metadata["apple_product_id"] = apple_product_id
-        metadata["ios_product_id"] = apple_product_id
-
-    out["metadata"] = metadata
-    return out
-
-
-def _enrich_topup_catalog_item_for_gateways(
-    item: Dict[str, Any],
-    *,
-    apple_product_by_pack: Dict[str, str],
-) -> Dict[str, Any]:
-    out = dict(item or {})
-    pack_code = str(out.get("pack_code") or "").strip().upper()
-    metadata = _as_dict_deep_loose(out.get("metadata") or out.get("metadata_json"))
-
-    apple_product_id = (
-        str(out.get("apple_product_id") or out.get("ios_product_id") or metadata.get("apple_product_id") or metadata.get("ios_product_id") or "").strip()
-        or apple_product_by_pack.get(pack_code)
-        or None
-    )
-
-    out["apple_product_id"] = apple_product_id
-    out["ios_product_id"] = apple_product_id
-
-    if apple_product_id:
-        metadata["apple_product_id"] = apple_product_id
-        metadata["ios_product_id"] = apple_product_id
-
-    out["metadata"] = metadata
-    return out
 
 
 async def _fetch_checkout_plan_row(conn, *, plan_code: str, currency: str, country_code: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -1093,6 +1434,30 @@ def _is_apple_managed_subscription(row: Optional[Dict[str, Any]]) -> bool:
     return _subscription_provider(row) == "apple_iap"
 
 
+def _is_google_play_managed_subscription(row: Optional[Dict[str, Any]]) -> bool:
+    return _subscription_provider(row) == "google_play"
+
+
+def _is_native_iap_managed_subscription(row: Optional[Dict[str, Any]]) -> bool:
+    return _subscription_provider(row) in {"apple_iap", "google_play"}
+
+
+async def _sync_subscription_cycle_credits(conn, *, user_id: UUID) -> Dict[str, Any]:
+    """Synchronize subscription included-credit lots after gateway changes.
+
+    The DB function is the source of truth for preserving purchased/top-up
+    credits, expiring old plan-included lots, and creating the current-cycle
+    included lot. Route handlers call this after native IAP confirmation so
+    Google Play / Apple flows cannot leave billing_entitlements updated without
+    matching spendable included credits.
+    """
+    row = await conn.fetchrow(
+        "select public.df_sync_subscription_cycle_credits($1::uuid) as sync_result",
+        user_id,
+    )
+    return _as_dict_deep_loose(row["sync_result"] if row else None)
+
+
 def _build_subscription_view(
     *,
     current_sub,
@@ -1166,7 +1531,7 @@ def _normalize_overview_payload(
         allowed["can_cancel"] = False
         allowed["can_reactivate"] = False
         allowed["can_downgrade"] = False
-    elif provider == "apple_iap":
+    elif provider in {"apple_iap", "google_play"}:
         allowed["can_manage_billing"] = False
         allowed["can_cancel"] = False
         allowed["can_reactivate"] = False
@@ -1175,22 +1540,10 @@ def _normalize_overview_payload(
         allowed["can_upgrade"] = False
     if is_enterprise or is_postpaid_money:
         allowed["can_top_up"] = False
-
-    guardrails = dict(overview.get("guardrails") or {})
-    if guardrails:
-        allow_topups = bool(guardrails.get("allow_topups", True))
-        allowed["can_top_up"] = bool(allowed.get("can_top_up", True)) and allow_topups
-        if not allow_topups:
-            messages = dict(overview.get("messages") or {})
-            messages.setdefault("topup_notice", "Top-ups are not available for your current plan.")
-            overview["messages"] = messages
-
     overview["allowed_actions"] = allowed
-    if guardrails:
-        overview["guardrails"] = guardrails
 
     # Do not build user-facing credit labels from pre-canonical overview data.
-    # The final header/display fields are set by build_canonical_billing_display()
+    # The final header/display fields are set by _build_canonical_billing_display()
     # after live v_pricing_account_overview balances have been applied.
     overview["header"] = dict(overview.get("header") or {})
 
@@ -1242,6 +1595,12 @@ def _normalize_overview_payload(
             "This subscription is managed through Apple on iOS. "
             "Stripe billing portal actions are unavailable for Apple-managed subscriptions."
         )
+    elif provider == "google_play" and normalized_plan_code != "free":
+        messages["status_title"] = "Managed by Google Play"
+        messages["status_body"] = (
+            "This subscription is managed through Google Play on Android. "
+            "Stripe billing portal actions are unavailable for Google Play-managed subscriptions."
+        )
     elif not linked and normalized_plan_code != "free":
         messages["status_title"] = "Entitlement active"
         messages["status_body"] = (
@@ -1252,7 +1611,7 @@ def _normalize_overview_payload(
 
     # Final production contract: customer-facing usage is credits-only and live
     # balances come from pricing account/lots, not billing entitlement remaining.
-    overview = build_canonical_billing_display(
+    overview = _build_canonical_billing_display(
         overview=overview,
         current_ent=current_ent,
         credit_account=credit_account,
@@ -1260,6 +1619,24 @@ def _normalize_overview_payload(
         current_plan_code=current_plan_code,
         current_tier_code=tier_code,
     )
+
+    # Backward-compatible top-level objects for older frontend builds.
+    # These must be sourced from canonical backend truth, not from the login JWT.
+    current_subscription_payload = dict(overview.get("current_subscription") or {})
+    if current_sub:
+        current_subscription_payload["gateway_provider"] = _subscription_provider(current_sub) or None
+        current_subscription_payload["gateway_subscription_id"] = str(current_sub.get("gateway_subscription_id") or "") or None
+        current_subscription_payload["gateway_price_id"] = str(current_sub.get("gateway_price_id") or "") or None
+    overview["subscription"] = _json_safe(current_subscription_payload) if current_subscription_payload else None
+    overview["entitlement"] = _json_safe(dict(current_ent)) if current_ent else None
+    billing_payload = dict(overview.get("billing") or {})
+    billing_payload.update({
+        "plan_code": overview.get("plan_code"),
+        "plan_name": overview.get("plan_name"),
+        "tier_code": overview.get("tier_code"),
+        "current_subscription_provider": _subscription_provider(current_sub) or None,
+    })
+    overview["billing"] = _json_safe(billing_payload)
     return overview
 
 
@@ -1603,21 +1980,6 @@ async def create_wallet_topup_checkout_session(inp: WalletTopupCreateIn, auth: A
         raise HTTPException(status_code=400, detail="missing_success_or_cancel_url")
 
     async with pool.acquire() as conn:
-        current_plan_code = await _resolve_current_plan_code(conn, user_id=auth.user_id)
-        try:
-            topup_guardrail_context = await validate_wallet_topup_allowed(
-                conn,
-                user_id=auth.user_id,
-                plan_code=current_plan_code,
-                credits_to_grant=credits_to_grant,
-            )
-        except TopupGuardrailError as exc:
-            status_code = 403 if exc.code == "topups_not_allowed_for_plan" else 409
-            raise HTTPException(
-                status_code=status_code,
-                detail={"code": exc.code, **(exc.context or {})},
-            )
-
         existing_checkout = await _existing_checkout_by_idempotency(
             conn,
             user_id=auth.user_id,
@@ -1668,7 +2030,7 @@ async def create_wallet_topup_checkout_session(inp: WalletTopupCreateIn, auth: A
               gateway_provider, payment_state, fulfillment_state, idempotency_key,
               metadata_json, created_at, updated_at
             )
-            values($1, 'topup', $2, $3, $4, 'stripe', 'pending', 'pending', $5, $6::jsonb, now(), now())
+            values($1, 'topup', $2, $3, $4, 'stripe', 'pending', 'pending', $5, '{}'::jsonb, now(), now())
             returning id
             ''',
             auth.user_id,
@@ -1676,7 +2038,6 @@ async def create_wallet_topup_checkout_session(inp: WalletTopupCreateIn, auth: A
             amount_minor,
             Decimal(credits_to_grant),
             inp.idempotency_key,
-            json.dumps({"guardrails": topup_guardrail_context}, default=str),
         )
         wallet_order_id = str(wallet_order["id"])
 
@@ -1828,6 +2189,9 @@ class SubscriptionCreateIn(BaseModel):
     success_url: Optional[str] = None
     cancel_url: Optional[str] = None
     idempotency_key: str
+    credit_reset_acknowledged: bool = False
+    credit_reset_acknowledged_at: Optional[str] = None
+    credit_reset_acknowledgement_text: Optional[str] = None
 
 
 class SubscriptionCreateOut(BaseModel):
@@ -1839,6 +2203,47 @@ class SubscriptionCreateOut(BaseModel):
     purpose: str
     plan_code: str
     current_plan_code: Optional[str] = None
+
+
+PLAN_CHANGE_CREDIT_RESET_ACKNOWLEDGEMENT_TEXT = (
+    "I understand that changing my plan may reset or overwrite unused plan-included "
+    "credits from my current billing cycle. Purchased top-up credits are preserved."
+)
+
+
+def _requires_plan_credit_reset_acknowledgement(*, current_plan_code: Optional[str], target_plan_code: Optional[str]) -> bool:
+    current = settings.normalize_plan_code(str(current_plan_code or "free"))
+    target = settings.normalize_plan_code(str(target_plan_code or "free"))
+    return bool(current and target and current != target)
+
+
+def _assert_plan_credit_reset_acknowledged(
+    *,
+    acknowledged: bool,
+    current_plan_code: Optional[str],
+    target_plan_code: Optional[str],
+) -> None:
+    if not _requires_plan_credit_reset_acknowledgement(
+        current_plan_code=current_plan_code,
+        target_plan_code=target_plan_code,
+    ):
+        return
+    if acknowledged:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "plan_credit_reset_ack_required",
+            "message": (
+                "Changing your plan can reset or overwrite unused plan-included credits "
+                "from the current billing cycle. Purchased top-up credits are preserved. "
+                "Please confirm this before changing plans."
+            ),
+            "current_plan_code": settings.normalize_plan_code(str(current_plan_code or "free")),
+            "target_plan_code": settings.normalize_plan_code(str(target_plan_code or "free")),
+            "acknowledgement_text": PLAN_CHANGE_CREDIT_RESET_ACKNOWLEDGEMENT_TEXT,
+        },
+    )
 
 
 @router.post("/subscriptions/create-checkout-session", response_model=SubscriptionCreateOut)
@@ -1885,6 +2290,11 @@ async def create_subscription_checkout_session(inp: SubscriptionCreateIn, auth: 
             user_id=auth.user_id,
             requested_plan_code=plan_code,
         )
+        _assert_plan_credit_reset_acknowledged(
+            acknowledged=bool(inp.credit_reset_acknowledged),
+            current_plan_code=current_plan_code,
+            target_plan_code=plan_code,
+        )
         customer = await _sync_customer_row(
             conn,
             user_id=auth.user_id,
@@ -1921,6 +2331,9 @@ async def create_subscription_checkout_session(inp: SubscriptionCreateIn, auth: 
             "requested_by_user_id": str(auth.user_id),
             "country_code": country_code,
             "currency": currency,
+            "credit_reset_acknowledged": bool(inp.credit_reset_acknowledged),
+            "credit_reset_acknowledged_at": inp.credit_reset_acknowledged_at,
+            "credit_reset_acknowledgement_text": inp.credit_reset_acknowledgement_text,
         }
 
         await conn.execute(
@@ -2036,6 +2449,16 @@ class PlanCatalogItemOut(BaseModel):
     disabled_reason: Optional[str] = None
     display_order: int = 0
 
+    # Gateway identifiers used by the mobile app to choose Stripe vs Apple IAP vs Google Play.
+    stripe_price_id: Optional[str] = None
+    apple_product_id: Optional[str] = None
+    ios_product_id: Optional[str] = None
+    google_product_id: Optional[str] = None
+    android_product_id: Optional[str] = None
+    google_base_plan_id: Optional[str] = None
+    self_serve: Optional[bool] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
 
 class PlansCatalogOut(BaseModel):
     currency: str
@@ -2065,8 +2488,6 @@ class CreditsSummaryOut(BaseModel):
     total_reserved: Optional[int] = None
     total_spendable: Optional[int] = None
     usage_percent: Optional[float] = None
-    breakdown: Dict[str, Any] = Field(default_factory=dict)
-    bucket_policy: Dict[str, Any] = Field(default_factory=dict)
     source: Optional[str] = None
 
 
@@ -2110,11 +2531,24 @@ class PaymentsOverviewOut(BaseModel):
     user_id: str
     country_code: Optional[str] = None
     currency: str
+
+    # Backward-compatible top-level plan fields. Several app surfaces and
+    # diagnostics read these directly, so keep them aligned with ``plan``.
+    plan_code: Optional[str] = None
+    plan_name: Optional[str] = None
+    tier_code: Optional[str] = None
+
     billing_model: Optional[str] = None
     billing_mode: Optional[str] = None
     settlement_mode: Optional[str] = None
     plan: Optional[OverviewPlanOut] = None
     current_subscription: SubscriptionCurrentOut
+
+    # Compatibility objects for earlier mobile builds. New code should prefer
+    # ``plan``, ``current_subscription``, and ``credits``.
+    subscription: Optional[Dict[str, Any]] = None
+    entitlement: Optional[Dict[str, Any]] = None
+    billing: Optional[Dict[str, Any]] = None
     current_plan: Optional[PlanCatalogItemOut] = None
     pending_change: Optional[PendingChangeOut] = None
     credits: CreditsSummaryOut
@@ -2122,7 +2556,6 @@ class PaymentsOverviewOut(BaseModel):
     display: Dict[str, Any] = Field(default_factory=dict)
     allowed_actions: AllowedActionsOut
     messages: OverviewMessagesOut
-    guardrails: Dict[str, Any] = Field(default_factory=dict)
 
 
 class TopupCatalogItemOut(BaseModel):
@@ -2134,20 +2567,14 @@ class TopupCatalogItemOut(BaseModel):
     price_label: str
     recommended: bool = False
     cta_label: Optional[str] = None
-    cta_enabled: bool = True
     display_order: int = 0
     is_active: bool = True
-
-    # Per-item guardrail result. The catalog should not advertise a pack as
-    # purchasable when wallet_credit_cap would reject it at checkout time.
-    can_purchase: bool = True
-    disabled_reason: Optional[str] = None
-    projected_wallet_total: Optional[int] = None
-    wallet_credit_cap: Optional[int] = None
 
     # Gateway identifiers for mobile IAP.
     apple_product_id: Optional[str] = None
     ios_product_id: Optional[str] = None
+    google_product_id: Optional[str] = None
+    android_product_id: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -2156,9 +2583,6 @@ class TopupsCatalogOut(BaseModel):
     country_code: Optional[str] = None
     currency: str
     current_plan_code: Optional[str] = None
-    allow_topups: bool = True
-    disabled_reason: Optional[str] = None
-    guardrails: Dict[str, Any] = Field(default_factory=dict)
     items: List[TopupCatalogItemOut]
 
 
@@ -2169,6 +2593,9 @@ class SubscriptionChangeIn(BaseModel):
     success_url: Optional[str] = None
     cancel_url: Optional[str] = None
     return_url: Optional[str] = None
+    credit_reset_acknowledged: bool = False
+    credit_reset_acknowledged_at: Optional[str] = None
+    credit_reset_acknowledgement_text: Optional[str] = None
 
 
 class SubscriptionMutationIn(BaseModel):
@@ -2242,6 +2669,16 @@ async def get_plans_catalog(auth: AuthContext = AuthDep, pool=PoolDep) -> PlansC
         ) or _tier_from_plan_code(current_plan_code)
         pending_change = _pending_change_from_subscription_row(current_sub)
         rows = await _fetch_public_recurring_plan_rows(conn, currency=currency, country_code=country_code)
+        apple_product_by_plan = await load_apple_subscription_product_map(
+            conn,
+            country_code=country_code,
+            currency=currency,
+        )
+        google_product_by_plan = await _load_google_subscription_product_map(
+            conn,
+            country_code=country_code,
+            currency=currency,
+        )
 
     items: List[PlanCatalogItemOut] = []
     for row in rows:
@@ -2258,6 +2695,15 @@ async def get_plans_catalog(auth: AuthContext = AuthDep, pool=PoolDep) -> PlansC
                 currency=currency,
                 current_plan_code=current_tier_code or current_plan_code,
             )
+
+        item = enrich_plan_catalog_item_for_gateways(
+            item,
+            apple_product_by_plan=apple_product_by_plan,
+        )
+        item = _enrich_plan_catalog_item_for_google_play(
+            item,
+            google_product_by_plan=google_product_by_plan,
+        )
 
         items.append(
             PlanCatalogItemOut(
@@ -2287,6 +2733,14 @@ async def get_plans_catalog(auth: AuthContext = AuthDep, pool=PoolDep) -> PlansC
                 cta_enabled=not (current_tier_code == "free" or _tier_from_plan_code(current_plan_code) == "free"),
                 disabled_reason=None,
                 display_order=-1,
+                stripe_price_id=None,
+                apple_product_id=None,
+                ios_product_id=None,
+                google_product_id=None,
+                android_product_id=None,
+                google_base_plan_id=None,
+                self_serve=True,
+                metadata={},
             ),
         )
 
@@ -2337,15 +2791,27 @@ async def get_payments_overview(auth: AuthContext = AuthDep, pool=PoolDep) -> Pa
         credit_account = await fetch_credit_account(conn, user_id=auth.user_id)
         pricing_overview_row = await fetch_pricing_account_overview(conn, user_id=auth.user_id)
         rows = await _fetch_public_recurring_plan_rows(conn, currency=currency, country_code=country_code)
+        apple_product_by_plan = await load_apple_subscription_product_map(
+            conn,
+            country_code=country_code,
+            currency=currency,
+        )
+        google_product_by_plan = await _load_google_subscription_product_map(
+            conn,
+            country_code=country_code,
+            currency=currency,
+        )
 
+    pricing_plan_json = _as_dict_deep_loose((pricing_overview_row or {}).get("plan_json") if pricing_overview_row else None)
     current_plan_code = (
         str(current_ent["plan_code"]) if current_ent and current_ent.get("plan_code") else ""
     ) or (
         str(current_sub["plan_code"]) if current_sub and current_sub.get("plan_code") else ""
-    ) or "free"
+    ) or str(pricing_plan_json.get("plan_code") or "") or "free"
+    current_plan_code = settings.normalize_plan_code(current_plan_code)
     current_tier_code = (
         str(current_ent["tier_code"]) if current_ent and current_ent.get("tier_code") else ""
-    ) or _tier_from_plan_code(current_plan_code)
+    ) or str(pricing_plan_json.get("tier_code") or "") or _tier_from_plan_code(current_plan_code)
 
     current_plan_item = None
     for row in rows:
@@ -2362,6 +2828,14 @@ async def get_payments_overview(auth: AuthContext = AuthDep, pool=PoolDep) -> Pa
                 currency=currency,
                 current_plan_code=current_plan_code,
             )
+        candidate = enrich_plan_catalog_item_for_gateways(
+            candidate,
+            apple_product_by_plan=apple_product_by_plan,
+        )
+        candidate = _enrich_plan_catalog_item_for_google_play(
+            candidate,
+            google_product_by_plan=google_product_by_plan,
+        )
         if str(candidate.get("plan_code") or "").strip().lower() == str(current_plan_code).strip().lower():
             candidate["is_current"] = True
             candidate["action"] = "current"
@@ -2375,7 +2849,7 @@ async def get_payments_overview(auth: AuthContext = AuthDep, pool=PoolDep) -> Pa
         contact_sales = str(current_tier_code).strip().lower() == "enterprise"
         current_plan_item = {
             "plan_code": current_plan_code,
-            "plan_name": _default_plan_name(current_plan_code),
+            "plan_name": _canonical_plan_name(current_plan_code, current_tier_code),
             "price_label": "Contact sales" if contact_sales else ("$0 / month" if currency == "USD" else "₹0 / month" if currency == "INR" else f"{currency} 0 / month"),
             "summary": _plan_summary(current_plan_code, {}),
             "feature_bullets": _feature_bullets({}, current_plan_code),
@@ -2392,6 +2866,14 @@ async def get_payments_overview(auth: AuthContext = AuthDep, pool=PoolDep) -> Pa
             "cta_enabled": False,
             "disabled_reason": None,
             "display_order": _plan_rank_value(current_plan_code),
+            "stripe_price_id": None,
+            "apple_product_id": apple_product_by_plan.get(str(current_plan_code or "").strip().lower()),
+            "ios_product_id": apple_product_by_plan.get(str(current_plan_code or "").strip().lower()),
+            "google_product_id": (google_product_by_plan.get(str(current_plan_code or "").strip().lower()) or {}).get("google_product_id"),
+            "android_product_id": (google_product_by_plan.get(str(current_plan_code or "").strip().lower()) or {}).get("android_product_id"),
+            "google_base_plan_id": (google_product_by_plan.get(str(current_plan_code or "").strip().lower()) or {}).get("google_base_plan_id"),
+            "self_serve": False,
+            "metadata": {},
         }
 
     overview = build_payment_overview(
@@ -2404,12 +2886,6 @@ async def get_payments_overview(auth: AuthContext = AuthDep, pool=PoolDep) -> Pa
         pricing_account_overview=pricing_overview_row,
     )
     overview["user_id"] = str(auth.user_id)
-
-    async with pool.acquire() as conn:
-        guardrail = await fetch_plan_credit_guardrail(conn, plan_code=current_plan_code)
-    if guardrail:
-        overview["guardrails"] = guardrail.as_public_dict()
-
     overview = _normalize_overview_payload(
         overview=overview,
         current_sub=current_sub,
@@ -2432,11 +2908,17 @@ async def get_payments_overview(auth: AuthContext = AuthDep, pool=PoolDep) -> Pa
         user_id=str(auth.user_id),
         country_code=overview.get("country_code"),
         currency=str(overview.get("currency") or currency),
+        plan_code=overview.get("plan_code") or (overview.get("plan") or {}).get("plan_code"),
+        plan_name=overview.get("plan_name") or (overview.get("plan") or {}).get("plan_name"),
+        tier_code=overview.get("tier_code") or (overview.get("plan") or {}).get("tier_code"),
         billing_model=overview.get("billing_model"),
         billing_mode=overview.get("billing_mode"),
         settlement_mode=overview.get("settlement_mode"),
         plan=OverviewPlanOut(**(overview.get("plan") or {})) if overview.get("plan") else None,
         current_subscription=SubscriptionCurrentOut(**(overview.get("current_subscription") or {})),
+        subscription=overview.get("subscription"),
+        entitlement=overview.get("entitlement"),
+        billing=overview.get("billing"),
         current_plan=PlanCatalogItemOut(**overview_current_plan_item) if overview_current_plan_item else None,
         pending_change=PendingChangeOut(**overview["pending_change"]) if overview.get("pending_change") else None,
         credits=CreditsSummaryOut(**(overview.get("credits") or {})),
@@ -2444,7 +2926,6 @@ async def get_payments_overview(auth: AuthContext = AuthDep, pool=PoolDep) -> Pa
         display=dict(overview.get("display") or {}),
         allowed_actions=AllowedActionsOut(**(overview.get("allowed_actions") or {})),
         messages=OverviewMessagesOut(**(overview.get("messages") or {})),
-        guardrails=dict(overview.get("guardrails") or {}),
     )
 
 
@@ -2458,63 +2939,37 @@ async def get_topups_catalog(auth: AuthContext = AuthDep, pool=PoolDep) -> Topup
         current_sub = _live_subscription_or_none(raw_sub)
         current_ent = await fetch_effective_billing_entitlement(conn, user_id=auth.user_id)
         current_plan_code = (
-            str(current_ent["plan_code"]) if current_ent and current_ent.get("plan_code") else ""
+            str(current_ent['plan_code']) if current_ent and current_ent.get('plan_code') else ''
         ) or (
-            str(current_sub["plan_code"]) if current_sub and current_sub.get("plan_code") else ""
-        ) or "free"
-
+            str(current_sub['plan_code']) if current_sub and current_sub.get('plan_code') else ''
+        ) or 'free'
         rows = await fetch_topup_pack_rows(conn, currency=currency, country_code=country_code)
-        apple_product_by_pack = await _load_apple_topup_product_map(
+        apple_product_by_pack = await load_apple_topup_product_map(
             conn,
             country_code=country_code,
             currency=currency,
         )
-        guardrail = await fetch_plan_credit_guardrail(conn, plan_code=current_plan_code)
-        wallet_totals = await fetch_purchased_wallet_totals(conn, user_id=auth.user_id)
-
-    guardrails = guardrail.as_public_dict() if guardrail else {}
-    allow_topups = bool(guardrails.get("allow_topups", True))
-    disabled_reason = None if allow_topups else "Top-ups are not available for your current plan."
-
-    wallet_cap = _to_decimal_or_none(guardrails.get("wallet_credit_cap"))
-    enforce_wallet_cap = _coerce_bool(guardrails.get("enforce_wallet_cap"), False)
-    current_wallet_total = _to_decimal_or_none(wallet_totals.get("purchased_total")) or Decimal("0")
+        google_product_by_pack = await _load_google_topup_product_map(
+            conn,
+            country_code=country_code,
+            currency=currency,
+        )
 
     items: List[TopupCatalogItemOut] = []
-
     for row in rows:
-        item_dict = _enrich_topup_catalog_item_for_gateways(
+        item = enrich_topup_catalog_item_for_gateways(
             build_topup_catalog_item(row),
             apple_product_by_pack=apple_product_by_pack,
         )
-
-        credits_to_grant = _to_decimal_or_none(item_dict.get("credits_to_grant")) or Decimal("0")
-        projected_wallet_total = current_wallet_total + credits_to_grant
-
-        item_can_purchase = bool(allow_topups)
-        item_disabled_reason = disabled_reason
-
-        if item_can_purchase and enforce_wallet_cap and wallet_cap is not None and projected_wallet_total > wallet_cap:
-            item_can_purchase = False
-            item_disabled_reason = (
-                f"This pack would exceed your wallet credit limit of {int(wallet_cap)} credits."
-            )
-
-        item_dict["can_purchase"] = item_can_purchase
-        item_dict["cta_enabled"] = item_can_purchase
-        item_dict["disabled_reason"] = item_disabled_reason
-        item_dict["projected_wallet_total"] = int(projected_wallet_total)
-        item_dict["wallet_credit_cap"] = int(wallet_cap) if wallet_cap is not None else None
-
-        if not item_can_purchase:
-            item_dict["cta_label"] = "Limit reached"
-
+        item = _enrich_topup_catalog_item_for_google_play(
+            item,
+            google_product_by_pack=google_product_by_pack,
+        )
         items.append(
             TopupCatalogItemOut(
-                **{k: v for k, v in item_dict.items() if k in TopupCatalogItemOut.model_fields}
+                **{k: v for k, v in item.items() if k in TopupCatalogItemOut.model_fields}
             )
         )
-
     items.sort(key=lambda x: (x.display_order, x.credits_to_grant, x.pack_code))
 
     return TopupsCatalogOut(
@@ -2522,9 +2977,6 @@ async def get_topups_catalog(auth: AuthContext = AuthDep, pool=PoolDep) -> Topup
         country_code=country_code,
         currency=currency,
         current_plan_code=current_plan_code,
-        allow_topups=allow_topups,
-        disabled_reason=disabled_reason,
-        guardrails=guardrails,
         items=items,
     )
 
@@ -2549,6 +3001,8 @@ async def create_billing_portal_session(inp: BillingPortalIn, auth: AuthContext 
         latest_sub_dict = dict(latest_sub) if latest_sub else None
         if _is_apple_managed_subscription(latest_sub_dict):
             raise HTTPException(status_code=400, detail="apple_iap_managed_subscription")
+        if _is_google_play_managed_subscription(latest_sub_dict):
+            raise HTTPException(status_code=400, detail="google_play_managed_subscription")
         customer = await _sync_customer_row(
             conn,
             user_id=auth.user_id,
@@ -2572,12 +3026,14 @@ async def create_billing_portal_session(inp: BillingPortalIn, auth: AuthContext 
 async def confirm_apple_subscription(inp: AppleSubscriptionConfirmIn, auth: AuthContext = AuthDep, pool=PoolDep) -> AppleSubscriptionConfirmOut:
     async with pool.acquire() as conn:
         async with conn.transaction():
-            return await apple_confirm_subscription_purchase(
+            result = await apple_confirm_subscription_purchase(
                 conn,
                 user_id=auth.user_id,
                 auth_country_code=_country_code_from_auth(auth),
                 payload=inp,
             )
+            await _sync_subscription_cycle_credits(conn, user_id=auth.user_id)
+            return result
 
 
 @router.post("/apple/credits/confirm", response_model=AppleCreditsConfirmOut)
@@ -2597,6 +3053,42 @@ async def handle_apple_notification(inp: AppleNotificationIn, pool=PoolDep) -> A
     async with pool.acquire() as conn:
         async with conn.transaction():
             return await apple_process_notification(
+                conn,
+                payload=inp,
+            )
+
+
+@router.post("/google/subscriptions/confirm", response_model=GoogleSubscriptionConfirmOut)
+async def confirm_google_subscription(inp: GoogleSubscriptionConfirmIn, auth: AuthContext = AuthDep, pool=PoolDep) -> GoogleSubscriptionConfirmOut:
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await google_confirm_subscription_purchase(
+                conn,
+                user_id=auth.user_id,
+                auth_country_code=_country_code_from_auth(auth),
+                payload=inp,
+            )
+            await _sync_subscription_cycle_credits(conn, user_id=auth.user_id)
+            return result
+
+
+@router.post("/google/credits/confirm", response_model=GoogleCreditsConfirmOut)
+async def confirm_google_credits(inp: GoogleCreditsConfirmIn, auth: AuthContext = AuthDep, pool=PoolDep) -> GoogleCreditsConfirmOut:
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            return await google_confirm_credit_purchase(
+                conn,
+                user_id=auth.user_id,
+                auth_country_code=_country_code_from_auth(auth),
+                payload=inp,
+            )
+
+
+@router.post("/google/notifications", response_model=GoogleNotificationOut)
+async def handle_google_notification(inp: GoogleNotificationIn, pool=PoolDep) -> GoogleNotificationOut:
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            return await google_process_notification(
                 conn,
                 payload=inp,
             )
@@ -2648,6 +3140,14 @@ async def change_subscription(inp: SubscriptionChangeIn, auth: AuthContext = Aut
             change_mode=inp.change_mode or "immediate",
             message="This subscription is managed through Apple on iOS. Use the Apple purchase flow to change the plan.",
         )
+    if _is_google_play_managed_subscription(current_row):
+        return SubscriptionMutationOut(
+            status="google_play_managed",
+            current_plan_code=current_plan_code,
+            target_plan_code=target_plan_code,
+            change_mode=inp.change_mode or "immediate",
+            message="This subscription is managed through Google Play on Android. Use the Google Play purchase flow to change the plan.",
+        )
 
     if (not has_linked_subscription) and current_rank > _plan_rank_value("free") and target_rank <= current_rank:
         return SubscriptionMutationOut(
@@ -2658,6 +3158,12 @@ async def change_subscription(inp: SubscriptionChangeIn, auth: AuthContext = Aut
             message="This account has active plan access but is not linked to a live Stripe subscription. Contact support to change or remove it.",
         )
 
+    _assert_plan_credit_reset_acknowledged(
+        acknowledged=bool(inp.credit_reset_acknowledged),
+        current_plan_code=current_plan_code,
+        target_plan_code=target_plan_code,
+    )
+
     wants_checkout = target_rank > current_rank
 
     if wants_checkout:
@@ -2667,6 +3173,9 @@ async def change_subscription(inp: SubscriptionChangeIn, auth: AuthContext = Aut
                 success_url=inp.success_url,
                 cancel_url=inp.cancel_url,
                 idempotency_key=inp.idempotency_key or f"sub-change:{auth.user_id}:{target_plan_code}",
+                credit_reset_acknowledged=bool(inp.credit_reset_acknowledged),
+                credit_reset_acknowledged_at=inp.credit_reset_acknowledged_at,
+                credit_reset_acknowledgement_text=inp.credit_reset_acknowledgement_text,
             ),
             auth=auth,
             pool=pool,
@@ -2727,6 +3236,17 @@ async def cancel_subscription(inp: SubscriptionMutationIn = SubscriptionMutation
             cancel_at_period_end=bool(row.get("cancel_at_period_end") or False),
             message="This subscription is managed through Apple on iOS. Cancel it from Apple subscription management.",
         )
+    if _is_google_play_managed_subscription(dict(row) if row else None):
+        return SubscriptionMutationOut(
+            status="google_play_managed",
+            current_plan_code=str(row["plan_code"]),
+            target_plan_code="free",
+            change_mode="period_end",
+            effective_at=row["current_period_end"].isoformat() if row.get("current_period_end") else None,
+            subscription_state=str(row["subscription_state"]) if row.get("subscription_state") else None,
+            cancel_at_period_end=bool(row.get("cancel_at_period_end") or False),
+            message="This subscription is managed through Google Play on Android. Cancel it from Google Play subscription management.",
+        )
 
     if bool(row.get("cancel_at_period_end") or False):
         return SubscriptionMutationOut(
@@ -2768,6 +3288,12 @@ async def reactivate_subscription(inp: SubscriptionMutationIn = SubscriptionMuta
                 status="apple_iap_managed",
                 current_plan_code=str(row["plan_code"]) if row and row.get("plan_code") else "free",
                 message="This subscription is managed through Apple on iOS. Reactivate it from Apple subscription management.",
+            )
+        if _is_google_play_managed_subscription(dict(row) if row else None):
+            return SubscriptionMutationOut(
+                status="google_play_managed",
+                current_plan_code=str(row["plan_code"]) if row and row.get("plan_code") else "free",
+                message="This subscription is managed through Google Play on Android. Reactivate it from Google Play subscription management.",
             )
         return await _undo_pending_change_internal(
             conn,

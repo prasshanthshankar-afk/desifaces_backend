@@ -843,7 +843,7 @@ def _normalize_pricing_view(pricing: Dict[str, Any], source: Optional[Dict[str, 
     sku_code = _safe_str(p.get("leaf_sku_code")) or _safe_str(p.get("sku_code")) or default_leaf
     final_amount = p.get("final_amount")
     if final_amount in (None, "") and (state or "").lower() == "committed":
-        final_amount = p.get("amount")
+        final_amount = p.get("amount") or p.get("estimated_amount")
 
     quote_breakdown = _as_dict_loose(p.get("quote_breakdown"))
     summary = _as_dict_loose(p.get("summary"))
@@ -862,25 +862,55 @@ def _normalize_pricing_view(pricing: Dict[str, Any], source: Optional[Dict[str, 
         }
     )
 
+    actual_units = _safe_str(p.get("actual_units"))
+    billed_units = _safe_str(p.get("billed_units"))
+    estimated_units = _safe_str(p.get("estimated_units"))
+    reserved_units = _safe_str(p.get("reserved_units"))
+    if (state or "").lower() == "committed":
+        if not actual_units:
+            actual_units = billed_units or reserved_units or estimated_units
+        if not billed_units:
+            billed_units = actual_units or reserved_units or estimated_units
+
+    settlement_mode = _safe_str(p.get("settlement_mode"))
+    if not settlement_mode and (state or "").lower() == "committed":
+        if billed_units or actual_units or estimated_units:
+            settlement_mode = "credits"
+
+    reservation_status = _safe_str(p.get("reservation_status"))
+    commit_status = _safe_str(p.get("commit_status"))
+    if (state or "").lower() == "committed":
+        reservation_status = reservation_status or "committed"
+        commit_status = commit_status or "committed"
+
     return {
         **p,
         "enabled": bool(p.get("enabled", False)),
         "state": state,
         "billing_mode": _safe_str(p.get("billing_mode")),
-        "settlement_mode": _safe_str(p.get("settlement_mode")),
+        "settlement_mode": settlement_mode,
+        "pricing_mode": _safe_str(p.get("pricing_mode")),
         "tier_code": _safe_str(p.get("tier_code")),
         "quote_id": _safe_str(p.get("quote_id")),
         "reservation_id": _safe_str(p.get("reservation_id")),
+        "reservation_status": reservation_status,
+        "commit_status": commit_status,
         "variant_code": variant_code,
         "sku_code": sku_code,
-        "estimated_units": _safe_str(p.get("estimated_units")),
-        "actual_units": _safe_str(p.get("actual_units")),
-        "billed_units": _safe_str(p.get("billed_units")),
+        "leaf_sku_code": _safe_str(p.get("leaf_sku_code")) or sku_code,
+        "estimated_units": estimated_units,
+        "reserved_units": reserved_units,
+        "actual_units": actual_units,
+        "billed_units": billed_units,
+        "released_units": _safe_str(p.get("released_units")),
         "amount": _safe_str(p.get("amount")),
         "estimated_amount": _safe_str(p.get("estimated_amount")) or _safe_str(p.get("amount")),
         "final_amount": _safe_str(final_amount),
         "currency": _safe_str(p.get("currency")),
-        "ledger_entry_id": _safe_str(p.get("ledger_entry_id")),
+        "ledger_entry_id": _safe_str(p.get("ledger_entry_id")) or _safe_str(p.get("ledger_id")) or _safe_str(p.get("ledger_event_id")),
+        "billing_account_id": _safe_str(p.get("billing_account_id")),
+        "service_name": _safe_str(p.get("service_name")),
+        "service_action": _safe_str(p.get("service_action")),
         "before_credits": before_credits,
         "after_estimated_credits": after_estimated_credits,
         "quote_breakdown": quote_breakdown,
@@ -892,10 +922,38 @@ def _normalize_pricing_view(pricing: Dict[str, Any], source: Optional[Dict[str, 
 def _normalize_pricing_summary_view(pricing: Dict[str, Any], summary: Dict[str, Any]) -> Dict[str, Any]:
     s = _as_dict_loose(summary)
     p = _normalize_pricing_view(pricing)
-    if s:
-        return s
     if not p:
-        return {}
+        return s
+
+    out = dict(s or {})
+    for key in (
+        "state",
+        "estimated_units",
+        "reserved_units",
+        "actual_units",
+        "billed_units",
+        "released_units",
+        "amount",
+        "estimated_amount",
+        "final_amount",
+        "currency",
+        "billing_mode",
+        "settlement_mode",
+        "pricing_mode",
+        "reservation_id",
+        "reservation_status",
+        "commit_status",
+        "ledger_entry_id",
+        "billing_account_id",
+        "variant_code",
+        "sku_code",
+        "leaf_sku_code",
+        "service_name",
+        "service_action",
+    ):
+        value = p.get(key)
+        if value not in (None, "", {}, []):
+            out[key] = value
 
     currency = _safe_str(p.get("currency"))
     def _fmt(v: Any) -> Optional[str]:
@@ -904,21 +962,17 @@ def _normalize_pricing_summary_view(pricing: Dict[str, Any], summary: Dict[str, 
             return None
         return f"{currency} {sv}" if currency else sv
 
-    estimate = p.get("amount")
+    estimate = p.get("amount") or p.get("estimated_amount")
     final = p.get("final_amount") or estimate
-    return {
-        "state": p.get("state"),
-        "estimated_units": p.get("estimated_units"),
-        "actual_units": p.get("actual_units"),
-        "billed_units": p.get("billed_units"),
-        "amount": p.get("amount"),
-        "final_amount": p.get("final_amount"),
-        "currency": p.get("currency"),
-        "display_estimate": _fmt(estimate),
-        "display_final": _fmt(final),
-        "display_delta": None,
-        "display_note": None,
-    }
+
+    if "display_estimate" not in out or not _safe_str(out.get("display_estimate")):
+        out["display_estimate"] = _fmt(estimate)
+    if "display_final" not in out or not _safe_str(out.get("display_final")):
+        out["display_final"] = _fmt(final)
+    if (p.get("state") or "").lower() == "committed":
+        out.setdefault("display_delta", None)
+        out["display_note"] = out.get("display_note") or "Final charge recorded after execution."
+    return out
 
 
 def _resolve_face_artifact_id(req: LongformCreateRequest) -> Optional[str]:
@@ -963,11 +1017,229 @@ def _extract_pricing_summary_view(job_or_tags: Dict[str, Any]) -> Dict[str, Any]
     return _normalize_pricing_summary_view(pricing, summary)
 
 
+def _merge_pricing_non_empty(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge pricing views without letting partial DB quote rows blank committed receipt fields."""
+    out = dict(base or {})
+    for key, value in dict(overlay or {}).items():
+        if value not in (None, "", {}, []):
+            out[key] = value
+    return out
+
+
+async def _lookup_latest_ledger_entry_id(
+    conn: asyncpg.Connection,
+    *,
+    reservation_id: Optional[str],
+    job_id: Optional[str],
+) -> Optional[str]:
+    """Best-effort lookup of the ledger row for receipt display."""
+    try:
+        exists = await conn.fetchval("select to_regclass('public.pricing_credit_ledger_events')::text")
+        if not exists:
+            return None
+
+        rows = await conn.fetch(
+            """
+            select column_name
+            from information_schema.columns
+            where table_schema = 'public'
+              and table_name = 'pricing_credit_ledger_events'
+            """
+        )
+        cols = {str(r["column_name"]) for r in rows}
+        if "id" not in cols:
+            return None
+
+        conditions: list[str] = []
+        args: list[Any] = []
+
+        def add_arg(value: str) -> str:
+            args.append(str(value))
+            return f"${len(args)}"
+
+        rid = _safe_str(reservation_id)
+        jid = _safe_str(job_id)
+
+        if rid and "reservation_id" in cols:
+            conditions.append(f"reservation_id::text = {add_arg(rid)}")
+        if jid:
+            for c in ("external_ref_id", "job_ref", "service_job_id", "source_ref_id", "ref_id", "job_id"):
+                if c in cols:
+                    conditions.append(f"{c}::text = {add_arg(jid)}")
+        if rid and "metadata_json" in cols:
+            conditions.append(f"metadata_json->>'reservation_id' = {add_arg(rid)}")
+        if jid and "metadata_json" in cols:
+            conditions.append(f"(metadata_json->>'job_id' = {add_arg(jid)} or metadata_json->>'longform_job_id' = {add_arg(jid)} or metadata_json->>'service_job_id' = {add_arg(jid)})")
+        if rid and "meta_json" in cols:
+            conditions.append(f"meta_json->>'reservation_id' = {add_arg(rid)}")
+        if jid and "meta_json" in cols:
+            conditions.append(f"(meta_json->>'job_id' = {add_arg(jid)} or meta_json->>'longform_job_id' = {add_arg(jid)} or meta_json->>'service_job_id' = {add_arg(jid)})")
+
+        if not conditions:
+            return None
+
+        order_col = "created_at" if "created_at" in cols else "id"
+        sql = f"""
+            select id::text
+            from public.pricing_credit_ledger_events
+            where {" or ".join(conditions)}
+            order by {order_col} desc
+            limit 1
+        """
+        return _safe_str(await conn.fetchval(sql, *args))
+    except Exception:
+        logger.exception(
+            "longform.ledger_lookup_failed",
+            extra={"reservation_id": reservation_id, "job_id": job_id},
+        )
+        return None
+
+
+def _pricing_receipt_summary(pricing: Dict[str, Any], summary: Dict[str, Any]) -> Dict[str, Any]:
+    return _normalize_pricing_summary_view(pricing, summary)
+
+
+def _first_nonempty(*values: Any) -> Optional[str]:
+    for value in values:
+        s = _safe_str(value)
+        if s:
+            return s
+    return None
+
+
+def _build_run_receipt_view(
+    pricing: Dict[str, Any],
+    pricing_summary: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Build a stable, UI-facing run receipt from canonical pricing fields.
+
+    The mobile app may read either snake_case or camelCase keys. Keep both here so
+    old and new client builds can render the same completed receipt.
+    """
+    p = _as_dict_loose(pricing)
+    s = _as_dict_loose(pricing_summary)
+    if not p and not s:
+        return None
+
+    state = _first_nonempty(p.get("state"), s.get("state"))
+    estimated_units = _first_nonempty(
+        p.get("estimated_units"),
+        s.get("estimated_units"),
+        p.get("reserved_units"),
+        s.get("reserved_units"),
+    )
+    reserved_units = _first_nonempty(
+        p.get("reserved_units"),
+        s.get("reserved_units"),
+        estimated_units,
+    )
+    actual_units = _first_nonempty(
+        p.get("actual_units"),
+        s.get("actual_units"),
+        p.get("billed_units"),
+        s.get("billed_units"),
+    )
+    billed_units = _first_nonempty(
+        p.get("billed_units"),
+        s.get("billed_units"),
+        actual_units,
+    )
+    settlement_mode = _first_nonempty(p.get("settlement_mode"), s.get("settlement_mode"))
+    billing_mode = _first_nonempty(p.get("billing_mode"), s.get("billing_mode"))
+    reservation_id = _first_nonempty(p.get("reservation_id"), s.get("reservation_id"))
+    reservation_status = _first_nonempty(p.get("reservation_status"), s.get("reservation_status"))
+    commit_status = _first_nonempty(p.get("commit_status"), s.get("commit_status"))
+    ledger_entry_id = _first_nonempty(p.get("ledger_entry_id"), s.get("ledger_entry_id"))
+
+    amount = _first_nonempty(p.get("amount"), s.get("amount"))
+    estimated_amount = _first_nonempty(
+        p.get("estimated_amount"),
+        s.get("estimated_amount"),
+        amount,
+    )
+    final_amount = _first_nonempty(
+        p.get("final_amount"),
+        s.get("final_amount"),
+        amount,
+        estimated_amount,
+    )
+    currency = _first_nonempty(p.get("currency"), s.get("currency"))
+    variant_code = _first_nonempty(p.get("variant_code"), s.get("variant_code"))
+    sku_code = _first_nonempty(p.get("sku_code"), s.get("sku_code"))
+    leaf_sku_code = _first_nonempty(p.get("leaf_sku_code"), s.get("leaf_sku_code"))
+    service_name = _first_nonempty(p.get("service_name"), s.get("service_name"))
+    service_action = _first_nonempty(p.get("service_action"), s.get("service_action"))
+
+    display_estimate = _first_nonempty(s.get("display_estimate"))
+    display_final = _first_nonempty(s.get("display_final"))
+    display_delta = _first_nonempty(s.get("display_delta"))
+    display_note = _first_nonempty(s.get("display_note")) or (
+        "Final charge recorded after execution." if state == "committed" else None
+    )
+
+    receipt = {
+        # Canonical snake_case for API/debug consistency.
+        "state": state,
+        "status": state,
+        "estimated_units": estimated_units,
+        "reserved_units": reserved_units,
+        "actual_units": actual_units,
+        "billed_units": billed_units,
+        "settlement_mode": settlement_mode,
+        "billing_mode": billing_mode,
+        "reservation_id": reservation_id,
+        "reservation_status": reservation_status,
+        "commit_status": commit_status,
+        "ledger_entry_id": ledger_entry_id,
+        "estimated_amount": estimated_amount,
+        "final_amount": final_amount,
+        "amount": final_amount or amount,
+        "currency": currency,
+        "display_estimate": display_estimate,
+        "display_final": display_final,
+        "display_delta": display_delta,
+        "display_note": display_note,
+        "variant_code": variant_code,
+        "sku_code": sku_code,
+        "leaf_sku_code": leaf_sku_code,
+        "service_name": service_name,
+        "service_action": service_action,
+
+        # Backward/forward compatible camelCase aliases for mobile clients.
+        "estimatedUnits": estimated_units,
+        "reservedUnits": reserved_units,
+        "actualUnits": actual_units,
+        "billedUnits": billed_units,
+        "settlementMode": settlement_mode,
+        "billingMode": billing_mode,
+        "reservationId": reservation_id,
+        "reservationStatus": reservation_status,
+        "commitStatus": commit_status,
+        "ledgerEntryId": ledger_entry_id,
+        "estimatedAmount": estimated_amount,
+        "finalAmount": final_amount,
+        "displayEstimate": display_estimate,
+        "displayFinal": display_final,
+        "displayDelta": display_delta,
+        "displayNote": display_note,
+        "variantCode": variant_code,
+        "skuCode": sku_code,
+        "leafSkuCode": leaf_sku_code,
+        "serviceName": service_name,
+        "serviceAction": service_action,
+    }
+
+    cleaned = {k: v for k, v in receipt.items() if v not in (None, "", {}, [])}
+    return cleaned or None
+
+
 async def _load_latest_pricing_view(conn: asyncpg.Connection, job_id: str, source: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    source_pricing = _extract_pricing_view(source)
+    source_summary = _extract_pricing_summary_view(source)
+
     row = await conn.fetchrow(
         """
-        select id, status, billing_account_id, settlement_mode, service_name, service_action, sku_code,
-               estimated_money, currency, quote_json, created_at, updated_at
+        select *
         from pricing_credit_reservations
         where job_ref = $1
         order by created_at desc
@@ -976,39 +1248,139 @@ async def _load_latest_pricing_view(conn: asyncpg.Connection, job_id: str, sourc
         str(job_id),
     )
     if not row:
-        return _extract_pricing_view(source), _extract_pricing_summary_view(source)
+        pricing = _normalize_pricing_view(source_pricing, source)
+        return pricing, _pricing_receipt_summary(pricing, source_summary)
 
     quote = _as_dict_loose(row.get('quote_json'))
     profile = _longform_profile_from_source(source)
     default_variant, default_leaf = _variant_and_leaf_for_profile(profile, source)
-    state = (_safe_str(row.get('status')) or _safe_str(quote.get('status')) or _safe_str(quote.get('state')) or '').lower() or 'reserved'
-    amount = _safe_str(quote.get('estimated_amount')) or _safe_str(quote.get('amount')) or (_safe_str(row.get('estimated_money')) if row.get('estimated_money') is not None else None)
-    final_amount = _safe_str(quote.get('final_charged_money')) or _safe_str(quote.get('final_amount'))
+
+    state = (
+        _safe_str(row.get('status'))
+        or _safe_str(quote.get('status'))
+        or _safe_str(quote.get('state'))
+        or _safe_str(source_pricing.get('state'))
+        or 'reserved'
+    ).lower()
+
+    row_final_credits = row.get('final_charged_credits') if 'final_charged_credits' in row else None
+    row_reserved_credits = row.get('reserved_credits') if 'reserved_credits' in row else None
+    row_final_money = row.get('final_charged_money') if 'final_charged_money' in row else None
+
+    amount = (
+        _safe_str(quote.get('estimated_amount'))
+        or _safe_str(quote.get('amount'))
+        or (_safe_str(row.get('estimated_money')) if 'estimated_money' in row and row.get('estimated_money') is not None else None)
+        or source_pricing.get('amount')
+        or source_pricing.get('estimated_amount')
+    )
+    final_amount = (
+        _safe_str(quote.get('final_charged_money'))
+        or _safe_str(quote.get('final_amount'))
+        or (_safe_str(row_final_money) if row_final_money is not None else None)
+        or source_pricing.get('final_amount')
+    )
     if not final_amount and state == 'committed':
         final_amount = amount
 
-    pricing = _normalize_pricing_view({
+    estimated_units = (
+        _safe_str(quote.get('estimated_units'))
+        or _safe_str(quote.get('requested_units'))
+        or _safe_str(quote.get('units'))
+        or _safe_str(source_pricing.get('estimated_units'))
+        or (_safe_str(row_reserved_credits) if row_reserved_credits is not None else None)
+    )
+    actual_units = (
+        _safe_str(quote.get('actual_units'))
+        or _safe_str(quote.get('final_charged_credits'))
+        or (_safe_str(row_final_credits) if row_final_credits is not None else None)
+        or _safe_str(source_pricing.get('actual_units'))
+    )
+    billed_units = (
+        _safe_str(quote.get('billed_units'))
+        or _safe_str(quote.get('final_charged_credits'))
+        or (_safe_str(row_final_credits) if row_final_credits is not None else None)
+        or _safe_str(source_pricing.get('billed_units'))
+        or actual_units
+    )
+    if state == 'committed':
+        actual_units = actual_units or billed_units or estimated_units
+        billed_units = billed_units or actual_units or estimated_units
+
+    settlement_mode = (
+        (_safe_str(row.get('settlement_mode')) if 'settlement_mode' in row else None)
+        or _safe_str(quote.get('settlement_mode'))
+        or _safe_str(source_pricing.get('settlement_mode'))
+    )
+    if not settlement_mode and state == 'committed':
+        if _safe_str(billed_units):
+            settlement_mode = 'credits'
+        elif final_amount:
+            settlement_mode = 'money'
+
+    reservation_id = str(row.get('id'))
+    ledger_entry_id = (
+        _safe_str(quote.get('ledger_entry_id'))
+        or _safe_str(quote.get('ledger_id'))
+        or _safe_str(quote.get('ledger_event_id'))
+        or _safe_str(source_pricing.get('ledger_entry_id'))
+    )
+    if not ledger_entry_id and state == 'committed':
+        ledger_entry_id = await _lookup_latest_ledger_entry_id(conn, reservation_id=reservation_id, job_id=str(job_id))
+
+    db_pricing = _normalize_pricing_view({
         'enabled': True,
         'state': state,
-        'billing_mode': _safe_str(quote.get('billing_mode_snapshot')) or _safe_str(quote.get('billing_mode')),
-        'settlement_mode': _safe_str(row.get('settlement_mode')) or _safe_str(quote.get('settlement_mode')),
-        'tier_code': _safe_str(quote.get('tier_code')),
-        'quote_id': _safe_str(quote.get('quote_id')),
-        'preview_fingerprint': _safe_str(quote.get('preview_fingerprint')),
-        'reservation_id': str(row.get('id')),
-        'variant_code': _safe_str(quote.get('variant_code')) or default_variant,
-        'sku_code': _safe_str(quote.get('leaf_sku_code')) or _safe_str(quote.get('sku_code')) or _safe_str(row.get('sku_code')) or default_leaf,
-        'leaf_sku_code': _safe_str(quote.get('leaf_sku_code')) or _safe_str(quote.get('sku_code')) or _safe_str(row.get('sku_code')) or default_leaf,
-        'estimated_units': _safe_str(quote.get('estimated_units')) or _safe_str(quote.get('requested_units')) or _safe_str(quote.get('units')),
-        'actual_units': _safe_str(quote.get('actual_units')),
-        'billed_units': _safe_str(quote.get('billed_units')),
+        'billing_mode': _safe_str(quote.get('billing_mode_snapshot')) or _safe_str(quote.get('billing_mode')) or source_pricing.get('billing_mode'),
+        'settlement_mode': settlement_mode,
+        'pricing_mode': _safe_str(quote.get('pricing_mode')) or source_pricing.get('pricing_mode'),
+        'tier_code': _safe_str(quote.get('tier_code')) or source_pricing.get('tier_code'),
+        'quote_id': _safe_str(quote.get('quote_id')) or source_pricing.get('quote_id'),
+        'preview_fingerprint': _safe_str(quote.get('preview_fingerprint')) or source_pricing.get('preview_fingerprint'),
+        'reservation_id': reservation_id,
+        'reservation_status': _safe_str(quote.get('reservation_status')) or state,
+        'commit_status': _safe_str(quote.get('commit_status')) or ('committed' if state == 'committed' else None),
+        'variant_code': _safe_str(quote.get('variant_code')) or source_pricing.get('variant_code') or default_variant,
+        'sku_code': _safe_str(quote.get('leaf_sku_code')) or _safe_str(quote.get('sku_code')) or (_safe_str(row.get('sku_code')) if 'sku_code' in row else None) or source_pricing.get('sku_code') or default_leaf,
+        'leaf_sku_code': _safe_str(quote.get('leaf_sku_code')) or _safe_str(quote.get('sku_code')) or (_safe_str(row.get('sku_code')) if 'sku_code' in row else None) or source_pricing.get('leaf_sku_code') or default_leaf,
+        'estimated_units': estimated_units,
+        'reserved_units': _safe_str(quote.get('reserved_units')) or estimated_units,
+        'actual_units': actual_units,
+        'billed_units': billed_units,
         'amount': amount,
+        'estimated_amount': _safe_str(quote.get('estimated_amount')) or amount,
         'final_amount': final_amount,
-        'currency': _safe_str(row.get('currency')) or _safe_str(quote.get('currency')) or 'USD',
-        'ledger_entry_id': _safe_str(quote.get('ledger_entry_id')),
-        'billing_account_id': str(row.get('billing_account_id')) if row.get('billing_account_id') else _safe_str(quote.get('billing_account_id')),
+        'currency': (_safe_str(row.get('currency')) if 'currency' in row else None) or _safe_str(quote.get('currency')) or source_pricing.get('currency') or 'USD',
+        'ledger_entry_id': ledger_entry_id,
+        'billing_account_id': (str(row.get('billing_account_id')) if 'billing_account_id' in row and row.get('billing_account_id') else None) or _safe_str(quote.get('billing_account_id')) or source_pricing.get('billing_account_id'),
+        'service_name': (_safe_str(row.get('service_name')) if 'service_name' in row else None) or _safe_str(quote.get('service_name')) or source_pricing.get('service_name') or 'svc-fusion-extension',
+        'service_action': (_safe_str(row.get('service_action')) if 'service_action' in row else None) or _safe_str(quote.get('service_action')) or source_pricing.get('service_action'),
     }, source)
-    summary = _normalize_pricing_summary_view(pricing, _as_dict_loose(quote.get('summary')) or _extract_pricing_summary_view(source))
+
+    pricing = _merge_pricing_non_empty(source_pricing, db_pricing)
+    if source_pricing.get('state') == 'committed' or db_pricing.get('state') == 'committed':
+        pricing['state'] = 'committed'
+        pricing['reservation_status'] = pricing.get('reservation_status') or 'committed'
+        pricing['commit_status'] = pricing.get('commit_status') or 'committed'
+        pricing['actual_units'] = pricing.get('actual_units') or pricing.get('billed_units') or pricing.get('estimated_units')
+        pricing['billed_units'] = pricing.get('billed_units') or pricing.get('actual_units') or pricing.get('estimated_units')
+        pricing['settlement_mode'] = pricing.get('settlement_mode') or ('credits' if pricing.get('billed_units') else None)
+        pricing['final_amount'] = pricing.get('final_amount') or pricing.get('amount')
+
+    pricing = _normalize_pricing_view(pricing, source)
+    db_summary = _normalize_pricing_summary_view(db_pricing, _as_dict_loose(quote.get('summary')))
+    summary = _pricing_receipt_summary(pricing, _merge_pricing_non_empty(source_summary, db_summary))
+
+    logger.info(
+        "longform.status_pricing_receipt job_id=%s state=%s estimated_units=%s billed_units=%s settlement=%s reservation_id=%s ledger_entry_id=%s",
+        job_id,
+        pricing.get("state"),
+        pricing.get("estimated_units"),
+        pricing.get("billed_units"),
+        pricing.get("settlement_mode"),
+        pricing.get("reservation_id"),
+        pricing.get("ledger_entry_id"),
+    )
     return pricing, summary
 
 
@@ -1366,6 +1738,7 @@ async def get_longform_job(
             )
 
         pricing_view, pricing_summary_view = await _load_latest_pricing_view(conn, str(row["id"]), {"tags": tags})
+        run_receipt_view = _build_run_receipt_view(pricing_view, pricing_summary_view)
 
         return LongformJobView(
             id=str(row["id"]),
@@ -1403,6 +1776,8 @@ async def get_longform_job(
             qc=qc,
             pricing=pricing_view,
             pricing_summary=pricing_summary_view,
+            run_receipt=run_receipt_view,
+            runReceipt=run_receipt_view,
         )
 
 
