@@ -1426,8 +1426,84 @@ def _live_subscription_or_none(row: Optional[Dict[str, Any]]) -> Optional[Dict[s
     return row if _subscription_row_is_live(row) else None
 
 
+_PAYMENT_PROVIDER_CODES = {"stripe", "apple_iap", "google_play", "other"}
+_SELF_SERVE_PAYMENT_PROVIDER_CODES = {"stripe", "apple_iap", "google_play"}
+
+
+def _normalize_payment_provider(value: Any) -> str:
+    provider = str(value or "").strip().lower()
+    return provider if provider in _PAYMENT_PROVIDER_CODES else ""
+
+
 def _subscription_provider(row: Optional[Dict[str, Any]]) -> str:
-    return str((row or {}).get("gateway_provider") or "").strip().lower()
+    return _normalize_payment_provider(_record_get(row, "gateway_provider", ""))
+
+
+def _entitlement_provider(row: Any) -> str:
+    source = _normalize_payment_provider(_record_get(row, "source", ""))
+    if source:
+        return source
+
+    md = _as_dict_deep_loose(_record_get(row, "metadata_json", None))
+    for key in ("provider", "gateway_provider", "source"):
+        provider = _normalize_payment_provider(md.get(key))
+        if provider:
+            return provider
+    return ""
+
+
+def _canonical_subscription_provider(
+    current_sub: Optional[Dict[str, Any]],
+    current_ent: Any = None,
+    *,
+    active_payment_sources: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Resolve the provider that owns the canonical DesiFaces entitlement.
+
+    Provider subscription rows are payment-rail history and may legitimately
+    contain more than one active source. The canonical current provider should
+    follow billing_entitlements.source first when present, because that row is
+    the single DesiFaces entitlement contract.
+    """
+    provider = _entitlement_provider(current_ent)
+    if provider:
+        return provider
+
+    provider = _subscription_provider(current_sub)
+    if provider:
+        return provider
+
+    sources = [
+        _normalize_payment_provider(source)
+        for source in (active_payment_sources or [])
+    ]
+    sources = [source for source in sources if source in _SELF_SERVE_PAYMENT_PROVIDER_CODES]
+    if len(set(sources)) == 1:
+        return sources[0]
+    return None
+
+
+async def _fetch_active_payment_sources(conn, *, user_id: UUID) -> List[str]:
+    rows = await conn.fetch(
+        """
+        select distinct gateway_provider
+        from public.payment_plan_subscriptions
+        where user_id = $1
+          and subscription_state in ('trialing', 'active', 'past_due')
+          and entitlement_state in ('active', 'grace')
+          and gateway_provider in ('stripe', 'apple_iap', 'google_play')
+        order by gateway_provider
+        """,
+        user_id,
+    )
+    out: List[str] = []
+    seen = set()
+    for row in rows:
+        provider = _normalize_payment_provider(_record_get(row, "gateway_provider", ""))
+        if provider and provider not in seen:
+            seen.add(provider)
+            out.append(provider)
+    return out
 
 
 def _is_apple_managed_subscription(row: Optional[Dict[str, Any]]) -> bool:
@@ -1507,6 +1583,7 @@ def _normalize_overview_payload(
     user_id: UUID,
     credit_account: Any = None,
     pricing_account_overview: Any = None,
+    active_payment_sources: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     linked = _has_linked_subscription(current_sub)
     normalized_plan_code = str(current_plan_code or "").strip().lower()
@@ -1524,8 +1601,18 @@ def _normalize_overview_payload(
     )
     overview["current_subscription"] = subscription_view.model_dump()
 
+    active_payment_sources = [
+        source
+        for source in (active_payment_sources or [])
+        if _normalize_payment_provider(source) in _SELF_SERVE_PAYMENT_PROVIDER_CODES
+    ]
+    provider = _canonical_subscription_provider(
+        current_sub,
+        current_ent,
+        active_payment_sources=active_payment_sources,
+    )
+
     allowed = dict(overview.get("allowed_actions") or {})
-    provider = _subscription_provider(current_sub)
     if not linked:
         allowed["can_manage_billing"] = False
         allowed["can_cancel"] = False
@@ -1623,10 +1710,10 @@ def _normalize_overview_payload(
     # Backward-compatible top-level objects for older frontend builds.
     # These must be sourced from canonical backend truth, not from the login JWT.
     current_subscription_payload = dict(overview.get("current_subscription") or {})
+    current_subscription_payload["gateway_provider"] = provider or None
     if current_sub:
-        current_subscription_payload["gateway_provider"] = _subscription_provider(current_sub) or None
-        current_subscription_payload["gateway_subscription_id"] = str(current_sub.get("gateway_subscription_id") or "") or None
-        current_subscription_payload["gateway_price_id"] = str(current_sub.get("gateway_price_id") or "") or None
+        current_subscription_payload["gateway_subscription_id"] = str(_record_get(current_sub, "gateway_subscription_id", "") or "") or None
+        current_subscription_payload["gateway_price_id"] = str(_record_get(current_sub, "gateway_price_id", "") or "") or None
     overview["subscription"] = _json_safe(current_subscription_payload) if current_subscription_payload else None
     overview["entitlement"] = _json_safe(dict(current_ent)) if current_ent else None
     billing_payload = dict(overview.get("billing") or {})
@@ -1634,7 +1721,8 @@ def _normalize_overview_payload(
         "plan_code": overview.get("plan_code"),
         "plan_name": overview.get("plan_name"),
         "tier_code": overview.get("tier_code"),
-        "current_subscription_provider": _subscription_provider(current_sub) or None,
+        "current_subscription_provider": provider or None,
+        "active_payment_sources": active_payment_sources,
     })
     overview["billing"] = _json_safe(billing_payload)
     return overview
@@ -1950,10 +2038,202 @@ async def list_payment_methods(auth: AuthContext = AuthDep, pool=PoolDep) -> Lis
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+
+def _normalize_topup_pack_code(value: Any) -> Optional[str]:
+    raw = str(value or "").strip().upper()
+    return raw or None
+
+
+def _safe_int_or_none(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(Decimal(str(value)).to_integral_value(rounding="ROUND_HALF_UP"))
+    except Exception:
+        return None
+
+
+def _price_money_to_minor(value: Any) -> Optional[int]:
+    amount = _to_decimal_or_none(value)
+    if amount is None:
+        return None
+    try:
+        return int((amount * Decimal("100")).to_integral_value(rounding="ROUND_HALF_UP"))
+    except Exception:
+        return None
+
+
+async def _resolve_wallet_topup_pack(
+    conn,
+    *,
+    pack_code: Optional[str],
+    currency: str,
+    country_code: Optional[str],
+    amount_minor: Optional[int],
+    credits_to_grant: Optional[str],
+) -> Dict[str, Any]:
+    normalized_pack_code = _normalize_topup_pack_code(pack_code)
+    requested_credits = _safe_int_or_none(credits_to_grant)
+    requested_amount_minor = int(amount_minor) if amount_minor is not None else None
+    resolved_currency = _normalize_currency(currency)
+
+    if not normalized_pack_code and (requested_amount_minor is None or requested_credits is None):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "topup_pack_required",
+                "message": "Provide pack_code, or provide amount_minor and credits_to_grant that match a configured top-up pack.",
+            },
+        )
+
+    rows = await fetch_topup_pack_rows(
+        conn,
+        currency=resolved_currency,
+        country_code=country_code,
+    )
+
+    candidates: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            item = build_topup_catalog_item(row)
+        except Exception:
+            item = {}
+
+        row_metadata = _as_dict_deep_loose(_record_get(row, "metadata_json", {}))
+        item_metadata = _as_dict_deep_loose(item.get("metadata") or item.get("metadata_json"))
+        metadata = dict(row_metadata)
+        metadata.update(item_metadata)
+
+        candidate_pack_code = _normalize_topup_pack_code(
+            item.get("pack_code")
+            or _record_get(row, "code", None)
+            or metadata.get("pack_code")
+        )
+
+        candidate_amount_minor = _safe_int_or_none(
+            item.get("amount_minor")
+            or _record_get(row, "amount_minor", None)
+        )
+        if candidate_amount_minor is None:
+            candidate_amount_minor = _price_money_to_minor(
+                _record_get(row, "price_money", None)
+                or metadata.get("price_money")
+            )
+
+        candidate_credits = _safe_int_or_none(
+            item.get("credits_to_grant")
+            or item.get("credits")
+            or _record_get(row, "credits", None)
+            or _record_get(row, "credits_to_grant", None)
+        )
+
+        stripe_price_id = str(
+            item.get("stripe_price_id")
+            or metadata.get("stripe_price_id")
+            or row_metadata.get("stripe_price_id")
+            or ""
+        ).strip() or None
+
+        if not candidate_pack_code or candidate_amount_minor is None or candidate_credits is None:
+            continue
+
+        candidates.append(
+            {
+                "pack_code": candidate_pack_code,
+                "currency": resolved_currency,
+                "amount_minor": int(candidate_amount_minor),
+                "credits_to_grant": int(candidate_credits),
+                "stripe_price_id": stripe_price_id,
+                "stripe_lookup_key": str(metadata.get("stripe_lookup_key") or "").strip() or None,
+                "stripe_account_id": str(metadata.get("stripe_account_id") or "").strip() or None,
+                "stripe_mode": str(metadata.get("stripe_mode") or "").strip() or None,
+                "metadata": metadata,
+                "catalog_item": item,
+            }
+        )
+
+    match: Optional[Dict[str, Any]] = None
+    for candidate in candidates:
+        if normalized_pack_code:
+            if candidate["pack_code"] == normalized_pack_code:
+                match = candidate
+                break
+            continue
+
+        if (
+            requested_amount_minor is not None
+            and requested_credits is not None
+            and candidate["amount_minor"] == requested_amount_minor
+            and candidate["credits_to_grant"] == requested_credits
+        ):
+            match = candidate
+            break
+
+    if not match:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "topup_pack_not_configured",
+                "message": "The requested top-up does not match an active configured pack for this currency/country.",
+                "requested": {
+                    "pack_code": normalized_pack_code,
+                    "currency": resolved_currency,
+                    "country_code": country_code,
+                    "amount_minor": requested_amount_minor,
+                    "credits_to_grant": requested_credits,
+                },
+                "available_packs": [
+                    {
+                        "pack_code": c["pack_code"],
+                        "amount_minor": c["amount_minor"],
+                        "credits_to_grant": c["credits_to_grant"],
+                    }
+                    for c in candidates
+                ],
+            },
+        )
+
+    mismatch_fields: Dict[str, Any] = {}
+    if normalized_pack_code and requested_amount_minor is not None and requested_amount_minor != match["amount_minor"]:
+        mismatch_fields["amount_minor"] = {
+            "requested": requested_amount_minor,
+            "expected": match["amount_minor"],
+        }
+    if normalized_pack_code and requested_credits is not None and requested_credits != match["credits_to_grant"]:
+        mismatch_fields["credits_to_grant"] = {
+            "requested": requested_credits,
+            "expected": match["credits_to_grant"],
+        }
+    if mismatch_fields:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "topup_pack_request_mismatch",
+                "message": "The requested amount or credits do not match the configured top-up pack.",
+                "pack_code": match["pack_code"],
+                "mismatches": mismatch_fields,
+            },
+        )
+
+    if not match.get("stripe_price_id"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "topup_stripe_price_not_configured",
+                "message": "This top-up pack is missing a canonical Stripe price id.",
+                "pack_code": match["pack_code"],
+                "currency": resolved_currency,
+            },
+        )
+
+    return match
+
+
 class WalletTopupCreateIn(BaseModel):
-    amount_minor: int
+    pack_code: Optional[str] = None
+    amount_minor: Optional[int] = None
     currency: Optional[str] = None
-    credits_to_grant: str
+    credits_to_grant: Optional[str] = None
     success_url: Optional[str] = None
     cancel_url: Optional[str] = None
     idempotency_key: str
@@ -1971,9 +2251,15 @@ class WalletTopupCreateOut(BaseModel):
 @router.post("/wallet/topups/create-checkout-session", response_model=WalletTopupCreateOut)
 async def create_wallet_topup_checkout_session(inp: WalletTopupCreateIn, auth: AuthContext = AuthDep, pool=PoolDep) -> WalletTopupCreateOut:
     gw = _gateway()
-    amount_minor = _normalize_amount_minor(inp.amount_minor)
-    currency = _normalize_currency(inp.currency or _currency_for_auth(auth))
-    credits_to_grant = _normalize_credits_to_grant(inp.credits_to_grant)
+    country_code = _country_code_from_auth(auth)
+    requested_currency = _normalize_currency(inp.currency or _currency_for_auth(auth))
+    requested_amount_minor = _normalize_amount_minor(inp.amount_minor) if inp.amount_minor is not None else None
+    requested_credits_to_grant = (
+        _normalize_credits_to_grant(inp.credits_to_grant)
+        if inp.credits_to_grant is not None and str(inp.credits_to_grant).strip() != ""
+        else None
+    )
+
     success_url = (inp.success_url or settings.DF_PAYMENT_SUCCESS_URL_BASE or "").strip()
     cancel_url = (inp.cancel_url or settings.DF_PAYMENT_CANCEL_URL_BASE or "").strip()
     if not success_url or not cancel_url:
@@ -2016,6 +2302,38 @@ async def create_wallet_topup_checkout_session(inp: WalletTopupCreateIn, auth: A
                     payment_state=str(existing["payment_state"]),
                 )
 
+        resolved_pack = await _resolve_wallet_topup_pack(
+            conn,
+            pack_code=inp.pack_code,
+            currency=requested_currency,
+            country_code=country_code,
+            amount_minor=requested_amount_minor,
+            credits_to_grant=requested_credits_to_grant,
+        )
+        pack_code = str(resolved_pack["pack_code"])
+        currency = str(resolved_pack["currency"]).upper()
+        amount_minor = int(resolved_pack["amount_minor"])
+        credits_to_grant = str(int(resolved_pack["credits_to_grant"]))
+        stripe_price_id = str(resolved_pack["stripe_price_id"])
+        stripe_lookup_key = str(resolved_pack.get("stripe_lookup_key") or "") or None
+        stripe_account_id = str(resolved_pack.get("stripe_account_id") or "") or None
+        stripe_mode = str(resolved_pack.get("stripe_mode") or "") or None
+
+        order_metadata = {
+            "pack_code": pack_code,
+            "stripe_price_id": stripe_price_id,
+            "stripe_lookup_key": stripe_lookup_key,
+            "stripe_account_id": stripe_account_id,
+            "stripe_mode": stripe_mode,
+            "requested": {
+                "pack_code": inp.pack_code,
+                "amount_minor": requested_amount_minor,
+                "currency": requested_currency,
+                "credits_to_grant": requested_credits_to_grant,
+            },
+            "source": "canonical_topup_pack",
+        }
+
         customer = await _sync_customer_row(
             conn,
             user_id=auth.user_id,
@@ -2024,20 +2342,21 @@ async def create_wallet_topup_checkout_session(inp: WalletTopupCreateIn, auth: A
             idempotency_key=f"stripe-customer-sync:{auth.user_id}",
         )
         wallet_order = await conn.fetchrow(
-            '''
+            """
             insert into payment_wallet_orders(
               user_id, order_type, currency, amount_minor, credits_to_grant,
               gateway_provider, payment_state, fulfillment_state, idempotency_key,
               metadata_json, created_at, updated_at
             )
-            values($1, 'topup', $2, $3, $4, 'stripe', 'pending', 'pending', $5, '{}'::jsonb, now(), now())
+            values($1, 'topup', $2, $3, $4, 'stripe', 'pending', 'pending', $5, $6::jsonb, now(), now())
             returning id
-            ''',
+            """,
             auth.user_id,
             currency,
             amount_minor,
             Decimal(credits_to_grant),
             inp.idempotency_key,
+            json.dumps(order_metadata, default=str),
         )
         wallet_order_id = str(wallet_order["id"])
 
@@ -2052,6 +2371,8 @@ async def create_wallet_topup_checkout_session(inp: WalletTopupCreateIn, auth: A
                 user_id=str(auth.user_id),
                 credits_to_grant=credits_to_grant,
                 idempotency_key=inp.idempotency_key,
+                price_id=stripe_price_id,
+                pack_code=pack_code,
             )
         except StripeGatewayError as exc:
             await conn.execute(
@@ -2064,13 +2385,27 @@ async def create_wallet_topup_checkout_session(inp: WalletTopupCreateIn, auth: A
         session_id = str(session["id"])
         checkout_url = str(session.get("url") or "")
         status = "open" if checkout_url else "created"
+        session_amount_minor = int(session.get("amount_total") or amount_minor)
         metadata_json = json.dumps(
-            {"checkout_session_id": session_id, "checkout_url": checkout_url, "stripe": session},
+            {
+                "checkout_session_id": session_id,
+                "checkout_url": checkout_url,
+                "stripe": session,
+                "pack_code": pack_code,
+                "stripe_price_id": stripe_price_id,
+                "stripe_lookup_key": stripe_lookup_key,
+                "stripe_account_id": stripe_account_id,
+                "stripe_mode": stripe_mode,
+                "credits_to_grant": credits_to_grant,
+                "currency": currency,
+                "amount_minor": amount_minor,
+                "source": "canonical_topup_pack",
+            },
             default=str,
         )
 
         await conn.execute(
-            '''
+            """
             insert into payment_gateway_checkout_sessions(
               user_id, gateway_provider, gateway_checkout_session_id, gateway_customer_id,
               mode, purpose, local_order_id, currency, amount_minor, status,
@@ -2090,13 +2425,13 @@ async def create_wallet_topup_checkout_session(inp: WalletTopupCreateIn, auth: A
               idempotency_key = excluded.idempotency_key,
               metadata_json = excluded.metadata_json,
               updated_at = now()
-            ''',
+            """,
             auth.user_id,
             session_id,
             customer["gateway_customer_id"],
             wallet_order_id,
             currency,
-            int(session.get("amount_total") or amount_minor),
+            session_amount_minor,
             status,
             success_url,
             cancel_url,
@@ -2129,6 +2464,8 @@ async def create_wallet_topup_checkout_session(inp: WalletTopupCreateIn, auth: A
                 "wallet_order_id": str(wallet_order_id),
                 "checkout_session_id": session_id,
                 "checkout_url": checkout_url,
+                "pack_code": pack_code,
+                "stripe_price_id": stripe_price_id,
                 "credits_to_grant": credits_to_grant,
                 "currency": currency,
                 "amount_minor": amount_minor,
@@ -2136,6 +2473,9 @@ async def create_wallet_topup_checkout_session(inp: WalletTopupCreateIn, auth: A
             "metadata_json": {
                 "wallet_order_id": str(wallet_order_id),
                 "checkout_session_id": session_id,
+                "pack_code": pack_code,
+                "stripe_price_id": stripe_price_id,
+                "stripe_lookup_key": stripe_lookup_key,
                 "credits_to_grant": credits_to_grant,
                 "currency": currency,
                 "amount_minor": amount_minor,
@@ -2570,7 +2910,8 @@ class TopupCatalogItemOut(BaseModel):
     display_order: int = 0
     is_active: bool = True
 
-    # Gateway identifiers for mobile IAP.
+    # Gateway identifiers for web checkout and mobile IAP.
+    stripe_price_id: Optional[str] = None
     apple_product_id: Optional[str] = None
     ios_product_id: Optional[str] = None
     google_product_id: Optional[str] = None
@@ -2801,6 +3142,7 @@ async def get_payments_overview(auth: AuthContext = AuthDep, pool=PoolDep) -> Pa
             country_code=country_code,
             currency=currency,
         )
+        active_payment_sources = await _fetch_active_payment_sources(conn, user_id=auth.user_id)
 
     pricing_plan_json = _as_dict_deep_loose((pricing_overview_row or {}).get("plan_json") if pricing_overview_row else None)
     current_plan_code = (
@@ -2894,6 +3236,7 @@ async def get_payments_overview(auth: AuthContext = AuthDep, pool=PoolDep) -> Pa
         user_id=auth.user_id,
         credit_account=credit_account,
         pricing_account_overview=pricing_overview_row,
+        active_payment_sources=active_payment_sources,
     )
 
     overview_current_plan_item = dict(current_plan_item or {})
@@ -2965,6 +3308,32 @@ async def get_topups_catalog(auth: AuthContext = AuthDep, pool=PoolDep) -> Topup
             item,
             google_product_by_pack=google_product_by_pack,
         )
+
+        # build_topup_catalog_item() intentionally keeps the public payload small.
+        # Reattach only Stripe catalog identifiers from pricing_credit_packs.metadata_json
+        # so diagnostics and web checkout surfaces can verify Apple/Google/Stripe
+        # mappings without exposing unrelated DB metadata.
+        row_metadata = _as_dict_deep_loose(_record_get(row, "metadata_json", {}))
+        metadata = _as_dict_deep_loose(item.get("metadata") or item.get("metadata_json"))
+
+        stripe_price_id = str(
+            item.get("stripe_price_id")
+            or metadata.get("stripe_price_id")
+            or row_metadata.get("stripe_price_id")
+            or ""
+        ).strip() or None
+
+        if stripe_price_id:
+            item["stripe_price_id"] = stripe_price_id
+            metadata["stripe_price_id"] = stripe_price_id
+
+        for key in ("stripe_lookup_key", "stripe_account_id", "stripe_mode", "stripe_product_id"):
+            value = str(metadata.get(key) or row_metadata.get(key) or "").strip()
+            if value:
+                metadata[key] = value
+
+        item["metadata"] = metadata
+
         items.append(
             TopupCatalogItemOut(
                 **{k: v for k, v in item.items() if k in TopupCatalogItemOut.model_fields}

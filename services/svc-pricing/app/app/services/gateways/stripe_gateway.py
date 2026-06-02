@@ -123,8 +123,43 @@ class StripeGateway:
         user_id: str,
         credits_to_grant: str,
         idempotency_key: str,
+        price_id: Optional[str] = None,
+        pack_code: Optional[str] = None,
     ) -> Dict[str, Any]:
         currency_l = currency.lower()
+
+        metadata: Dict[str, Any] = {
+            "df_order_type": "wallet_topup",
+            "df_wallet_order_id": wallet_order_id,
+            "df_user_id": user_id,
+            "df_credits_to_grant": credits_to_grant,
+            "df_currency": currency_l,
+            "df_amount_minor": str(amount_minor),
+            "df_service": "svc-pricing",
+        }
+        if pack_code:
+            metadata["df_pack_code"] = str(pack_code)
+        if price_id:
+            metadata["df_stripe_price_id"] = str(price_id)
+
+        if price_id:
+            line_item: Dict[str, Any] = {
+                "price": str(price_id),
+                "quantity": 1,
+            }
+        else:
+            # Backward-compatible fallback. Production route code should resolve
+            # configured top-up packs and pass price_id so Stripe Checkout uses
+            # canonical catalog prices instead of creating ad-hoc inline prices.
+            line_item = {
+                "price_data": {
+                    "currency": currency_l,
+                    "unit_amount": amount_minor,
+                    "product_data": {"name": f"DesiFaces Wallet Top-up ({credits_to_grant} credits)"},
+                },
+                "quantity": 1,
+            }
+
         form = {
             "mode": "payment",
             "customer": customer_id,
@@ -134,23 +169,8 @@ class StripeGateway:
             "payment_method_types": ["card"],
             "billing_address_collection": "auto",
             "allow_promotion_codes": True,
-            "line_items": [
-                {
-                    "price_data": {
-                        "currency": currency_l,
-                        "unit_amount": amount_minor,
-                        "product_data": {"name": f"DesiFaces Wallet Top-up ({credits_to_grant} credits)"},
-                    },
-                    "quantity": 1,
-                }
-            ],
-            "metadata": {
-                "df_order_type": "wallet_topup",
-                "df_wallet_order_id": wallet_order_id,
-                "df_user_id": user_id,
-                "df_credits_to_grant": credits_to_grant,
-                "df_service": "svc-pricing",
-            },
+            "line_items": [line_item],
+            "metadata": metadata,
         }
         return await self._request("POST", "/v1/checkout/sessions", form=form, idempotency_key=idempotency_key)
 
@@ -254,7 +274,6 @@ class StripeGateway:
             form={"cancel_at_period_end": cancel_at_period_end},
             idempotency_key=idempotency_key,
         )
-
 
     async def reactivate_subscription(
         self,
