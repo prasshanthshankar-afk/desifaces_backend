@@ -362,6 +362,7 @@ def _should_try_free_pricing_bootstrap(tier: str | None) -> bool:
     return normalized in {"", "free"}
 
 
+
 async def _best_effort_bootstrap_pricing_for_user(
     *,
     user_id: str,
@@ -386,6 +387,8 @@ async def _best_effort_bootstrap_pricing_for_user(
         )
         return
 
+    # Keep the remote bootstrap request backward-compatible. svc-pricing is
+    # the single owner of Free signup billing/credit bootstrap.
     payload = json.dumps(
         {
             "user_id": user_id,
@@ -436,6 +439,7 @@ async def _best_effort_bootstrap_pricing_for_user(
         logger.warning("pricing bootstrap URL error for user %s: %s", user_id, e)
     except Exception as e:
         logger.warning("pricing bootstrap after auth failed for user %s: %s", user_id, e)
+
 
 
 

@@ -100,6 +100,7 @@ async def fetch_purchased_wallet_totals(conn, *, user_id: UUID) -> Dict[str, Dec
         where user_id = $1
           and status = 'active'
           and bucket_type = 'purchased'
+          and (expires_at is null or expires_at > now())
         """,
         user_id,
     )

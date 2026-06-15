@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from typing import Optional
 
 from app.db import ensure_db_pool
 from app.services.gateways.stripe_gateway import StripeGateway
 from app.services.subscription_reconciler import run_subscription_reconciler_once
+
+logger = logging.getLogger(__name__)
 
 
 def reconciler_enabled() -> bool:
@@ -41,14 +44,19 @@ async def subscription_reconciler_loop() -> None:
 
     while True:
         try:
-            await run_subscription_reconciler_once(
+            result = await run_subscription_reconciler_once(
                 pool,
                 gw=gateway,
                 lookahead_minutes=reconciler_lookahead_minutes(),
                 limit=100,
             )
+            logger.info(
+                "subscription_reconciler_tick_complete count=%s",
+                result.get("count") if isinstance(result, dict) else None,
+            )
         except Exception:
-            # Best-effort background loop: log in real implementation
-            pass
+            # Best-effort background loop: never crash the API, but do not
+            # swallow failures silently. Silent failure hides payment drift.
+            logger.exception("subscription_reconciler_tick_failed")
 
         await asyncio.sleep(reconciler_interval_seconds())

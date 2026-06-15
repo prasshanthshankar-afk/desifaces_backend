@@ -33,69 +33,69 @@ with active_entitlement as (
 ), lot_summary as (
     select
         coalesce(l.user_id, bam.user_id) as user_id,
-        count(*) filter (where l.bucket_type = 'included'::text and l.status = 'active'::text) as included_lot_count,
-        count(*) filter (where l.bucket_type = 'purchased'::text and l.status = 'active'::text) as purchased_lot_count,
-        count(*) filter (where l.bucket_type = 'promo'::text and l.status = 'active'::text) as promo_lot_count,
-        count(*) filter (where l.status = 'active'::text) as active_lot_count,
+        count(*) filter (where l.bucket_type = 'included'::text and l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())) as included_lot_count,
+        count(*) filter (where l.bucket_type = 'purchased'::text and l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())) as purchased_lot_count,
+        count(*) filter (where l.bucket_type = 'promo'::text and l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())) as promo_lot_count,
+        count(*) filter (where l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())) as active_lot_count,
         sum(
             case
-                when l.bucket_type = 'included'::text and l.status = 'active'::text
+                when l.bucket_type = 'included'::text and l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())
                 then greatest(coalesce(l.remaining_amount, 0::numeric) - coalesce(l.reserved_amount, 0::numeric), 0::numeric)
                 else 0::numeric
             end
         ) as included_available,
         sum(
             case
-                when l.bucket_type = 'included'::text and l.status = 'active'::text
+                when l.bucket_type = 'included'::text and l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())
                 then coalesce(l.reserved_amount, 0::numeric)
                 else 0::numeric
             end
         ) as included_reserved,
         sum(
             case
-                when l.bucket_type = 'included'::text and l.status = 'active'::text
+                when l.bucket_type = 'included'::text and l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())
                 then coalesce(l.remaining_amount, 0::numeric)
                 else 0::numeric
             end
         ) as included_balance,
         sum(
             case
-                when l.bucket_type = 'purchased'::text and l.status = 'active'::text
+                when l.bucket_type = 'purchased'::text and l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())
                 then greatest(coalesce(l.remaining_amount, 0::numeric) - coalesce(l.reserved_amount, 0::numeric), 0::numeric)
                 else 0::numeric
             end
         ) as purchased_available,
         sum(
             case
-                when l.bucket_type = 'purchased'::text and l.status = 'active'::text
+                when l.bucket_type = 'purchased'::text and l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())
                 then coalesce(l.reserved_amount, 0::numeric)
                 else 0::numeric
             end
         ) as purchased_reserved,
         sum(
             case
-                when l.bucket_type = 'purchased'::text and l.status = 'active'::text
+                when l.bucket_type = 'purchased'::text and l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())
                 then coalesce(l.remaining_amount, 0::numeric)
                 else 0::numeric
             end
         ) as purchased_balance,
         sum(
             case
-                when l.bucket_type = 'promo'::text and l.status = 'active'::text
+                when l.bucket_type = 'promo'::text and l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())
                 then greatest(coalesce(l.remaining_amount, 0::numeric) - coalesce(l.reserved_amount, 0::numeric), 0::numeric)
                 else 0::numeric
             end
         ) as promo_available,
         sum(
             case
-                when l.bucket_type = 'promo'::text and l.status = 'active'::text
+                when l.bucket_type = 'promo'::text and l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())
                 then coalesce(l.reserved_amount, 0::numeric)
                 else 0::numeric
             end
         ) as promo_reserved,
         sum(
             case
-                when l.bucket_type = 'promo'::text and l.status = 'active'::text
+                when l.bucket_type = 'promo'::text and l.status = 'active'::text and (l.expires_at is null or l.expires_at > now())
                 then coalesce(l.remaining_amount, 0::numeric)
                 else 0::numeric
             end
@@ -229,6 +229,15 @@ select
         'included_available', included_available_live,
         'included_reserved', included_reserved_live,
         'included_balance', included_balance_live,
+        'included_used', case
+            when coalesce(included_lot_count, 0) > 0 then greatest(coalesce(included_credits_total, 0::numeric) - coalesce(included_balance_live, 0::numeric), 0::numeric)::numeric(18,4)
+            else 0::numeric
+        end,
+        'included_expired_or_unavailable', case
+            when coalesce(included_lot_count, 0) > 0 then 0::numeric
+            else greatest(coalesce(included_credits_total, 0::numeric) - coalesce(included_balance_live, 0::numeric) - coalesce(included_reserved_live, 0::numeric), 0::numeric)::numeric(18,4)
+        end,
+        'included_lot_count', coalesce(included_lot_count, 0),
         'wallet_available', purchased_available_live,
         'wallet_reserved', purchased_reserved_live,
         'wallet_balance', purchased_balance_live,
@@ -274,6 +283,8 @@ with overview as (
         coalesce((plan_json ->> 'included_credits_total')::numeric, 0::numeric)::numeric(18,4) as included_credits_total,
         coalesce((lots_json ->> 'included_available')::numeric, 0::numeric)::numeric(18,4) as included_available,
         coalesce((lots_json ->> 'included_reserved')::numeric, 0::numeric)::numeric(18,4) as included_reserved,
+        coalesce(nullif(lots_json ->> 'included_used', '')::numeric, 0::numeric)::numeric(18,4) as included_used,
+        coalesce(nullif(lots_json ->> 'included_expired_or_unavailable', '')::numeric, 0::numeric)::numeric(18,4) as included_expired_or_unavailable,
         coalesce((lots_json ->> 'wallet_available')::numeric, (lots_json ->> 'purchased_available')::numeric, 0::numeric)::numeric(18,4) as wallet_available,
         coalesce((lots_json ->> 'wallet_reserved')::numeric, (lots_json ->> 'purchased_reserved')::numeric, 0::numeric)::numeric(18,4) as wallet_reserved,
         coalesce((lots_json ->> 'promo_available')::numeric, 0::numeric)::numeric(18,4) as promo_available,
@@ -287,9 +298,8 @@ with overview as (
 ), computed as (
     select
         n.*,
-        greatest(n.included_credits_total - n.included_available - n.included_reserved, 0::numeric)::numeric(18,4) as included_used,
         case
-            when n.included_credits_total > 0::numeric then round(greatest(n.included_credits_total - n.included_available - n.included_reserved, 0::numeric) / n.included_credits_total * 100::numeric, 2)
+            when n.included_credits_total > 0::numeric then round(coalesce(n.included_used, 0::numeric) / n.included_credits_total * 100::numeric, 2)
             else 0::numeric
         end as usage_percent
     from normalized n
@@ -332,6 +342,7 @@ select
         'included_available', included_available,
         'included_reserved', included_reserved,
         'included_used', included_used,
+        'included_expired_or_unavailable', included_expired_or_unavailable,
         'wallet_available', wallet_available,
         'wallet_reserved', wallet_reserved,
         'purchased_available', wallet_available,
@@ -344,6 +355,7 @@ select
         'source', credit_source,
         'used_credits', included_used,
         'included_used', included_used,
+        'included_expired_or_unavailable', included_expired_or_unavailable,
         'usage_percent', usage_percent,
         'billing_model', billing_model
     ) as usage_summary_json,

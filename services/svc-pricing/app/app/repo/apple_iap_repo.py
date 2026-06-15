@@ -7,6 +7,32 @@ from typing import Any, Dict, Optional
 from uuid import UUID
 
 
+_APPLE_IAP_PLACEHOLDER_SUBSCRIPTION_ID_VALUES = {
+    "",
+    "0",
+    "null",
+    "none",
+    "undefined",
+    "n/a",
+    "na",
+}
+
+_APPLE_IAP_PLACEHOLDER_SUBSCRIPTION_ID_MARKERS = (
+    "smoke",
+    "placeholder",
+    "dummy",
+    "fake",
+    "test",
+)
+
+
+def _is_invalid_apple_subscription_identifier(value: Optional[str]) -> bool:
+    text = str(value or "").strip().lower()
+    if text in _APPLE_IAP_PLACEHOLDER_SUBSCRIPTION_ID_VALUES:
+        return True
+    return any(marker in text for marker in _APPLE_IAP_PLACEHOLDER_SUBSCRIPTION_ID_MARKERS)
+
+
 def as_dict_loose(x: Any) -> Dict[str, Any]:
     if x is None:
         return {}
@@ -334,6 +360,11 @@ async def upsert_apple_subscription_row(
     trial_end: Optional[datetime],
     metadata_json: Dict[str, Any],
 ) -> None:
+    subscription_id = str(original_transaction_id or "").strip()
+    if _is_invalid_apple_subscription_identifier(subscription_id):
+        raise ValueError("invalid_apple_original_transaction_id_for_subscription")
+    original_transaction_id = subscription_id
+
     await conn.execute(
         """
         insert into public.payment_plan_subscriptions (
@@ -686,8 +717,11 @@ async def best_effort_grant_apple_credits(
 
 
 async def find_subscription_user_id(conn, *, original_transaction_id: str):
+    subscription_id = str(original_transaction_id or "").strip()
+    if _is_invalid_apple_subscription_identifier(subscription_id):
+        return None
     row = await conn.fetchrow(
         "select user_id from public.payment_plan_subscriptions where gateway_subscription_id = $1 limit 1",
-        original_transaction_id,
+        subscription_id,
     )
     return row.get("user_id") if row else None

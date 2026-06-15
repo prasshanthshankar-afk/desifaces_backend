@@ -18,6 +18,8 @@ with overview as (
         coalesce((plan_json ->> 'included_credits_total')::numeric, 0::numeric)::numeric(18,4) as included_credits_total,
         coalesce((lots_json ->> 'included_available')::numeric, 0::numeric)::numeric(18,4) as included_available,
         coalesce((lots_json ->> 'included_reserved')::numeric, 0::numeric)::numeric(18,4) as included_reserved,
+        coalesce(nullif(lots_json ->> 'included_used', '')::numeric, 0::numeric)::numeric(18,4) as included_used,
+        coalesce(nullif(lots_json ->> 'included_expired_or_unavailable', '')::numeric, 0::numeric)::numeric(18,4) as included_expired_or_unavailable,
         coalesce((lots_json ->> 'wallet_available')::numeric, (lots_json ->> 'purchased_available')::numeric, 0::numeric)::numeric(18,4) as wallet_available,
         coalesce((lots_json ->> 'wallet_reserved')::numeric, (lots_json ->> 'purchased_reserved')::numeric, 0::numeric)::numeric(18,4) as wallet_reserved,
         coalesce((lots_json ->> 'promo_available')::numeric, 0::numeric)::numeric(18,4) as promo_available,
@@ -31,9 +33,8 @@ with overview as (
 ), computed as (
     select
         n.*,
-        greatest(n.included_credits_total - n.included_available - n.included_reserved, 0::numeric)::numeric(18,4) as included_used,
         case
-            when n.included_credits_total > 0::numeric then round(greatest(n.included_credits_total - n.included_available - n.included_reserved, 0::numeric) / n.included_credits_total * 100::numeric, 2)
+            when n.included_credits_total > 0::numeric then round(coalesce(n.included_used, 0::numeric) / n.included_credits_total * 100::numeric, 2)
             else 0::numeric
         end as usage_percent
     from normalized n
@@ -76,6 +77,7 @@ select
         'included_available', included_available,
         'included_reserved', included_reserved,
         'included_used', included_used,
+        'included_expired_or_unavailable', included_expired_or_unavailable,
         'wallet_available', wallet_available,
         'wallet_reserved', wallet_reserved,
         'purchased_available', wallet_available,
@@ -88,6 +90,7 @@ select
         'source', credit_source,
         'used_credits', included_used,
         'included_used', included_used,
+        'included_expired_or_unavailable', included_expired_or_unavailable,
         'usage_percent', usage_percent,
         'billing_model', billing_model
     ) as usage_summary_json,

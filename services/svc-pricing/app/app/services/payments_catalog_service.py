@@ -430,20 +430,14 @@ def build_payment_overview(
         total_val = int(Decimal(str(billing_entitlement["included_credits_total"] or "0")))
         total = total_val if total_val > 0 else None
 
-    used = None
-    if total is not None:
-        remaining_included = None
-        if overview_plan:
-            try:
-                remaining_included = int(Decimal(str(overview_plan.get("included_credits_remaining") or "0")))
-            except Exception:
-                remaining_included = None
-        elif billing_entitlement:
-            remaining_included = int(Decimal(str(billing_entitlement["included_credits_remaining"] or "0")))
-        if remaining_included is not None:
-            used = max(total - remaining_included, 0)
-        else:
-            used = max(total - available - reserved, 0)
+    # Usage must be actual committed included-credit spend from the canonical
+    # lots read model. Do not infer usage from unavailable/expired plan credits.
+    used = 0
+    if overview_lots:
+        try:
+            used = max(int(Decimal(str(overview_lots.get("included_used") or "0"))), 0)
+        except Exception:
+            used = 0
 
     billing_mode = _clean_text(billing_entitlement["billing_mode"]) if billing_entitlement else (_clean_text(overview_plan.get("billing_mode")) if overview_plan else ("free" if current_plan_code == "free" else None))
     settlement_mode = _clean_text(billing_entitlement["settlement_mode"]) if billing_entitlement else (_clean_text(overview_plan.get("settlement_mode")) if overview_plan else (_clean_text(credit_account["settlement_mode"]) if credit_account else None))

@@ -639,26 +639,6 @@ class PricingCallerContext(BaseModel):
     auth_mode: str = "internal_bearer"
 
 
-class FreeUserBootstrapRequest(BaseModel):
-    user_id: str
-    email: Optional[str] = None
-    source: str = "internal_bootstrap"
-    credits: Optional[int] = None
-
-
-class FreeUserBootstrapResponse(BaseModel):
-    status: str = "ok"
-    user_id: str
-    bootstrapped: bool
-    tier_code: Optional[str] = None
-    plan_code: Optional[str] = None
-    included_credits_total: Optional[int] = None
-    included_credits_remaining: Optional[int] = None
-    target_credits: Optional[int] = None
-    account_action: Optional[str] = None
-    reason: Optional[str] = None
-
-
 def _require_internal_pricing_caller(
     authorization: Optional[str],
     x_user_id: Optional[str],
@@ -858,45 +838,10 @@ class ReservationOut(BaseModel):
 
 
 # ---------------------------------------------------------------------
-# internal bootstrap for brand-new free users
+# free-user bootstrap is owned by app.api.routes.bootstrap.
+# This module keeps _bootstrap_free_user_pricing_tx for preview/reserve first-touch
+# hardening, but intentionally does not register /api/pricing/bootstrap/free-user.
 # ---------------------------------------------------------------------
-@router.post("/api/pricing/bootstrap/free-user", response_model=FreeUserBootstrapResponse)
-async def bootstrap_free_user(
-    req: FreeUserBootstrapRequest,
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
-    x_service_name: Optional[str] = Header(default=None, alias="X-Service-Name"),
-    pool=PoolDep,
-) -> FreeUserBootstrapResponse:
-    caller = _require_internal_pricing_caller(authorization, x_user_id, x_service_name)
-
-    if str(req.user_id) != str(caller.user_id):
-        raise HTTPException(status_code=403, detail="user_mismatch")
-
-    user_uuid = UUID(str(req.user_id))
-
-    async with pool.acquire() as conn:
-        result = await _bootstrap_free_user_pricing_tx(
-            conn,
-            user_id=user_uuid,
-            email=req.email,
-            source=req.source or "internal_bootstrap",
-            credits=req.credits,
-        )
-
-    return FreeUserBootstrapResponse(
-        status="ok",
-        user_id=str(req.user_id),
-        bootstrapped=bool(result.get("bootstrapped")),
-        tier_code=(str(result.get("tier_code")) if result.get("tier_code") else None),
-        plan_code=(str(result.get("plan_code")) if result.get("plan_code") else None),
-        included_credits_total=(int(result.get("included_credits_total")) if result.get("included_credits_total") is not None else None),
-        included_credits_remaining=(int(result.get("included_credits_remaining")) if result.get("included_credits_remaining") is not None else None),
-        target_credits=(int(result.get("target_credits")) if result.get("target_credits") is not None else None),
-        account_action=(str(result.get("account_action")) if result.get("account_action") else None),
-        reason=(str(result.get("reason")) if result.get("reason") else None),
-    )
-
 
 # ---------------------------------------------------------------------
 # preview -> quote + balance + entitlement context (no reservation)

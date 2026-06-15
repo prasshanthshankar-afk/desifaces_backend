@@ -261,9 +261,12 @@ def build_canonical_billing_display(
         included_reserved + wallet_reserved + promo_reserved,
     )
 
+    # Do not infer usage from unavailable plan credits. Expired/stale included
+    # credits are not customer usage. Usage must come from the canonical lots
+    # read model, which computes actual committed included-credit spend.
     included_used = _to_int_credits(
-        _first_decimal(lots_json.get("included_used"), overview_credits.get("included_used"), overview_credits.get("used_credits")),
-        max(plan_total - included_available - included_reserved, 0) if plan_total > 0 else 0,
+        _first_decimal(lots_json.get("included_used")),
+        0,
     )
 
     usage_percent: Optional[float] = None

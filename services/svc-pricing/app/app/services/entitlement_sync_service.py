@@ -353,6 +353,7 @@ async def _grant_cycle_credits_once(
           and source_type = 'plan_grant'
           and source_ref = $2
           and status = 'active'
+          and (expires_at is null or expires_at > now())
         limit 1
         """,
         user_id,
@@ -363,7 +364,11 @@ async def _grant_cycle_credits_once(
 
     current_included_row = await conn.fetchrow(
         """
-        select coalesce(sum(case when bucket_type = 'included' and status = 'active' then remaining_amount else 0 end), 0) as included_remaining
+        select coalesce(sum(case
+            when bucket_type = 'included'
+             and status = 'active'
+             and (expires_at is null or expires_at > now())
+            then remaining_amount else 0 end), 0) as included_remaining
         from pricing_credit_lots
         where user_id = $1
         """,
@@ -427,6 +432,7 @@ async def _grant_cycle_credits_once(
             and source_type = 'plan_grant'
             and source_ref = $2::text
             and status = 'active'
+            and (expires_at is null or expires_at > now())
         )
         """,
         user_id,

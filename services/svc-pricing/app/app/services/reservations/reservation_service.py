@@ -597,6 +597,7 @@ async def _fetch_active_lots(conn: asyncpg.Connection, user_id: UUID) -> list[di
         from pricing_credit_lots
         where user_id = $1
           and status = 'active'
+          and (expires_at is null or expires_at > now())
         order by
           case bucket_type
             when 'included' then 0

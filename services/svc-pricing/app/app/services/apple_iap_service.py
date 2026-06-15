@@ -147,6 +147,152 @@ def coerce_transaction_country_code(
     return ""
 
 
+
+_APPLE_IAP_PLACEHOLDER_ID_VALUES = {
+    "",
+    "0",
+    "null",
+    "none",
+    "undefined",
+    "n/a",
+    "na",
+}
+
+_APPLE_IAP_PLACEHOLDER_ID_MARKERS = (
+    "smoke",
+    "placeholder",
+    "dummy",
+    "fake",
+    "test",
+)
+
+
+def _is_placeholder_apple_iap_identifier(value: Optional[str]) -> bool:
+    text = str(value or "").strip().lower()
+    if text in _APPLE_IAP_PLACEHOLDER_ID_VALUES:
+        return True
+    return any(marker in text for marker in _APPLE_IAP_PLACEHOLDER_ID_MARKERS)
+
+
+def _apple_local_storekit_placeholders_enabled(
+    *,
+    environment: Optional[str],
+    verification_mode: Optional[str],
+) -> bool:
+    """Allow local StoreKit placeholder IDs only when explicitly enabled.
+
+    Production/TestFlight/App Store verification should always provide real
+    transactionId/originalTransactionId values. The explicit flag exists only
+    for Xcode-local StoreKit smoke testing where Apple may return "0".
+    """
+    flag = str(
+        os.getenv("DF_APPLE_IAP_ALLOW_LOCAL_PLACEHOLDER_IDS")
+        or getattr(settings, "DF_APPLE_IAP_ALLOW_LOCAL_PLACEHOLDER_IDS", "")
+        or ""
+    ).strip().lower()
+    if flag not in {"1", "true", "t", "yes", "y", "on"}:
+        return False
+
+    env = str(environment or "").strip().lower()
+    mode = str(verification_mode or "").strip().lower()
+    return env in {"sandbox", "xcode", "local", "storekit"} or mode in {
+        "decode_only",
+        "local",
+        "storekit",
+        "mock",
+        "disabled",
+    }
+
+
+def _stable_local_storekit_identifier(
+    *,
+    prefix: str,
+    user_id: UUID,
+    apple_product_id: str,
+    transaction_id: Optional[str],
+    original_transaction_id: Optional[str],
+    signed_transaction_info: Optional[str],
+) -> str:
+    import hashlib
+
+    digest_src = "|".join(
+        [
+            str(user_id),
+            str(apple_product_id or ""),
+            str(transaction_id or ""),
+            str(original_transaction_id or ""),
+            str(signed_transaction_info or ""),
+        ]
+    )
+    return f"{prefix}-" + hashlib.sha256(digest_src.encode("utf-8")).hexdigest()[:32]
+
+
+def _safe_apple_transaction_id(
+    *,
+    user_id: UUID,
+    apple_product_id: str,
+    transaction_id: str,
+    original_transaction_id: Optional[str],
+    environment: Optional[str],
+    verification_mode: Optional[str],
+    signed_transaction_info: Optional[str],
+    id_role: str = "transaction",
+) -> str:
+    txid = str(transaction_id or "").strip()
+    if not _is_placeholder_apple_iap_identifier(txid):
+        return txid
+
+    if not _apple_local_storekit_placeholders_enabled(
+        environment=environment,
+        verification_mode=verification_mode,
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"apple_{id_role}_id_placeholder_not_allowed",
+        )
+
+    return _stable_local_storekit_identifier(
+        prefix="local-storekit-tx",
+        user_id=user_id,
+        apple_product_id=apple_product_id,
+        transaction_id=transaction_id,
+        original_transaction_id=original_transaction_id,
+        signed_transaction_info=signed_transaction_info,
+    )
+
+
+def _safe_apple_original_transaction_id(
+    *,
+    user_id: UUID,
+    apple_product_id: str,
+    transaction_id: Optional[str],
+    original_transaction_id: Optional[str],
+    environment: Optional[str],
+    verification_mode: Optional[str],
+    signed_transaction_info: Optional[str],
+) -> str:
+    original = str(original_transaction_id or "").strip()
+    if not _is_placeholder_apple_iap_identifier(original):
+        return original
+
+    if not _apple_local_storekit_placeholders_enabled(
+        environment=environment,
+        verification_mode=verification_mode,
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="apple_original_transaction_id_placeholder_not_allowed",
+        )
+
+    return _stable_local_storekit_identifier(
+        prefix="local-storekit-sub",
+        user_id=user_id,
+        apple_product_id=apple_product_id,
+        transaction_id=transaction_id,
+        original_transaction_id=original_transaction_id,
+        signed_transaction_info=signed_transaction_info,
+    )
+
 def derive_subscription_state_from_notification(
     notification_type: str,
     subtype: Optional[str],
@@ -208,6 +354,7 @@ def _raise_from_repo_error(exc: Exception) -> None:
         "apple_product_not_mapped",
         "apple_plan_profile_missing",
         "apple_credit_pack_missing",
+        "invalid_apple_original_transaction_id_for_subscription",
     }:
         raise HTTPException(status_code=422, detail=detail)
     raise exc
@@ -247,13 +394,25 @@ async def confirm_subscription_purchase(
         raise HTTPException(status_code=422, detail="invalid_apple_signed_transaction")
     decoded_renewal = jws_to_payload_dict(payload.signed_renewal_info) if payload.signed_renewal_info else {}
 
-    apple_product_id = str(decoded_txn.get("productId") or payload.apple_product_id or "").strip()
+    decoded_product_id = str(decoded_txn.get("productId") or "").strip()
+    payload_product_id = str(payload.apple_product_id or "").strip()
+    if decoded_product_id and payload_product_id and decoded_product_id != payload_product_id:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "apple_product_id_mismatch",
+                "payload_product_id": payload_product_id,
+                "decoded_product_id": decoded_product_id,
+            },
+        )
+
+    apple_product_id = decoded_product_id or payload_product_id
     if not apple_product_id:
         raise HTTPException(status_code=422, detail="apple_product_id_missing")
 
-    transaction_id = str(decoded_txn.get("transactionId") or payload.transaction_id or "").strip()
-    original_transaction_id = str(decoded_txn.get("originalTransactionId") or payload.original_transaction_id or "").strip()
-    if not transaction_id or not original_transaction_id:
+    raw_transaction_id = str(decoded_txn.get("transactionId") or payload.transaction_id or "").strip()
+    raw_original_transaction_id = str(decoded_txn.get("originalTransactionId") or payload.original_transaction_id or "").strip()
+    if not raw_transaction_id or not raw_original_transaction_id:
         raise HTTPException(status_code=422, detail="apple_subscription_ids_missing")
 
     app_account_token = as_uuid_or_none(decoded_txn.get("appAccountToken") or payload.app_account_token)
@@ -265,6 +424,25 @@ async def confirm_subscription_purchase(
     purchase_date = apple_epoch_ms_to_datetime(decoded_txn.get("purchaseDate"))
     expires_date = apple_epoch_ms_to_datetime(decoded_txn.get("expiresDate"))
     environment = normalize_apple_environment(decoded_txn.get("environment") or payload.environment)
+    transaction_id = _safe_apple_transaction_id(
+        user_id=user_id,
+        apple_product_id=apple_product_id,
+        transaction_id=raw_transaction_id,
+        original_transaction_id=raw_original_transaction_id,
+        environment=environment,
+        verification_mode=verification_mode,
+        signed_transaction_info=payload.signed_transaction_info,
+        id_role="transaction",
+    )
+    original_transaction_id = _safe_apple_original_transaction_id(
+        user_id=user_id,
+        apple_product_id=apple_product_id,
+        transaction_id=transaction_id,
+        original_transaction_id=raw_original_transaction_id,
+        environment=environment,
+        verification_mode=verification_mode,
+        signed_transaction_info=payload.signed_transaction_info,
+    )
     storefront = str(payload.storefront or decoded_txn.get("storefront") or "").strip() or None
     storefront_id = str(decoded_txn.get("storefrontId") or "").strip() or None
     ownership_type = str(decoded_txn.get("inAppOwnershipType") or "").strip() or None
@@ -402,11 +580,23 @@ async def confirm_credit_purchase(
     if not decoded_txn:
         raise HTTPException(status_code=422, detail="invalid_apple_signed_transaction")
 
-    apple_product_id = str(decoded_txn.get("productId") or payload.apple_product_id or "").strip()
+    decoded_product_id = str(decoded_txn.get("productId") or "").strip()
+    payload_product_id = str(payload.apple_product_id or "").strip()
+    if decoded_product_id and payload_product_id and decoded_product_id != payload_product_id:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "apple_product_id_mismatch",
+                "payload_product_id": payload_product_id,
+                "decoded_product_id": decoded_product_id,
+            },
+        )
+
+    apple_product_id = decoded_product_id or payload_product_id
     if not apple_product_id:
         raise HTTPException(status_code=422, detail="apple_product_id_missing")
-    transaction_id = str(decoded_txn.get("transactionId") or payload.transaction_id or "").strip()
-    if not transaction_id:
+    raw_transaction_id = str(decoded_txn.get("transactionId") or payload.transaction_id or "").strip()
+    if not raw_transaction_id:
         raise HTTPException(status_code=422, detail="apple_transaction_id_missing")
 
     original_transaction_id = str(decoded_txn.get("originalTransactionId") or payload.original_transaction_id or "").strip() or None
@@ -418,6 +608,16 @@ async def confirm_credit_purchase(
     country_code = coerce_transaction_country_code(payload.country_code, auth_country_code, payload.storefront or decoded_txn.get("storefront"))
     purchase_date = apple_epoch_ms_to_datetime(decoded_txn.get("purchaseDate"))
     environment = normalize_apple_environment(decoded_txn.get("environment") or payload.environment)
+    transaction_id = _safe_apple_transaction_id(
+        user_id=user_id,
+        apple_product_id=apple_product_id,
+        transaction_id=raw_transaction_id,
+        original_transaction_id=original_transaction_id,
+        environment=environment,
+        verification_mode=verification_mode,
+        signed_transaction_info=payload.signed_transaction_info,
+        id_role="transaction",
+    )
     storefront = str(payload.storefront or decoded_txn.get("storefront") or "").strip() or None
     storefront_id = str(decoded_txn.get("storefrontId") or "").strip() or None
 
@@ -542,6 +742,13 @@ async def process_notification(
     transaction_id = str(decoded_txn.get("transactionId") or "").strip() or None
     original_transaction_id = str(decoded_txn.get("originalTransactionId") or "").strip() or None
     app_account_token = as_uuid_or_none(decoded_txn.get("appAccountToken"))
+    has_placeholder_notification_ids = (
+        bool(decoded_txn)
+        and (
+            _is_placeholder_apple_iap_identifier(transaction_id)
+            or _is_placeholder_apple_iap_identifier(original_transaction_id)
+        )
+    )
 
     if not notification_uuid:
         raise HTTPException(status_code=422, detail="apple_notification_uuid_missing")
@@ -560,7 +767,7 @@ async def process_notification(
             app_account_token=app_account_token,
         )
 
-        if inserted and original_transaction_id and decoded_txn:
+        if inserted and original_transaction_id and decoded_txn and not has_placeholder_notification_ids:
             apple_product_id = str(decoded_txn.get("productId") or "").strip()
             transaction_country = coerce_transaction_country_code(None, None, decoded_txn.get("storefront"))
             currency = "INR" if transaction_country == "IN" else "USD"
