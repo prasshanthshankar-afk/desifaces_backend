@@ -130,7 +130,16 @@ begin
   end if;
 
   v_cycle_key := coalesce(
-    to_char(v_period_start at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    to_char(
+      (
+        case
+          when lower(coalesce(v_sub_provider, '')) = 'google_play' and v_period_end is not null
+            then v_period_end
+          else v_period_start
+        end
+      ) at time zone 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+    ),
     to_char(date_trunc('month', now()) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
   );
 
@@ -171,8 +180,9 @@ begin
     and l.bucket_type = 'included'
     and l.source_type = 'plan_grant'
     and l.source_ref = v_source_ref
-    and l.status = 'active'
-  limit 1;
+    
+   limit 1
+   for update;
 
   if v_existing_lot_id is null then
     insert into public.pricing_credit_lots (
@@ -220,9 +230,42 @@ begin
       now(),
       now()
     )
-    returning id into v_inserted_lot_id;
+     returning id into v_inserted_lot_id;
   else
-    v_inserted_lot_id := v_existing_lot_id;
+    update public.pricing_credit_lots
+    set
+      status = 'active',
+      expires_at = v_period_end,
+      plan_code_at_grant = v_plan_code,
+      granted_amount = greatest(coalesce(granted_amount, 0), v_ent_included_total),
+      remaining_amount = case
+        when status = 'expired'
+          then v_ent_included_total
+        else least(
+          greatest(coalesce(remaining_amount, 0), 0),
+          greatest(coalesce(granted_amount, 0), v_ent_included_total)
+        )
+      end,
+      reserved_amount = least(coalesce(reserved_amount, 0), v_ent_included_total),
+      metadata_json = case
+        when jsonb_typeof(coalesce(metadata_json, '{}'::jsonb)) = 'object'
+          then coalesce(metadata_json, '{}'::jsonb)
+        else '{}'::jsonb
+      end || jsonb_build_object(
+        'source', 'df_sync_subscription_cycle_credits',
+        'repair_reason', 'existing_subscription_cycle_lot_reused_without_on_conflict',
+        'gateway_provider', v_sub_provider,
+        'gateway_subscription_id', v_sub_gateway_id,
+        'payment_plan_subscription_id', v_sub_id,
+        'cycle_key', v_cycle_key,
+        'plan_code', v_plan_code,
+        'tier_code', v_tier_code,
+        'included_credits_total', v_ent_included_total,
+        'repaired_at', now()
+      ),
+      updated_at = now()
+    where id = v_existing_lot_id
+    returning id into v_inserted_lot_id;
   end if;
 
   select

@@ -45,6 +45,36 @@ def _as_dict_loose(x: Any) -> Dict[str, Any]:
         return {}
 
 
+
+def _stripe_id(value: Any, *, expected_prefix: Optional[str] = None) -> Optional[str]:
+    """Return a scalar Stripe id from either a raw id string or an expanded Stripe object.
+
+    Stripe APIs may return either:
+      - "cus_..." as a string
+      - {"id": "cus_...", ...} as an expanded object
+
+    DB identity columns must store the scalar provider id only.
+    Full provider objects belong in metadata_json, not gateway_*_id columns.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        raw = value.get("id")
+    else:
+        raw = getattr(value, "id", None) or value
+
+    text = str(raw or "").strip()
+    if not text:
+        return None
+
+    if expected_prefix and not text.startswith(expected_prefix):
+        return None
+
+    return text
+
+
+
 def _to_uuid_or_none(x: Any) -> Optional[UUID]:
     try:
         return UUID(str(x)) if x else None
@@ -519,7 +549,7 @@ async def sync_subscription_and_entitlement(
     if not user_id:
         return None
 
-    gateway_customer_id = str(subscription.get("customer") or "").strip() or None
+    gateway_customer_id = _stripe_id(subscription.get("customer"), expected_prefix="cus_")
     gateway_subscription_id = str(subscription.get("id") or "").strip()
     if not gateway_subscription_id:
         return user_id
