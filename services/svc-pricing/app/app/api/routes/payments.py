@@ -1523,12 +1523,37 @@ async def _sync_subscription_cycle_credits(conn, *, user_id: UUID) -> Dict[str, 
     included lot. Route handlers call this after native IAP confirmation so
     Google Play / Apple flows cannot leave billing_entitlements updated without
     matching spendable included credits.
+
+    Native stores can deliver the same purchase/restore more than once. The DB
+    function should be idempotent, but older deployed function bodies may still
+    raise the pricing_credit_lots unique constraint on duplicate source_ref.
+    Use a nested transaction/savepoint so the outer payment confirmation can
+    remain successful for duplicate restore/confirm callbacks.
     """
-    row = await conn.fetchrow(
-        "select public.df_sync_subscription_cycle_credits($1::uuid) as sync_result",
-        user_id,
-    )
-    return _as_dict_deep_loose(row["sync_result"] if row else None)
+    try:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "select public.df_sync_subscription_cycle_credits($1::uuid) as sync_result",
+                user_id,
+            )
+            return _as_dict_deep_loose(row["sync_result"] if row else None)
+    except Exception as exc:
+        message = str(exc)
+        duplicate_existing_cycle = (
+            "pricing_credit_lots" in message
+            and "source_ref" in message
+            and "already exists" in message
+            and "subscription_cycle:" in message
+        )
+        if not duplicate_existing_cycle:
+            raise
+
+        return {
+            "ok": True,
+            "action": "idempotent_existing_subscription_cycle_lot_after_duplicate_key",
+            "user_id": str(user_id),
+            "message": "duplicate subscription-cycle credit lot already exists; treated as successful restore/confirm",
+        }
 
 
 def _build_subscription_view(

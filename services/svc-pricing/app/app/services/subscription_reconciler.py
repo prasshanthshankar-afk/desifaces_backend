@@ -11,6 +11,7 @@ import asyncpg
 from app.services.gateways.stripe_gateway import StripeGateway
 from app.services.entitlement_sync_service import sync_subscription_and_entitlement
 from app.repo.google_play_iap_repo import revert_user_to_free_entitlement
+from app.services.entitlements.plan_credit_reconciliation_service import reconcile_included_plan_credits
 
 
 def _as_dict_loose(value: Any) -> Dict[str, Any]:
@@ -139,6 +140,29 @@ async def mark_reconcile_attempt(
     )
 
 
+
+def _json_default_safe(value: Any):
+    """JSON serializer fallback for metadata objects.
+
+    Reconciler metadata can contain datetimes, UUIDs, Decimals, asyncpg records,
+    or nested service-return payloads. Store metadata as JSON-safe primitives.
+    """
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    if isinstance(value, (set, tuple)):
+        return list(value)
+    try:
+        return str(value)
+    except Exception:
+        return repr(value)
+
+
+def _json_dumps_safe(value: Any) -> str:
+    return json.dumps(value, default=_json_default_safe)
+
 def _is_stale_period(candidate: ReconcileCandidate) -> bool:
     if candidate.current_period_end is None:
         return True
@@ -146,6 +170,356 @@ def _is_stale_period(candidate: ReconcileCandidate) -> bool:
     if end.tzinfo is None:
         end = end.replace(tzinfo=timezone.utc)
     return end <= datetime.now(timezone.utc)
+
+
+
+
+async def _restore_free_included_credit_floor(
+    conn: asyncpg.Connection,
+    *,
+    user_id: UUID,
+    source: str,
+    cycle_key: str,
+    metadata_json: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Guarantee a reverted Free user has the Free included-credit contract.
+
+    This is intentionally scoped to included credits only. Purchased/top-up lots
+    are preserved and included in the rebuilt legacy aggregate account.
+    """
+    row = await conn.fetchrow(
+        """
+        select
+          included_credits_total,
+          included_credits_remaining
+        from billing_entitlements
+        where user_id = $1
+          and lower(coalesce(tier_code, '')) = 'free'
+          and lower(coalesce(plan_code, '')) = 'free'
+          and lower(coalesce(billing_mode, '')) = 'free'
+          and (effective_from is null or effective_from <= now())
+          and (effective_to is null or effective_to > now())
+        order by effective_from desc nulls last, updated_at desc nulls last
+        limit 1
+        """,
+        user_id,
+    )
+
+    try:
+        free_cap = int(row.get("included_credits_total") or 100) if row else 100
+    except Exception:
+        free_cap = 100
+    if free_cap <= 0:
+        free_cap = 100
+
+    # Make expired included lots physically non-active so account rebuilds and
+    # dashboard views do not accidentally see stale included credits.
+    await conn.execute(
+        """
+        update public.pricing_credit_lots
+        set status = 'expired',
+            updated_at = now()
+        where user_id = $1
+          and bucket_type = 'included'
+          and status = 'active'
+          and expires_at is not null
+          and expires_at <= now()
+        """,
+        user_id,
+    )
+
+    # Reuse an active Free lot if present; otherwise create one. If a prior
+    # reconciler left an active Free lot with zero remaining, repair it to the
+    # Free contract floor.
+    lot_row = await conn.fetchrow(
+        """
+        select id
+        from public.pricing_credit_lots
+        where user_id = $1
+          and bucket_type = 'included'
+          and source_type = 'plan_grant'
+          and lower(coalesce(plan_code_at_grant, '')) = 'free'
+          and status = 'active'
+          and (expires_at is null or expires_at > now())
+        order by created_at desc nulls last
+        limit 1
+        """,
+        user_id,
+    )
+
+    if lot_row:
+        lot_id = lot_row["id"]
+        await conn.execute(
+            """
+            update public.pricing_credit_lots
+            set granted_amount = greatest(coalesce(granted_amount, 0), $2::numeric),
+                remaining_amount = greatest(coalesce(remaining_amount, 0), $2::numeric),
+                reserved_amount = least(coalesce(reserved_amount, 0), $2::numeric),
+                expires_at = null,
+                status = 'active',
+                metadata_json = case
+                    when jsonb_typeof(coalesce(metadata_json, '{}'::jsonb)) = 'object'
+                    then coalesce(metadata_json, '{}'::jsonb)
+                    else '{}'::jsonb
+                end || $3::jsonb,
+                updated_at = now()
+            where id = $1
+            """,
+            lot_id,
+            free_cap,
+            _json_dumps_safe(
+                {
+                    "source": source,
+                    "cycle_key": cycle_key,
+                    "reason": "restore_free_included_credit_floor",
+                    "plan_code": "free",
+                    "tier_code": "free",
+                    "included_credit_cap": free_cap,
+                    **metadata_json,
+                }
+            ),
+        )
+    else:
+        lot_id = await conn.fetchval(
+            """
+            insert into public.pricing_credit_lots(
+              id,
+              billing_account_id,
+              user_id,
+              bucket_type,
+              source_type,
+              source_ref,
+              plan_code_at_grant,
+              granted_amount,
+              remaining_amount,
+              reserved_amount,
+              granted_at,
+              expires_at,
+              status,
+              metadata_json,
+              created_at,
+              updated_at
+            )
+            values(
+              gen_random_uuid(),
+              null,
+              $1,
+              'included',
+              'plan_grant',
+              $2,
+              'free',
+              $3::numeric,
+              $3::numeric,
+              0,
+              now(),
+              null,
+              'active',
+              $4::jsonb,
+              now(),
+              now()
+            )
+            returning id
+            """,
+            user_id,
+            f"{source}:free_restore:{cycle_key}",
+            free_cap,
+            _json_dumps_safe(
+                {
+                    "source": source,
+                    "cycle_key": cycle_key,
+                    "reason": "restore_free_included_credit_floor",
+                    "plan_code": "free",
+                    "tier_code": "free",
+                    "included_credit_cap": free_cap,
+                    **metadata_json,
+                }
+            ),
+        )
+
+    await conn.execute(
+        """
+        update public.billing_entitlements
+        set tier_code = 'free',
+            plan_code = 'free',
+            billing_mode = 'free',
+            settlement_mode = 'credits',
+            included_credits_total = $2::numeric,
+            included_credits_remaining = $2::numeric,
+            overage_allowed = false,
+            wallet_topup_allowed = true,
+            hard_stop_on_insufficient_balance = true,
+            source = $3,
+            metadata_json = case
+                when jsonb_typeof(coalesce(metadata_json, '{}'::jsonb)) = 'object'
+                then coalesce(metadata_json, '{}'::jsonb)
+                else '{}'::jsonb
+            end || $4::jsonb,
+            updated_at = now()
+        where user_id = $1
+          and (effective_from is null or effective_from <= now())
+          and (effective_to is null or effective_to > now())
+        """,
+        user_id,
+        free_cap,
+        source,
+        _json_dumps_safe(
+            {
+                "source": source,
+                "cycle_key": cycle_key,
+                "last_free_credit_floor_restore_at": datetime.now(timezone.utc).isoformat(),
+                "last_free_credit_floor_lot_id": str(lot_id),
+                "included_credit_cap": free_cap,
+            }
+        ),
+    )
+
+    totals = await conn.fetchrow(
+        """
+        select
+          coalesce(sum(
+            case
+              when status = 'active'
+               and (expires_at is null or expires_at > now())
+              then coalesce(remaining_amount, 0)
+              else 0
+            end
+          ), 0)::bigint as balance_credits,
+          coalesce(sum(
+            case
+              when status = 'active'
+               and (expires_at is null or expires_at > now())
+              then coalesce(reserved_amount, 0)
+              else 0
+            end
+          ), 0)::bigint as reserved_credits
+        from public.pricing_credit_lots
+        where user_id = $1
+        """,
+        user_id,
+    )
+    balance_credits = int(totals.get("balance_credits") or 0) if totals else free_cap
+    reserved_credits = int(totals.get("reserved_credits") or 0) if totals else 0
+
+    await conn.execute(
+        """
+        insert into public.pricing_credit_accounts(
+          user_id,
+          balance_credits,
+          reserved_credits,
+          settlement_mode,
+          updated_at
+        )
+        values($1, $2, $3, 'prepaid', now())
+        on conflict (user_id)
+        do update set
+          balance_credits = excluded.balance_credits,
+          reserved_credits = excluded.reserved_credits,
+          settlement_mode = case
+              when coalesce(trim(public.pricing_credit_accounts.settlement_mode), '') in ('', 'credits')
+              then 'prepaid'
+              else public.pricing_credit_accounts.settlement_mode
+          end,
+          updated_at = now()
+        """,
+        user_id,
+        balance_credits,
+        reserved_credits,
+    )
+
+    return {
+        "action": "free_included_credit_floor_restored",
+        "user_id": str(user_id),
+        "free_cap": free_cap,
+        "lot_id": str(lot_id),
+        "balance_credits": balance_credits,
+        "reserved_credits": reserved_credits,
+    }
+
+
+
+async def _reconcile_user_to_free_included_credits(
+    conn: asyncpg.Connection,
+    *,
+    user_id: UUID,
+    source: str,
+    cycle_key: str,
+    current_period_end: Optional[datetime],
+    metadata_json: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Reconcile included credits after a provider subscription is no longer active.
+
+    Purchased/top-up wallet lots must be preserved. Included paid-plan lots must
+    not leak after a Google Play test subscription expires or a real subscription
+    becomes stale/canceled.
+    """
+    row = await conn.fetchrow(
+        """
+        select
+          plan_code,
+          tier_code,
+          included_credits_total,
+          included_credits_remaining
+        from billing_entitlements
+        where user_id = $1
+          and (effective_from is null or effective_from <= now())
+          and (effective_to is null or effective_to > now())
+        order by effective_from desc nulls last, updated_at desc nulls last
+        limit 1
+        """,
+        user_id,
+    )
+
+    plan_code = str(row.get("plan_code") or "free").strip().lower() if row else "free"
+    tier_code = str(row.get("tier_code") or "free").strip().lower() if row else "free"
+
+    try:
+        included_cap = int(row.get("included_credits_total") or 100) if row else 100
+    except Exception:
+        included_cap = 100
+
+    if plan_code != "free":
+        plan_code = "free"
+    if tier_code != "free":
+        tier_code = "free"
+    if included_cap <= 0:
+        included_cap = 100
+
+    reconcile_result = await reconcile_included_plan_credits(
+        conn,
+        user_id=user_id,
+        plan_code=plan_code,
+        tier_code=tier_code,
+        included_credit_cap=included_cap,
+        cycle_key=cycle_key,
+        current_period_start=None,
+        current_period_end=current_period_end,
+        source=source,
+        metadata_json={
+            **metadata_json,
+            "source": source,
+            "plan_code": plan_code,
+            "tier_code": tier_code,
+            "included_credit_cap": included_cap,
+            "reason": "provider_subscription_inactive_reconcile_to_free",
+        },
+    )
+
+    free_floor_result = await _restore_free_included_credit_floor(
+        conn,
+        user_id=user_id,
+        source=source,
+        cycle_key=cycle_key,
+        metadata_json={
+            **metadata_json,
+            "reconcile_result": reconcile_result,
+        },
+    )
+
+    return {
+        "action": "reconciled_to_free_included_credits",
+        "reconcile_result": reconcile_result,
+        "free_floor_result": free_floor_result,
+    }
 
 
 async def reconcile_google_play_candidate(
@@ -225,11 +599,22 @@ async def reconcile_google_play_candidate(
         metadata_json=metadata,
     )
 
-    # Expire stale paid-plan included lots and recompute cached credit account.
-    # This DB function preserves purchased/top-up lots.
-    await conn.fetchrow(
-        "select public.df_sync_subscription_cycle_credits($1::uuid) as sync_result",
-        candidate.user_id,
+    # Expire stale paid-plan included lots and rebuild cached credit display
+    # from canonical credit lots. Purchased/top-up lots are preserved.
+    await _reconcile_user_to_free_included_credits(
+        conn,
+        user_id=candidate.user_id,
+        source="google_play_reconciler_stale_period",
+        cycle_key=(
+            "google_play_stale_period:"
+            f"{candidate.gateway_subscription_id}:"
+            f"{candidate.current_period_end.isoformat() if candidate.current_period_end else 'no_period_end'}"
+        ),
+        current_period_end=candidate.current_period_end,
+        metadata_json={
+            **metadata,
+            "gateway_subscription_id": candidate.gateway_subscription_id,
+        },
     )
 
     return {
@@ -302,9 +687,13 @@ async def reconcile_google_play_orphan_entitlements(
             metadata_json=metadata,
         )
 
-        await conn.fetchrow(
-            "select public.df_sync_subscription_cycle_credits($1::uuid) as sync_result",
-            user_id,
+        await _reconcile_user_to_free_included_credits(
+            conn,
+            user_id=user_id,
+            source="google_play_reconciler_orphan_entitlement",
+            cycle_key=f"google_play_orphan_entitlement:{user_id}",
+            current_period_end=None,
+            metadata_json=metadata,
         )
 
         await conn.execute(
