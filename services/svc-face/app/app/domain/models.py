@@ -199,7 +199,15 @@ class CreatorPlatformRequest(BaseModel):
     source_image_url: Optional[str] = None
     source_image_asset_id: Optional[str] = None
 
-    preservation_strength: float = Field(0.75, ge=0.0, le=1.0)
+    preservation_strength: float = Field(0.98, ge=0.0, le=1.0)
+    identity_lock: bool = Field(default=False)
+    identity_lock_level: Optional[str] = None
+    preserve_source_identity: bool = Field(default=False)
+    preserve_source_gender: bool = Field(default=False)
+    gender_lock_mode: Optional[str] = None
+    allowed_i2i_changes: Optional[list[str]] = None
+    forbidden_i2i_changes: Optional[list[str]] = None
+    identity_lock_instructions: Optional[str] = Field(default=None, max_length=1500)
 
     # Future-proof knobs
     facial_features: Dict[str, str] = Field(default_factory=dict)

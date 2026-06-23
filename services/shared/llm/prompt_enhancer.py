@@ -250,7 +250,7 @@ def _fallback_response(req: PromptEnhanceRequest) -> PromptEnhanceResponse:
         variants = int(float(locked.get("num_variants") or context.get("num_variants") or 4))
         preservation_strength = float(locked.get("preservation_strength") or 0.0)
         why = (
-            f"Identity strength {preservation_strength:.2f} keeps the same person while allowing styling change."
+            f"STRICT IDENTITY LOCK {preservation_strength:.2f} - EDIT THE INPUT PHOTO ONLY: preserve the exact same human identity, same face, same gender presentation, same facial geometry, same age group, same skin tone, same eyes, same eye spacing, same lips, same jawline, same eyebrows, same nose, same cheekbones, and same facial proportions from the source image. The user prompt may change only request-only editable attributes such as styling, attire, accessories, lighting, framing, background, and composition. Do not change identity-defining features even if the prompt asks for a different face."
             if _clean_text(locked.get("mode")) == "image-to-image"
             else "The rewrite adds clearer framing, visual cues, and quality direction without changing your chosen identity inputs."
         )
@@ -267,7 +267,7 @@ def _fallback_response(req: PromptEnhanceRequest) -> PromptEnhanceResponse:
                     "" if _friendly_label(locked.get("shot_type_label")) else "Add one framing cue like headshot, medium shot, or full-body.",
                     "" if _friendly_label(locked.get("context_label")) else "Add a clear setting so the background looks intentional instead of generic.",
                     "Run 2 to 4 variants first when you are testing a new idea to save credits." if variants > 4 else "",
-                    "Keep the prompt focused on styling, lighting, attire, and scene changes when identity lock is on." if _clean_text(locked.get("mode")) == "image-to-image" else "Call out attire, lighting, and mood together for more reliable results.",
+                    "Keep the prompt focused on styling, lighting, attire, accessories, and scene changes. Do not change face, gender, age group, skin tone, or identity when I2I identity lock is on." if _clean_text(locked.get("mode")) == "image-to-image" else "Call out attire, lighting, and mood together for more reliable results.",
                     why,
                 ]
             )[:5],

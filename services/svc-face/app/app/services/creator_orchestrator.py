@@ -1885,6 +1885,48 @@ class CreatorOrchestrator:
         request_dict["mode"] = mode
 
         if mode == "image-to-image":
+            # Product contract: I2I source image is the identity authority.
+            # The prompt may change styling/background/accessories only; it must not change face/gender.
+            request_dict["identity_lock"] = True
+            request_dict["identity_lock_level"] = "strict"
+            request_dict["preserve_source_identity"] = True
+            request_dict["preserve_source_gender"] = True
+            request_dict["gender_lock_mode"] = "preserve_from_source"
+            request_dict["allowed_i2i_changes"] = [
+                "facial_hair",
+                "glasses",
+                "dress",
+                "jewelry",
+                "background",
+                "lighting",
+                "camera_angle",
+                "framing",
+                "color_grade",
+            ]
+            request_dict["forbidden_i2i_changes"] = [
+                "identity",
+                "face",
+                "gender",
+                "facial_structure",
+                "skin_tone",
+                "eye_shape",
+                "nose_shape",
+                "mouth_shape",
+                "jawline",
+                "age_group",
+            ]
+            request_dict["identity_lock_instructions"] = (
+                "Preserve the exact same human identity and gender presentation from the source image. "
+                "Do not change face, gender, age group, skin tone, facial geometry, or core identity. "
+                "Only apply requested changes to facial hair, glasses, dress, jewelry, background, lighting, "
+                "color grade, camera angle, and framing."
+            )
+            try:
+                _i2i_strength = float(request_dict.get("preservation_strength") or 0.0)
+            except Exception:
+                _i2i_strength = 0.0
+            request_dict["preservation_strength"] = max(0.98, min(1.0, _i2i_strength if _i2i_strength > 0 else 0.98))
+
             asset_ref = (request_dict.get("source_image_asset_id") or "").strip()
             url_ref = (request_dict.get("source_image_url") or "").strip()
             ref = asset_ref or url_ref
@@ -2256,7 +2298,7 @@ class CreatorOrchestrator:
             return {}
 
         source_image_url = await self._resolve_source_image_ref(source_image_ref)
-        preservation_strength = self._clamp_strength(request_dict.get("preservation_strength"), 0.25)
+        preservation_strength = max(0.98, self._clamp_strength(request_dict.get("preservation_strength"), 0.98))
 
         out: Dict[str, Any] = {
             "source_image_ref": source_image_ref,
@@ -3101,7 +3143,7 @@ class CreatorOrchestrator:
                 elif parsed.scheme != "file":
                     raise ValueError(f"unsupported_source_image_scheme:{parsed.scheme or 'missing'}")
 
-                strength = self._clamp_strength(shared_inputs.get("preservation_strength"), payload_json.get("preservation_strength") or 0.25)
+                strength = max(0.98, self._clamp_strength(shared_inputs.get("preservation_strength"), payload_json.get("preservation_strength") or 0.98))
 
                 await self._provider_runs_upsert(
                     job_id=job_id,

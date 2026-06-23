@@ -142,7 +142,7 @@ class ImageProviderRouter:
         height: int = 1024,
         num_inference_steps: int = 40,
         guidance_scale: float = 0.0,
-        preservation_strength: float = 0.75,
+        preservation_strength: float = 0.98,
         # OpenAI edits need local files:
         src_local_path: Optional[str] = None,
         mask_local_path: Optional[str] = None,
