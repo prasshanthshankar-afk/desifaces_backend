@@ -192,7 +192,7 @@ class CreatorPromptService:
 
         T2I vs I2I policy:
           - T2I: gender required (default "female"); age/region/skin_tone optional (only included if provided)
-          - I2I: source image identity dominates; user_prompt may only change styling, attire, accessories, lighting, framing, or background
+          - I2I: do NOT inject demographic defaults; user_prompt must dominate the edit
         """
 
         # Normalize clothing param name (some callers may send clothing_code)
@@ -457,13 +457,7 @@ class CreatorPromptService:
             if not is_i2i:
                 full_prompt = self._join([demographic_prefix, prompt_instruction, self._join(creative_parts)])
             else:
-                i2i_base = (
-                    "STRICT IDENTITY LOCK - EDIT THE INPUT PHOTO ONLY: preserve the exact same human identity, "
-                    "same face, same gender presentation, same facial geometry, same age group, same skin tone, same eyes, same eye spacing, same lips, same jawline, same eyebrows, same nose, same cheekbones, "
-                    "same core facial features. Do not create a different person. Do not change gender. "
-                    "Only change explicitly requested styling, facial hair, glasses, clothing, jewelry, lighting, "
-                    "background, color grade, camera angle, and framing."
-                )
+                i2i_base = "EDIT THE INPUT PHOTO: keep the SAME person/identity"
                 i2i_parts = [i2i_base]
 
                 demo_light: List[str] = []

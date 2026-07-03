@@ -4,6 +4,7 @@ import base64
 import io
 import logging
 import os
+import re
 from typing import Any, Dict, Optional, Tuple
 
 from azure.ai.contentsafety import ContentSafetyClient
@@ -19,13 +20,48 @@ from app.config import settings
 
 logger = logging.getLogger("svc-face.safety")
 
-BLOCKED_KEYWORDS = [
-    "nude", "naked", "nsfw", "explicit", "sexual", "pornographic", "obscene",
-    "lingerie", "bikini", "revealing", "transparent", "see-through", "exposed",
-    "violence", "blood", "gore", "weapon", "kill", "fight", "abuse",
-    "political", "election", "modi", "gandhi", "rahul", "bjp", "congress",
-    "child abuse", "underage", "minor", "kid",
-    "drugs", "cocaine", "heroin", "meth",
+# Prompt safety must not hard-block broad creator terms like "bikini",
+# "political", "kid", "fight", or "weapon" by keyword alone. Those are
+# context signals for the moderation provider, not automatic user-facing
+# rejections. Keep direct keyword blocks only for clearly disallowed content.
+#
+# Azure Content Safety severities commonly use 0 / 2 / 4 / 6. Moving the
+# default block threshold from 2 to 3 gives the requested launch leeway:
+# borderline severity 2 is allowed, while severity 4+ remains blocked.
+DEFAULT_TEXT_SAFETY_BLOCK_SEVERITY = 3
+DEFAULT_IMAGE_SAFETY_BLOCK_SEVERITY = 3
+
+HARD_BLOCK_PATTERNS = [
+    {
+        "pattern": r"\b(child|kid|minor|underage)\b.{0,80}\b(nude|naked|sexual|sex|porn|pornographic|explicit|erotic|seductive|lingerie|bikini|revealing)\b",
+        "category": "minors",
+        "not_permitted": "sexualized or unsafe content involving minors",
+        "suggested_changes": "Remove references to minors in sexual, nude, revealing, or unsafe contexts.",
+    },
+    {
+        "pattern": r"\b(nude|naked|porn|pornographic|nsfw|obscene|explicit sexual|sexual act|sex act|erotic sex|exposed genitals)\b",
+        "category": "sexual",
+        "not_permitted": "nudity, pornography, explicit sexual content, or exposed intimate body parts",
+        "suggested_changes": "Keep the subject fully clothed and describe fashion, lighting, mood, and setting instead.",
+    },
+    {
+        "pattern": r"\b(rape|sexual assault|molest|child abuse|child exploitation|underage sex)\b",
+        "category": "abuse",
+        "not_permitted": "sexual violence, exploitation, or abuse",
+        "suggested_changes": "Remove abuse or exploitation references and rewrite the prompt in a safe, non-sexual context.",
+    },
+    {
+        "pattern": r"\b(gore|gory|bloodbath|dismember|decapitat(?:e|ed|ion)|mutilat(?:e|ed|ion))\b",
+        "category": "violence",
+        "not_permitted": "graphic gore, mutilation, or extreme violence",
+        "suggested_changes": "Use non-graphic action or dramatic mood without blood, gore, or bodily harm.",
+    },
+    {
+        "pattern": r"\b(make|manufacture|cook|synthesize|traffic|sell)\b.{0,60}\b(cocaine|heroin|meth|fentanyl|illegal drugs?)\b",
+        "category": "illegal_drugs",
+        "not_permitted": "instructions or facilitation for illegal drug activity",
+        "suggested_changes": "Remove drug-making, selling, trafficking, or usage instructions.",
+    },
 ]
 
 SAFETY_NEGATIVE_PROMPT = """
@@ -41,6 +77,128 @@ low quality, blurry, watermark, text overlay
 """
 
 AZURE_IMAGE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _setting_int(name: str, default: int, *, min_value: int = 0, max_value: int = 6) -> int:
+    raw = getattr(settings, name, None)
+    if raw is None or str(raw).strip() == "":
+        raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        raw = os.getenv(f"DF_{name}")
+
+    try:
+        value = int(str(raw).strip()) if raw is not None else int(default)
+    except Exception:
+        logger.warning("invalid_safety_threshold", extra={"setting": name, "value": raw, "default": default})
+        value = int(default)
+
+    return max(min_value, min(max_value, value))
+
+
+def _text_block_threshold() -> int:
+    return _setting_int("TEXT_SAFETY_BLOCK_SEVERITY", DEFAULT_TEXT_SAFETY_BLOCK_SEVERITY)
+
+
+def _image_block_threshold() -> int:
+    return _setting_int("IMAGE_SAFETY_BLOCK_SEVERITY", DEFAULT_IMAGE_SAFETY_BLOCK_SEVERITY)
+
+
+def _policy_message(
+    *,
+    category: str,
+    not_permitted: str,
+    suggested_changes: str,
+    source: str = "prompt",
+) -> str:
+    target = "Prompt" if source == "prompt" else "Image"
+    return (
+        f"PROMPT_POLICY_BLOCKED: {target} needs changes. "
+        f"Blocked category: {category}. "
+        f"Not permitted: {not_permitted}. "
+        f"Please change: {suggested_changes} "
+        "You can retry after updating the prompt or image."
+    )
+
+
+def _category_policy_message(category: str, *, source: str = "prompt") -> str:
+    normalized = category.replace("_", " ").lower()
+    if normalized == "sexual":
+        return _policy_message(
+            category="sexual",
+            not_permitted="nudity, pornography, explicit sexual content, or exposed intimate body parts",
+            suggested_changes="keep subjects fully clothed and focus on clothing, lighting, mood, camera style, and setting",
+            source=source,
+        )
+    if normalized == "hate":
+        return _policy_message(
+            category="hate",
+            not_permitted="hate, demeaning, or targeted abusive content toward protected groups",
+            suggested_changes="remove slurs, hateful framing, and targeted abuse; keep the prompt respectful and neutral",
+            source=source,
+        )
+    if normalized == "self harm":
+        return _policy_message(
+            category="self_harm",
+            not_permitted="self-harm encouragement, instructions, or graphic self-harm content",
+            suggested_changes="remove self-harm details and use a supportive, non-graphic framing",
+            source=source,
+        )
+    if normalized == "violence":
+        return _policy_message(
+            category="violence",
+            not_permitted="graphic violence, gore, mutilation, or instructions to harm people",
+            suggested_changes="use non-graphic dramatic mood or action without blood, gore, weapons-use instructions, or bodily harm",
+            source=source,
+        )
+    return _policy_message(
+        category=normalized or "content_safety",
+        not_permitted="content that violates the generation safety policy",
+        suggested_changes="rewrite in a family-friendly way and focus on safe visual details",
+        source=source,
+    )
+
+
+def _hard_keyword_policy_message(text: str) -> Optional[str]:
+    normalized = (text or "").lower()
+    for rule in HARD_BLOCK_PATTERNS:
+        if re.search(str(rule["pattern"]), normalized, flags=re.IGNORECASE | re.DOTALL):
+            return _policy_message(
+                category=str(rule["category"]),
+                not_permitted=str(rule["not_permitted"]),
+                suggested_changes=str(rule["suggested_changes"]),
+                source="prompt",
+            )
+    return None
+
+
+def _extract_text_severity(response: object, category_name: str) -> int:
+    legacy_attr = f"{category_name.lower()}_result"
+    legacy = getattr(response, legacy_attr, None)
+    if legacy is not None:
+        try:
+            return int(getattr(legacy, "severity", 0) or 0)
+        except Exception:
+            return 0
+
+    categories = getattr(response, "categories_analysis", None)
+    if categories is None and isinstance(response, dict):
+        categories = response.get("categories_analysis") or response.get("categoriesAnalysis")
+    if categories:
+        wanted = category_name.replace("_", "").lower()
+        for item in categories:
+            cat = getattr(item, "category", None)
+            sev = getattr(item, "severity", None)
+            if cat is None and isinstance(item, dict):
+                cat = item.get("category")
+                sev = item.get("severity")
+            cat_name = str(cat).split(".")[-1].replace("_", "").lower() if cat is not None else ""
+            if cat_name == wanted:
+                try:
+                    return int(sev or 0)
+                except Exception:
+                    return 0
+
+    return 0
 
 
 class ImageSafetyUnavailableError(RuntimeError):
@@ -242,10 +400,9 @@ class SafetyService:
             )
 
     def check_keywords(self, text: str) -> Tuple[bool, str]:
-        text_lower = (text or "").lower()
-        for keyword in BLOCKED_KEYWORDS:
-            if keyword in text_lower:
-                return False, f"Blocked keyword detected: {keyword}"
+        reason = _hard_keyword_policy_message(text)
+        if reason:
+            return False, reason
         return True, ""
 
     async def validate_text(self, text: str) -> Tuple[bool, str]:
@@ -259,18 +416,30 @@ class SafetyService:
         try:
             request = AnalyzeTextOptions(text=text)
             response = self.client.analyze_text(request)
+            threshold = _text_block_threshold()
 
-            if response.hate_result and response.hate_result.severity >= 2:
-                return False, "Content contains hate speech"
-            if response.self_harm_result and response.self_harm_result.severity >= 2:
-                return False, "Content contains self-harm references"
-            if response.sexual_result and response.sexual_result.severity >= 2:
-                return False, "Content contains sexual references"
-            if response.violence_result and response.violence_result.severity >= 2:
-                return False, "Content contains violence"
+            category_severities = {
+                "hate": _extract_text_severity(response, "hate"),
+                "self_harm": _extract_text_severity(response, "self_harm"),
+                "sexual": _extract_text_severity(response, "sexual"),
+                "violence": _extract_text_severity(response, "violence"),
+            }
+
+            for category, severity in category_severities.items():
+                if severity >= threshold:
+                    logger.info(
+                        "text_safety_blocked",
+                        extra={
+                            "category": category,
+                            "severity": severity,
+                            "threshold": threshold,
+                        },
+                    )
+                    return False, _category_policy_message(category, source="prompt")
 
             return True, ""
         except Exception:
+            logger.exception("azure_text_safety_unavailable_fail_open")
             return True, ""
 
     async def validate_image(
@@ -304,8 +473,24 @@ class SafetyService:
             sexual_severity = _extract_image_severity(response, "sexual")
             violence_severity = _extract_image_severity(response, "violence")
 
-            if max(hate_severity, self_harm_severity, sexual_severity, violence_severity) >= 2:
-                return False, "Image contains inappropriate content"
+            category_severities = {
+                "hate": hate_severity,
+                "self_harm": self_harm_severity,
+                "sexual": sexual_severity,
+                "violence": violence_severity,
+            }
+            threshold = _image_block_threshold()
+            for category, severity in category_severities.items():
+                if severity >= threshold:
+                    logger.info(
+                        "image_safety_blocked",
+                        extra={
+                            "category": category,
+                            "severity": severity,
+                            "threshold": threshold,
+                        },
+                    )
+                    return False, _category_policy_message(category, source="image")
 
             return True, ""
         except (UnsupportedImageFormatError, ImageTooLargeError):

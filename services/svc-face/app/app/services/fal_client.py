@@ -327,7 +327,7 @@ class FalClient:
         prompt: str,
         negative_prompt: Optional[str],
         image_url: str,
-        strength: float = 0.98,  # preservation_strength (svc-face semantic, STRICT IDENTITY LOCKED)
+        strength: float = 0.75,  # preservation_strength (svc-face semantic, LOCKED)
         seed: Optional[int] = None,
         width: int = 1024,
         height: int = 1024,

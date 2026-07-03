@@ -124,6 +124,206 @@ logger = logging.getLogger(__name__)
 JsonDict = Dict[str, Any]
 
 
+def _is_i2i_mode_value(value: Any) -> bool:
+    return str(value or "").strip().lower().replace("_", "-") in {
+        "image-to-image",
+        "i2i",
+        "img2img",
+    }
+
+
+def _merge_csv_terms(*values: Any) -> str:
+    out: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        for part in raw.split(","):
+            term = re.sub(r"\s+", " ", part).strip()
+            if not term:
+                continue
+            key = term.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(term)
+    return ", ".join(out)
+
+
+def _build_strict_edit_face_identity_contract(request_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    DesiFaces Edit Face contract.
+
+    Edit Face is not a face transformation feature. The source image owns identity.
+    Prompt enhancement and user text may change requested non-identity areas only.
+    """
+    rd = dict(request_dict or {})
+    if not _is_i2i_mode_value(rd.get("mode") or rd.get("generation_mode")):
+        return rd
+
+    locked_identity_features = [
+        "identity",
+        "same_real_person",
+        "face",
+        "facial_geometry",
+        "facial_proportions",
+        "forehead",
+        "hairline",
+        "visible_hair",
+        "eyes",
+        "eye_shape",
+        "eye_spacing",
+        "eyelids",
+        "eyebrows",
+        "nose",
+        "nose_width",
+        "nose_bridge",
+        "lips",
+        "mouth_shape",
+        "cheeks",
+        "cheek_shape",
+        "cheek_volume",
+        "cheek_fullness",
+        "lower_face_width",
+        "jawline",
+        "jawline_definition",
+        "chin",
+        "chin_size",
+        "chin_shape",
+        "facial_fullness",
+        "skin_tone",
+        "natural_complexion",
+        "skin_texture",
+        "age_appearance",
+        "gender_presentation",
+        "facial_hair",
+        "glasses",
+        "eyewear",
+        "natural_imperfections",
+    ]
+
+    allowed_i2i_changes = [
+        "clothing",
+        "outfit",
+        "attire",
+        "jewelry",
+        "background",
+        "environment",
+        "scene",
+        "lighting",
+        "camera_angle",
+        "framing",
+        "composition",
+        "color_grade",
+        "style",
+    ]
+
+    forbidden_i2i_changes = [
+        "different_person",
+        "new_face",
+        "lookalike",
+        "beautified_face",
+        "idealized_portrait",
+        "model_like_face",
+        "celebrity_like_face",
+        "ai_generated_face",
+        "synthetic_face",
+        "waxy_face",
+        "plastic_skin",
+        "airbrushed_skin",
+        "overly_smoothed_skin",
+        "beauty_filter",
+        "face",
+        "face_shape",
+        "facial_geometry",
+        "facial_proportions",
+        "forehead",
+        "hairline",
+        "visible_hair",
+        "eyes",
+        "eye_shape",
+        "eye_spacing",
+        "eyebrows",
+        "nose",
+        "lips",
+        "jawline",
+        "jawline_definition",
+        "chin",
+        "chin_size",
+        "chin_shape",
+        "cheeks",
+        "cheek_shape",
+        "cheek_volume",
+        "cheek_fullness",
+        "swollen_cheeks",
+        "puffy_cheeks",
+        "enlarged_cheeks",
+        "rounded_cheeks",
+        "bloated_face",
+        "lower_face_width",
+        "widened_lower_face",
+        "skin_tone",
+        "complexion",
+        "skin_texture",
+        "age",
+        "age_group",
+        "gender",
+        "gender_presentation",
+        "facial_hair",
+        "glasses",
+        "eyewear",
+        "expression",
+    ]
+
+    identity_instruction = (
+        "DESIFACES EDIT FACE STRICT IDENTITY LOCK: edit the input photo while preserving the exact same real person. "
+        "Do not create a new portrait, lookalike, beautified version, or AI-polished face. "
+        "Preserve the original face geometry and natural appearance: forehead, hairline, visible hair, eyes, eye spacing, eyelids, eyebrows, nose width and bridge, lips, mouth shape, cheeks, cheek shape, cheek volume, cheek fullness, lower-face width, jawline, jawline definition, chin size, chin shape, facial fullness, skin tone, natural complexion, skin texture, age appearance, gender presentation, facial hair, glasses/eyewear if present, and natural imperfections. "
+        "The user request may change only explicitly requested non-identity areas such as outfit, clothing, jewelry, background, scene, lighting, framing, camera angle, composition, color grade, or style. "
+        "If the prompt conflicts with identity preservation, ignore only the conflicting identity-change portion and preserve source identity."
+    )
+
+    negative_prompt = (
+        "different person, new face, lookalike, changed identity, changed face, changed facial geometry, changed facial proportions, "
+        "changed forehead, changed hairline, changed eyes, changed eye shape, changed eye spacing, changed eyebrows, changed nose, changed lips, changed mouth, "
+        "changed cheeks, changed cheek shape, changed cheek volume, changed cheek fullness, swollen cheeks, puffy cheeks, enlarged cheeks, fuller cheeks, rounded cheeks, bloated face, "
+        "changed lower face, widened lower face, altered lower face, changed jawline, softened jawline, changed chin, larger chin, smaller chin, rounded chin, "
+        "changed skin tone, lighter complexion, darker complexion, changed complexion, changed skin texture, airbrushed skin, overly smoothed skin, plastic skin, waxy skin, "
+        "beautified face, idealized portrait, model-like face, celebrity-like face, AI-generated face, synthetic face, beauty filter, glamour retouch, studio retouch, "
+        "removed glasses, changed glasses, missing eyewear, changed facial hair, changed age, younger face, older face, changed gender presentation"
+    )
+
+    rd["identity_lock"] = True
+    rd["identity_lock_level"] = "strict"
+    rd["preserve_source_identity"] = True
+    rd["preserve_source_gender"] = True
+    rd["gender_lock_mode"] = "preserve_from_source"
+    rd["locked_identity_features"] = locked_identity_features
+    rd["allowed_i2i_changes"] = allowed_i2i_changes
+    rd["request_only_editable_attributes"] = allowed_i2i_changes
+    rd["forbidden_i2i_changes"] = forbidden_i2i_changes
+    rd["identity_lock_instructions"] = identity_instruction
+    rd["strict_identity_instruction"] = identity_instruction
+    rd["strict_i2i_edit_instruction"] = (
+        "REQUEST-ONLY EDITING RULE: modify only the non-identity attributes the user explicitly asks to change. "
+        "Do not infer changes to cheeks, chin, jawline, skin tone, glasses, facial hair, age, gender, or facial structure."
+    )
+    rd["negative_prompt"] = _merge_csv_terms(
+        rd.get("negative_prompt"),
+        rd.get("negativePrompt"),
+        negative_prompt,
+    )
+    rd["system_prompt"] = " ".join(
+        part for part in [
+            identity_instruction,
+            str(rd.get("system_prompt") or "").strip(),
+        ] if part
+    )
+    return rd
+
+
+
 def _notifications_base_url() -> str:
     return str(
         os.getenv("DF_NOTIFICATIONS_URL")
@@ -1885,48 +2085,6 @@ class CreatorOrchestrator:
         request_dict["mode"] = mode
 
         if mode == "image-to-image":
-            # Product contract: I2I source image is the identity authority.
-            # The prompt may change styling/background/accessories only; it must not change face/gender.
-            request_dict["identity_lock"] = True
-            request_dict["identity_lock_level"] = "strict"
-            request_dict["preserve_source_identity"] = True
-            request_dict["preserve_source_gender"] = True
-            request_dict["gender_lock_mode"] = "preserve_from_source"
-            request_dict["allowed_i2i_changes"] = [
-                "facial_hair",
-                "glasses",
-                "dress",
-                "jewelry",
-                "background",
-                "lighting",
-                "camera_angle",
-                "framing",
-                "color_grade",
-            ]
-            request_dict["forbidden_i2i_changes"] = [
-                "identity",
-                "face",
-                "gender",
-                "facial_structure",
-                "skin_tone",
-                "eye_shape",
-                "nose_shape",
-                "mouth_shape",
-                "jawline",
-                "age_group",
-            ]
-            request_dict["identity_lock_instructions"] = (
-                "Preserve the exact same human identity and gender presentation from the source image. "
-                "Do not change face, gender, age group, skin tone, facial geometry, or core identity. "
-                "Only apply requested changes to facial hair, glasses, dress, jewelry, background, lighting, "
-                "color grade, camera angle, and framing."
-            )
-            try:
-                _i2i_strength = float(request_dict.get("preservation_strength") or 0.0)
-            except Exception:
-                _i2i_strength = 0.0
-            request_dict["preservation_strength"] = max(0.98, min(1.0, _i2i_strength if _i2i_strength > 0 else 0.98))
-
             asset_ref = (request_dict.get("source_image_asset_id") or "").strip()
             url_ref = (request_dict.get("source_image_url") or "").strip()
             ref = asset_ref or url_ref
@@ -1941,6 +2099,8 @@ class CreatorOrchestrator:
                 request_dict["source_image_asset_id"] = asset_ref
             elif self._UUID_RE.match(ref) and not request_dict.get("source_image_asset_id"):
                 request_dict["source_image_asset_id"] = ref
+
+            request_dict = _build_strict_edit_face_identity_contract(request_dict)
 
         translation_meta: Dict[str, Any] = {}
         if request_dict.get("user_prompt"):
@@ -2298,7 +2458,7 @@ class CreatorOrchestrator:
             return {}
 
         source_image_url = await self._resolve_source_image_ref(source_image_ref)
-        preservation_strength = max(0.98, self._clamp_strength(request_dict.get("preservation_strength"), 0.98))
+        preservation_strength = self._clamp_strength(request_dict.get("preservation_strength"), 0.25)
 
         out: Dict[str, Any] = {
             "source_image_ref": source_image_ref,
@@ -2834,6 +2994,9 @@ class CreatorOrchestrator:
                     )
                     return
 
+            if mode == "image-to-image":
+                payload_json = _build_strict_edit_face_identity_contract(payload_json)
+
             variants, resolved = await self.prompt_service.build_variants(
                 request_dict=payload_json,
                 job_seed=int(job_seed),
@@ -3049,6 +3212,26 @@ class CreatorOrchestrator:
         prompt = (variant.get("prompt") or "").strip()
         neg = (variant.get("negative_prompt") or "").strip()
 
+        # Enforce Edit Face UI/backend identity negative prompt.
+        # Variant prompts may be generated by CreatorPromptService, but the request-level
+        # I2I contract owns source-identity locking and must always be merged.
+        if mode == "image-to-image":
+            request_negative = str(
+                request_dict.get("negative_prompt")
+                or request_dict.get("negativePrompt")
+                or ""
+            ).strip()
+            if request_negative:
+                neg = _merge_csv_terms(neg, request_negative)
+
+            request_identity_lock = str(
+                request_dict.get("identity_lock_instructions")
+                or request_dict.get("strict_identity_instruction")
+                or ""
+            ).strip()
+            if request_identity_lock and request_identity_lock.lower() not in prompt.lower():
+                prompt = f"{request_identity_lock}\n\nUser requested edit: {prompt}" if prompt else request_identity_lock
+
         technical = self._coerce_dict(variant.get("technical_specs"))
         aspect_ratio = self._normalize_aspect_ratio(
             technical.get("aspect_ratio") or variant.get("aspect_ratio") or request_dict.get("aspect_ratio")
@@ -3143,7 +3326,7 @@ class CreatorOrchestrator:
                 elif parsed.scheme != "file":
                     raise ValueError(f"unsupported_source_image_scheme:{parsed.scheme or 'missing'}")
 
-                strength = max(0.98, self._clamp_strength(shared_inputs.get("preservation_strength"), payload_json.get("preservation_strength") or 0.98))
+                strength = self._clamp_strength(shared_inputs.get("preservation_strength"), payload_json.get("preservation_strength") or 0.25)
 
                 await self._provider_runs_upsert(
                     job_id=job_id,

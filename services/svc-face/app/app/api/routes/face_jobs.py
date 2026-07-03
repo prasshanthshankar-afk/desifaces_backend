@@ -557,7 +557,7 @@ async def upload_source_image(
          {
            "mode": "image-to-image",
            "source_image_asset_id": "<asset_id>",
-           "preservation_strength": 0.98
+           "preservation_strength": 0.995
          }
     """
     if not file:
@@ -982,7 +982,7 @@ async def creator_generate_faces(
     For image-to-image identity lock:
       - mode must be "image-to-image"
       - source_image_url or source_image_asset_id must be provided
-      - preservation_strength is forced to strict identity lock, normally 0.98
+      - preservation_strength is forced to strict identity lock, normally 0.995
     """
     pool = await get_pool()
     orch = CreatorOrchestrator(pool)

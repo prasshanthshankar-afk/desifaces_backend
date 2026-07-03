@@ -42,6 +42,10 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _is_i2i_mode(value: Any) -> bool:
+    return str(value or "").strip().lower().replace("_", "-") in {"image-to-image", "i2i", "img2img"}
+
+
 def _friendly_label(value: Any) -> str:
     raw = _clean_text(value)
     if not raw:
@@ -145,16 +149,26 @@ def _build_face_prompt(
     shot_type = _friendly_label(locked_fields.get("shot_type_label") or locked_fields.get("shot_type_code"))
     aspect_ratio = _clean_text(locked_fields.get("aspect_ratio"))
 
-    style_hint = {
-        "commercial": "premium commercial photography, crisp composition, polished styling, realistic lighting",
-        "natural": "natural lifestyle realism, candid energy, believable styling, soft authentic light",
-        "premium": "premium editorial portrait, refined styling, cinematic realism, elegant lighting",
-        "primary": "high-quality portrait, realistic lighting, clean composition, culturally respectful",
-    }[flavor]
+    is_i2i = _is_i2i_mode(mode)
+
+    if is_i2i:
+        style_hint = {
+            "commercial": "clean realistic product-quality photo edit, natural lighting, no beauty retouching",
+            "natural": "natural source-faithful realism, believable lighting, ordinary human skin texture",
+            "premium": "premium but natural photo edit, refined scene styling, no face polishing",
+            "primary": "source-faithful realistic photo edit, natural lighting, no AI-polished face",
+        }[flavor]
+    else:
+        style_hint = {
+            "commercial": "premium commercial photography, crisp composition, polished styling, realistic lighting",
+            "natural": "natural lifestyle realism, candid energy, believable styling, soft authentic light",
+            "premium": "premium editorial portrait, refined styling, cinematic realism, elegant lighting",
+            "primary": "high-quality portrait, realistic lighting, clean composition, culturally respectful",
+        }[flavor]
 
     identity_guard = (
-        "same person and identity preserved from the source photo"
-        if mode == "image-to-image"
+        "STRICT EDIT FACE IDENTITY LOCK: preserve the exact same person from the source photo, including forehead, hairline, eyes, nose, lips, cheek shape, cheek volume, cheek fullness, lower-face width, jawline, chin size, chin shape, skin tone, natural skin texture, age appearance, facial hair, and glasses or eyewear if present; do not beautify, smooth, slim, swell, reshape, de-age, or make the face look AI-generated"
+        if is_i2i
         else f"{gender} presentation preserved" if gender else ""
     )
 
@@ -162,7 +176,7 @@ def _build_face_prompt(
         [
             user_input,
             identity_guard,
-            f"authentic {region} visual cues" if region else f"authentic {zone} regional cues" if zone else "",
+            (f"authentic {region} cues only in clothing, background, or scene, not facial traits" if region else f"authentic {zone} cues only in clothing, background, or scene, not facial traits" if zone else "") if is_i2i else (f"authentic {region} visual cues" if region else f"authentic {zone} regional cues" if zone else ""),
             f"{context_label} context" if context_label else "",
             f"{use_case} use case" if use_case else "",
             f"{shot_type} framing" if shot_type else "",
@@ -250,7 +264,7 @@ def _fallback_response(req: PromptEnhanceRequest) -> PromptEnhanceResponse:
         variants = int(float(locked.get("num_variants") or context.get("num_variants") or 4))
         preservation_strength = float(locked.get("preservation_strength") or 0.0)
         why = (
-            f"STRICT IDENTITY LOCK {preservation_strength:.2f} - EDIT THE INPUT PHOTO ONLY: preserve the exact same human identity, same face, same gender presentation, same facial geometry, same age group, same skin tone, same eyes, same eye spacing, same lips, same jawline, same eyebrows, same nose, same cheekbones, and same facial proportions from the source image. The user prompt may change only request-only editable attributes such as styling, attire, accessories, lighting, framing, background, and composition. Do not change identity-defining features even if the prompt asks for a different face."
+            f"STRICT IDENTITY LOCK {preservation_strength:.2f} - EDIT THE INPUT PHOTO ONLY: preserve the exact same human identity, same real face, same gender presentation, same facial geometry, same age appearance, same skin tone, same natural skin texture, same eyes, same eye spacing, same lips, same jawline, same eyebrows, same nose, same cheek shape, same cheek volume, same cheek fullness, same lower-face width, same chin size, same chin shape, same hairline, same facial hair, and same glasses/eyewear if present. The user prompt may change only request-only non-identity attributes such as clothing, outfit, jewelry, lighting, framing, background, camera angle, composition, style, and color grade, and only when explicitly requested. Do not make cheeks puffy or swollen, do not change chin or jawline, do not smooth or polish the face, and do not make the person look AI-generated. If the user prompt conflicts with identity preservation, ignore only the conflicting identity-change portion and preserve the source identity. The user prompt is subordinate to this identity lock for image-to-image jobs."
             if _clean_text(locked.get("mode")) == "image-to-image"
             else "The rewrite adds clearer framing, visual cues, and quality direction without changing your chosen identity inputs."
         )
@@ -267,7 +281,7 @@ def _fallback_response(req: PromptEnhanceRequest) -> PromptEnhanceResponse:
                     "" if _friendly_label(locked.get("shot_type_label")) else "Add one framing cue like headshot, medium shot, or full-body.",
                     "" if _friendly_label(locked.get("context_label")) else "Add a clear setting so the background looks intentional instead of generic.",
                     "Run 2 to 4 variants first when you are testing a new idea to save credits." if variants > 4 else "",
-                    "Keep the prompt focused on styling, lighting, attire, accessories, and scene changes. Do not change face, gender, age group, skin tone, or identity when I2I identity lock is on." if _clean_text(locked.get("mode")) == "image-to-image" else "Call out attire, lighting, and mood together for more reliable results.",
+                    "Keep the prompt focused on clothing, lighting, background, scene, and framing. Do not ask the enhancer to change face, cheeks, chin, jawline, glasses, facial hair, gender, age, skin tone, or identity when I2I identity lock is on." if _is_i2i_mode(locked.get("mode")) else "Call out attire, lighting, and mood together for more reliable results.",
                     why,
                 ]
             )[:5],
@@ -354,6 +368,9 @@ Required JSON shape:
 For face:
 - Improve visual specificity, framing, styling, lighting, and scene.
 - Do not alter the selected identity.
+- If mode is image-to-image, Edit Face is source-faithful photo editing, not face transformation. Preserve the exact same person, including cheeks, cheek volume, chin, jawline, lower-face width, skin tone, natural skin texture, facial hair, glasses/eyewear, age appearance, and gender presentation.
+- If mode is image-to-image, do not add beautifying, glamour, airbrushed, model-like, younger, slimmer, fuller-cheek, rounded-chin, or AI-polished face language.
+- If region/culture is present for image-to-image, apply it only to clothing, background, scene, or styling; never reinterpret facial traits.
 - structured may include shot_type, context, use_case, aspect_ratio.
 - Background images should not be blurred and should be intentional and culturally relevant, not generic.
 
@@ -459,9 +476,23 @@ async def enhance_prompt(
 
     if req.studio == "face" and req.locked_fields:
         # Keep locked visual selections obvious in the final enhanced prompt.
+        is_i2i = _is_i2i_mode(req.locked_fields.get("mode") or req.mode)
         if _friendly_label(req.locked_fields.get("shot_type_label")) and _friendly_label(req.locked_fields.get("shot_type_label")).lower() not in response.enhanced_input.lower():
             response.enhanced_input = f"{response.enhanced_input}, {_friendly_label(req.locked_fields.get('shot_type_label'))} framing"
         if _friendly_label(req.locked_fields.get("region_label")) and _friendly_label(req.locked_fields.get("region_label")).lower() not in response.enhanced_input.lower():
-            response.enhanced_input = f"{response.enhanced_input}, authentic {_friendly_label(req.locked_fields.get('region_label'))} visual cues"
+            if is_i2i:
+                response.enhanced_input = f"{response.enhanced_input}, authentic {_friendly_label(req.locked_fields.get('region_label'))} cues only in clothing, background, or scene, not facial traits"
+            else:
+                response.enhanced_input = f"{response.enhanced_input}, authentic {_friendly_label(req.locked_fields.get('region_label'))} visual cues"
+
+        if is_i2i:
+            i2i_guard = (
+                "STRICT EDIT FACE IDENTITY LOCK: preserve the exact same person from the source photo, including cheek shape, cheek volume, cheek fullness, lower-face width, chin size, chin shape, jawline, skin tone, natural skin texture, facial hair, and glasses/eyewear if present; do not beautify, smooth, slim, swell, reshape, de-age, or make the face look AI-generated"
+            )
+            if "strict edit face identity lock" not in response.enhanced_input.lower():
+                response.enhanced_input = f"{i2i_guard}. {response.enhanced_input}"
+            for alt in response.alternatives:
+                if "strict edit face identity lock" not in alt.text.lower():
+                    alt.text = f"{i2i_guard}. {alt.text}"
 
     return response

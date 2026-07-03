@@ -199,7 +199,7 @@ class CreatorPlatformRequest(BaseModel):
     source_image_url: Optional[str] = None
     source_image_asset_id: Optional[str] = None
 
-    preservation_strength: float = Field(0.98, ge=0.0, le=1.0)
+    preservation_strength: float = Field(0.995, ge=0.0, le=1.0)
     identity_lock: bool = Field(default=False)
     identity_lock_level: Optional[str] = None
     preserve_source_identity: bool = Field(default=False)

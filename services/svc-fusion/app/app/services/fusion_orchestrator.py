@@ -1561,6 +1561,143 @@ class FusionOrchestrator:
                 return True
         return False
 
+    async def _has_thumbnail_artifact(self, job_id: str) -> bool:
+        try:
+            rows = await self.artifacts.list_artifacts(job_id)
+        except Exception:
+            logger.exception("fusion_list_thumbnail_artifacts_failed", extra={"job_id": job_id})
+            return False
+
+        for row in rows or []:
+            kind = str((row or {}).get("kind") or "").strip().lower()
+            content_type = str((row or {}).get("content_type") or "").strip().lower()
+            url = str((row or {}).get("url") or "").strip()
+            if not url:
+                continue
+            if kind in {"thumbnail", "poster"}:
+                return True
+            if content_type.startswith("image/") and kind not in {"resolved_face_sas_url", "provider_audio_ref", "resolved_audio_sas_url"}:
+                return True
+        return False
+
+    @staticmethod
+    def _image_content_type_for_url(url: Optional[str]) -> str:
+        path = ""
+        try:
+            path = (urlparse(str(url or "")).path or "").lower()
+        except Exception:
+            path = str(url or "").split("?", 1)[0].lower()
+
+        if path.endswith(".jpg") or path.endswith(".jpeg"):
+            return "image/jpeg"
+        if path.endswith(".webp"):
+            return "image/webp"
+        if path.endswith(".gif"):
+            return "image/gif"
+        return "image/png"
+
+    async def _persist_thumbnail_fallback_artifact(
+        self,
+        *,
+        job_id: str,
+        req: FusionJobCreate,
+        provider_name: str,
+        provider_job_id: Optional[str],
+    ) -> Optional[str]:
+        """
+        Launch-stability thumbnail fallback for Fusion videos.
+
+        The final MP4 is not an image thumbnail. Until true poster-frame extraction is
+        wired into the Fusion finalization path, store the resolved face image as a
+        job-scoped thumbnail artifact so Dashboard/Saved Work can show an image card
+        instead of a blank/failed video thumbnail.
+
+        This method is best-effort and must never fail the video generation path.
+        """
+        try:
+            if await self._has_thumbnail_artifact(job_id):
+                return None
+
+            candidate_url: Optional[str] = None
+            candidate_source = ""
+
+            try:
+                rows = await self.artifacts.list_artifacts(job_id)
+            except Exception:
+                rows = []
+
+            for row in rows or []:
+                kind = str((row or {}).get("kind") or "").strip().lower()
+                url = str((row or {}).get("url") or "").strip()
+                if kind == "resolved_face_sas_url" and url:
+                    candidate_url = url
+                    candidate_source = "resolved_face_sas_url"
+                    break
+
+            if not candidate_url:
+                face_artifact_id = getattr(req, "face_artifact_id", None)
+                if face_artifact_id:
+                    row = await self.artifacts.get_artifact_by_id(str(face_artifact_id))
+                    if row:
+                        candidate_url = await self.artifact_service.mint_read_sas_for_artifact(
+                            dict(row),
+                            ttl_hours=self._sas_ttl_hours(),
+                        )
+                        candidate_source = "face_artifact_id"
+
+            if not candidate_url:
+                direct_face_url = getattr(req, "face_image_url", None)
+                if direct_face_url:
+                    candidate_url = await self._refresh_input_url_if_azure_blob(str(direct_face_url))
+                    candidate_source = "face_image_url"
+
+            candidate_url = str(candidate_url or "").strip()
+            if not candidate_url:
+                return None
+
+            await self.artifacts.add_artifact(
+                job_id,
+                "thumbnail",
+                candidate_url,
+                content_type=self._image_content_type_for_url(candidate_url),
+                meta_json={
+                    "provider": provider_name,
+                    "provider_job_id": provider_job_id,
+                    "source": candidate_source or "fusion_face_thumbnail_fallback",
+                    "fallback_thumbnail": True,
+                    "thumbnail_role": "fusion_video_card",
+                },
+            )
+
+            await self._merge_job_meta(
+                job_id,
+                {
+                    "thumbnail_url": candidate_url,
+                    "poster_url": candidate_url,
+                    "thumbnail_source": candidate_source or "fusion_face_thumbnail_fallback",
+                },
+            )
+
+            logger.info(
+                "fusion_thumbnail_fallback_artifact_saved job_id=%s provider=%s provider_job_id=%s source=%s thumbnail_url=%s",
+                job_id,
+                provider_name,
+                provider_job_id,
+                candidate_source,
+                _preview_url(candidate_url),
+            )
+            return candidate_url
+        except Exception:
+            logger.exception(
+                "fusion_thumbnail_fallback_artifact_failed",
+                extra={
+                    "job_id": job_id,
+                    "provider": provider_name,
+                    "provider_job_id": provider_job_id,
+                },
+            )
+            return None
+
     async def _finalize_from_primary_video_url(
         self,
         *,
@@ -1597,6 +1734,13 @@ class FusionOrchestrator:
                     "recovered_from_primary_video_url": True,
                 },
             )
+
+        await self._persist_thumbnail_fallback_artifact(
+            job_id=job_id,
+            req=req,
+            provider_name=provider_name,
+            provider_job_id=provider_job_id,
+        )
 
         try:
             perf_id = await self.perfs.upsert_performance(
@@ -2817,6 +2961,12 @@ class FusionOrchestrator:
                         "provider_meta": submit_meta,
                     },
                 )
+                await self._persist_thumbnail_fallback_artifact(
+                    job_id=job_id,
+                    req=req,
+                    provider_name=provider_name,
+                    provider_job_id=provider_job_id or provider_idem,
+                )
                 await self._persist_light_status(job_id, provider=provider_name, provider_job_id=provider_job_id or provider_idem, provider_status="succeeded", primary_video_url=final_video_url)
 
                 if performance_id:
@@ -3137,6 +3287,12 @@ class FusionOrchestrator:
                     "provider_job_id": provider_job_id,
                     "provider_meta": prepared.submit_meta if prepared else {},
                 },
+            )
+            await self._persist_thumbnail_fallback_artifact(
+                job_id=job_id,
+                req=req,
+                provider_name=provider_name,
+                provider_job_id=provider_job_id,
             )
             await self._persist_light_status(job_id, provider=provider_name, provider_job_id=provider_job_id, provider_status="succeeded", primary_video_url=final_video_url)
 

@@ -1133,7 +1133,25 @@ async def _fetch_library_view_rows(
     studio_filter_sql = "lower(coalesce(v.studio, '')) = 'video'" if want_video_only else "true"
 
     combined_sql = f'''
-    with view_rows as (
+    with video_thumb_artifacts as (
+      select distinct on (a.job_id)
+        a.job_id,
+        a.url as thumbnail_url,
+        a.kind
+      from public.artifacts a
+      where a.url is not null
+        and a.url <> ''
+        and a.kind in ('poster', 'thumbnail', 'resolved_face_sas_url')
+      order by
+        a.job_id,
+        case
+          when a.kind in ('poster', 'thumbnail') then 0
+          when a.kind = 'resolved_face_sas_url' then 1
+          else 9
+        end,
+        a.created_at desc,
+        a.id desc
+    ), view_rows as (
       select
         v.library_id,
         v.user_id,
@@ -1142,7 +1160,7 @@ async def _fetch_library_view_rows(
         v.title,
         v.status,
         v.created_at,
-        v.thumbnail_url,
+        coalesce(v.thumbnail_url, vta.thumbnail_url) as thumbnail_url,
         v.preview_url,
         v.download_url,
         v.artifact_id,
@@ -1151,6 +1169,9 @@ async def _fetch_library_view_rows(
         v.reuse_payload_json,
         v.metadata_json
       from public.v_dashboard_asset_library v
+      left join video_thumb_artifacts vta
+        on lower(coalesce(v.studio, '')) = 'video'
+       and v.source_job_id = vta.job_id
       where v.user_id = $1::uuid
         and {studio_filter_sql}
         and (
@@ -1405,13 +1426,22 @@ def _normalize_library_item(
         recent_video_ttl_seconds if _is_recent(item, recent_window_days) else default_video_ttl_seconds
     )
 
+    raw_thumbnail_candidate = (
+        _pick_first(item, "thumbnail_url", "image_url")
+        if studio == "video"
+        else _pick_first(item, "thumbnail_url", "image_url", "preview_url")
+    )
+
     thumbnail_url = _signed_url_from_parts(
         signer,
-        _pick_first(item, "thumbnail_url", "image_url", "preview_url"),
+        raw_thumbnail_candidate,
         _pick_first(item, "thumbnail_container", "thumbnail_storage_container", "storage_container", "container_name"),
         _pick_first(item, "thumbnail_storage_path", "thumbnail_blob_path", "thumbnail_path", "storage_path", "blob_path"),
         ttl,
     )
+
+    if studio == "video" and _clean_text(thumbnail_url).lower().split("?", 1)[0].endswith((".mp4", ".mov", ".m4v", ".webm")):
+        thumbnail_url = ""
 
     preview_url = _signed_url_from_parts(
         signer,
