@@ -188,7 +188,13 @@ except Exception as pricing_import_error:
 
 
 from app.repos.tts_jobs_repo import TTSJobsRepo
-from app.services.tts_service import TTSService, TerminalTTSValidationError, _normalize_speech_locale, _normalize_translation_target
+from app.services.tts_service import (
+    RetryableTTSProviderError,
+    TTSService,
+    TerminalTTSValidationError,
+    _normalize_speech_locale,
+    _normalize_translation_target,
+)
 from app.services.azure_storage_service import AzureStorageService
 
 logger = logging.getLogger("tts_orchestrator")
@@ -394,9 +400,17 @@ def _classify_error(e: Exception) -> str:
             return "LOCALE_NOT_SUPPORTED"
         if "missing_target_locale" in msg:
             return "MISSING_TARGET_LOCALE"
+        if "gender_translation" in msg:
+            return "TRANSLATION_FAILED"
+        if "gender_mismatch" in msg or "voice_locale_mismatch" in msg:
+            return "VOICE_PROFILE_MISMATCH"
         return "INVALID_TTS_REQUEST"
 
     msg = str(e or "").lower()
+    if isinstance(e, RetryableTTSProviderError) and (
+        "translation" in msg or "translator" in msg
+    ):
+        return "TRANSLATION_FAILED"
 
     if "insufficient" in msg and "credit" in msg:
         return "PRICING_INSUFFICIENT_CREDITS"
@@ -408,7 +422,12 @@ def _classify_error(e: Exception) -> str:
         return "LOCALE_NOT_SUPPORTED"
     if "invalid_target_language" in msg or ('code":400036' in msg) or ("target language is not valid" in msg):
         return "INVALID_TARGET_LANGUAGE"
-    if "translate" in msg or "translator_failed" in msg:
+    if (
+        "translate" in msg
+        or "translation" in msg
+        or "translator_failed" in msg
+        or "gender_translation" in msg
+    ):
         return "TRANSLATION_FAILED"
     return "tts_failed"
 
@@ -1002,6 +1021,11 @@ class TTSOrchestrator:
             normalized_target_locale = target_locale
         input_language = str(payload.get("input_language") or payload.get("source_language") or "en")
         output_format = str(payload.get("output_format") or "mp3")
+        requested_voice = str(payload.get("voice") or payload.get("voice_id") or "").strip() or None
+        speaker_gender = str(payload.get("speaker_gender") or "").strip().lower() or None
+        voice_gender = str(payload.get("voice_gender") or "").strip().lower() or None
+        voice_locale = str(payload.get("voice_locale") or target_locale or "").strip() or None
+        translation_tone = str(payload.get("translation_tone") or "neutral").strip().lower()
 
         if not user_id:
             raise ValueError("user_id is required")
@@ -1056,6 +1080,11 @@ class TTSOrchestrator:
                 "target_locale_original": target_locale if (normalized_target_locale and normalized_target_locale != target_locale) else None,
                 "input_language": input_language,
                 "output_format": output_format,
+                "voice": requested_voice,
+                "voice_locale": voice_locale,
+                "speaker_gender": speaker_gender,
+                "voice_gender": voice_gender,
+                "translation_tone": translation_tone,
                 "text_length": len(text),
             },
         }
@@ -1134,6 +1163,11 @@ class TTSOrchestrator:
             "target_locale_original": target_locale if (normalized_target_locale and normalized_target_locale != target_locale) else None,
             "input_language": input_language,
             "output_format": output_format,
+            "voice": requested_voice,
+            "voice_locale": voice_locale,
+            "speaker_gender": speaker_gender,
+            "voice_gender": voice_gender,
+            "translation_tone": translation_tone,
         }
 
         reserve_spec = PricingReserveSpec(
@@ -1573,13 +1607,17 @@ class TTSOrchestrator:
                 text=text,
                 input_language=input_language,
                 target_locale=normalized_target_locale,
-                voice=payload.get("voice"),
+                voice=payload.get("voice") or payload.get("voice_id"),
                 style=payload.get("style"),
                 emotion=payload.get("emotion"),
                 rate=rate,
                 pitch=pitch,
                 translate=bool(payload.get("translate", True)),
                 output_format=output_format,
+                speaker_gender=payload.get("speaker_gender"),
+                voice_gender=payload.get("voice_gender"),
+                voice_locale=payload.get("voice_locale"),
+                translation_tone=payload.get("translation_tone") or "neutral",
             )
 
             upload = await self.storage.upload_bytes(
@@ -1602,11 +1640,23 @@ class TTSOrchestrator:
 
             payload_updates: Dict[str, Any] = {
                 "voice": chosen_voice,
+                "voice_id": chosen_voice,
                 "final_synthesis_text": final_text,
                 "target_locale": normalized_target_locale,
                 "target_locale_original": original_target_locale,
                 "translation_target_language": normalized_translation_target,
             }
+            if isinstance(meta, dict):
+                for key in (
+                    "speaker_gender",
+                    "voice_gender",
+                    "voice_locale",
+                    "translation_tone",
+                    "translation_provider",
+                    "translation_model",
+                ):
+                    if meta.get(key) is not None:
+                        payload_updates[key] = meta[key]
             if translated_text:
                 payload_updates["translated_text"] = translated_text
             if isinstance(meta, dict) and meta:

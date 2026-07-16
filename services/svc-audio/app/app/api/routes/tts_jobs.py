@@ -7,7 +7,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -686,7 +686,18 @@ class TTSCreateRequest(BaseModel):
     source_language: Optional[str] = Field(default=None, max_length=20)
     translate: bool = True
 
+    # `voice` remains the canonical provider voice field for backward
+    # compatibility. `voice_id` is accepted because current mobile clients send it.
     voice: Optional[str] = None
+    voice_id: Optional[str] = None
+    voice_locale: Optional[str] = Field(default=None, max_length=20)
+
+    # Speaker gender controls grammatical agreement during translation. Voice
+    # gender is validated against public.tts_voices and cannot override catalog data.
+    speaker_gender: Optional[Literal["female", "male", "neutral", "unspecified"]] = None
+    voice_gender: Optional[Literal["female", "male", "neutral", "unspecified"]] = None
+    translation_tone: Literal["neutral", "formal", "informal"] = "neutral"
+
     style: Optional[str] = None
     style_degree: Optional[float] = None
     rate: Optional[float] = None
@@ -754,13 +765,20 @@ class JobStatusResponse(BaseModel):
 
 
 def _build_audio_payload(req: TTSCreateRequest) -> Dict[str, Any]:
+    canonical_voice = req.voice or req.voice_id
+
     payload: Dict[str, Any] = {
         "text": req.text,
         "target_locale": req.target_locale,
         "source_language": req.source_language,
         "input_language": (req.source_language or "en"),
         "translate": req.translate,
-        "voice": req.voice,
+        "voice": canonical_voice,
+        "voice_id": req.voice_id or canonical_voice,
+        "voice_locale": req.voice_locale or req.target_locale,
+        "speaker_gender": req.speaker_gender,
+        "voice_gender": req.voice_gender,
+        "translation_tone": req.translation_tone,
         "style": req.style,
         "style_degree": req.style_degree,
         "rate": req.rate,
@@ -780,6 +798,11 @@ def _audio_preview_meta(req: TTSCreateRequest) -> Dict[str, Any]:
         "mode": "tts",
         "target_locale": req.target_locale,
         "input_language": req.source_language or "en",
+        "voice": req.voice or req.voice_id,
+        "voice_locale": req.voice_locale or req.target_locale,
+        "speaker_gender": req.speaker_gender,
+        "voice_gender": req.voice_gender,
+        "translation_tone": req.translation_tone,
         "output_format": req.output_format,
         "text_length": len(text),
         "chars_1k": str(_chars_1k_units(text)),
