@@ -2117,6 +2117,72 @@ class CreatorOrchestrator:
         request_dict = self._normalize_request_framing(request_dict)
         return request_dict, translation_meta, mode
 
+    async def _prepare_pricing_preview_request_dict(
+        self,
+        request: CreatorPlatformRequest,
+    ) -> Tuple[Dict[str, Any], str]:
+        """
+        Prepare only the deterministic fields required to calculate a Face price.
+
+        Pricing does not depend on prompt safety classification or translated
+        prompt text. Full safety validation and translation remain part of the
+        Create Face path through _prepare_creator_request_dict().
+        """
+        if hasattr(request, "model_dump"):
+            request_dict = request.model_dump(
+                mode="json",
+                exclude_none=True,
+            )
+        elif isinstance(request, dict):
+            request_dict = dict(request)
+        else:
+            request_dict = dict(getattr(request, "__dict__", {}) or {})
+
+        mode = self._coerce_mode(request_dict.get("mode"))
+        request_dict["mode"] = mode
+
+        user_prompt = self._clean_text(
+            request_dict.get("user_prompt")
+            or request_dict.get("prompt")
+        )
+        if user_prompt:
+            request_dict["user_prompt"] = user_prompt
+            request_dict["prompt"] = user_prompt
+
+        # Pricing only needs to know that I2I was requested. Do not resolve or
+        # download the source image while calculating a quote.
+        if mode == "image-to-image":
+            asset_ref = self._clean_text(
+                request_dict.get("source_image_asset_id")
+                or request_dict.get("source_asset_id")
+            )
+            url_ref = self._clean_text(
+                request_dict.get("source_image_url")
+            )
+            source_ref = asset_ref or url_ref
+
+            if not source_ref:
+                raise ValueError(
+                    "missing_required_fields: ['source_image_url'] "
+                    "for image-to-image mode"
+                )
+
+            request_dict["source_image_ref"] = source_ref
+
+            if asset_ref:
+                request_dict["source_image_asset_id"] = asset_ref
+            else:
+                request_dict["source_image_url"] = url_ref
+
+        request_dict = await self._ensure_required_config_codes(
+            request_dict
+        )
+        request_dict = self._normalize_request_framing(
+            request_dict
+        )
+
+        return request_dict, mode
+
 
     def _pricing_rpc_timeout_s(self) -> float:
         try:
@@ -2225,7 +2291,7 @@ class CreatorOrchestrator:
         request: CreatorPlatformRequest,
         client_context: Optional[Dict[str, Any]] = None,
     ) -> PricingPreviewResponseModel:
-        request_dict, _, mode = await self._prepare_creator_request_dict(request)
+        request_dict, mode = await self._prepare_pricing_preview_request_dict(request)
 
         pricing = self._build_initial_pricing_block(request_dict)
         if not pricing.get("enabled"):
@@ -2310,12 +2376,17 @@ class CreatorOrchestrator:
 
         preview_ref = self._generate_request_hash(request_hash_payload)
 
+        resolved_client_context = client_context or {}
+        resolved_channel = self._clean_text(resolved_client_context.get("channel")) or "mobile"
+        resolved_country_code = self._clean_text(resolved_client_context.get("country_code"))
+        resolved_currency = self._clean_text(resolved_client_context.get("currency")) or "USD"
+
         preview_meta = {
             **self._coerce_dict(pricing.get("meta")),
-            "channel": "service",
-            "country_code": self._clean_text((client_context or {}).get("country_code")),
-            "currency": self._clean_text((client_context or {}).get("currency")),
-            "client_context": client_context or {},
+            "channel": resolved_channel,
+            "country_code": resolved_country_code,
+            "currency": resolved_currency,
+            "client_context": resolved_client_context,
             "request_hash": preview_ref,
             "mode": mode,
             "shot_type_code": request_dict.get("shot_type_code"),
