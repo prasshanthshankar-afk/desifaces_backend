@@ -193,6 +193,7 @@ SELECT
     'ready'::text AS status,
     COALESCE(al.created_at, sj.created_at) AS created_at,
     NULL::text AS thumbnail_url,
+    
     al.url AS preview_url,
     al.url AS download_url,
     al.artifact_id,
@@ -249,7 +250,10 @@ SELECT
         ELSE dp.status
     END AS status,
     COALESCE(fjo.created_at, dp.created_at, sj.created_at) AS created_at,
-    NULL::text AS thumbnail_url,
+    COALESCE(
+        NULLIF(sj.meta_json ->> 'thumbnail_url', ''),
+        NULLIF(sj.meta_json ->> 'poster_url', '')
+    ) AS thumbnail_url,
     COALESCE(vl.url, ma.storage_ref, dp.share_url) AS preview_url,
     COALESCE(vl.url, ma.storage_ref, dp.share_url) AS download_url,
     vl.artifact_id,

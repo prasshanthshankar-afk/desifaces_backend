@@ -215,7 +215,6 @@ services:
       PYTHONPATH: "/app"
 
       DF_FUSION_STUDIO_ENABLED: ${DF_FUSION_STUDIO_ENABLED:-true}
-      DF_VEED_FABRIC_MODEL_ID: ${DF_VEED_FABRIC_MODEL_ID:-veed/fabric-1.0}
 
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
@@ -251,8 +250,6 @@ services:
   # -------------------------
   svc-fusion-worker:
     <<: *python_service
-    healthcheck:
-      disable: true
     container_name: df-svc-fusion-worker
     depends_on:
       desifaces-db:
@@ -278,7 +275,6 @@ services:
       HEYGEN_SUBMIT_PATH: ${HEYGEN_SUBMIT_PATH:-}
 
       DF_FUSION_STUDIO_ENABLED: ${DF_FUSION_STUDIO_ENABLED:-true}
-      DF_VEED_FABRIC_MODEL_ID: ${DF_VEED_FABRIC_MODEL_ID:-veed/fabric-1.0}
 
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
@@ -803,8 +799,6 @@ services:
   # -------------------------
   svc-audio-worker:
     <<: *python_service
-    healthcheck:
-      disable: true
     container_name: df-svc-audio-worker
     depends_on:
       desifaces-db:
@@ -887,8 +881,6 @@ services:
 
   svc-dashboard-worker:
     <<: *python_service
-    healthcheck:
-      disable: true
     container_name: df-svc-dashboard-worker
     build:
       context: ./services/svc-dashboard/app
@@ -1367,8 +1359,6 @@ services:
   # -------------------------
   svc-studio-coach-refresh-worker:
     <<: *python_service
-    healthcheck:
-      disable: true
     container_name: df-svc-studio-coach-refresh-worker
     build:
       context: ./services/svc-core/app

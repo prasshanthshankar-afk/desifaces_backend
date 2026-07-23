@@ -38,42 +38,8 @@ curl -sS "$DASHBOARD_URL/api/dashboard/library?type=video&limit=10&offset=0&fina
   -H "Authorization: Bearer $TOKEN" \
   -H "X-User-Id: $USER_ID" > "$VIDEO_JSON"
 
-ITEM_JSON="$(
-  jq -c '
-    (.items // [])
-    | map(
-        select(
-          ((.thumbnail_url // "") | length) == 0
-          and
-          ((.source_job_id // "") | length) > 0
-          and
-          (
-            ((.reuse_payload.video_url // "") | length) > 0
-            or ((.video_url // "") | length) > 0
-            or ((.preview_url // "") | length) > 0
-            or ((.download_url // "") | length) > 0
-          )
-        )
-      )
-    | .[0] // empty
-  ' "$VIDEO_JSON"
-)"
-
-JOB_ID="$(
-  echo "$ITEM_JSON" |
-  jq -r '.source_job_id // empty'
-)"
-
-VIDEO_URL="$(
-  echo "$ITEM_JSON" |
-  jq -r '
-    .reuse_payload.video_url
-    // .video_url
-    // .preview_url
-    // .download_url
-    // empty
-  '
-)"
+JOB_ID="$(jq -r '(.items // [])[0].source_job_id // empty' "$VIDEO_JSON")"
+VIDEO_URL="$(jq -r '(.items // [])[0].reuse_payload.video_url // (.items // [])[0].video_url // (.items // [])[0].preview_url // (.items // [])[0].download_url // empty' "$VIDEO_JSON")"
 
 if [ -z "$JOB_ID" ] || [ -z "$VIDEO_URL" ]; then
   echo "No final video row found in dashboard library response."

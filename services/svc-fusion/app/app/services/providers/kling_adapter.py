@@ -238,11 +238,14 @@ class KlingAdapter(ProviderClient):
         provider_options = self._provider_options(payload)
         reference_urls = list(data.reference_image_urls or payload.get("reference_image_urls") or [])
 
+        # Prefer the freshly resolved provider input URL. The orchestrator
+        # refreshes Azure Blob SAS URLs immediately before provider preparation.
+        # Persisted provider_options/reference URLs may already be expired.
         start_image_url = self._safe_str(
-            provider_options.get("start_image_url")
-            or provider_options.get("image_url")
+            data.resolved_face_url
             or (reference_urls[0] if reference_urls else "")
-            or (data.resolved_face_url or "")
+            or provider_options.get("start_image_url")
+            or provider_options.get("image_url")
         )
         end_image_url = self._safe_str(provider_options.get("end_image_url")) or None
         duration_sec = (

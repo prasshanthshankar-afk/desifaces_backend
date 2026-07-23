@@ -2125,8 +2125,8 @@ class CreatorOrchestrator:
         Prepare only the deterministic fields required to calculate a Face price.
 
         Pricing does not depend on prompt safety classification or translated
-        prompt text. Full safety validation and translation remain part of the
-        Create Face path through _prepare_creator_request_dict().
+        prompt text. Full safety validation and translation remain enforced by
+        process_job() in the Face worker before variant generation.
         """
         if hasattr(request, "model_dump"):
             request_dict = request.model_dump(
@@ -2182,6 +2182,21 @@ class CreatorOrchestrator:
         )
 
         return request_dict, mode
+
+    async def _prepare_creator_submission_request_dict(
+        self,
+        request: CreatorPlatformRequest,
+    ) -> Tuple[Dict[str, Any], str]:
+        """
+        Prepare the deterministic submission payload only.
+
+        This intentionally reuses the proven pricing-preview preparation path so
+        POST /creator/generate can create, reserve, and queue the job without
+        running remote prompt safety or translation work in the API process.
+        Full prompt preparation remains enforced by process_job() before variant
+        generation.
+        """
+        return await self._prepare_pricing_preview_request_dict(request)
 
 
     def _pricing_rpc_timeout_s(self) -> float:
@@ -2754,7 +2769,7 @@ class CreatorOrchestrator:
             },
         )
 
-        request_dict, translation_meta, mode = await self._prepare_creator_request_dict(request)
+        request_dict, mode = await self._prepare_creator_submission_request_dict(request)
 
         pre_mode = self._pre_resolve_seed_mode(request_dict)
 
@@ -2855,8 +2870,8 @@ class CreatorOrchestrator:
                 "request_type": "creator_platform",
                 "api_version": "v2",
                 "language": request_dict.get("language") or "en",
-                "safety_validated": True if request_dict.get("user_prompt") else False,
-                "translation_success": bool(request_dict.get("translation_success")) if translation_meta else True,
+                "safety_validated": False,
+                "translation_success": True if not request_dict.get("user_prompt") else None,
                 "config_validated": True,
                 "seed_mode": seed_mode,
                 "job_seed": int(job_seed),
@@ -3027,6 +3042,49 @@ class CreatorOrchestrator:
                 seed_mode = "deterministic"
 
             request_hash = str(self._row_get(job, "request_hash", "") or "")
+
+            user_prompt = self._clean_text(
+                payload_json.get("user_prompt")
+                or payload_json.get("prompt")
+            )
+            prompt_already_prepared = bool(
+                self._clean_text(payload_json.get("user_prompt_translated_en"))
+                and bool(meta_json.get("safety_validated"))
+            )
+
+            if user_prompt and not prompt_already_prepared:
+                try:
+                    translation_meta = await self.prompt_service.translate_and_validate(
+                        user_prompt=user_prompt,
+                        language=payload_json.get("language") or "en",
+                    )
+                except ValueError as e:
+                    error_text = str(e)
+                    unsafe_prompt = error_text.startswith("unsafe_prompt")
+                    await self._fail_job(
+                        job_id=job_id,
+                        user_id=user_id,
+                        pricing=pricing,
+                        error_code="UNSAFE_PROMPT" if unsafe_prompt else "PROMPT_PREPARATION_FAILED",
+                        error_message=error_text,
+                        release_reason="unsafe_prompt" if unsafe_prompt else "prompt_preparation_failed",
+                    )
+                    return
+
+                payload_json["translated_prompt"] = (
+                    translation_meta.get("user_prompt_translated_en")
+                    or user_prompt
+                )
+                payload_json.update(translation_meta)
+                await self.jobs_repo.patch_job_meta(
+                    job_id,
+                    {
+                        "safety_validated": True,
+                        "translation_success": bool(
+                            translation_meta.get("translation_success", True)
+                        ),
+                    },
+                )
 
             source_image_url = (payload_json.get("source_image_url") or "").strip()
             if mode == "text-to-image" and source_image_url:

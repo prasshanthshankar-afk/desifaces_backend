@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import subprocess
 import tempfile
@@ -13,6 +14,9 @@ from app.config import settings
 from app.db import get_db_pool
 from app.services.sas_service import parse_blob_path_from_sas_url
 from app.services.sas_service import AzureBlobService  # you already use this in routes
+
+
+logger = logging.getLogger(__name__)
 
 
 async def _download(url: str, path: str) -> None:
@@ -48,6 +52,53 @@ def _upload_final_mp4(connection_string: str, container: str, blob_path: str, lo
             overwrite=True,
             content_settings=ContentSettings(content_type="video/mp4"),
         )
+
+
+def _extract_poster_frame(video_path: str, poster_path: str) -> None:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        "00:00:01",
+        "-i",
+        video_path,
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=720:-2",
+        "-q:v",
+        "3",
+        poster_path,
+    ]
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg poster extraction failed: {p.stderr[-2000:]}")
+    if not os.path.exists(poster_path) or os.path.getsize(poster_path) == 0:
+        raise RuntimeError("ffmpeg poster extraction produced an empty file")
+
+
+def _upload_poster_jpeg(
+    connection_string: str,
+    container: str,
+    blob_path: str,
+    local_path: str,
+) -> str:
+    bsc = BlobServiceClient.from_connection_string(connection_string)
+    bc = bsc.get_blob_client(container=container, blob=blob_path)
+
+    with open(local_path, "rb") as f:
+        bc.upload_blob(
+            f,
+            overwrite=True,
+            content_settings=ContentSettings(content_type="image/jpeg"),
+        )
+
+    return f"https://{bsc.account_name}.blob.core.windows.net/{container}/{blob_path}"
 
 
 async def _claim_one_stitch_job(conn) -> Optional[dict]:
@@ -149,6 +200,28 @@ async def stitch_loop() -> None:
                     settings.FINAL_SAS_TTL_SECONDS,
                 )
 
+                # Poster generation is best-effort and must not fail the completed video.
+                poster_url: Optional[str] = None
+                poster_blob_path: Optional[str] = None
+                try:
+                    poster_path = os.path.join(td, "poster.jpg")
+                    poster_blob_path = f"longform/posters/{job_id}.jpg"
+
+                    _extract_poster_frame(out_path, poster_path)
+                    poster_url = _upload_poster_jpeg(
+                        settings.AZURE_STORAGE_CONNECTION_STRING,
+                        settings.AZURE_FINAL_VIDEO_CONTAINER,
+                        poster_blob_path,
+                        poster_path,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Longform poster generation failed; preserving video success job_id=%s",
+                        job_id,
+                    )
+                    poster_url = None
+                    poster_blob_path = None
+
             async with pool.acquire() as conn:
                 await conn.execute(
                     """
@@ -156,12 +229,23 @@ async def stitch_loop() -> None:
                     set status='succeeded',
                         final_storage_path=$2,
                         final_video_url=$3,
+                        tags = coalesce(tags, '{}'::jsonb)
+                               || jsonb_strip_nulls(
+                                    jsonb_build_object(
+                                      'thumbnail_url', $4::text,
+                                      'poster_url', $4::text,
+                                      'cover_url', $4::text,
+                                      'thumbnail_blob_path', $5::text
+                                    )
+                                  ),
                         updated_at=now()
                     where id=$1::uuid
                     """,
                     job_id,
                     final_blob_path,
                     final_sas_url,
+                    poster_url,
+                    poster_blob_path,
                 )
 
         except Exception as e:
