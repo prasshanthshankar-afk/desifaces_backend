@@ -229,8 +229,8 @@ class OpenAIImageClient:
         # Allow override for proxies / gateways
         self.base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 
-        self.model_t2i = os.getenv("OPENAI_IMAGE_MODEL_T2I", "gpt-image-1.5")
-        self.model_edit = os.getenv("OPENAI_IMAGE_MODEL_EDIT", "gpt-image-1.5")
+        self.model_t2i = os.getenv("OPENAI_IMAGE_MODEL_T2I", "gpt-image-2")
+        self.model_edit = os.getenv("OPENAI_IMAGE_MODEL_EDIT", "gpt-image-2")
 
         # For GPT Image models, "auto" is a safe default (prevents accidental bad sizes)
         self.image_size = os.getenv("OPENAI_IMAGE_SIZE", "auto")

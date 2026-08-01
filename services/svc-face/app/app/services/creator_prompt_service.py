@@ -6,6 +6,7 @@ import random
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.safety_service import SafetyService
+from app.services.community_visual_profile import CommunityVisualProfileResolver
 from app.services.translation_service import TranslationService
 from app.repos.creator_config_repo import CreatorPlatformConfigRepo
 
@@ -35,11 +36,15 @@ class CreatorPromptService:
         safety: SafetyService,
         translator: TranslationService,
         config_repo: Optional[CreatorPlatformConfigRepo] = None,
+        visual_profile_resolver: Optional[CommunityVisualProfileResolver] = None,
     ):
         self.pool = db_pool
         self.safety = safety
         self.translator = translator
         self.config_repo = config_repo or CreatorPlatformConfigRepo(db_pool)
+        self.visual_profile_resolver = (
+            visual_profile_resolver or CommunityVisualProfileResolver()
+        )
 
     # ---------------------------------------------------------------------
     # Small helpers
@@ -299,6 +304,11 @@ class CreatorPromptService:
         explicit_region = self._is_nonempty_code(region_code)
         explicit_skin_tone = self._is_nonempty_code(skin_tone_code)
 
+        visual_profile = self.visual_profile_resolver.resolve(
+            request_dict=request_dict,
+            region=region,
+        )
+
         # Gender policy
         gender = explicit_gender
         if (not is_i2i) and (not gender):
@@ -336,7 +346,9 @@ class CreatorPromptService:
             if skin_tone:
                 demographic_parts.append(self._as_text(self._get(skin_tone, "prompt_descriptor")))
 
-            demographic_parts.append("authentic Indian features, natural appearance, culturally accurate")
+            demographic_parts.extend(
+                visual_profile.t2i_demographic_fragments
+            )
 
         demographic_prefix = self._join(demographic_parts)
 
@@ -444,6 +456,15 @@ class CreatorPromptService:
                     if guidelines.get("authenticity") == "high":
                         creative_parts.append("authentic, documentary realism, not stock-photo")
 
+            if is_i2i:
+                creative_parts.extend(
+                    visual_profile.i2i_quality_fragments
+                )
+            else:
+                creative_parts.extend(
+                    visual_profile.t2i_quality_fragments
+                )
+
             # Per-variant instruction: preferred_variations[i] wins, else translated_prompt
             prompt_instruction = ""
             if preferred_variations and i < len(preferred_variations):
@@ -460,25 +481,11 @@ class CreatorPromptService:
                 i2i_base = "EDIT THE INPUT PHOTO: keep the SAME person/identity"
                 i2i_parts = [i2i_base]
 
-                demo_light: List[str] = []
-                if age_range:
-                    demo_light.append(self._as_text(self._get(age_range, "prompt_descriptor")))
-
-                gp = gender_phrase(gender) if gender else None
-                if gp:
-                    demo_light.append(gp)
-
-                if region:
-                    region_name = self._region_name(region)
-                    if region_name:
-                        demo_light.append(f"from {region_name}")
-
-                if skin_tone:
-                    demo_light.append(self._as_text(self._get(skin_tone, "prompt_descriptor")))
-
-                if demo_light:
-                    i2i_parts.append(self._join(demo_light))
-
+                # I2I source image owns personal identity and demographics.
+                # Do not re-describe age, gender presentation, region-derived
+                # appearance or skin tone here; doing so can cause identity drift.
+                # Community guidance may still improve requested wardrobe,
+                # environment, lighting and styling through creative_parts.
                 if creative_parts:
                     i2i_parts.append(self._join(creative_parts))
 
@@ -539,6 +546,9 @@ class CreatorPromptService:
                     ]
                 )
 
+            negative.extend(
+                visual_profile.negative_fragments
+            )
             negative_prompt = self._join(negative)
 
             variants.append(
@@ -563,6 +573,7 @@ class CreatorPromptService:
                     "demographic_base": demographic_prefix,  # keep key name stable for your existing logs/tools
                     "prompt_instruction": prompt_instruction,
                     "prompt_source": "preferred_variations" if preferred_variations else "translated_prompt",
+                    "visual_profile": visual_profile.as_metadata(),
                     "demographic_constraints": {
                         "gender": gender,
                         "gender_explicit": bool(explicit_gender),
