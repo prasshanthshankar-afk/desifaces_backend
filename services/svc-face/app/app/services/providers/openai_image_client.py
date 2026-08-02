@@ -236,6 +236,13 @@ class OpenAIImageClient:
         self.image_size = os.getenv("OPENAI_IMAGE_SIZE", "auto")
         self.quality = os.getenv("OPENAI_IMAGE_QUALITY", "high")
 
+        # GPT Image supports moderation="auto" or "low".
+        # desifaces keeps its own explicit/minor safety controls upstream, while
+        # "low" reduces false-positive provider blocks for legitimate adult
+        # glamour, fashion, editorial and swimwear imagery.
+        moderation = os.getenv("OPENAI_IMAGE_MODERATION", "low").strip().lower()
+        self.moderation = moderation if moderation in {"auto", "low"} else "low"
+
     def _headers(self) -> Dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key}"}
 
@@ -257,6 +264,7 @@ class OpenAIImageClient:
             "prompt": prompt,
             "size": _normalize_gpt_image_size(size or self.image_size),
             "quality": quality or self.quality,
+            "moderation": self.moderation,
         }
 
         r = requests.post(
@@ -287,6 +295,7 @@ class OpenAIImageClient:
             "prompt": prompt,
             "size": _normalize_gpt_image_size(size or self.image_size),
             "quality": quality or self.quality,
+            "moderation": self.moderation,
         }
 
         safe_output_format = _safe_output_format(output_format)
