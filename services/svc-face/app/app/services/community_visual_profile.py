@@ -17,6 +17,13 @@ GLOBAL_PREMIUM_PROFILE = CommunityVisualProfile(
             "natural rather than stiff, synthetic or mechanically posed"
         ),
         (
+            "when explicitly requested, allow sophisticated adult glamour, fashion, "
+            "beauty and editorial presentation with confident expressive posing, "
+            "refined makeup and styling, elegant fitted or revealing-but-non-explicit "
+            "clothing, and polished cinematic presentation while preserving natural "
+            "skin texture, anatomy and culturally coherent appearance"
+        ),
+        (
             "natural skin texture with realistic pores and tonal variation, "
             "believable facial proportions, physically coherent cinematic lighting "
             "when appropriate while faithfully honoring explicitly requested lighting "

@@ -39,6 +39,26 @@ HARD_BLOCK_PATTERNS = [
         "suggested_changes": "Remove references to minors in sexual, nude, revealing, or unsafe contexts.",
     },
     {
+        "pattern": (
+            r"\b(?:[0-9]|1[0-7])\s*[- ]?\s*(?:years?|yrs?)\s*[- ]?\s*old\b"
+            r".{0,80}\b(nude|naked|sexual|sex|porn|pornographic|explicit|erotic|"
+            r"seductive|lingerie|bikini|revealing)\b"
+        ),
+        "category": "minors",
+        "not_permitted": "sexualized or unsafe content involving minors",
+        "suggested_changes": "Remove sexual, nude, lingerie, revealing, or unsafe treatment of anyone under 18.",
+    },
+    {
+        "pattern": (
+            r"\b(?:teen|teenage|teenager)\b.{0,80}"
+            r"\b(nude|naked|sexual|sex|porn|pornographic|explicit|erotic|"
+            r"seductive|lingerie|revealing)\b"
+        ),
+        "category": "minors",
+        "not_permitted": "sexualized or unsafe content involving young people",
+        "suggested_changes": "Use an explicitly adult subject and remove sexual or unsafe young-person context.",
+    },
+    {
         "pattern": r"\b(nude|naked|porn|pornographic|nsfw|obscene|explicit sexual|sexual act|sex act|erotic sex|exposed genitals)\b",
         "category": "sexual",
         "not_permitted": "nudity, pornography, explicit sexual content, or exposed intimate body parts",
@@ -66,8 +86,8 @@ HARD_BLOCK_PATTERNS = [
 
 SAFETY_NEGATIVE_PROMPT = """
 nude, nudity, naked, nsfw, explicit, sexual, pornographic, obscene,
-inappropriate, adult content, revealing clothing, transparent clothing,
-see-through, exposed body parts, sexual acts, suggestive poses,
+inappropriate, explicit sexual content, pornographic presentation,
+exposed intimate body parts, sexual acts, explicitly sexual poses,
 violence, blood, gore, weapons, fighting, abuse,
 child in inappropriate context, underage,
 political symbols, political figures, controversial symbols,

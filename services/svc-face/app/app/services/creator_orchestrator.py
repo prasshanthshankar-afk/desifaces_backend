@@ -290,7 +290,7 @@ def _build_strict_edit_face_identity_contract(request_dict: Dict[str, Any]) -> D
         "changed cheeks, changed cheek shape, changed cheek volume, changed cheek fullness, swollen cheeks, puffy cheeks, enlarged cheeks, fuller cheeks, rounded cheeks, bloated face, "
         "changed lower face, widened lower face, altered lower face, changed jawline, softened jawline, changed chin, larger chin, smaller chin, rounded chin, "
         "changed skin tone, lighter complexion, darker complexion, changed complexion, changed skin texture, airbrushed skin, overly smoothed skin, plastic skin, waxy skin, "
-        "beautified face, idealized portrait, model-like face, celebrity-like face, AI-generated face, synthetic face, beauty filter, glamour retouch, studio retouch, "
+        "beautified face, idealized replacement face, celebrity-like replacement face, AI-generated replacement face, synthetic replacement face, beauty filter that changes identity, identity-altering glamour retouch, face-reshaping studio retouch, "
         "removed glasses, changed glasses, missing eyewear, changed facial hair, changed age, younger face, older face, changed gender presentation"
     )
 
