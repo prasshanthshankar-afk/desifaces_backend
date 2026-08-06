@@ -10,6 +10,20 @@ import httpx
 import asyncpg
 
 from app.services.azure_tts_service import AzureTTSService
+from app.repos.locale_catalog_repo import LocaleCatalogRepository
+from app.repos.locale_context_repo import LocaleContextRepository
+from app.repos.tts_catalog_repo import TTSCatalogRepository
+from app.services.locale_resolver import LocaleResolver
+from app.services.locale_context_resolver import LocaleContextResolver
+from app.services.tts_model_resolver import TTSModelResolver
+from app.services.tts_voice_resolver import TTSVoiceResolver
+from app.services.tts_resolution_planner import (
+    TTSResolutionPlanError,
+    TTSResolutionPlanRequest,
+    TTSResolutionPlanner,
+)
+from app.services.tts_provider_executor import TTSProviderExecutor
+from app.services.tts_provider_adapter import TTSProviderAdapterError
 from gender_translation import (
     GenderTranslationError,
     normalize_gender,
@@ -158,6 +172,28 @@ def _normalize_output_format(fmt: Optional[str]) -> str:
     return f"azure:{s}"
 
 
+def _resolution_output_format(value: Optional[str]) -> str:
+    """Normalize concrete codec names to provider-neutral format families."""
+    raw = str(value or "").strip().lower()
+
+    if not raw:
+        return "mp3"
+
+    if "mp3" in raw:
+        return "mp3"
+
+    if (
+        "wav" in raw
+        or "wave" in raw
+        or "riff" in raw
+        or "pcm" in raw
+    ):
+        return "wav"
+
+    return raw
+
+
+
 def _safe_ssml_text(text: str) -> str:
     """
     Escape XML entities. Keep it simple + safe.
@@ -171,6 +207,18 @@ class TTSService:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
         self.tts = AzureTTSService()
+
+        locale_catalog = LocaleCatalogRepository(pool)
+        locale_context = LocaleContextRepository(pool)
+        tts_catalog = TTSCatalogRepository(pool)
+
+        self.resolution_planner = TTSResolutionPlanner(
+            locale_resolver=LocaleResolver(locale_catalog),
+            context_resolver=LocaleContextResolver(locale_context),
+            model_resolver=TTSModelResolver(tts_catalog),
+            voice_resolver=TTSVoiceResolver(tts_catalog),
+        )
+        self.provider_executor = TTSProviderExecutor()
 
         self.translator_key = os.getenv("AZURE_TRANSLATOR_KEY", "").strip()
         self.translator_region = os.getenv("AZURE_TRANSLATOR_REGION", "").strip()
@@ -223,117 +271,8 @@ class TTSService:
             raise RetryableTTSProviderError(f"translator_failed status={r.status_code} body={body_text}")
 
 
-    async def _voice_exists(self, voice_name: str) -> bool:
-        row = await self.pool.fetchrow(
-            """
-            SELECT 1
-            FROM public.tts_voices
-            WHERE provider='azure' AND voice_name=$1
-            LIMIT 1
-            """,
-            voice_name,
-        )
-        return bool(row)
 
-    async def resolve_voice_profile(
-        self,
-        *,
-        voice_name: str,
-    ) -> Dict[str, Optional[str]]:
-        row = await self.pool.fetchrow(
-            """
-            SELECT voice_name, locale, gender
-            FROM public.tts_voices
-            WHERE provider = 'azure'
-              AND voice_name = $1
-            LIMIT 1
-            """,
-            voice_name,
-        )
-        if not row:
-            raise TerminalTTSValidationError(
-                f"voice_profile_not_found:{voice_name}"
-            )
-        return {
-            "voice_name": str(row["voice_name"]),
-            "locale": str(row["locale"] or ""),
-            "gender": normalize_gender(row["gender"]),
-        }
 
-    async def resolve_default_voice(self, *, locale: str, requested_voice: Optional[str]) -> str:
-        """
-        DB schema:
-          - tts_locales has NO default_voice column
-          - tts_voices has is_default boolean
-
-        Rules:
-          1) If requested_voice provided and exists, use it.
-          2) Else pick default for exact locale (enabled locale only).
-          3) Else fallback to base language match (hi-IN -> any hi-*)
-        """
-        locale = _normalize_speech_locale(locale)
-        req = (requested_voice or "").strip()
-        if req and req.lower() != "auto":
-            if await self._voice_exists(req):
-                return req
-            # If caller asked for something invalid, we *fallback* instead of failing hard.
-            # (You can make this strict later if you prefer.)
-
-        # Exact locale, only if locale enabled
-        row = await self.pool.fetchrow(
-            """
-            SELECT v.voice_name
-            FROM public.tts_voices v
-            JOIN public.tts_locales l
-              ON l.locale = v.locale
-            WHERE v.provider='azure'
-              AND v.locale=$1
-              AND l.is_enabled=true
-            ORDER BY
-              v.is_default DESC,
-              CASE
-                WHEN v.voice_type ILIKE 'Neural' THEN 0
-                WHEN v.voice_name ILIKE '%Neural%' THEN 1
-                ELSE 2
-              END,
-              CASE WHEN v.gender ILIKE 'Female' THEN 0 ELSE 1 END,
-              v.voice_name ASC
-            LIMIT 1
-            """,
-            locale,
-        )
-        if row and row.get("voice_name"):
-            return str(row["voice_name"])
-
-        # Base-language fallback: hi-IN -> hi-%
-        base = _base_lang(locale)
-        if base:
-            row2 = await self.pool.fetchrow(
-                """
-                SELECT v.voice_name
-                FROM public.tts_voices v
-                JOIN public.tts_locales l
-                  ON l.locale = v.locale
-                WHERE v.provider='azure'
-                  AND v.locale ILIKE $1
-                  AND l.is_enabled=true
-                ORDER BY
-                  v.is_default DESC,
-                  CASE
-                    WHEN v.voice_type ILIKE 'Neural' THEN 0
-                    WHEN v.voice_name ILIKE '%Neural%' THEN 1
-                    ELSE 2
-                  END,
-                  CASE WHEN v.gender ILIKE 'Female' THEN 0 ELSE 1 END,
-                  v.voice_name ASC
-                LIMIT 1
-                """,
-                f"{base}-%",
-            )
-            if row2 and row2.get("voice_name"):
-                return str(row2["voice_name"])
-
-        raise TerminalTTSValidationError(f"no_voice_for_locale:{locale}")
 
     def build_ssml(
         self,
@@ -407,18 +346,83 @@ class TTSService:
         target_lang = _base_lang(target_locale)
         final_text = text
 
-        chosen_voice = await self.resolve_default_voice(
-            locale=target_locale,
-            requested_voice=voice,
+        requested_speaker_gender = normalize_gender(
+            speaker_gender
         )
-        voice_profile = await self.resolve_voice_profile(voice_name=chosen_voice)
+        requested_voice_gender = normalize_gender(
+            voice_gender
+        )
 
-        authoritative_voice_gender = normalize_gender(voice_profile.get("gender"))
+        if requested_voice_gender in {"female", "male"}:
+            planner_gender = requested_voice_gender
+        elif requested_speaker_gender in {"female", "male"}:
+            planner_gender = requested_speaker_gender
+        else:
+            planner_gender = None
+
+        try:
+            resolution_plan = (
+                await self.resolution_planner.resolve(
+                    TTSResolutionPlanRequest(
+                        requested_locale=target_locale,
+                        text_length=len(text or ""),
+                        output_format=(
+                            _resolution_output_format(
+                                output_format
+                            )
+                        ),
+                        requested_voice=voice,
+                        requested_gender=planner_gender,
+                        requires_style=bool(style),
+                        requires_emotion=bool(emotion),
+                    )
+                )
+            )
+        except TTSResolutionPlanError as exc:
+            message = str(exc or "")
+
+            terminal_markers = (
+                "missing_requested_locale",
+                "unknown_locale:",
+                "alias_target_locale_unavailable:",
+                "alias_target_missing:",
+                "no_locale_for_language:",
+                "ambiguous_locale:",
+                "no_eligible_tts_model:",
+                "ambiguous_tts_model_candidates:",
+                "requested_voice_not_eligible:",
+                "no_eligible_tts_voice:",
+                "duplicate_requested_voice_candidates:",
+                "ambiguous_tts_voice_candidates:",
+                "provider_resolution_mismatch",
+                "model_resolution_mismatch",
+                "voice_locale_resolution_mismatch",
+            )
+
+            if any(
+                marker in message
+                for marker in terminal_markers
+            ):
+                raise TerminalTTSValidationError(
+                    f"tts_resolution_failed:{message}"
+                ) from exc
+
+            # Do not expose raw infrastructure/DB errors.
+            raise RetryableTTSProviderError(
+                "tts_resolution_temporarily_unavailable"
+            ) from exc
+
+        chosen_voice = resolution_plan.voice_name
+
+        authoritative_voice_gender = normalize_gender(
+            resolution_plan.voice_gender
+        )
+
         authoritative_voice_locale = str(
-            voice_profile.get("locale") or target_locale
+            resolution_plan.voice_home_locale
+            or resolution_plan.canonical_locale
+            or target_locale
         ).strip()
-        requested_speaker_gender = normalize_gender(speaker_gender)
-        requested_voice_gender = normalize_gender(voice_gender)
 
         if (
             requested_voice_gender in {"female", "male"}
@@ -529,7 +533,10 @@ class TTSService:
 
         fmt = _normalize_output_format(output_format)
 
-        # Build SSML (try style first; if Azure rejects, retry without express-as).
+        # Provider-neutral execution. Provider/model/voice selection
+        # has already been resolved from DB-backed masterdata.
+        execution_format = _resolution_output_format(output_format)
+
         ssml = self.build_ssml(
             text=final_text,
             locale=target_locale,
@@ -541,53 +548,23 @@ class TTSService:
             allow_express_as=True,
         )
 
+        style_retried = False
         try:
-            if fmt == "wav":
-                audio_bytes = await self.tts.synthesize_wav(ssml=ssml)
-                return (
-                    audio_bytes,
-                    final_text,
-                    chosen_voice,
-                    "audio/wav",
-                    "wav",
-                    result_meta("wav"),
-                )
-
-            if fmt == "mp3":
-                audio_bytes = await self.tts.synthesize_mp3(ssml=ssml)
-                return (
-                    audio_bytes,
-                    final_text,
-                    chosen_voice,
-                    "audio/mpeg",
-                    "mp3",
-                    result_meta("mp3"),
-                )
-
-            azure_fmt = fmt.split("azure:", 1)[1]
-            audio_bytes = await self.tts.synthesize(
+            provider_result = await self.provider_executor.synthesize(
+                plan=resolution_plan,
+                text=final_text,
+                output_format=execution_format,
                 ssml=ssml,
-                output_format=azure_fmt,
+                style=style,
+                emotion=emotion,
+                rate=rate,
+                pitch=pitch,
             )
-            low = azure_fmt.lower()
-            if "mp3" in low:
-                content_type, ext = "audio/mpeg", "mp3"
-            elif "riff" in low or "pcm" in low or "wav" in low:
-                content_type, ext = "audio/wav", "wav"
-            else:
-                content_type, ext = "application/octet-stream", "bin"
-            return (
-                audio_bytes,
-                final_text,
-                chosen_voice,
-                content_type,
-                ext,
-                result_meta(azure_fmt),
-            )
+        except TTSProviderAdapterError as exc:
+            if resolution_plan.adapter_key != "azure" or not (style or emotion):
+                raise RetryableTTSProviderError(str(exc)) from exc
 
-        except RuntimeError as exc:
-            original_error = str(exc)
-            ssml_without_style = self.build_ssml(
+            retry_ssml = self.build_ssml(
                 text=final_text,
                 locale=target_locale,
                 voice=chosen_voice,
@@ -597,51 +574,31 @@ class TTSService:
                 pitch=pitch,
                 allow_express_as=False,
             )
-            if ssml_without_style != ssml:
-                if fmt == "wav":
-                    audio_bytes = await self.tts.synthesize_wav(
-                        ssml=ssml_without_style
-                    )
-                    return (
-                        audio_bytes,
-                        final_text,
-                        chosen_voice,
-                        "audio/wav",
-                        "wav",
-                        result_meta("wav", style_retried=True),
-                    )
-                if fmt == "mp3":
-                    audio_bytes = await self.tts.synthesize_mp3(
-                        ssml=ssml_without_style
-                    )
-                    return (
-                        audio_bytes,
-                        final_text,
-                        chosen_voice,
-                        "audio/mpeg",
-                        "mp3",
-                        result_meta("mp3", style_retried=True),
-                    )
-                if fmt.startswith("azure:"):
-                    azure_fmt = fmt.split("azure:", 1)[1]
-                    audio_bytes = await self.tts.synthesize(
-                        ssml=ssml_without_style,
-                        output_format=azure_fmt,
-                    )
-                    low = azure_fmt.lower()
-                    if "mp3" in low:
-                        content_type, ext = "audio/mpeg", "mp3"
-                    elif "riff" in low or "pcm" in low or "wav" in low:
-                        content_type, ext = "audio/wav", "wav"
-                    else:
-                        content_type, ext = "application/octet-stream", "bin"
-                    return (
-                        audio_bytes,
-                        final_text,
-                        chosen_voice,
-                        content_type,
-                        ext,
-                        result_meta(azure_fmt, style_retried=True),
-                    )
+            try:
+                provider_result = await self.provider_executor.synthesize(
+                    plan=resolution_plan,
+                    text=final_text,
+                    output_format=execution_format,
+                    ssml=retry_ssml,
+                    style=None,
+                    emotion=None,
+                    rate=rate,
+                    pitch=pitch,
+                )
+                style_retried = True
+            except TTSProviderAdapterError as retry_exc:
+                raise RetryableTTSProviderError(str(retry_exc)) from retry_exc
 
-            raise RuntimeError(original_error) from exc
+        meta = result_meta(execution_format, style_retried=style_retried)
+        meta.update(dict(provider_result.metadata or {}))
+        meta["provider_code"] = provider_result.provider_code
+        meta["model_code"] = provider_result.model_code
+
+        return (
+            provider_result.audio_bytes,
+            final_text,
+            provider_result.voice_name,
+            provider_result.content_type,
+            provider_result.extension,
+            meta,
+        )

@@ -121,6 +121,119 @@ class CatalogSyncService:
 
         return upserted
 
+    async def sync_speech_capabilities(self) -> Tuple[int, int, int]:
+        """Bridge discovered Azure voices into provider-neutral capability masterdata."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                model_locales = await conn.execute(
+                    """
+                    INSERT INTO public.tts_model_locale_capabilities(
+                      provider_code,model_code,locale,
+                      provider_locale_code,accent_code,
+                      support_level,is_enabled,is_approved,
+                      source,source_version,last_seen_at,meta_json
+                    )
+                    SELECT
+                      $1::text,m.model_code,v.locale,
+                      v.locale,NULL,
+                      'supported',true,true,
+                      'provider_catalog','azure_speech_live',now(),
+                      jsonb_build_object('provider',$1::text)
+                    FROM public.tts_provider_models m
+                    CROSS JOIN (
+                      SELECT DISTINCT locale
+                      FROM public.tts_voices
+                      WHERE provider=$1::text
+                        AND locale IS NOT NULL
+                    ) v
+                    WHERE m.provider_code=$1::text
+                      AND m.is_enabled=true
+                    ON CONFLICT(provider_code,model_code,locale)
+                    DO UPDATE SET
+                      provider_locale_code=EXCLUDED.provider_locale_code,
+                      support_level='supported',
+                      is_enabled=true,
+                      is_approved=true,
+                      source='provider_catalog',
+                      source_version='azure_speech_live',
+                      last_seen_at=now(),
+                      updated_at=now()
+                    """,
+                    self.PROVIDER,
+                )
+
+                voice_models = await conn.execute(
+                    """
+                    INSERT INTO public.tts_voice_model_capabilities(
+                      provider_code,voice_id,model_code,
+                      is_enabled,is_approved,supports_styles,
+                      source,source_version,
+                      discovered_at,last_seen_at,meta_json
+                    )
+                    SELECT
+                      $1::text,v.id,m.model_code,
+                      true,true,v.supports_styles,
+                      'provider_catalog','azure_speech_live',
+                      now(),now(),
+                      jsonb_build_object('provider',$1::text)
+                    FROM public.tts_voices v
+                    CROSS JOIN public.tts_provider_models m
+                    WHERE v.provider=$1::text
+                      AND m.provider_code=$1::text
+                      AND m.is_enabled=true
+                    ON CONFLICT(provider_code,voice_id,model_code)
+                    DO UPDATE SET
+                      is_enabled=true,
+                      is_approved=true,
+                      supports_styles=EXCLUDED.supports_styles,
+                      source='provider_catalog',
+                      source_version='azure_speech_live',
+                      last_seen_at=now(),
+                      updated_at=now()
+                    """,
+                    self.PROVIDER,
+                )
+
+                voice_locales = await conn.execute(
+                    """
+                    INSERT INTO public.tts_voice_locale_capabilities(
+                      voice_id,locale,accent_code,
+                      is_native_fit,is_recommended,
+                      is_enabled,is_approved,quality_score,
+                      source,source_version,last_seen_at,
+                      meta_json,selection_priority
+                    )
+                    SELECT
+                      v.id,v.locale,'',
+                      true,false,
+                      true,true,0.9000,
+                      'provider_catalog','azure_speech_live',now(),
+                      jsonb_build_object('provider',$1::text),0
+                    FROM public.tts_voices v
+                    WHERE v.provider=$1::text
+                      AND v.locale IS NOT NULL
+                    ON CONFLICT(voice_id,locale,accent_code)
+                    DO UPDATE SET
+                      is_native_fit=true,
+                      is_enabled=true,
+                      is_approved=true,
+                      quality_score=COALESCE(
+                        public.tts_voice_locale_capabilities.quality_score,
+                        EXCLUDED.quality_score
+                      ),
+                      source='provider_catalog',
+                      source_version='azure_speech_live',
+                      last_seen_at=now(),
+                      updated_at=now()
+                    """,
+                    self.PROVIDER,
+                )
+
+        def count(tag: str) -> int:
+            return int(tag.split()[-1])
+
+        return count(model_locales), count(voice_models), count(voice_locales)
+
     # ----------------------------
     # 2) Translator languages inventory
     # ----------------------------
@@ -197,10 +310,8 @@ class CatalogSyncService:
                            SELECT 1
                              FROM public.tts_voices v
                             WHERE v.locale = l.locale
-                              AND v.provider = $1
                        )
-                    """,
-                    self.PROVIDER,
+                    """
                 )
                 reconciled = int(res1.split()[-1]) if res1.startswith("UPDATE") else 0
 
@@ -245,6 +356,7 @@ class CatalogSyncService:
     # ----------------------------
     async def sync_all(self) -> SyncSummary:
         speech_upserted = await self.sync_speech_voices()
+        await self.sync_speech_capabilities()
         langs_seen, locales_touched = await self.sync_translator_languages()
         locales_reconciled, defaults_set = await self.reconcile_locales()
 

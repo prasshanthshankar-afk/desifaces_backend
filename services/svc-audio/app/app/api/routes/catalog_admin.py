@@ -15,11 +15,15 @@ async def sync_catalog(
     svc = CatalogSyncService(pool)
     try:
         voices_upserted = await svc.sync_speech_voices()
+        model_locales, voice_models, voice_locales = await svc.sync_speech_capabilities()
         langs_seen, locales_touched = await svc.sync_translator_languages()
         reconciled, defaults_set = await svc.reconcile_locales()
 
         return {
             "speech_voices_upserted": voices_upserted,
+            "model_locale_capabilities_upserted": model_locales,
+            "voice_model_capabilities_upserted": voice_models,
+            "voice_locale_capabilities_upserted": voice_locales,
             "translator_langs_seen": langs_seen,
             "locales_touched": locales_touched,
             "locales_reconciled": reconciled,
