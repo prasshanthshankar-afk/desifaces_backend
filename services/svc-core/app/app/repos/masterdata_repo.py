@@ -37,6 +37,7 @@ class MasterdataRepo:
                   sort_order
                 FROM public.face_generation_regions
                 WHERE is_active = true
+                  AND left(code, 4) <> 'geo_'
                 ORDER BY sort_order ASC, label ASC;
                 """,
                 lang,

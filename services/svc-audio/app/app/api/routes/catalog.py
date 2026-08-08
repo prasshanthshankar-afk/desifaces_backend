@@ -113,6 +113,141 @@ async def list_locales(
     return {"items": [dict(r) for r in rows]}
 
 
+
+@router.get("/countries")
+async def list_countries(
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> Dict[str, Any]:
+    """
+    Return countries having at least one currently usable TTS target locale.
+
+    Country availability is derived entirely from locale and provider
+    capability masterdata.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                l.country_code,
+                COUNT(*) AS locale_count
+            FROM public.tts_locales l
+            WHERE l.is_enabled = TRUE
+              AND l.tts_supported = TRUE
+              AND l.is_user_selectable = TRUE
+              AND l.country_code IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM public.tts_voice_locale_capabilities vl
+                  JOIN public.tts_voices v
+                    ON v.id = vl.voice_id
+                  JOIN public.tts_voice_model_capabilities vm
+                    ON vm.voice_id = v.id
+                   AND vm.provider_code = v.provider
+                   AND vm.is_enabled = TRUE
+                   AND vm.is_approved = TRUE
+                  JOIN public.tts_provider_models m
+                    ON m.provider_code = vm.provider_code
+                   AND m.model_code = vm.model_code
+                   AND m.is_enabled = TRUE
+                   AND m.routing_enabled = TRUE
+                  JOIN public.tts_providers p
+                    ON p.provider_code = vm.provider_code
+                   AND p.is_enabled = TRUE
+                   AND p.routing_enabled = TRUE
+                  WHERE vl.locale = l.locale
+                    AND vl.is_enabled = TRUE
+                    AND vl.is_approved = TRUE
+              )
+            GROUP BY l.country_code
+            ORDER BY l.country_code
+            """
+        )
+
+    return {
+        "items": [
+            {
+                "country_code": r["country_code"],
+                "locale_count": int(r["locale_count"]),
+            }
+            for r in rows
+        ]
+    }
+
+
+@router.get("/target-languages")
+async def list_target_languages(
+    country_code: str = Query(
+        ...,
+        description="ISO 3166-1 alpha-2 country code",
+    ),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> Dict[str, Any]:
+    """
+    Return currently usable TTS target locales for the selected country.
+
+    Country/language/provider decisions are not encoded in application
+    source; eligibility comes from database masterdata and capabilities.
+    """
+    normalized_country = str(country_code or "").strip().upper()
+
+    if len(normalized_country) != 2 or not normalized_country.isalpha():
+        raise HTTPException(
+            status_code=400,
+            detail="invalid_country_code",
+        )
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                l.locale,
+                l.language_code,
+                l.country_code,
+                l.translator_lang,
+                l.display_name,
+                l.native_name,
+                l.tts_supported,
+                l.translate_supported,
+                l.is_user_selectable
+            FROM public.tts_locales l
+            WHERE l.country_code = $1
+              AND l.is_enabled = TRUE
+              AND l.tts_supported = TRUE
+              AND l.is_user_selectable = TRUE
+              AND EXISTS (
+                  SELECT 1
+                  FROM public.tts_voice_locale_capabilities vl
+                  JOIN public.tts_voices v
+                    ON v.id = vl.voice_id
+                  JOIN public.tts_voice_model_capabilities vm
+                    ON vm.voice_id = v.id
+                   AND vm.provider_code = v.provider
+                   AND vm.is_enabled = TRUE
+                   AND vm.is_approved = TRUE
+                  JOIN public.tts_provider_models m
+                    ON m.provider_code = vm.provider_code
+                   AND m.model_code = vm.model_code
+                   AND m.is_enabled = TRUE
+                   AND m.routing_enabled = TRUE
+                  JOIN public.tts_providers p
+                    ON p.provider_code = vm.provider_code
+                   AND p.is_enabled = TRUE
+                   AND p.routing_enabled = TRUE
+                  WHERE vl.locale = l.locale
+                    AND vl.is_enabled = TRUE
+                    AND vl.is_approved = TRUE
+              )
+            ORDER BY l.display_name, l.locale
+            """,
+            normalized_country,
+        )
+
+    return {
+        "country_code": normalized_country,
+        "items": [dict(r) for r in rows],
+    }
+
+
 @router.get("/voices")
 async def list_voices(
     locale: str = Query(..., description="BCP 47 locale code"),

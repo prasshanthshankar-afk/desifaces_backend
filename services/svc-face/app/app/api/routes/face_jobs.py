@@ -1170,14 +1170,25 @@ async def list_user_profiles(
 @router.get("/config/regions", response_model=List[RegionConfigView])
 async def get_available_regions(language: str = "en") -> List[RegionConfigView]:
     """
-    Get available regions for face generation.
-    Uses creator config repo (svc-face canonical config source).
+    Get legacy regions for face generation.
+
+    Canonical global geography is exposed separately through
+    /config/countries and /config/subdivisions.
     """
     pool = await get_pool()
     config_repo = CreatorPlatformConfigRepo(pool)
 
     if hasattr(config_repo, "list_regions"):
         regions = await config_repo.list_regions(active_only=True)
+
+        # Preserve the existing legacy contract even after canonical
+        # global geography rows become active.
+        regions = [
+            r
+            for r in regions
+            if not str(r.get("code") or "").startswith("geo_")
+        ]
+
         return [
             RegionConfigView(
                 code=r["code"],
@@ -1196,6 +1207,7 @@ async def get_available_regions(language: str = "en") -> List[RegionConfigView]:
     SELECT code, display_name, sub_region, is_active
     FROM public.face_generation_regions
     WHERE ($1::bool IS FALSE OR is_active = TRUE)
+      AND left(code, 4) <> 'geo_'
     ORDER BY code
     """
     rows = await config_repo.execute_queries(q, True)
@@ -1212,6 +1224,106 @@ async def get_available_regions(language: str = "en") -> List[RegionConfigView]:
             sub_region=r.get("sub_region"),
             is_active=bool(r.get("is_active", True)),
         )
+        for r in rows
+    ]
+
+
+@router.get("/config/countries")
+async def get_available_countries(language: str = "en"):
+    """
+    Return active canonical Face countries.
+
+    Geography and labels are entirely DB-driven.
+    """
+    pool = await get_pool()
+    config_repo = CreatorPlatformConfigRepo(pool)
+
+    q = """
+    SELECT
+        code,
+        display_name,
+        country_code,
+        geography_type,
+        is_active
+    FROM public.face_generation_regions
+    WHERE geography_type = 'country'
+      AND country_code IS NOT NULL
+      AND is_active = TRUE
+    ORDER BY (display_name->>'en'), country_code
+    """
+
+    rows = await config_repo.execute_queries(q)
+    rows = [config_repo.convert_db_row(r) for r in rows]
+
+    return [
+        {
+            "code": r["country_code"],
+            "country_code": r["country_code"],
+            "display_name": _localized_text(
+                r.get("display_name"),
+                language,
+                r["country_code"],
+            ),
+            "is_active": bool(r.get("is_active", True)),
+        }
+        for r in rows
+    ]
+
+
+@router.get("/config/subdivisions")
+async def get_available_subdivisions(
+    country_code: str,
+    language: str = "en",
+):
+    """
+    Return active canonical subdivisions for a selected country.
+
+    Country/subdivision relationships are entirely DB-driven.
+    """
+    normalized_country = str(country_code or "").strip().upper()
+
+    if len(normalized_country) != 2 or not normalized_country.isalpha():
+        raise HTTPException(
+            status_code=400,
+            detail="invalid_country_code",
+        )
+
+    pool = await get_pool()
+    config_repo = CreatorPlatformConfigRepo(pool)
+
+    q = """
+    SELECT
+        code,
+        display_name,
+        country_code,
+        subdivision_code,
+        geography_type,
+        is_active
+    FROM public.face_generation_regions
+    WHERE geography_type = 'subdivision'
+      AND country_code = $1
+      AND subdivision_code IS NOT NULL
+      AND is_active = TRUE
+    ORDER BY (display_name->>'en'), subdivision_code
+    """
+
+    rows = await config_repo.execute_queries(q, normalized_country)
+    rows = [config_repo.convert_db_row(r) for r in rows]
+
+    return [
+        {
+            "code": r["code"],
+            "region_code": r["code"],
+            "country_code": r["country_code"],
+            "subdivision_code": r["subdivision_code"],
+            "display_name": _localized_text(
+                r.get("display_name"),
+                language,
+                r["subdivision_code"],
+            ),
+            "internal_region_code": r["code"],
+            "is_active": bool(r.get("is_active", True)),
+        }
         for r in rows
     ]
 
