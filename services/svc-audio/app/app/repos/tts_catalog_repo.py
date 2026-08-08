@@ -164,6 +164,11 @@ class TTSCatalogRepository:
                     ELSE 'language'
                 END AS capability_scope,
 
+                CASE
+                    WHEN mlc.locale IS NOT NULL THEN 0
+                    ELSE 1
+                END AS capability_rank,
+
                 m.max_input_chars,
 
                 m.supports_streaming,
@@ -277,7 +282,8 @@ class TTSCatalogRepository:
                   )
 
             ORDER BY
-                capability_scope,
+                quality_score DESC NULLS LAST,
+                capability_rank,
                 p.provider_code,
                 m.model_code
             """,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import json
-from typing import Dict, Optional
+from typing import Optional
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 
@@ -44,12 +43,6 @@ class Settings(BaseSettings):
     AZURE_TRANSLATOR_ENDPOINT: str = ""  # e.g. https://api.cognitive.microsofttranslator.com
     AZURE_TRANSLATOR_REGION: str = ""    # required if using multi-service key
 
-    # ----------------------------
-    # Defaults / voice map override
-    # ----------------------------
-    # JSON string override: {"en-US":"en-US-JennyNeural", "hi-IN":"hi-IN-SwaraNeural", ...}
-    DEFAULT_VOICE_MAP_JSON: str = ""
-
     # Worker polling
     WORKER_POLL_SECS: float = 1.5
     WORKER_BATCH_SIZE: int = 1
@@ -58,38 +51,7 @@ class Settings(BaseSettings):
         env_file = ".env"
         extra = "ignore"
 
-    def default_voice_map(self) -> Dict[str, str]:
-        # Reasonable defaults; override with DEFAULT_VOICE_MAP_JSON
-        base = {
-            # English (US/UK/India)
-            "en-US": "en-US-JennyNeural",
-            "en-GB": "en-GB-SoniaNeural",
-            "en-IN": "en-IN-NeerjaNeural",
 
-            # Hindi
-            "hi-IN": "hi-IN-SwaraNeural",
-
-            # Indian regional languages (expand as needed)
-            "ta-IN": "ta-IN-PallaviNeural",
-            "te-IN": "te-IN-ShrutiNeural",
-            "kn-IN": "kn-IN-SapnaNeural",
-            "ml-IN": "ml-IN-SobhanaNeural",
-            "mr-IN": "mr-IN-AarohiNeural",
-            "bn-IN": "bn-IN-TanishaaNeural",
-            "gu-IN": "gu-IN-DhwaniNeural",
-            "pa-IN": "pa-IN-GurleenNeural",
-            "or-IN": "or-IN-SubhasiniNeural",
-            "as-IN": "as-IN-YashicaNeural",
-        }
-        if self.DEFAULT_VOICE_MAP_JSON.strip():
-            try:
-                override = json.loads(self.DEFAULT_VOICE_MAP_JSON)
-                if isinstance(override, dict):
-                    base.update({str(k): str(v) for k, v in override.items()})
-            except Exception:
-                # ignore invalid JSON
-                pass
-        return base
 
 
 settings = Settings()

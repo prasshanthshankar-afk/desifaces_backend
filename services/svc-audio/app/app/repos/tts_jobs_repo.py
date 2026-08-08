@@ -156,6 +156,7 @@ class TTSJobsRepo:
                        error_code=COALESCE($3, error_code),
                        error_message=COALESCE($4, error_message)
                  WHERE id=$1::uuid
+                   AND status='running'
                 """,
                 job_id,
                 int(delay_seconds),

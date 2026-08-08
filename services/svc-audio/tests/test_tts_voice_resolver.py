@@ -169,7 +169,7 @@ class TTSVoiceResolverTests(
                 )
             )
 
-    async def test_equal_top_rank_fails_closed(self):
+    async def test_equal_top_rank_uses_repository_order(self):
         resolver = TTSVoiceResolver(
             FakeCatalog(
                 [
@@ -189,17 +189,15 @@ class TTSVoiceResolverTests(
             )
         )
 
-        with self.assertRaisesRegex(
-            TTSVoiceResolutionError,
-            "ambiguous_tts_voice_candidates",
-        ):
-            await resolver.resolve(
-                TTSVoiceResolutionRequest(
-                    provider_code="provider-from-db",
-                    model_code="model-from-db",
-                    canonical_locale="hi-IN",
-                )
+        result = await resolver.resolve(
+            TTSVoiceResolutionRequest(
+                provider_code="provider-from-db",
+                model_code="model-from-db",
+                canonical_locale="hi-IN",
             )
+        )
+
+        self.assertEqual(result.voice_name, "voice-a")
 
     async def test_invalid_gender_rejected(self):
         resolver = TTSVoiceResolver(

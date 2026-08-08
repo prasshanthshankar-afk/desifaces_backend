@@ -40,108 +40,51 @@ class RetryableTTSProviderError(RuntimeError):
     """Transient provider/transport failure that may succeed on retry."""
 
 
-_LOCALE_ALIASES = {
-    "in": "hi-IN",
-    "india": "hi-IN",
-    "hindi": "hi-IN",
-    "hindi-india": "hi-IN",
-    "hi": "hi-IN",
-    "hi-in": "hi-IN",
-    "english-india": "en-IN",
-    "en-in": "en-IN",
-    "en": "en-US",
-    "tamil": "ta-IN",
-    "ta": "ta-IN",
-    "ta-in": "ta-IN",
-    "telugu": "te-IN",
-    "te": "te-IN",
-    "te-in": "te-IN",
-    "kannada": "kn-IN",
-    "kn": "kn-IN",
-    "kn-in": "kn-IN",
-    "malayalam": "ml-IN",
-    "ml": "ml-IN",
-    "ml-in": "ml-IN",
-    "marathi": "mr-IN",
-    "mr": "mr-IN",
-    "mr-in": "mr-IN",
-    "gujarati": "gu-IN",
-    "gu": "gu-IN",
-    "gu-in": "gu-IN",
-    "punjabi": "pa-IN",
-    "pa": "pa-IN",
-    "pa-in": "pa-IN",
-    "bengali": "bn-IN",
-    "bn": "bn-IN",
-    "bn-in": "bn-IN",
-}
-
-_TRANSLATION_TARGET_ALIASES = {
-    "in": "hi",
-    "india": "hi",
-    "hindi": "hi",
-    "hindi-india": "hi",
-    "hi": "hi",
-    "hi-in": "hi",
-    "english-india": "en",
-    "en-in": "en",
-    "en": "en",
-    "tamil": "ta",
-    "ta": "ta",
-    "ta-in": "ta",
-    "telugu": "te",
-    "te": "te",
-    "te-in": "te",
-    "kannada": "kn",
-    "kn": "kn",
-    "kn-in": "kn",
-    "malayalam": "ml",
-    "ml": "ml",
-    "ml-in": "ml",
-    "marathi": "mr",
-    "mr": "mr",
-    "mr-in": "mr",
-    "gujarati": "gu",
-    "gu": "gu",
-    "gu-in": "gu",
-    "punjabi": "pa",
-    "pa": "pa",
-    "pa-in": "pa",
-    "bengali": "bn",
-    "bn": "bn",
-    "bn-in": "bn",
-}
-
-
 def _normalize_speech_locale(locale: str) -> str:
-    raw = (locale or "").strip().replace("_", "-")
+    """
+    Syntax normalization only.
+
+    Semantic locale aliases and language/geography resolution belong to
+    DB-backed locale masterdata.
+    """
+    raw = str(locale or "").strip().replace("_", "-")
     if not raw:
         raise TerminalTTSValidationError("missing_target_locale")
-    key = raw.lower()
-    if key in _LOCALE_ALIASES:
-        return _LOCALE_ALIASES[key]
-    if re.fullmatch(r"[a-z]{2,3}-[A-Z]{2,3}", raw):
-        return raw
-    if re.fullmatch(r"[a-z]{2,3}-[a-z]{2,3}", raw):
-        lang, region = raw.split("-", 1)
-        return f"{lang.lower()}-{region.upper()}"
-    if re.fullmatch(r"[a-z]{2,3}", key):
-        if key in _LOCALE_ALIASES:
-            return _LOCALE_ALIASES[key]
-    return raw
+
+    parts = raw.split("-")
+
+    if len(parts) == 1:
+        return parts[0].lower()
+
+    language = parts[0].lower()
+    remainder = list(parts[1:])
+
+    if remainder:
+        region = remainder[-1]
+        if len(region) == 2 and region.isalpha():
+            remainder[-1] = region.upper()
+        elif len(region) == 3 and region.isdigit():
+            remainder[-1] = region
+
+    return "-".join([language, *remainder])
 
 
-def _normalize_translation_target(target_locale: str, *, input_language: str = "") -> str:
-    raw = (target_locale or "").strip().replace("_", "-").lower()
-    if not raw:
-        fallback = (input_language or "").strip().lower()
-        return fallback or "en"
-    if raw in _TRANSLATION_TARGET_ALIASES:
-        return _TRANSLATION_TARGET_ALIASES[raw]
-    if "-" in raw:
-        return raw.split("-", 1)[0]
-    return raw
+def _normalize_translation_target(
+    target_locale: str,
+    *,
+    input_language: str = "",
+) -> str:
+    """
+    Derive only the base language identifier from an already resolved locale.
+    No semantic locale mapping is encoded in application source.
+    """
+    raw = str(target_locale or "").strip().replace("_", "-")
 
+    if raw:
+        return raw.split("-", 1)[0].lower()
+
+    fallback = str(input_language or "").strip().replace("_", "-")
+    return fallback.split("-", 1)[0].lower() if fallback else "en"
 
 def _should_translate(*, translate: bool, input_language: str, target_lang: str) -> bool:
     if not translate:

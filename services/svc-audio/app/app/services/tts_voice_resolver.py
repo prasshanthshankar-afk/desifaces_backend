@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Optional
 
-from app.repos.tts_catalog_repo import (
-    TTSCatalogRepository,
-    TTSVoiceCandidate,
-)
+from app.repos.tts_catalog_repo import TTSCatalogRepository
 
 
 class TTSVoiceResolutionError(ValueError):
@@ -53,8 +50,9 @@ class TTSVoiceResolver:
 
     Gender is used only when the caller explicitly supplies it.
 
-    Unresolved top-ranking ties fail closed rather than silently
-    introducing an application-level voice preference.
+    Automatic selection consumes the repository's deterministic
+    SQL-backed candidate ordering. No provider or locale preference
+    is encoded in application source.
     """
 
     def __init__(self, catalog: TTSCatalogRepository):
@@ -74,22 +72,6 @@ class TTSVoiceResolver:
 
         raise TTSVoiceResolutionError(
             f"invalid_voice_gender:{raw}"
-        )
-
-    @staticmethod
-    def _rank(
-        voice: TTSVoiceCandidate,
-    ) -> Tuple[int, int, int, int, float]:
-        return (
-            1 if voice.is_recommended else 0,
-            int(voice.selection_priority or 0),
-            1 if voice.is_default else 0,
-            1 if voice.is_native_fit else 0,
-            (
-                float(voice.quality_score)
-                if voice.quality_score is not None
-                else -1.0
-            ),
         )
 
     async def resolve(
@@ -161,25 +143,6 @@ class TTSVoiceResolver:
             )
 
         chosen = candidates[0]
-
-        if len(candidates) > 1:
-            top_rank = self._rank(candidates[0])
-            second_rank = self._rank(candidates[1])
-
-            if top_rank == second_rank:
-                names = ",".join(
-                    sorted(
-                        item.voice_name
-                        for item in candidates
-                        if self._rank(item) == top_rank
-                    )
-                )
-
-                raise TTSVoiceResolutionError(
-                    "ambiguous_tts_voice_candidates:"
-                    f"{provider}/{model}/{locale}:"
-                    f"{names}"
-                )
 
         return ResolvedTTSVoice(
             voice_id=chosen.voice_id,
