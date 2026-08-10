@@ -5811,7 +5811,7 @@ BEGIN
     -- the locale is actually synthesizable and, for non-English
     -- targets, translation support exists.
     UPDATE public.tts_locales
-       SET is_user_selectable = (
+       SET is_user_selectable = COALESCE((
            is_enabled
            AND tts_supported
            AND country_code ~ '^[A-Z]{2}$'
@@ -5819,8 +5819,8 @@ BEGIN
                lower(language_code) = 'en'
                OR translate_supported
            )
-       )
-     WHERE is_user_selectable IS DISTINCT FROM (
+       ), false)
+     WHERE is_user_selectable IS DISTINCT FROM COALESCE((
            is_enabled
            AND tts_supported
            AND country_code ~ '^[A-Z]{2}$'
@@ -5828,7 +5828,7 @@ BEGIN
                lower(language_code) = 'en'
                OR translate_supported
            )
-       );
+       ), false);
 
     GET DIAGNOSTICS v_rows = ROW_COUNT;
     v_changes := v_changes + v_rows;
