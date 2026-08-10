@@ -129,8 +129,17 @@ async def list_countries(
             """
             SELECT
                 l.country_code,
+                COALESCE(
+                    c.display_name ->> 'en',
+                    (SELECT value FROM jsonb_each_text(c.display_name) LIMIT 1),
+                    l.country_code
+                ) AS display_name,
                 COUNT(*) AS locale_count
             FROM public.tts_locales l
+            LEFT JOIN public.face_generation_regions c
+              ON c.country_code = l.country_code
+             AND c.geography_type = 'country'
+             AND c.is_active = TRUE
             WHERE l.is_enabled = TRUE
               AND l.tts_supported = TRUE
               AND l.is_user_selectable = TRUE
@@ -158,8 +167,8 @@ async def list_countries(
                     AND vl.is_enabled = TRUE
                     AND vl.is_approved = TRUE
               )
-            GROUP BY l.country_code
-            ORDER BY l.country_code
+            GROUP BY l.country_code, c.display_name
+            ORDER BY display_name, l.country_code
             """
         )
 
@@ -167,6 +176,7 @@ async def list_countries(
         "items": [
             {
                 "country_code": r["country_code"],
+                "display_name": r["display_name"],
                 "locale_count": int(r["locale_count"]),
             }
             for r in rows

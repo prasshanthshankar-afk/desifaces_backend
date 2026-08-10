@@ -212,6 +212,12 @@ class TTSResolutionPlanner:
                         requires_streaming=bool(
                             request.requires_streaming
                         ),
+                        requested_voice=(
+                            request.requested_voice
+                        ),
+                        requested_gender=(
+                            request.requested_gender
+                        ),
                     )
                 )
             )

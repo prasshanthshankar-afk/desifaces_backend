@@ -1257,8 +1257,15 @@ async def get_available_countries(language: str = "en"):
 
     return [
         {
+            # Public country selector code remains the ISO-3166 alpha-2 code.
             "code": r["country_code"],
             "country_code": r["country_code"],
+
+            # Generation-compatible geography code from face_generation_regions.
+            # Mobile uses this only when the selected country has no subdivisions.
+            "region_code": r["code"],
+            "internal_region_code": r["code"],
+
             "display_name": _localized_text(
                 r.get("display_name"),
                 language,

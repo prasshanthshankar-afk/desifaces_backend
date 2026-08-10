@@ -7,3 +7,7 @@ infra/.env.bak.*
 *.pem
 *.p12
 *.key
+
+# Python generated files
+__pycache__/
+*.py[cod]

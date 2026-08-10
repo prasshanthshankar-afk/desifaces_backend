@@ -188,37 +188,80 @@ def _build_face_prompt(
     return ", ".join(parts)
 
 
+def _normalize_audio_spoken_script(user_input: str) -> str:
+    script = " ".join(_clean_text(user_input).split())
+
+    if script and not script.endswith((".", "!", "?")):
+        script = f"{script}."
+
+    return script
+
+
+def _audio_script_has_control_directives(text: str) -> bool:
+    """
+    Audio enhancement output must contain spoken words only.
+
+    Locale, voice, pacing, style and TTS instructions are control
+    metadata and must never leak into the script that will be spoken.
+    """
+    normalized = " ".join(
+        _clean_text(text).lower().split()
+    )
+
+    if not normalized:
+        return False
+
+    control_markers = (
+        "write for ",
+        "delivery style:",
+        "pacing:",
+        "target locale:",
+        "source locale:",
+        "voice style:",
+        "voice direction:",
+        "tts direction:",
+        "tts guidance:",
+        "tts instruction:",
+        "speech instruction:",
+        "narration instruction:",
+    )
+
+    return any(
+        marker in normalized
+        for marker in control_markers
+    )
+
+
 def _build_audio_script(
     user_input: str,
     locked_fields: Dict[str, Any],
     *,
     flavor: Literal["primary", "short", "premium"],
 ) -> str:
-    locale = _friendly_label(locked_fields.get("target_locale") or locked_fields.get("locale"))
-    voice_style = _friendly_label(locked_fields.get("voice_style") or locked_fields.get("delivery_style"))
-    pacing = _friendly_label(locked_fields.get("pacing"))
-    tone = "confident, natural, and clear"
-    if voice_style:
-        tone = f"{voice_style}, natural, and clear"
-    if flavor == "premium":
-        tone = f"{tone}, premium and polished"
-    elif flavor == "short":
-        tone = f"{tone}, punchy and concise"
+    """
+    Conservative local fallback.
 
-    script = user_input.strip()
-    if script and not script.endswith((".", "!", "?")):
-        script = f"{script}."
+    The live LLM performs semantic script enrichment. If the LLM is
+    unavailable, preserve the user's factual content and make it
+    speakable without fabricating facts or injecting TTS controls.
+    """
+    script = _normalize_audio_spoken_script(user_input)
 
-    suffix = _dedupe(
-        [
-            f"Write for {locale}" if locale else "",
-            f"Delivery style: {tone}",
-            f"Pacing: {pacing}" if pacing else "",
+    if flavor == "short":
+        # Safely prefer the first complete sentence when a multi-sentence
+        # script is available. Never invent new factual content.
+        boundaries = [
+            index
+            for marker in (". ", "! ", "? ")
+            for index in [script.find(marker)]
+            if index >= 0
         ]
-    )
-    return " ".join([script] + suffix)
 
+        if boundaries:
+            end = min(boundaries)
+            return script[: end + 1].strip()
 
+    return script
 def _build_fusion_prompt(
     user_input: str,
     locked_fields: Dict[str, Any],
@@ -300,24 +343,52 @@ def _fallback_response(req: PromptEnhanceRequest) -> PromptEnhanceResponse:
     if req.studio == "audio":
         return PromptEnhanceResponse(
             original_input=user_input,
-            enhanced_input=_build_audio_script(user_input, locked, flavor="primary"),
+            enhanced_input=_build_audio_script(
+                user_input,
+                locked,
+                flavor="primary",
+            ),
             alternatives=[
-                PromptEnhanceAlternative(label="Shorter", text=_build_audio_script(user_input, locked, flavor="short")),
-                PromptEnhanceAlternative(label="Premium", text=_build_audio_script(user_input, locked, flavor="premium")),
+                PromptEnhanceAlternative(
+                    label="Shorter",
+                    text=_build_audio_script(
+                        user_input,
+                        locked,
+                        flavor="short",
+                    ),
+                ),
+                PromptEnhanceAlternative(
+                    label="Premium",
+                    text=_build_audio_script(
+                        user_input,
+                        locked,
+                        flavor="premium",
+                    ),
+                ),
             ][: max(1, req.max_alternatives)],
             tips=_dedupe(
                 [
-                    "Shorter sentences usually sound cleaner in TTS.",
-                    "Add tone and pacing separately so the voice direction stays clear.",
-                    "If you want a viral cut, ask for a punchier opening line and fewer clauses.",
+                    "The script contains spoken words only; voice, locale, pacing, and delivery controls stay separate.",
+                    "Live enhancement can enrich context and flow while preserving the original meaning.",
+                    "Review names, numbers, dates, and factual claims before applying the rewrite.",
                 ]
             ),
-            why_this_is_better="The rewrite keeps your meaning but improves delivery direction for TTS.",
+            why_this_is_better=(
+                "The fallback preserves the spoken message without "
+                "mixing TTS or delivery instructions into the script."
+            ),
             source="fallback",
             fallback_used=True,
             structured={
-                "locale": _friendly_label(locked.get("target_locale") or locked.get("locale")),
-                "voice_style": _friendly_label(locked.get("voice_style") or locked.get("delivery_style")),
+                "source_language": "en",
+                "target_locale": _friendly_label(
+                    locked.get("target_locale")
+                    or locked.get("locale")
+                ),
+                "voice_style": _friendly_label(
+                    locked.get("voice_style")
+                    or locked.get("delivery_style")
+                ),
             },
         )
 
@@ -375,10 +446,18 @@ For face:
 - Background images should not be blurred and should be intentional and culturally relevant, not generic.
 
 For audio:
-- Improve spoken rhythm, clarity, and delivery direction.
-- structured may include voice_style, pacing, locale.
-- If the user input is a script, keep the rewrite focused on improving delivery without changing meaning. If the user input is more of a concept or theme, feel free to enhance the script more.
-- Keep tone and pacing direction separate for clearer TTS guidance.
+- Treat user_input as the actual script that a human voice will speak, not as a prompt for a TTS engine.
+- enhanced_input and every alternative text must contain spoken English words only.
+- The selected target locale is downstream translation metadata. Do not translate the enhanced script and do not copy locale codes or locale instructions into spoken text.
+- Voice, gender, tone, pacing, context, target locale, and delivery style are background metadata only. Use them to understand intent, but never write them as instructions inside the spoken script.
+- Enrich the actual message: improve grammar, flow, context, transitions, natural narration, clarity, and audience engagement while preserving the user's original meaning.
+- For a very short script, the primary enhancement may add reasonable general context that follows from the user's message, but it must not invent specific facts, numbers, dates, partnerships, features, claims, people, places, or events.
+- Preserve names, brands, numbers, dates, URLs, product names, and other explicit factual details unless a grammatical correction is clearly needed.
+- The primary enhanced_input should normally be richer and more complete than a very short original script.
+- Return an alternative labeled "Shorter" that communicates the same message more concisely.
+- Return an alternative labeled "Premium" that is more polished, expressive, engaging, and context-rich without fabricating facts.
+- Never put phrases such as "Write for", "Delivery style:", "Pacing:", "Target locale:", "Voice style:", "TTS direction:", "Speak in", or similar generation instructions into enhanced_input or alternative text.
+- structured may contain voice_style, pacing, source_language, and target_locale because structured is metadata and is not spoken.
 
 For fusion:
 - Improve performance, emotion, body motion, background motion, and camera guidance.
@@ -473,6 +552,35 @@ async def enhance_prompt(
         fallback_used=False,
         structured=structured,
     )
+
+    if req.studio == "audio":
+        spoken_outputs = [
+            response.enhanced_input,
+            *[
+                alternative.text
+                for alternative in response.alternatives
+            ],
+        ]
+
+        if any(
+            _audio_script_has_control_directives(text)
+            for text in spoken_outputs
+        ):
+            logger.warning(
+                "Audio script enhancer returned control directives; "
+                "using safe spoken-script fallback."
+            )
+            return fallback
+
+        labels = {
+            _clean_text(alternative.label).lower()
+            for alternative in response.alternatives
+        }
+
+        # Keep the Audio UX contract deterministic even if an LLM returns
+        # unexpected option names.
+        if not {"shorter", "premium"}.issubset(labels):
+            response.alternatives = fallback.alternatives
 
     if req.studio == "face" and req.locked_fields:
         # Keep locked visual selections obvious in the final enhanced prompt.

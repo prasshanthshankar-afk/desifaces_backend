@@ -334,6 +334,7 @@ class TTSService:
                 "no_eligible_tts_model:",
                 "ambiguous_tts_model_candidates:",
                 "requested_voice_not_eligible:",
+                "requested_voice_not_eligible_for_any_model:",
                 "no_eligible_tts_voice:",
                 "duplicate_requested_voice_candidates:",
                 "ambiguous_tts_voice_candidates:",

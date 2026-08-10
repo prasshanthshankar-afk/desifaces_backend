@@ -27,6 +27,9 @@ class TTSModelResolutionRequest:
     requires_emotion: bool = False
     requires_streaming: bool = False
 
+    requested_voice: Optional[str] = None
+    requested_gender: Optional[str] = None
+
 
 @dataclass(frozen=True)
 class ResolvedTTSModel:
@@ -137,6 +140,36 @@ class TTSModelResolver:
             raise TTSModelResolutionError(
                 f"no_eligible_tts_model:{locale}"
             )
+
+        requested_voice = str(
+            request.requested_voice or ""
+        ).strip()
+
+        if requested_voice.lower() in {"", "auto"}:
+            requested_voice = ""
+
+        if requested_voice:
+            compatible_candidates = []
+
+            for candidate in candidates:
+                voice_candidates = await self.catalog.list_voice_candidates(
+                    provider_code=candidate.provider_code,
+                    model_code=candidate.model_code,
+                    canonical_locale=locale,
+                    requested_voice=requested_voice,
+                    requested_gender=request.requested_gender,
+                )
+
+                if voice_candidates:
+                    compatible_candidates.append(candidate)
+
+            if not compatible_candidates:
+                raise TTSModelResolutionError(
+                    "requested_voice_not_eligible_for_any_model:"
+                    f"{locale}/{requested_voice}"
+                )
+
+            candidates = compatible_candidates
 
         chosen: TTSModelCandidate = candidates[0]
 

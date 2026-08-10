@@ -19,6 +19,46 @@ _HEIF_REGISTRATION_ATTEMPTED = False
 _HEIF_SUPPORT_AVAILABLE = False
 
 
+class OpenAIImageModerationBlockedError(RuntimeError):
+    """Structured OpenAI image moderation failure.
+
+    This exception does not weaken or bypass provider moderation. It only
+    preserves the moderation stage/category so callers can distinguish an
+    output-generation block from an unsafe input request.
+    """
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        request_id: Optional[str],
+        moderation_stage: str,
+        categories: list[str],
+        message: str,
+    ):
+        self.status_code = int(status_code)
+        self.request_id = str(request_id or "").strip() or None
+        self.moderation_stage = str(moderation_stage or "").strip().lower()
+        self.categories = [
+            str(category).strip().lower()
+            for category in (categories or [])
+            if str(category).strip()
+        ]
+        self.provider_code = "moderation_blocked"
+        super().__init__(
+            "openai_images_moderation_blocked "
+            f"status={self.status_code} "
+            f"req_id={self.request_id or ''} "
+            f"stage={self.moderation_stage or 'unknown'} "
+            f"categories={','.join(self.categories) or 'unknown'} "
+            f"message={str(message or '').strip()}"
+        )
+
+    @property
+    def is_output_block(self) -> bool:
+        return self.moderation_stage == "output"
+
+
 def _normalize_gpt_image_size(size: Optional[str]) -> str:
     """
     GPT Image models only support: 1024x1024, 1536x1024, 1024x1536, auto.
@@ -249,8 +289,33 @@ class OpenAIImageClient:
     def _raise_for_status_with_body(self, r: requests.Response) -> None:
         if r.status_code < 400:
             return
+
         req_id = r.headers.get("x-request-id")
-        raise RuntimeError(f"openai_images_error status={r.status_code} req_id={req_id} body={r.text}")
+
+        try:
+            payload = r.json()
+        except Exception:
+            payload = None
+
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(error, dict) and str(error.get("code") or "").strip().lower() == "moderation_blocked":
+            details = error.get("moderation_details")
+            details = details if isinstance(details, dict) else {}
+
+            categories_raw = details.get("categories")
+            categories = categories_raw if isinstance(categories_raw, list) else []
+
+            raise OpenAIImageModerationBlockedError(
+                status_code=r.status_code,
+                request_id=req_id,
+                moderation_stage=str(details.get("moderation_stage") or ""),
+                categories=[str(category) for category in categories],
+                message=str(error.get("message") or "Image generation blocked by provider moderation."),
+            )
+
+        raise RuntimeError(
+            f"openai_images_error status={r.status_code} req_id={req_id} body={r.text}"
+        )
 
     def generate_image(
         self,

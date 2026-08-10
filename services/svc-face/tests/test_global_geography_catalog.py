@@ -88,6 +88,8 @@ def test_country_catalog_exposes_iso_country_code(monkeypatch):
         {
             "code": "JP",
             "country_code": "JP",
+            "region_code": "geo_country_jp",
+            "internal_region_code": "geo_country_jp",
             "display_name": "Japan",
             "is_active": True,
         }

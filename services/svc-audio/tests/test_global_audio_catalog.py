@@ -40,6 +40,7 @@ def test_audio_country_catalog_is_db_and_capability_driven():
         [
             {
                 "country_code": "IN",
+                "display_name": "India",
                 "locale_count": 13,
             }
         ]
@@ -53,6 +54,7 @@ def test_audio_country_catalog_is_db_and_capability_driven():
         "items": [
             {
                 "country_code": "IN",
+                "display_name": "India",
                 "locale_count": 13,
             }
         ]

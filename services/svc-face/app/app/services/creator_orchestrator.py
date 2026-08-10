@@ -119,6 +119,7 @@ from app.services.fal_client import FalClient
 from app.services.idempotency_service import provider_idempotency_key
 from app.services.safety_service import SafetyService
 from app.services.translation_service import TranslationService
+from app.services.providers.openai_image_client import OpenAIImageModerationBlockedError
 
 logger = logging.getLogger(__name__)
 JsonDict = Dict[str, Any]
@@ -2531,6 +2532,68 @@ class CreatorOrchestrator:
         except Exception:
             return 3
 
+    @staticmethod
+    def _output_moderation_retry_limit() -> int:
+        """
+        Retry only OpenAI output-stage moderation blocks.
+
+        This is intentionally bounded and does not retry input moderation,
+        policy blocks without an output stage, or ordinary provider failures.
+        """
+        try:
+            return max(
+                0,
+                min(
+                    2,
+                    int(os.getenv("DF_FACE_OUTPUT_MODERATION_RETRIES", "2")),
+                ),
+            )
+        except Exception:
+            return 2
+
+    @classmethod
+    def _output_moderation_retry_seed(
+        cls,
+        *,
+        original_seed: int,
+        retry_number: int,
+    ) -> int:
+        if retry_number <= 0:
+            return int(original_seed)
+        material = (
+            f"df:face:output-moderation-retry:v1|"
+            f"seed={int(original_seed)}|retry={int(retry_number)}"
+        )
+        digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        return int(int(digest[:8], 16) % cls.SEED_MODULUS)
+
+    @staticmethod
+    def _output_moderation_retry_prompt(
+        prompt: str,
+        *,
+        retry_number: int,
+    ) -> str:
+        """
+        Preserve the user's intent while making an already-benign scene
+        unambiguously safe for a fresh output generation.
+
+        This is not used for input moderation failures and does not ask the
+        provider to ignore or bypass safety rules.
+        """
+        base = str(prompt or "").strip()
+        if retry_number <= 0:
+            return base
+
+        clarification = (
+            "Render the requested scene in a clearly family-friendly, "
+            "non-sexual manner, with a natural non-suggestive pose and "
+            "context-appropriate presentation. Do not add nudity, sexual "
+            "activity, or erotic framing."
+        )
+        if clarification.lower() in base.lower():
+            return base
+        return f"{base}, {clarification}" if base else clarification
+
     async def _prepare_shared_variant_inputs(self, request_dict: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
         if mode != "image-to-image":
             return {}
@@ -3408,6 +3471,9 @@ class CreatorOrchestrator:
                 with open(dst_path, "wb") as f:
                     f.write(r.content)
 
+        output_moderation_events: List[Dict[str, Any]] = []
+        output_moderation_retry_count = 0
+
         await self._provider_runs_upsert(
             job_id=job_id,
             provider=provider_name,
@@ -3496,31 +3562,85 @@ class CreatorOrchestrator:
                     else:
                         await _download_to_tmp(source_image_url, tmp_src_path)
 
-                out = await router.generate_i2i_bytes(
-                    prompt=prompt,
-                    image_url=source_image_url,
-                    negative_prompt=neg or None,
-                    seed=seed,
-                    width=width,
-                    height=height,
-                    num_inference_steps=num_steps,
-                    guidance_scale=guidance,
-                    preservation_strength=float(strength),
-                    src_local_path=tmp_src_path,
-                    mask_local_path=None,
-                    provider="openai",
+            max_output_moderation_retries = self._output_moderation_retry_limit()
+            original_prompt = prompt
+            original_seed = seed
+
+            for attempt_index in range(max_output_moderation_retries + 1):
+                retry_number = attempt_index
+                attempt_prompt = self._output_moderation_retry_prompt(
+                    original_prompt,
+                    retry_number=retry_number,
                 )
-            else:
-                out = await router.generate_t2i_bytes(
-                    prompt=prompt,
-                    negative_prompt=neg or None,
-                    seed=seed,
-                    width=width,
-                    height=height,
-                    num_inference_steps=num_steps,
-                    guidance_scale=guidance,
-                    provider="openai",
+                attempt_seed = self._output_moderation_retry_seed(
+                    original_seed=original_seed,
+                    retry_number=retry_number,
                 )
+
+                try:
+                    if mode == "image-to-image":
+                        out = await router.generate_i2i_bytes(
+                            prompt=attempt_prompt,
+                            image_url=source_image_url,
+                            negative_prompt=neg or None,
+                            seed=attempt_seed,
+                            width=width,
+                            height=height,
+                            num_inference_steps=num_steps,
+                            guidance_scale=guidance,
+                            preservation_strength=float(strength),
+                            src_local_path=tmp_src_path,
+                            mask_local_path=None,
+                            provider="openai",
+                        )
+                    else:
+                        out = await router.generate_t2i_bytes(
+                            prompt=attempt_prompt,
+                            negative_prompt=neg or None,
+                            seed=attempt_seed,
+                            width=width,
+                            height=height,
+                            num_inference_steps=num_steps,
+                            guidance_scale=guidance,
+                            provider="openai",
+                        )
+
+                    prompt = attempt_prompt
+                    seed = attempt_seed
+                    output_moderation_retry_count = retry_number
+                    break
+
+                except OpenAIImageModerationBlockedError as moderation_error:
+                    # Retry only an output-stage provider block. Input-stage
+                    # moderation remains terminal and unchanged.
+                    if not moderation_error.is_output_block:
+                        raise
+
+                    output_moderation_events.append(
+                        {
+                            "attempt": retry_number + 1,
+                            "request_id": moderation_error.request_id,
+                            "stage": moderation_error.moderation_stage,
+                            "categories": moderation_error.categories,
+                            "seed": int(attempt_seed),
+                            "prompt_hash": hashlib.sha256(
+                                attempt_prompt.encode("utf-8")
+                            ).hexdigest()[:16],
+                        }
+                    )
+
+                    logger.warning(
+                        "face_provider_output_moderation_block "
+                        "job_id=%s variant=%s attempt=%s request_id=%s categories=%s",
+                        job_id,
+                        variant_num,
+                        retry_number + 1,
+                        moderation_error.request_id,
+                        ",".join(moderation_error.categories),
+                    )
+
+                    if retry_number >= max_output_moderation_retries:
+                        raise
 
             await self._provider_runs_upsert(
                 job_id=job_id,
@@ -3546,12 +3666,22 @@ class CreatorOrchestrator:
                     "content_type": out.content_type or "image/png",
                     "provider_meta": self._prune_provider_meta(out.meta),
                 },
-                meta_json={"request_hash": base_rh, "rh_variant": rh_variant},
+                meta_json={
+                    "request_hash": base_rh,
+                    "rh_variant": rh_variant,
+                    "output_moderation_retry_count": int(output_moderation_retry_count),
+                    "output_moderation_events": output_moderation_events,
+                },
             )
 
             image_bytes = out.bytes
             content_type = out.content_type or "image/png"
             file_size = len(image_bytes)
+
+            if output_moderation_retry_count:
+                technical["output_moderation_retry_count"] = int(
+                    output_moderation_retry_count
+                )
 
             storage_path: str
             image_url: str
@@ -3754,6 +3884,24 @@ class CreatorOrchestrator:
             )
 
         except Exception as e:
+            failure_response: Dict[str, Any] = {"error": str(e)[:500]}
+            failure_meta: Dict[str, Any] = {
+                "request_hash": base_rh,
+                "rh_variant": rh_variant,
+                "output_moderation_retry_count": int(output_moderation_retry_count),
+                "output_moderation_events": output_moderation_events,
+            }
+
+            if isinstance(e, OpenAIImageModerationBlockedError):
+                failure_response.update(
+                    {
+                        "error_code": e.provider_code,
+                        "moderation_stage": e.moderation_stage,
+                        "moderation_categories": e.categories,
+                        "provider_request_id": e.request_id,
+                    }
+                )
+
             await self._provider_runs_upsert(
                 job_id=job_id,
                 provider=provider_name,
@@ -3773,8 +3921,8 @@ class CreatorOrchestrator:
                     "shot_type_code": request_dict.get("shot_type_code"),
                     "preservation_strength": float(strength) if strength is not None else None,
                 },
-                response_json={"error": str(e)[:500]},
-                meta_json={"request_hash": base_rh, "rh_variant": rh_variant},
+                response_json=failure_response,
+                meta_json=failure_meta,
             )
             raise
         finally:
