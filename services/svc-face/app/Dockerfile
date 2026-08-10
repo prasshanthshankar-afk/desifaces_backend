@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY services/svc-face/app/app /app/app
 COPY services/shared/python/desifaces_shared /app/desifaces_shared
+COPY services/shared/llm /app/desifaces_shared/llm
 
 EXPOSE 8000
 
