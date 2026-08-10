@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, List
 
 from jose import jwt, JWTError
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
 # -------------------------
 # Password hashing (Argon2id)
@@ -25,9 +25,18 @@ def hash_password(plain: str) -> str:
     return _pwd_hasher.hash(plain)
 
 def verify_password(plain: str, hashed: str) -> bool:
+    """Return True only when the plaintext password matches the stored Argon2 hash.
+
+    Never let malformed/legacy hashes bubble up as HTTP 500s. A bad hash,
+    unsupported hash format, or wrong password must behave like a normal
+    authentication failure.
+    """
+    if not plain or not hashed:
+        return False
+
     try:
-        return _pwd_hasher.verify(hashed, plain)
-    except VerifyMismatchError:
+        return bool(_pwd_hasher.verify(str(hashed), plain))
+    except (VerifyMismatchError, InvalidHashError, VerificationError, TypeError, ValueError):
         return False
 
 # -------------------------

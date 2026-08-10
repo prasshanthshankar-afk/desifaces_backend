@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -183,24 +185,25 @@ def _should_fallback_to_next_submit_path(path: str, status_code: int, body: str)
 
 class HeyGenAV4Client:
     """
-    AV4-first HeyGen client.
+    Stable HeyGen client used by Fusion.
 
-    Submit strategy:
-      1) /v2/video/av4/generate
-      2) /v2/video/generate (fallback)
+    Responsibilities:
+      - upload talking-photo style source image (current bridge flow)
+      - submit Avatar Video payloads
+      - poll video status
+      - fetch share URLs
 
-    Poll strategy:
-      1) /v1/video_status.get
-      2) /v1/video.list (optional fallback)
-
-    This keeps Fusion compatible with HeyGen's dedicated AV4 endpoint while
-    still surviving endpoint rollout differences across accounts.
+    Note:
+      - submit() remains generic for the current V2 create-video payload.
+      - upload_talking_photo() is intentionally centralized here so the service
+        layer and orchestrator do not drift on helper method names again.
     """
     provider_name = "heygen_av4"
 
     def __init__(self) -> None:
         self.base = settings.HEYGEN_BASE_URL.rstrip("/")
         self.timeout = settings.HEYGEN_TIMEOUT_SECONDS
+        self.upload_base = str(os.getenv("HEYGEN_UPLOAD_BASE_URL", "https://upload.heygen.com")).rstrip("/")
 
     def _submit_paths(self) -> List[str]:
         env_path = str(os.getenv("HEYGEN_SUBMIT_PATH", "")).strip()
@@ -215,6 +218,56 @@ class HeyGenAV4Client:
     def _enable_list_fallback(self) -> bool:
         v = str(os.getenv("HEYGEN_ENABLE_VIDEO_LIST_FALLBACK", "1")).strip().lower()
         return v in {"1", "true", "yes", "y"}
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=0.6, min=0.6, max=6.0),
+        retry=retry_if_exception(_is_retryable_exception),
+    )
+    async def upload_talking_photo(self, image_path: str) -> str:
+        """
+        Upload a local face image and return a talking_photo_id.
+
+        This keeps the current Fusion flow working while the product still uses
+        a talking-photo style input for exact-audio videos.
+        """
+        api_key = getattr(settings, "HEYGEN_API_KEY", None)
+        if not api_key:
+            raise HeyGenApiError("HEYGEN_API_KEY is not set.")
+        path = Path(image_path)
+        if not path.exists():
+            raise FileNotFoundError(image_path)
+
+        content_type, _ = mimetypes.guess_type(str(path))
+        if not content_type:
+            content_type = "image/png"
+
+        headers = {
+            "X-Api-Key": api_key,
+            "Accept": "application/json",
+            "Content-Type": content_type,
+        }
+        url = f"{self.upload_base}/v1/talking_photo"
+        data = path.read_bytes()
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(url, headers=headers, content=data)
+
+        if resp.status_code >= 400:
+            raise HeyGenApiError(f"HeyGen talking photo upload failed {resp.status_code}: {resp.text}")
+
+        obj = _safe_json(resp)
+        data_obj = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        talking_photo_id = (
+            data_obj.get("talking_photo_id")
+            or obj.get("talking_photo_id")
+            or data_obj.get("id")
+            or obj.get("id")
+        )
+        if not talking_photo_id:
+            raise HeyGenApiError(f"HeyGen talking photo upload missing talking_photo_id: {obj}")
+        return str(talking_photo_id).strip()
 
     @retry(
         reraise=True,

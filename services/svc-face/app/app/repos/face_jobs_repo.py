@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import logging
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -219,6 +221,110 @@ class FaceJobsRepo(BaseRepository):
         WHERE id=$1::uuid
         """
         await self.execute_command(query, job_id, error_code, error_message, str(int(delay_seconds)))
+
+    async def patch_job_meta(self, job_id: str, meta_patch: Dict[str, Any]) -> None:
+        query = """
+        UPDATE studio_jobs
+        SET
+          meta_json = COALESCE(meta_json, '{}'::jsonb) || $2::jsonb,
+          updated_at = now()
+        WHERE id = $1::uuid
+        """
+        await self.execute_command(query, job_id, self.prepare_jsonb_param(meta_patch or {}))
+
+    async def update_variant_state(
+        self,
+        job_id: str,
+        variant_number: int,
+        state_patch: Dict[str, Any],
+        *,
+        variants_requested: Optional[int] = None,
+    ) -> None:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT meta_json FROM studio_jobs WHERE id = $1::uuid FOR UPDATE",
+                    job_id,
+                )
+                raw_meta = row["meta_json"] if row else {}
+                if isinstance(raw_meta, str):
+                    try:
+                        meta = json.loads(raw_meta)
+                    except Exception:
+                        meta = {}
+                else:
+                    meta = dict(raw_meta or {})
+
+                variants_state = meta.get("variants_state") or {}
+                if not isinstance(variants_state, dict):
+                    variants_state = {}
+
+                key = str(int(variant_number))
+                current = variants_state.get(key) or {}
+                if not isinstance(current, dict):
+                    current = {}
+                current.update(state_patch or {})
+                current["variant_number"] = int(variant_number)
+                variants_state[key] = current
+
+                if variants_requested is not None:
+                    meta["variants_requested"] = max(1, int(variants_requested))
+                elif "variants_requested" not in meta:
+                    meta["variants_requested"] = max(1, len(variants_state))
+
+                completed = 0
+                failed = 0
+                running = 0
+                for v in variants_state.values():
+                    status = str((v or {}).get("status") or "").strip().lower()
+                    if status == "succeeded":
+                        completed += 1
+                    elif status == "failed":
+                        failed += 1
+                    elif status in {"running", "submitted", "polling"}:
+                        running += 1
+
+                meta["variants_state"] = variants_state
+                meta["variants_completed"] = completed
+                meta["variants_failed"] = failed
+                meta["variants_running"] = running
+
+                await conn.execute(
+                    "UPDATE studio_jobs SET meta_json = $2::jsonb, updated_at = now() WHERE id = $1::uuid",
+                    job_id,
+                    json.dumps(meta, default=str),
+                )
+
+    async def claim_stale_running_jobs(
+        self,
+        studio_type: str = "face",
+        limit: int = 5,
+        stale_seconds: int = 120,
+    ) -> List[str]:
+        query = """
+        WITH claimed_jobs AS (
+            SELECT id
+            FROM studio_jobs
+            WHERE studio_type = $1
+              AND status = 'running'
+              AND updated_at < now() - ($3 || ' seconds')::interval
+            ORDER BY updated_at
+            FOR UPDATE SKIP LOCKED
+            LIMIT $2
+        )
+        UPDATE studio_jobs j
+        SET
+          updated_at = now(),
+          meta_json = COALESCE(meta_json, '{}'::jsonb) || jsonb_build_object(
+            'recovery_claimed_at', now()::text,
+            'recovery_reason', 'stale_running'
+          )
+        FROM claimed_jobs cj
+        WHERE j.id = cj.id
+        RETURNING j.id::text AS id
+        """
+        rows = await self.execute_queries(query, studio_type, int(limit), int(stale_seconds))
+        return [str(r["id"]) for r in rows]
 
     async def list_user_jobs(self, user_id: str, limit: int = 20) -> List[StudioJobDB]:
         query = """

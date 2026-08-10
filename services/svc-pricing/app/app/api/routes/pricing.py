@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import AuthContext, AuthDep, PoolDep
 from app.services.engine.module_gate import evaluate_gate
 from app.services.engine.pricing_engine import quote_variant
+from app.services.entitlements.free_signup_bootstrap_service import bootstrap_free_user_pricing
 
 router = APIRouter(prefix="/api/pricing", tags=["pricing"])
 
@@ -315,6 +316,13 @@ async def quote(inp: QuoteIn, auth: AuthContext = AuthDep, pool=PoolDep) -> Quot
     currency = _norm_currency(inp.currency)
 
     async with pool.acquire() as conn:
+        await _maybe_bootstrap_free_user_pricing(
+            conn,
+            user_id=auth.user_id,
+            email=getattr(auth, "email", None),
+            source="pricing_quote_first_touch",
+        )
+
         v = await conn.fetchrow(
             "select category from pricing_variants where code = $1 and is_active=true",
             inp.variant_code,

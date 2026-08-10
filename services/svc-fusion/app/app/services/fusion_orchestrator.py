@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
+import tempfile
+from datetime import datetime
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 from uuid import uuid4
 
 import asyncpg
+import httpx
 
 PRICING_IMPORT_ERROR: Optional[str] = None
 
@@ -19,6 +23,19 @@ try:
         PricingCommitRequest,
         PricingReleaseRequest,
         PricingReserveRequest,
+    )
+    from desifaces_shared.pricing.orchestration import (
+        PricingReserveSpec,
+        PricingCommitSpec,
+        PricingReleaseSpec,
+        apply_pricing_snapshot,
+        build_commit_request,
+        build_pricing_summary,
+        build_release_request,
+        build_reserve_request,
+        make_committed_artifact,
+        make_released_artifact,
+        make_reserved_artifact,
     )
 except Exception as pricing_import_error:
     PRICING_IMPORT_ERROR = str(pricing_import_error)
@@ -62,6 +79,97 @@ except Exception as pricing_import_error:
         idempotency_key: str
         meta: Dict[str, Any]
 
+    @dataclass
+    class PricingReserveSpec:
+        user_id: str
+        service_name: str
+        service_action: str
+        sku_code: str
+        units: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+        quote_id: Optional[str] = None
+        preview_fingerprint: Optional[str] = None
+        external_ref_type: str = "studio_job"
+
+    @dataclass
+    class PricingCommitSpec:
+        user_id: str
+        reservation_id: str
+        actual_units: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+        external_ref_type: str = "studio_job"
+
+    @dataclass
+    class PricingReleaseSpec:
+        user_id: str
+        reservation_id: str
+        reason: str
+        external_ref_id: str
+        idempotency_key: str
+        meta: Dict[str, Any]
+        external_ref_type: str = "studio_job"
+
+    def build_reserve_request(spec: PricingReserveSpec) -> PricingReserveRequest:
+        return PricingReserveRequest(
+            user_id=spec.user_id,
+            service_name=spec.service_name,
+            service_action=spec.service_action,
+            sku_code=spec.sku_code,
+            units=spec.units,
+            external_ref_type=spec.external_ref_type,
+            external_ref_id=spec.external_ref_id,
+            idempotency_key=spec.idempotency_key,
+            meta=spec.meta,
+        )
+
+    def build_commit_request(spec: PricingCommitSpec) -> PricingCommitRequest:
+        return PricingCommitRequest(
+            user_id=spec.user_id,
+            reservation_id=spec.reservation_id,
+            actual_units=spec.actual_units,
+            external_ref_type=spec.external_ref_type,
+            external_ref_id=spec.external_ref_id,
+            idempotency_key=spec.idempotency_key,
+            meta=spec.meta,
+        )
+
+    def build_release_request(spec: PricingReleaseSpec) -> PricingReleaseRequest:
+        return PricingReleaseRequest(
+            user_id=spec.user_id,
+            reservation_id=spec.reservation_id,
+            reason=spec.reason,
+            external_ref_type=spec.external_ref_type,
+            external_ref_id=spec.external_ref_id,
+            idempotency_key=spec.idempotency_key,
+            meta=spec.meta,
+        )
+
+    def build_pricing_summary(pricing: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        return {}
+
+    def apply_pricing_snapshot(
+        target: Dict[str, Any],
+        *,
+        pricing: Optional[Dict[str, Any]] = None,
+        pricing_summary: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        target["pricing"] = dict(pricing or {})
+        target["pricing_summary"] = dict(pricing_summary or {})
+        return target
+
+    def make_reserved_artifact(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return {"pricing": {}, "pricing_summary": {}}
+
+    def make_committed_artifact(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return {"pricing": {}, "pricing_summary": {}}
+
+    def make_released_artifact(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return {"pricing": {}, "pricing_summary": {}}
+
     class SvcPricingClient:
         enabled = False
 
@@ -89,11 +197,40 @@ from app.repos.provider_runs_repo import ProviderRunsRepo
 from app.repos.steps_repo import StepsRepo
 from app.services.artifact_service import ArtifactService
 from app.services.idempotency_service import provider_idempotency_key, request_hash
-from app.services.providers.heygen.assets import HeyGenAssetsClient
-from app.services.providers.heygen.av4_payload import build_av4_payload
-from app.services.providers.heygen.client import HeyGenAV4Client, HeyGenApiError
+from app.services.providers.base import (
+    ProviderClient,
+    ProviderPrepareInput,
+    ProviderPrepareResult,
+    ProviderPollResult,
+    ProviderSubmitResult,
+)
+from app.services.providers.kling_adapter import KlingAdapter, KlingAdapterError
+from app.services.providers.luma_adapter import LumaAdapter, LumaAdapterError
+from app.services.providers.runway_adapter import RunwayAdapter, RunwayAdapterError
+from app.services.providers.omnihuman_adapter import OmniHumanAdapter, OmniHumanAdapterError
+from app.services.providers.veed_fabric_adapter import VeedFabricAdapter, VeedFabricAdapterError
+try:
+    from app.services.heygen_service import HeyGenService
+except Exception as heygen_import_error:
+    HeyGenService = None  # type: ignore[assignment]
+    HEYGEN_IMPORT_ERROR = str(heygen_import_error)
+else:
+    HEYGEN_IMPORT_ERROR = None
 
 logger = logging.getLogger("fusion_orchestrator")
+
+
+def _preview_url(url: Optional[str], keep: int = 96) -> Optional[str]:
+    if not url:
+        return None
+    s = str(url).strip()
+    if len(s) <= keep:
+        return s
+    return s[:keep] + "..."
+
+
+class FusionProviderError(RuntimeError):
+    pass
 
 
 class _DisabledPricingClient:
@@ -109,22 +246,63 @@ class _DisabledPricingClient:
         raise PricingClientError("pricing client unavailable")
 
 
+@dataclass
+class _PreparedProviderCache:
+    provider_name: str
+    provider_version: str
+    request_json: Dict[str, Any]
+    submit_meta: Dict[str, Any]
+
+
+def _is_provider_degraded_message(message: Any) -> bool:
+    msg = str(message or '').strip().lower()
+    if not msg:
+        return False
+    markers = (
+        'provider_degraded_downstream_unavailable',
+        'provider_degraded',
+        'downstream_service_unavailable',
+        'downstream service unavailable',
+        'provider degraded',
+    )
+    return any(marker in msg for marker in markers)
+
+
 def _classify_error(e: Exception) -> str:
     msg = str(e).lower()
-    if isinstance(e, HeyGenApiError):
-        if "voice not found" in msg:
-            return "HEYGEN_VOICE_NOT_FOUND"
-        if "empty_body" in msg or "invalid_json" in msg:
-            return "HEYGEN_TRANSIENT_EMPTY_BODY"
-        if "timed out" in msg or "timeout" in msg:
+
+    if isinstance(e, (FusionProviderError, KlingAdapterError, LumaAdapterError, RunwayAdapterError, OmniHumanAdapterError, VeedFabricAdapterError)):
+        if _is_provider_degraded_message(msg):
+            return "PROVIDER_DEGRADED"
+        if "insufficient credits" in msg:
+            return "PROVIDER_INSUFFICIENT_CREDITS"
+        if "timeout" in msg or "timed out" in msg:
+            return "PROVIDER_TIMEOUT"
+        if "face" in msg and "required" in msg:
+            return "PROVIDER_FACE_REQUIRED"
+        if "audio" in msg and "required" in msg:
+            return "PROVIDER_AUDIO_REQUIRED"
+        if "model" in msg and "not found" in msg:
+            return "PROVIDER_MODEL_NOT_FOUND"
+        return "PROVIDER_API_ERROR"
+
+    if "heygen" in msg:
+        if "timeout" in msg or "timed out" in msg:
             return "HEYGEN_TIMEOUT"
-        if "talking_photo_id" in msg:
-            return "HEYGEN_TALKING_PHOTO_REQUIRED"
+        if "provider disabled" in msg or "not wired" in msg:
+            return "PROVIDER_DISABLED"
         return "HEYGEN_API_ERROR"
+
+    if _is_provider_degraded_message(msg):
+        return "PROVIDER_DEGRADED"
+    if "provider disabled" in msg or "disabled for production" in msg:
+        return "PROVIDER_DISABLED"
     if "requires" in msg and ("face" in msg or "audio" in msg):
         return "INVALID_REQUEST"
     if "pricing" in msg:
         return "PRICING_ERROR"
+    if "timeout" in msg or "timed out" in msg:
+        return "PROVIDER_TIMEOUT"
     return "FUSION_FAILED"
 
 
@@ -218,6 +396,33 @@ def _provider_poll_interval_seconds() -> int:
         return 5
 
 
+def _adaptive_provider_poll_interval_seconds(
+    *,
+    elapsed_s: float,
+    provider_name: Optional[str] = None,
+    base_interval_s: Optional[int] = None,
+) -> int:
+    base = max(2, int(base_interval_s or _provider_poll_interval_seconds()))
+    provider = str(provider_name or "").strip().lower()
+
+    if provider == "heygen_av4":
+        if elapsed_s < 20:
+            return max(2, min(base, 3))
+        if elapsed_s < 90:
+            return max(3, base)
+        if elapsed_s < 240:
+            return max(5, base)
+        return max(8, base + 2)
+
+    if elapsed_s < 15:
+        return max(2, min(base, 2))
+    if elapsed_s < 60:
+        return max(3, min(base, 4))
+    if elapsed_s < 180:
+        return max(5, base)
+    return max(8, base + 2)
+
+
 def _normalize_provider_status(raw_status: Optional[str]) -> str:
     s = str(raw_status or "").strip().lower()
 
@@ -246,21 +451,14 @@ def _normalize_provider_status(raw_status: Optional[str]) -> str:
 
 class FusionOrchestrator:
     """
-    HeyGen AV4 orchestration.
+    Provider-driven Fusion orchestration.
 
     Key behavior:
-      - UI should pass artifact IDs (face_artifact_id, audio_artifact_id)
-      - Fusion mints fresh SAS at run time to avoid expired SAS URLs
-      - Still supports legacy URLs (face_image_url and voice_audio.audio_url)
-      - AV4/create-video path requires a real talking_photo_id for talking-photo flow
-      - Provider idempotency is job-scoped to avoid cross-job run reuse
-      - Pricing can be enforced with DF_PRICING_REQUIRED=1 to fail fast when disabled
-
-    Pricing note:
-      - svc-pricing reserve currently expects request.sku_code to carry the
-        pricing_variants.code, not the leaf pricing_skus.code.
-      - For Fusion this means reserve must use FUSION_TALKING_VIDEO, while the
-        leaf SKU remains FUSION_TALK_MIN through pricing_variant_lines.
+      - UI should prefer artifact IDs; Fusion mints fresh SAS at run time.
+      - Provider-specific payload construction lives behind provider.prepare().
+      - Provider idempotency is job-scoped to avoid cross-job reuse.
+      - Pricing reserve / commit / release stays centralized here.
+      - Default provider is HeyGen for talking clips; Kling/Luma/Runway use the generic provider path.
     """
 
     def __init__(self, pool: asyncpg.Pool):
@@ -271,9 +469,15 @@ class FusionOrchestrator:
         self.artifacts = ArtifactsRepo(pool)
         self.perfs = DigitalPerformancesRepo(pool)
 
-        self.provider = HeyGenAV4Client()
-        self.assets = HeyGenAssetsClient()
         self.artifact_service = ArtifactService()
+        self.default_provider_name = str(os.getenv("DF_FUSION_PROVIDER", "omnihuman_v15") or "omnihuman_v15").strip().lower()
+        self.alias_heygen_to_hedra = str(
+            os.getenv("DF_FUSION_ALIAS_HEYGEN_TO_HEDRA", "0")
+        ).strip().lower() in {"1", "true", "yes", "y"}
+        self.hedra_enabled = str(
+            os.getenv("DF_FUSION_ENABLE_HEDRA", "0")
+        ).strip().lower() in {"1", "true", "yes", "y"}
+        self._provider_cache: Dict[str, ProviderClient] = {}
 
         try:
             self.pricing_client = SvcPricingClient.from_env(service_name="svc-fusion")
@@ -283,6 +487,612 @@ class FusionOrchestrator:
                 extra={"error": str(e)},
             )
             self.pricing_client = _DisabledPricingClient()
+
+    def _resolve_provider_name(self, requested: Optional[str]) -> str:
+        raw = str(requested or self.default_provider_name or "omnihuman_v15").strip().lower()
+        if raw in {"heygen", "heygen_av4", "heygen_v2", "native"}:
+            return "heygen_av4"
+        if raw in {"omnihuman_v15", "omnihuman"}:
+            return "omnihuman_v15"
+        if raw in {"veed", "veed_fabric", "veed_fabric_1", "fabric", "fabric_1_0", "veed/fabric-1.0"}:
+            return "veed_fabric"
+        if raw in {"kling", "kling_i2v", "kling_t2v"}:
+            return "kling"
+        if raw in {"luma", "luma_ray2", "luma_ray_2"}:
+            return "luma"
+        if raw in {"runway", "runway_gen3", "runway_gen4"}:
+            return "runway"
+        return raw
+
+    def _get_provider(self, provider_name: str) -> ProviderClient:
+        name = self._resolve_provider_name(provider_name)
+        cached = self._provider_cache.get(name)
+        if cached is not None:
+            return cached
+
+        if name == "omnihuman_v15":
+            provider: ProviderClient = OmniHumanAdapter()
+        elif name == "veed_fabric":
+            provider = VeedFabricAdapter()
+        elif name == "kling":
+            provider = KlingAdapter()
+        elif name == "luma":
+            provider = LumaAdapter()
+        elif name == "runway":
+            provider = RunwayAdapter()
+        else:
+            raise ValueError(f"unsupported_fusion_provider: {provider_name}")
+
+        self._provider_cache[name] = provider
+        return provider
+
+    def _prepared_log_meta(self, prepared: Optional[ProviderPrepareResult]) -> Dict[str, Any]:
+        if not prepared:
+            return {}
+        request_json = self._coerce_dict(getattr(prepared, "request_json", None))
+        submit_meta = self._coerce_dict(getattr(prepared, "submit_meta", None))
+        return {
+            "provider_name": getattr(prepared, "provider_name", None),
+            "provider_version": getattr(prepared, "provider_version", None),
+            "request_keys": sorted(request_json.keys()),
+            "image_url": _preview_url(request_json.get("image_url")),
+            "audio_url": _preview_url(request_json.get("audio_url")),
+            "resolution": request_json.get("resolution") or submit_meta.get("resolution"),
+            "duration_sec": submit_meta.get("duration_sec"),
+            "model_id": submit_meta.get("model_id") or submit_meta.get("provider_model_name"),
+            "prompt_preview": submit_meta.get("prompt_preview"),
+        }
+
+    def _poll_log_meta(self, poll: Optional[ProviderPollResult]) -> Dict[str, Any]:
+        if not poll:
+            return {}
+        return {
+            "status": getattr(poll, "status", None),
+            "video_url": _preview_url(getattr(poll, "video_url", None)),
+            "share_url": _preview_url(getattr(poll, "share_url", None)),
+            "error_message": getattr(poll, "error_message", None),
+        }
+
+    async def _attempt_provider_timeout_recovery(
+        self,
+        *,
+        provider: Optional[ProviderClient],
+        provider_name: str,
+        provider_job_id: Optional[str],
+        job_id: str,
+        attempts: int = 3,
+        sleep_s: float = 2.0,
+    ) -> Optional[ProviderPollResult]:
+        if provider is None or not provider_job_id:
+            return None
+        if provider_name != "omnihuman_v15":
+            return None
+
+        last_poll: Optional[ProviderPollResult] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                poll = await provider.poll(provider_job_id)
+                last_poll = poll
+                video_url = str(getattr(poll, "video_url", None) or "").strip()
+                logger.info(
+                    "fusion provider timeout recovery poll job_id=%s provider=%s provider_job_id=%s attempt=%s/%s status=%s has_video_url=%s",
+                    job_id, provider_name, provider_job_id, attempt, attempts, getattr(poll, "status", None), bool(video_url)
+                )
+                if video_url:
+                    return poll
+            except Exception as exc:
+                logger.warning(
+                    "fusion provider timeout recovery error job_id=%s provider=%s provider_job_id=%s attempt=%s/%s error=%s",
+                    job_id, provider_name, provider_job_id, attempt, attempts, str(exc)
+                )
+            if attempt < attempts:
+                await asyncio.sleep(sleep_s)
+        return last_poll
+
+    def _requested_billed_units(self, req: FusionJobCreate) -> int:
+        try:
+            video = req.video.model_dump()
+        except Exception:
+            video = {}
+        duration_sec = video.get("duration_sec")
+        duration_ms = video.get("duration_ms")
+        try:
+            if duration_sec is not None:
+                return max(1, int(math.ceil(float(duration_sec) / 60.0)))
+            if duration_ms is not None:
+                return max(1, int(math.ceil(float(duration_ms) / 60000.0)))
+        except Exception:
+            pass
+        return 1
+
+
+    def _provider_disabled_message(self, provider_name: str) -> str:
+        if provider_name == "heygen_av4" and HEYGEN_IMPORT_ERROR:
+            return f"HeyGen provider is not wired correctly: {HEYGEN_IMPORT_ERROR}"
+        if provider_name == "heygen_av4" and HeyGenService is None:
+            return "HeyGen provider is not wired correctly in this deployment."
+        if provider_name == "omnihuman_v15":
+            return "OmniHuman provider is not wired correctly in this deployment."
+        if provider_name == "veed_fabric":
+            return "VEED Fabric provider is not wired correctly in this deployment."
+        return f"Provider {provider_name} is not available."
+
+
+    @staticmethod
+    def _truthy_internal_child_marker(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        s = str(value or "").strip().lower()
+        return s in {"1", "true", "yes", "y", "on", "internal", "internal_child", "suppressed"}
+
+    def _context_has_internal_child_marker(self, ctx: Optional[Dict[str, Any]]) -> bool:
+        ctx = self._coerce_dict(ctx)
+        if not ctx:
+            return False
+
+        mode = str(
+            ctx.get("mode")
+            or ctx.get("billing_mode")
+            or ctx.get("pricing_mode")
+            or ctx.get("state")
+            or ""
+        ).strip().lower()
+        if mode in {"internal_child", "internal", "suppressed"}:
+            return True
+
+        marker_keys = (
+            "pricing_suppressed",
+            "suppress_pricing",
+            "skip_pricing",
+            "disable_pricing",
+            "is_internal_child",
+            "internal_child",
+            "child_job_of_billable_longform_parent",
+        )
+        if any(self._truthy_internal_child_marker(ctx.get(k)) for k in marker_keys):
+            return True
+
+        parent_ref = (
+            ctx.get("parent_longform_job_id")
+            or ctx.get("parent_story_job_id")
+            or ctx.get("billing_parent_job_id")
+            or ctx.get("parent_job_id")
+        )
+        child_ref = (
+            self._truthy_internal_child_marker(ctx.get("internal_job"))
+            or self._truthy_internal_child_marker(ctx.get("child_job"))
+            or self._truthy_internal_child_marker(ctx.get("bill_to_parent"))
+            or "child_job_of_billable_longform_parent" in str(ctx.get("reason") or "").lower()
+        )
+        if parent_ref and child_ref:
+            return True
+
+        if ctx.get("pricing_enabled") is False and parent_ref:
+            return True
+
+        return False
+
+    def _iter_internal_child_contexts(self, payload_json: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return all request sub-dicts that may carry internal-child pricing markers.
+
+        longform_worker intentionally duplicates suppression markers in provider_options
+        and tags because older svc-fusion API layers may strip unknown top-level fields.
+        The orchestrator must therefore inspect nested request blocks, not only the
+        top-level billing_context.
+        """
+        root = self._coerce_dict(payload_json)
+        out: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+
+        def visit(value: Any, depth: int = 0) -> None:
+            if depth > 5:
+                return
+            if isinstance(value, str):
+                value = self._coerce_dict(value)
+            if isinstance(value, dict):
+                ident = id(value)
+                if ident in seen:
+                    return
+                seen.add(ident)
+                out.append(value)
+                for key in (
+                    "billing_context",
+                    "pricing_context",
+                    "billing",
+                    "pricing",
+                    "pricing_confirmation",
+                    "provider_options",
+                    "tags",
+                    "meta",
+                    "metadata",
+                    "input_json",
+                ):
+                    if key in value:
+                        visit(value.get(key), depth + 1)
+                return
+            if isinstance(value, list):
+                for item in value[:20]:
+                    visit(item, depth + 1)
+
+        visit(root)
+        return out
+
+    def _extract_internal_child_billing_context(self, payload_json: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        allowed_keys = {
+            "mode",
+            "pricing_suppressed",
+            "suppress_pricing",
+            "skip_pricing",
+            "disable_pricing",
+            "pricing_enabled",
+            "internal_job",
+            "child_job",
+            "is_internal_child",
+            "child_job_of_billable_longform_parent",
+            "bill_to_parent",
+            "parent_service",
+            "parent_story_job_id",
+            "parent_longform_job_id",
+            "parent_job_id",
+            "billing_parent_job_id",
+            "segment_id",
+            "child_role",
+            "longform_profile",
+            "reason",
+            "state",
+            "billing_mode",
+            "settlement_mode",
+            "pricing_mode",
+        }
+        merged: Dict[str, Any] = {}
+        for ctx in self._iter_internal_child_contexts(payload_json):
+            if not self._context_has_internal_child_marker(ctx):
+                continue
+            for key in allowed_keys:
+                if key in ctx and key not in merged:
+                    merged[key] = ctx[key]
+            for nested_key in ("billing_context", "pricing_context", "billing", "pricing", "pricing_confirmation", "meta"):
+                nested = self._coerce_dict(ctx.get(nested_key))
+                if not nested:
+                    continue
+                for key in allowed_keys:
+                    if key in nested and key not in merged:
+                        merged[key] = nested[key]
+        return merged
+
+    def _is_internal_child_request_payload(self, payload_json: Dict[str, Any]) -> bool:
+        for ctx in self._iter_internal_child_contexts(payload_json):
+            if self._context_has_internal_child_marker(ctx):
+                return True
+        return False
+
+    def _is_internal_child_pricing(self, pricing: Optional[Dict[str, Any]]) -> bool:
+        pricing = self._coerce_dict(pricing)
+        if not pricing:
+            return False
+        if self._context_has_internal_child_marker(pricing):
+            return True
+        meta = self._coerce_dict(pricing.get("meta"))
+        if meta and self._is_internal_child_request_payload(meta):
+            return True
+        return False
+
+    def _build_internal_child_pricing_block(
+        self,
+        *,
+        req: FusionJobCreate,
+        payload_json: Dict[str, Any],
+        provider_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        provider_name = provider_name or self._resolve_provider_name(getattr(req, "provider", None))
+        billing_context = self._extract_internal_child_billing_context(payload_json)
+        parent_story_job_id = str(
+            billing_context.get("parent_story_job_id")
+            or billing_context.get("parent_longform_job_id")
+            or billing_context.get("billing_parent_job_id")
+            or billing_context.get("parent_job_id")
+            or payload_json.get("parent_story_job_id")
+            or payload_json.get("parent_longform_job_id")
+            or payload_json.get("billing_parent_job_id")
+            or payload_json.get("parent_job_id")
+            or ""
+        ).strip() or None
+        segment_id = str(billing_context.get("segment_id") or payload_json.get("segment_id") or "").strip() or None
+        render_kind = str(payload_json.get("render_kind") or "child_render").strip() or "child_render"
+        return {
+            "enabled": False,
+            "pricing_suppressed": True,
+            "suppress_pricing": True,
+            "suppressed": True,
+            "pricing_enabled": False,
+            "state": "suppressed",
+            "service_name": "svc-fusion",
+            "service_action": "fusion.child.render",
+            "variant_code": None,
+            "sku_code": None,
+            "leaf_sku_code": None,
+            "estimated_units": "0",
+            "unit_type": "internal",
+            "reservation_id": None,
+            "reservation_status": None,
+            "quote_id": None,
+            "reserved_units": None,
+            "actual_units": None,
+            "billed_units": None,
+            "released_units": None,
+            "amount": None,
+            "currency": None,
+            "ledger_entry_id": None,
+            "billing_mode": "internal_child",
+            "billing_account_id": None,
+            "settlement_mode": None,
+            "pricing_mode": "internal_child",
+            "entitlement_source": "internal_child",
+            "entitlement_reason": "parent_storytelling_job",
+            "tier_code": None,
+            "disabled_reason": None,
+            "parent_story_job_id": parent_story_job_id,
+            "parent_longform_job_id": str(
+                billing_context.get("parent_longform_job_id")
+                or billing_context.get("billing_parent_job_id")
+                or parent_story_job_id
+                or ""
+            ) or None,
+            "billing_parent_job_id": str(billing_context.get("billing_parent_job_id") or parent_story_job_id or "") or None,
+            "segment_id": segment_id,
+            "child_role": str(billing_context.get("child_role") or "") or None,
+            "meta": {
+                "provider": provider_name,
+                "voice_mode": req.voice_mode.value,
+                "video": req.video.model_dump(),
+                "render_kind": render_kind,
+                "parent_service": str(billing_context.get("parent_service") or "svc-fusion-extension"),
+                "parent_story_job_id": parent_story_job_id,
+                "parent_longform_job_id": str(
+                    billing_context.get("parent_longform_job_id")
+                    or billing_context.get("billing_parent_job_id")
+                    or parent_story_job_id
+                    or ""
+                ) or None,
+                "billing_parent_job_id": str(billing_context.get("billing_parent_job_id") or parent_story_job_id or "") or None,
+                "segment_id": segment_id,
+                "child_role": str(billing_context.get("child_role") or "") or None,
+                "billing_context": billing_context,
+                "has_face_artifact_id": bool(getattr(req, "face_artifact_id", None)),
+                "has_audio_artifact_id": bool(
+                    getattr(getattr(req, "voice_audio", None), "audio_artifact_id", None)
+                ),
+                "has_provider_options": bool(getattr(req, "provider_options", None)),
+            },
+        }
+
+    def _heygen_dimensions_for_request(self, req: FusionJobCreate) -> Dict[str, int]:
+        try:
+            video = req.video.model_dump()
+        except Exception:
+            video = {}
+        aspect_ratio = str(video.get("aspect_ratio") or "9:16").strip()
+        if aspect_ratio == "16:9":
+            return {"width": 1920, "height": 1080}
+        if aspect_ratio == "1:1":
+            return {"width": 1080, "height": 1080}
+        return {"width": 1080, "height": 1920}
+
+    async def _download_face_image_tempfile(self, face_url: str) -> str:
+        suffix = ".png"
+        try:
+            parsed = urlparse(str(face_url))
+            _, ext = os.path.splitext(parsed.path or "")
+            if ext and len(ext) <= 5:
+                suffix = ext
+        except Exception:
+            pass
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(face_url)
+            resp.raise_for_status()
+            data = resp.content
+
+        fd, temp_path = tempfile.mkstemp(prefix="df_fusion_face_", suffix=suffix)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            raise
+        return temp_path
+
+    def _extract_video_direction_prompt(self, payload_json: Dict[str, Any]) -> str:
+        provider_options = self._coerce_dict(payload_json.get("provider_options"))
+        tags = self._coerce_dict(payload_json.get("tags"))
+        candidates = [
+            payload_json.get("user_prompt"),
+            payload_json.get("video_prompt"),
+            payload_json.get("performance_prompt"),
+            payload_json.get("motion_prompt"),
+            payload_json.get("movement_prompt"),
+            payload_json.get("gesture_prompt"),
+            payload_json.get("body_motion_prompt"),
+            payload_json.get("emotion_prompt"),
+            payload_json.get("expression_prompt"),
+            payload_json.get("creative_direction"),
+            payload_json.get("prompt"),
+            provider_options.get("user_prompt"),
+            provider_options.get("prompt"),
+            tags.get("prompt_preview"),
+            tags.get("user_prompt"),
+            tags.get("prompt"),
+        ]
+        for value in candidates:
+            s = str(value or "").strip()
+            if s:
+                return s
+        return ""
+
+    async def _run_heygen_direct_job(
+        self,
+        *,
+        job_id: str,
+        req: FusionJobCreate,
+        provider_idem: str,
+        payload_json: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if HeyGenService is None:
+            raise RuntimeError(self._provider_disabled_message("heygen_av4"))
+        if req.voice_mode.value != "audio":
+            raise RuntimeError("HeyGen production path currently requires audio mode")
+
+        resolved_face_url = await self._resolve_face_url(job_id, req)
+        resolved_audio_url = await self._resolve_audio_url(job_id, req)
+        logger.info("fusion.heygen submit prep job_id=%s resolved_face_url=%s resolved_audio_url=%s", job_id, _preview_url(resolved_face_url), _preview_url(resolved_audio_url))
+        await self.artifacts.add_artifact(
+            job_id,
+            "provider_audio_ref",
+            resolved_audio_url,
+            content_type="text/uri-list",
+            meta_json={"provider": "heygen_av4"},
+        )
+
+        creative_prompt = self._extract_video_direction_prompt(payload_json)
+        dimensions = self._heygen_dimensions_for_request(req)
+        temp_face_path = await self._download_face_image_tempfile(resolved_face_url)
+        try:
+            svc = HeyGenService()
+            submit_fn = getattr(svc, "submit_video_from_azure_assets", None)
+            if callable(submit_fn):
+                try:
+                    result = await submit_fn(
+                        req=req,
+                        face_image_path=temp_face_path,
+                        audio_blob_path=resolved_audio_url,
+                        idempotency_key=provider_idem,
+                        dimension=dimensions,
+                        test_mode=False,
+                        creative_prompt=creative_prompt or None,
+                    )
+                except TypeError:
+                    result = await submit_fn(
+                        face_image_path=temp_face_path,
+                        audio_blob_path=resolved_audio_url,
+                        idempotency_key=provider_idem,
+                        dimension=dimensions,
+                        test_mode=False,
+                        creative_prompt=creative_prompt or None,
+                    )
+            else:
+                legacy_fn = getattr(svc, "create_video_from_azure_assets", None)
+                if not callable(legacy_fn):
+                    raise RuntimeError("HeyGenService missing submit/create video method")
+                result = await legacy_fn(
+                    face_image_path=temp_face_path,
+                    audio_blob_path=resolved_audio_url,
+                    idempotency_key=provider_idem,
+                    dimension=dimensions,
+                    test_mode=False,
+                )
+        finally:
+            try:
+                os.remove(temp_face_path)
+            except Exception:
+                pass
+
+        result_dict = self._coerce_dict(result)
+        provider_job_id = self._string_or_none(
+            result_dict.get("provider_job_id")
+            or result_dict.get("video_id")
+            or result_dict.get("id")
+            or self._coerce_dict(result_dict.get("data")).get("video_id")
+            or self._coerce_dict(result_dict.get("data")).get("id")
+        )
+        if not provider_job_id:
+            raise RuntimeError("HeyGen submit did not return a provider job id")
+
+        logger.info("fusion.heygen submit ok job_id=%s provider_job_id=%s share_url=%s", job_id, provider_job_id, _preview_url(self._string_or_none(result_dict.get("share_url"))))
+        return {
+            "provider_job_id": provider_job_id,
+            "share_url": self._string_or_none(result_dict.get("share_url")),
+            "raw_response": self._coerce_dict(result_dict.get("raw_response")) or result_dict,
+            "submit_meta": {
+                "provider": "heygen_av4",
+                "path": "direct_service_submit_only",
+                "dimensions": dimensions,
+                "prompt_preview": (creative_prompt or "")[:160] or None,
+                "has_audio": True,
+                "audio_url_preview": resolved_audio_url[:120],
+            },
+        }
+
+    async def _poll_heygen_direct_job(self, provider_job_id: str) -> Dict[str, Any]:
+        if HeyGenService is None:
+            raise RuntimeError(self._provider_disabled_message("heygen_av4"))
+
+        svc = HeyGenService()
+        poll_fn = getattr(svc, "poll_video", None)
+        if callable(poll_fn):
+            result = await poll_fn(provider_job_id)
+            return self._coerce_dict(result)
+
+        status_fn = getattr(svc, "get_video_status", None)
+        if callable(status_fn):
+            result = await status_fn(provider_job_id)
+            return self._coerce_dict(result)
+
+        raise RuntimeError("HeyGenService missing poll/status method")
+
+    async def _mark_job_processing_for_retry(
+        self,
+        *,
+        job_id: str,
+        provider_name: str,
+        provider_job_id: str,
+        run_id: Optional[str],
+        performance_id: Optional[str],
+        user_id: str,
+        reason: str,
+        retry_after_s: int,
+        meta_json: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        retry_meta = {
+            "provider": provider_name,
+            "provider_job_id": provider_job_id,
+            "recovery_reason": reason,
+            "retry_after_s": retry_after_s,
+            **(meta_json or {}),
+        }
+        try:
+            await self.jobs.set_status(job_id, "processing")
+        except Exception:
+            logger.warning("fusion_set_processing_status_failed", extra={"job_id": job_id})
+        try:
+            await self.steps.upsert_step(
+                job_id,
+                StepCode.provider_poll.value,
+                "running",
+                attempt=0,
+                meta_json=retry_meta,
+            )
+        except Exception:
+            logger.warning("fusion_step_retry_mark_failed", extra={"job_id": job_id})
+        try:
+            if run_id:
+                await self.runs.update_status(run_id, "processing", meta_json=retry_meta)
+        except Exception:
+            logger.warning("fusion_run_retry_mark_failed", extra={"job_id": job_id, "run_id": run_id})
+        try:
+            perf_id = performance_id or await self.perfs.upsert_performance(
+                user_id=user_id,
+                provider=provider_name,
+                provider_job_id=provider_job_id,
+                status="processing",
+                share_url=None,
+                meta_json={"job_id": job_id, **retry_meta},
+            )
+            await self.perfs.upsert_fusion_job_output(job_id, perf_id)
+        except Exception:
+            logger.warning("fusion_perf_retry_mark_failed", extra={"job_id": job_id, "performance_id": performance_id})
 
     # -------------------------------------------------------------------------
     # Generic helpers
@@ -325,6 +1135,94 @@ class FusionOrchestrator:
                 return default if value is None else value
         return value
 
+    @staticmethod
+    def _string_or_none(v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    @staticmethod
+    def _normalize_settlement_mode(v: Any) -> str:
+        s = str(v or "").strip().lower()
+        if s in {"postpaid", "invoice", "bill", "billed"}:
+            return "postpaid"
+        if s in {"prepaid", "credit", "credits", "wallet", "payg"}:
+            return "prepaid"
+        if s in {"hybrid", "mixed"}:
+            return "hybrid"
+        return s
+
+    def _canonicalize_pricing_entitlement(
+        self,
+        pricing: Optional[Dict[str, Any]],
+        *,
+        resp: Any = None,
+    ) -> Dict[str, Any]:
+        out = dict(pricing or {})
+
+        billing_account_id = self._string_or_none(
+            self._pricing_resp_get(resp, "billing_account_id") if resp is not None else None
+        ) or self._string_or_none(out.get("billing_account_id"))
+        settlement_mode = self._normalize_settlement_mode(
+            self._pricing_resp_get(resp, "settlement_mode") if resp is not None else out.get("settlement_mode")
+        ) or self._normalize_settlement_mode(out.get("settlement_mode"))
+        billing_mode = self._string_or_none(
+            self._pricing_resp_get(resp, "billing_mode") if resp is not None else None
+        ) or self._string_or_none(out.get("billing_mode"))
+        pricing_mode = self._string_or_none(
+            self._pricing_resp_get(resp, "pricing_mode") if resp is not None else None
+        ) or self._string_or_none(out.get("pricing_mode"))
+
+        explicit_tier = self._string_or_none(
+            self._pricing_resp_get(resp, "tier_code") if resp is not None else out.get("tier_code")
+        ) or ""
+        explicit_source = self._string_or_none(
+            self._pricing_resp_get(resp, "entitlement_source") if resp is not None else out.get("entitlement_source")
+        ) or ""
+        explicit_reason = self._string_or_none(
+            self._pricing_resp_get(resp, "entitlement_reason") if resp is not None else out.get("entitlement_reason")
+        ) or ""
+
+        weak_tier = bool(billing_account_id and explicit_tier.lower() == "free")
+        weak_source = bool(billing_account_id and explicit_source.lower() == "module_gate_fallback")
+
+        if billing_account_id:
+            out["billing_account_id"] = billing_account_id
+        if settlement_mode:
+            out["settlement_mode"] = settlement_mode
+        if billing_mode:
+            out["billing_mode"] = billing_mode
+        if pricing_mode:
+            out["pricing_mode"] = pricing_mode
+
+        if explicit_tier and not weak_tier:
+            out["tier_code"] = explicit_tier
+        elif billing_account_id and settlement_mode == "postpaid":
+            out["tier_code"] = "enterprise"
+        elif billing_account_id and settlement_mode == "hybrid":
+            out["tier_code"] = "business"
+        elif explicit_tier:
+            out["tier_code"] = explicit_tier
+
+        if explicit_source and not weak_source:
+            out["entitlement_source"] = explicit_source
+        elif billing_account_id and settlement_mode == "postpaid":
+            out["entitlement_source"] = "credit_account"
+        elif billing_account_id:
+            out["entitlement_source"] = "billing_account"
+        elif explicit_source:
+            out["entitlement_source"] = explicit_source
+
+        if explicit_reason:
+            out["entitlement_reason"] = explicit_reason
+        elif billing_account_id and (weak_tier or weak_source):
+            out["entitlement_reason"] = "billing_account_context_override"
+        elif billing_account_id and not self._string_or_none(out.get("entitlement_reason")):
+            out["entitlement_reason"] = "billing_account_context_fallback"
+
+        return out
+
     def _sas_ttl_hours(self) -> int:
         ttl = getattr(settings, "AZURE_SAS_EXPIRY_HOURS", None)
         try:
@@ -333,6 +1231,35 @@ class FusionOrchestrator:
         except Exception:
             pass
         return 4
+    @staticmethod
+    def _is_azure_blob_url(url: Optional[str]) -> bool:
+        s = str(url or "").strip()
+        if not s:
+            return False
+        try:
+            host = (urlparse(s).netloc or "").lower()
+        except Exception:
+            return False
+        return host.endswith(".blob.core.windows.net")
+
+    async def _refresh_input_url_if_azure_blob(self, url: Optional[str]) -> Optional[str]:
+        source_url = str(url or "").strip()
+        if not source_url:
+            return None
+        if not self._is_azure_blob_url(source_url):
+            return source_url
+        try:
+            return await self.artifact_service.mint_read_sas_for_url(
+                source_url,
+                ttl_hours=self._sas_ttl_hours(),
+            )
+        except Exception:
+            logger.exception(
+                "fusion_refresh_input_sas_failed",
+                extra={"url_preview": _preview_url(source_url)},
+            )
+            return source_url
+
 
     def _pricing_required(self) -> bool:
         v = str(os.getenv("DF_PRICING_REQUIRED", "0")).strip().lower()
@@ -384,10 +1311,9 @@ class FusionOrchestrator:
         state = "pending_reservation" if pricing_enabled else "disabled"
         disabled_reason = None if pricing_enabled else self._pricing_disabled_reason()
 
-        # Current Fusion pricing is per-minute and reserve needs qty_param=minutes.
-        # Until we wire exact predicted duration, reserve a minimum of 1 minute.
-        estimated_units = "1"
-        estimated_minutes = "1"
+        estimated_units = str(self._requested_billed_units(req))
+        estimated_minutes = estimated_units
+        provider_name = self._resolve_provider_name(getattr(req, "provider", None))
 
         return {
             "enabled": pricing_enabled,
@@ -418,7 +1344,7 @@ class FusionOrchestrator:
             "tier_code": None,
             "disabled_reason": disabled_reason,
             "meta": {
-                "provider": req.provider,
+                "provider": provider_name,
                 "voice_mode": req.voice_mode.value,
                 "video": req.video.model_dump(),
                 "variant_code": variant_code,
@@ -429,7 +1355,7 @@ class FusionOrchestrator:
                 "has_audio_artifact_id": bool(
                     getattr(getattr(req, "voice_audio", None), "audio_artifact_id", None)
                 ),
-                "has_talking_photo_id": bool(getattr(req, "heygen_talking_photo_id", None)),
+                "has_provider_options": bool(getattr(req, "provider_options", None)),
             },
         }
 
@@ -451,27 +1377,40 @@ class FusionOrchestrator:
 
         pricing = self._coerce_dict(payload.get("pricing"))
         if pricing:
-            return pricing
+            return self._canonicalize_pricing_entitlement(pricing)
 
         pricing = self._coerce_dict(meta.get("pricing"))
         if pricing:
-            return pricing
+            return self._canonicalize_pricing_entitlement(pricing)
 
         return {}
 
-    async def _persist_pricing_block(self, job_id: str, pricing: Dict[str, Any]) -> None:
+    async def _persist_pricing_block(
+        self,
+        job_id: str,
+        pricing: Dict[str, Any],
+        pricing_summary: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        pricing = self._canonicalize_pricing_entitlement(dict(pricing or {}))
+        pricing_summary = dict(pricing_summary or build_pricing_summary(pricing))
+
         q = """
         UPDATE public.studio_jobs
         SET
-          payload_json = COALESCE(payload_json, '{}'::jsonb) || jsonb_build_object('pricing', $2::jsonb),
+          payload_json = COALESCE(payload_json, '{}'::jsonb)
+                         || jsonb_build_object(
+                              'pricing', $2::jsonb,
+                              'pricing_summary', $3::jsonb
+                            ),
           meta_json = COALESCE(meta_json, '{}'::jsonb)
                       || jsonb_build_object(
                            'pricing', $2::jsonb,
-                           'pricing_state', COALESCE($3::text, ''),
-                           'pricing_enabled', $4::bool,
-                           'pricing_billing_mode', NULLIF($5::text, ''),
-                           'pricing_settlement_mode', NULLIF($6::text, ''),
-                           'pricing_billing_account_id', NULLIF($7::text, '')
+                           'pricing_summary', $3::jsonb,
+                           'pricing_state', COALESCE($4::text, ''),
+                           'pricing_enabled', $5::bool,
+                           'pricing_billing_mode', NULLIF($6::text, ''),
+                           'pricing_settlement_mode', NULLIF($7::text, ''),
+                           'pricing_billing_account_id', NULLIF($8::text, '')
                          ),
           updated_at = now()
         WHERE id = $1::uuid
@@ -483,6 +1422,7 @@ class FusionOrchestrator:
                     q,
                     job_id,
                     json.dumps(pricing or {}),
+                    json.dumps(pricing_summary or {}),
                     str(pricing.get("state") or ""),
                     bool(pricing.get("enabled", False)),
                     str(pricing.get("billing_mode") or ""),
@@ -491,6 +1431,483 @@ class FusionOrchestrator:
                 )
         except Exception:
             logger.exception("fusion_pricing_persist_failed", extra={"job_id": job_id})
+
+    async def _merge_job_meta(self, job_id: str, patch: Dict[str, Any]) -> None:
+        if not patch:
+            return
+        q = """
+        UPDATE public.studio_jobs
+        SET
+          meta_json = COALESCE(meta_json, '{}'::jsonb) || $2::jsonb,
+          updated_at = now()
+        WHERE id = $1::uuid
+          AND studio_type = 'fusion'
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(q, job_id, json.dumps(patch or {}))
+        except Exception:
+            logger.exception("fusion_job_meta_patch_failed", extra={"job_id": job_id, "patch_keys": sorted((patch or {}).keys())})
+
+    async def _load_job_meta(self, job_id: str) -> Dict[str, Any]:
+        q = """
+        SELECT meta_json
+        FROM public.studio_jobs
+        WHERE id = $1::uuid
+          AND studio_type = 'fusion'
+        LIMIT 1
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(q, job_id)
+            if not row:
+                return {}
+            return self._coerce_dict(row["meta_json"])
+        except Exception:
+            logger.exception("fusion_job_meta_load_failed", extra={"job_id": job_id})
+            return {}
+
+    async def _persist_provider_prepare_cache(
+        self,
+        job_id: str,
+        *,
+        provider_name: str,
+        provider_version: str,
+        request_json: Dict[str, Any],
+        submit_meta: Optional[Dict[str, Any]] = None,
+        resolved_face_url: Optional[str] = None,
+        resolved_audio_url: Optional[str] = None,
+        reference_image_urls: Optional[List[str]] = None,
+    ) -> None:
+        cache = {
+            "provider_name": provider_name,
+            "provider_version": provider_version,
+            "request_json": dict(request_json or {}),
+            "submit_meta": dict(submit_meta or {}),
+            "resolved_face_url": resolved_face_url,
+            "resolved_audio_url": resolved_audio_url,
+            "reference_image_urls": list(reference_image_urls or []),
+        }
+        await self._merge_job_meta(job_id, {"provider_prepare_cache": cache})
+
+    async def _load_provider_prepare_cache(
+        self,
+        job_id: str,
+        *,
+        provider_name: str,
+    ) -> Optional[_PreparedProviderCache]:
+        meta = await self._load_job_meta(job_id)
+        cache = self._coerce_dict(meta.get("provider_prepare_cache"))
+        if not cache:
+            return None
+        cached_provider = str(cache.get("provider_name") or "").strip().lower()
+        if cached_provider != str(provider_name or "").strip().lower():
+            return None
+        request_json = self._coerce_dict(cache.get("request_json"))
+        if not request_json:
+            return None
+        return _PreparedProviderCache(
+            provider_name=str(cache.get("provider_name") or provider_name),
+            provider_version=str(cache.get("provider_version") or "v1"),
+            request_json=request_json,
+            submit_meta=self._coerce_dict(cache.get("submit_meta")),
+        )
+
+    async def _persist_light_status(
+        self,
+        job_id: str,
+        *,
+        provider: Optional[str] = None,
+        provider_job_id: Optional[str] = None,
+        provider_status: Optional[str] = None,
+        primary_video_url: Optional[str] = None,
+        share_url: Optional[str] = None,
+        progress_pct: Optional[float] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        light_status = {
+            "provider": provider,
+            "provider_job_id": provider_job_id,
+            "provider_status": provider_status,
+            "primary_video_url": primary_video_url,
+            "share_url": share_url,
+            "progress_pct": progress_pct,
+            "error_message": error_message,
+        }
+        patch = {
+            "provider": provider,
+            "provider_job_id": provider_job_id,
+            "provider_status": provider_status,
+            "primary_video_url": primary_video_url,
+            "share_url": share_url,
+            "progress_pct": progress_pct,
+            "light_status": light_status,
+        }
+        await self._merge_job_meta(job_id, patch)
+
+    async def _has_video_artifact(self, job_id: str) -> bool:
+        try:
+            rows = await self.artifacts.list_artifacts(job_id)
+        except Exception:
+            logger.exception("fusion_list_artifacts_failed", extra={"job_id": job_id})
+            return False
+        for row in rows or []:
+            kind = str((row or {}).get("kind") or "").strip().lower()
+            content_type = str((row or {}).get("content_type") or "").strip().lower()
+            url = str((row or {}).get("url") or "").strip()
+            if kind == "video" and url:
+                return True
+            if content_type.startswith("video/") and url:
+                return True
+        return False
+
+    async def _has_thumbnail_artifact(self, job_id: str) -> bool:
+        try:
+            rows = await self.artifacts.list_artifacts(job_id)
+        except Exception:
+            logger.exception("fusion_list_thumbnail_artifacts_failed", extra={"job_id": job_id})
+            return False
+
+        for row in rows or []:
+            kind = str((row or {}).get("kind") or "").strip().lower()
+            content_type = str((row or {}).get("content_type") or "").strip().lower()
+            url = str((row or {}).get("url") or "").strip()
+            if not url:
+                continue
+            if kind in {"thumbnail", "poster"}:
+                return True
+            if content_type.startswith("image/") and kind not in {"resolved_face_sas_url", "provider_audio_ref", "resolved_audio_sas_url"}:
+                return True
+        return False
+
+    @staticmethod
+    def _image_content_type_for_url(url: Optional[str]) -> str:
+        path = ""
+        try:
+            path = (urlparse(str(url or "")).path or "").lower()
+        except Exception:
+            path = str(url or "").split("?", 1)[0].lower()
+
+        if path.endswith(".jpg") or path.endswith(".jpeg"):
+            return "image/jpeg"
+        if path.endswith(".webp"):
+            return "image/webp"
+        if path.endswith(".gif"):
+            return "image/gif"
+        return "image/png"
+
+    async def _persist_thumbnail_fallback_artifact(
+        self,
+        *,
+        job_id: str,
+        req: FusionJobCreate,
+        provider_name: str,
+        provider_job_id: Optional[str],
+    ) -> Optional[str]:
+        """
+        Launch-stability thumbnail fallback for Fusion videos.
+
+        The final MP4 is not an image thumbnail. Until true poster-frame extraction is
+        wired into the Fusion finalization path, store the resolved face image as a
+        job-scoped thumbnail artifact so Dashboard/Saved Work can show an image card
+        instead of a blank/failed video thumbnail.
+
+        This method is best-effort and must never fail the video generation path.
+        """
+        try:
+            if await self._has_thumbnail_artifact(job_id):
+                return None
+
+            candidate_url: Optional[str] = None
+            candidate_source = ""
+
+            try:
+                rows = await self.artifacts.list_artifacts(job_id)
+            except Exception:
+                rows = []
+
+            for row in rows or []:
+                kind = str((row or {}).get("kind") or "").strip().lower()
+                url = str((row or {}).get("url") or "").strip()
+                if kind == "resolved_face_sas_url" and url:
+                    candidate_url = url
+                    candidate_source = "resolved_face_sas_url"
+                    break
+
+            if not candidate_url:
+                face_artifact_id = getattr(req, "face_artifact_id", None)
+                if face_artifact_id:
+                    row = await self.artifacts.get_artifact_by_id(str(face_artifact_id))
+                    if row:
+                        candidate_url = await self.artifact_service.mint_read_sas_for_artifact(
+                            dict(row),
+                            ttl_hours=self._sas_ttl_hours(),
+                        )
+                        candidate_source = "face_artifact_id"
+
+            if not candidate_url:
+                direct_face_url = getattr(req, "face_image_url", None)
+                if direct_face_url:
+                    candidate_url = await self._refresh_input_url_if_azure_blob(str(direct_face_url))
+                    candidate_source = "face_image_url"
+
+            candidate_url = str(candidate_url or "").strip()
+            if not candidate_url:
+                return None
+
+            await self.artifacts.add_artifact(
+                job_id,
+                "thumbnail",
+                candidate_url,
+                content_type=self._image_content_type_for_url(candidate_url),
+                meta_json={
+                    "provider": provider_name,
+                    "provider_job_id": provider_job_id,
+                    "source": candidate_source or "fusion_face_thumbnail_fallback",
+                    "fallback_thumbnail": True,
+                    "thumbnail_role": "fusion_video_card",
+                },
+            )
+
+            await self._merge_job_meta(
+                job_id,
+                {
+                    "thumbnail_url": candidate_url,
+                    "poster_url": candidate_url,
+                    "thumbnail_source": candidate_source or "fusion_face_thumbnail_fallback",
+                },
+            )
+
+            logger.info(
+                "fusion_thumbnail_fallback_artifact_saved job_id=%s provider=%s provider_job_id=%s source=%s thumbnail_url=%s",
+                job_id,
+                provider_name,
+                provider_job_id,
+                candidate_source,
+                _preview_url(candidate_url),
+            )
+            return candidate_url
+        except Exception:
+            logger.exception(
+                "fusion_thumbnail_fallback_artifact_failed",
+                extra={
+                    "job_id": job_id,
+                    "provider": provider_name,
+                    "provider_job_id": provider_job_id,
+                },
+            )
+            return None
+
+    async def _finalize_from_primary_video_url(
+        self,
+        *,
+        job_id: str,
+        job: Dict[str, Any],
+        req: FusionJobCreate,
+        provider_name: str,
+        provider_job_id: str,
+        primary_video_url: str,
+        pricing: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        pricing = dict(pricing or {})
+        user_id = str(job.get("user_id") or "").strip()
+        final_video_url = primary_video_url
+
+        await self.steps.upsert_step(job_id, StepCode.finalize.value, "running", attempt=0)
+
+        already_has_video = await self._has_video_artifact(job_id)
+        if not already_has_video:
+            final_video_url = await self.artifact_service.persist_video_artifact(
+                primary_video_url,
+                user_id=user_id,
+                job_id=job_id,
+                provider_job_id=provider_job_id,
+            )
+            await self.artifacts.add_artifact(
+                job_id,
+                "video",
+                final_video_url,
+                content_type="video/mp4",
+                meta_json={
+                    "provider": provider_name,
+                    "provider_job_id": provider_job_id,
+                    "recovered_from_primary_video_url": True,
+                },
+            )
+
+        await self._persist_thumbnail_fallback_artifact(
+            job_id=job_id,
+            req=req,
+            provider_name=provider_name,
+            provider_job_id=provider_job_id,
+        )
+
+        try:
+            perf_id = await self.perfs.upsert_performance(
+                user_id=user_id,
+                provider=provider_name,
+                provider_job_id=provider_job_id,
+                status="processing",
+                share_url=None,
+                meta_json={
+                    "job_id": job_id,
+                    "provider_job_id": provider_job_id,
+                    "recovered_finalize": True,
+                },
+            )
+            await self.perfs.upsert_fusion_job_output(job_id, perf_id)
+            await self.perfs.mark_ready(
+                perf_id,
+                share_url=None,
+                meta_json={
+                    "job_id": job_id,
+                    "provider_job_id": provider_job_id,
+                    "video_url": final_video_url,
+                    "status": "ready",
+                    "user_id": user_id,
+                    "provider": provider_name,
+                    "recovered_finalize": True,
+                },
+            )
+        except Exception:
+            logger.warning("fusion_recovery_perf_mark_ready_failed", extra={"job_id": job_id, "provider_job_id": provider_job_id})
+
+        latest_pricing = await self._load_latest_pricing(job_id)
+        if latest_pricing:
+            pricing = latest_pricing
+
+        pricing_state = str(pricing.get("state") or "").strip().lower()
+        if pricing.get("enabled") and pricing_state not in {"committed", "released"}:
+            pricing = await self._commit_pricing_for_job(
+                job_id=job_id,
+                user_id=user_id,
+                pricing=pricing,
+                actual_units=self._requested_billed_units(req),
+            )
+
+        await self._persist_light_status(
+            job_id,
+            provider=provider_name,
+            provider_job_id=provider_job_id,
+            provider_status="succeeded",
+            primary_video_url=final_video_url,
+        )
+        await self.steps.upsert_step(job_id, StepCode.finalize.value, "succeeded", attempt=0)
+        await self.jobs.set_status(job_id, "succeeded")
+        return final_video_url
+
+    async def claim_stale_processing_job_ids(
+        self,
+        *,
+        limit: int,
+        stale_seconds: int,
+        claim_ttl_seconds: int,
+        owner: Optional[str] = None,
+    ) -> List[str]:
+        owner = owner or f"fusion-recovery:{os.getpid()}"
+        if hasattr(self.jobs, "claim_stale_processing_jobs"):
+            return await self.jobs.claim_stale_processing_jobs(
+                studio_type="fusion",
+                limit=limit,
+                stale_seconds=stale_seconds,
+                claim_ttl_seconds=claim_ttl_seconds,
+                owner=owner,
+            )
+        q = """
+        WITH cand AS (
+            SELECT id
+            FROM public.studio_jobs
+            WHERE studio_type = $1
+              AND status = 'processing'
+              AND updated_at < now() - make_interval(secs => $2::int)
+              AND COALESCE(NULLIF(meta_json->>'recovery_claimed_at', '')::timestamptz, to_timestamp(0))
+                    < now() - make_interval(secs => $3::int)
+            ORDER BY updated_at ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT $4
+        )
+        UPDATE public.studio_jobs j
+        SET meta_json = COALESCE(j.meta_json, '{}'::jsonb)
+                        || jsonb_build_object(
+                             'recovery_claimed_at', now()::text,
+                             'recovery_owner', $5::text,
+                             'recovery_reason', 'stale_processing',
+                             'recovery_attempts', COALESCE((NULLIF(j.meta_json->>'recovery_attempts', ''))::int, 0) + 1
+                           ),
+            updated_at = now()
+        FROM cand
+        WHERE j.id = cand.id
+        RETURNING j.id::text
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(q, "fusion", int(stale_seconds), int(claim_ttl_seconds), int(limit), owner)
+        return [str(r["id"]) for r in rows]
+
+    async def recover_job(self, job_id: str) -> None:
+        job = await self.jobs.get_job(job_id)
+        if not job:
+            return
+        status = str(job.get("status") or "").strip().lower()
+        if status in {"succeeded", "failed", "blocked", "canceled", "cancelled"}:
+            return
+
+        payload_json = job.get("payload_json")
+        if isinstance(payload_json, str):
+            payload_json = json.loads(payload_json)
+        if not isinstance(payload_json, dict):
+            raise ValueError(f"Unexpected payload_json type during recovery: {type(payload_json)}")
+        req = FusionJobCreate.model_validate(payload_json)
+
+        meta = await self._load_job_meta(job_id)
+        light = self._coerce_dict(meta.get("light_status"))
+        provider_name = self._resolve_provider_name(
+            meta.get("provider") or light.get("provider") or payload_json.get("provider") or getattr(req, "provider", None)
+        )
+        provider_job_id = str(
+            meta.get("provider_job_id") or light.get("provider_job_id") or ""
+        ).strip()
+        primary_video_url = str(
+            meta.get("primary_video_url") or light.get("primary_video_url") or ""
+        ).strip()
+        pricing = await self._load_latest_pricing(job_id)
+
+        await self._merge_job_meta(job_id, {"recovery_last_started_at": datetime.utcnow().isoformat() + "Z"})
+
+        if primary_video_url:
+            await self._finalize_from_primary_video_url(
+                job_id=job_id,
+                job=job,
+                req=req,
+                provider_name=provider_name,
+                provider_job_id=provider_job_id or f"recovered:{job_id}",
+                primary_video_url=primary_video_url,
+                pricing=pricing,
+            )
+            return
+
+        await self.run_job(job_id)
+
+    async def recover_stale_processing_jobs_once(
+        self,
+        *,
+        limit: int,
+        stale_seconds: int,
+        claim_ttl_seconds: int,
+        owner: Optional[str] = None,
+    ) -> int:
+        job_ids = await self.claim_stale_processing_job_ids(
+            limit=limit,
+            stale_seconds=stale_seconds,
+            claim_ttl_seconds=claim_ttl_seconds,
+            owner=owner,
+        )
+        if not job_ids:
+            return 0
+        results = await asyncio.gather(*(self.recover_job(job_id) for job_id in job_ids), return_exceptions=True)
+        for job_id, result in zip(job_ids, results):
+            if isinstance(result, Exception):
+                logger.exception("fusion_recover_job_failed", extra={"job_id": job_id}, exc_info=(type(result), result, result.__traceback__))
+        return len(job_ids)
 
     async def _load_latest_pricing(self, job_id: str) -> Dict[str, Any]:
         q = """
@@ -556,6 +1973,8 @@ class FusionOrchestrator:
         user_id: str,
         pricing: Dict[str, Any],
     ) -> Dict[str, Any]:
+        if self._is_internal_child_pricing(pricing):
+            return pricing
         if not self._pricing_enabled():
             return pricing
 
@@ -636,7 +2055,8 @@ class FusionOrchestrator:
                 meta=meta,
                 disabled_reason=None,
             )
-            await self._persist_pricing_block(job_id, pricing)
+            pricing = self._canonicalize_pricing_entitlement(pricing, resp=resp)
+            await self._persist_pricing_block(job_id, pricing, build_pricing_summary(pricing))
             return pricing
         except Exception as e:
             logger.exception(
@@ -670,6 +2090,8 @@ class FusionOrchestrator:
         pricing: Dict[str, Any],
         actual_units: int,
     ) -> Dict[str, Any]:
+        if self._is_internal_child_pricing(pricing):
+            return pricing
         if not self._pricing_enabled():
             return pricing
 
@@ -710,45 +2132,69 @@ class FusionOrchestrator:
         ).strip() or self._fusion_pricing_leaf_sku_code()
 
         try:
-            resp = await self.pricing_client.commit(
-                PricingCommitRequest(
-                    user_id=str(user_id),
-                    reservation_id=reservation_id,
-                    actual_units=str(max(1, int(actual_units))),
-                    external_ref_type="studio_job",
-                    external_ref_id=str(job_id),
-                    idempotency_key=f"svc-fusion:job:{job_id}:commit",
-                    meta={
-                        "variant_code": variant_code,
-                        "sku_code": variant_code,
-                        "leaf_sku_code": leaf_sku_code,
-                        "minutes": str(max(1, int(actual_units))),
-                        "service_action": pricing.get("service_action"),
-                        "requested_units": pricing.get("estimated_units"),
-                    },
-                )
+            commit_meta = {
+                "variant_code": variant_code,
+                "sku_code": variant_code,
+                "leaf_sku_code": leaf_sku_code,
+                "minutes": str(max(1, int(actual_units))),
+                "service_action": pricing.get("service_action"),
+                "requested_units": pricing.get("estimated_units"),
+            }
+            commit_spec = PricingCommitSpec(
+                user_id=str(user_id),
+                reservation_id=reservation_id,
+                actual_units=str(max(1, int(actual_units))),
+                external_ref_id=str(job_id),
+                idempotency_key=f"svc-fusion:job:{job_id}:commit",
+                meta=commit_meta,
+            )
+            resp = await self.pricing_client.commit(build_commit_request(commit_spec))
+            commit_artifact = make_committed_artifact(
+                resp,
+                base_pricing=pricing,
+                actual_units=str(max(1, int(actual_units))),
+                meta=commit_meta,
             )
             commit_status = str(self._pricing_resp_get(resp, "status", "committed") or "committed")
-            pricing = self._merge_pricing_block(
+
+            pricing = dict(pricing or {})
+            artifact_pricing = dict(self._coerce_dict(commit_artifact.get("pricing")))
+            artifact_summary = dict(self._coerce_dict(commit_artifact.get("pricing_summary")))
+            pricing.update(artifact_pricing)
+
+            pricing["enabled"] = True
+            pricing["state"] = "committed"
+            pricing["variant_code"] = self._pricing_resp_get(resp, "variant_code") or variant_code
+            pricing["sku_code"] = self._pricing_resp_get(resp, "variant_code") or variant_code
+            pricing["leaf_sku_code"] = self._pricing_resp_get(resp, "sku_code") or leaf_sku_code
+            pricing["commit_status"] = commit_status
+            pricing["reservation_status"] = commit_status
+            pricing["actual_units"] = str(max(1, int(actual_units)))
+            pricing["amount"] = self._pricing_resp_get(resp, "amount") or pricing.get("amount")
+            pricing["currency"] = self._pricing_resp_get(resp, "currency") or pricing.get("currency")
+            pricing["billing_mode"] = self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode")
+            pricing["billing_account_id"] = self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id")
+            pricing["settlement_mode"] = self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode")
+            pricing["pricing_mode"] = self._pricing_resp_get(resp, "pricing_mode") or pricing.get("pricing_mode")
+            pricing["entitlement_source"] = self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source")
+            pricing["entitlement_reason"] = self._pricing_resp_get(resp, "entitlement_reason") or pricing.get("entitlement_reason")
+            pricing["tier_code"] = self._pricing_resp_get(resp, "tier_code") or pricing.get("tier_code")
+            pricing["ledger_entry_id"] = self._pricing_resp_get(resp, "ledger_entry_id") or pricing.get("ledger_entry_id")
+            pricing["invoice_id"] = self._pricing_resp_get(resp, "invoice_id") or pricing.get("invoice_id")
+            pricing["disabled_reason"] = None
+            pricing["error"] = None
+            pricing["error_code"] = None
+
+            meta_block = dict(self._coerce_dict(pricing.get("meta")))
+            meta_block.update(commit_meta)
+            pricing["meta"] = meta_block
+            pricing = self._canonicalize_pricing_entitlement(pricing, resp=resp)
+
+            await self._persist_pricing_block(
+                job_id,
                 pricing,
-                state="committed",
-                variant_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
-                sku_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
-                leaf_sku_code=self._pricing_resp_get(resp, "sku_code") or leaf_sku_code,
-                actual_units=str(max(1, int(actual_units))),
-                commit_status=commit_status,
-                reservation_status=commit_status,
-                ledger_entry_id=self._pricing_resp_get(resp, "ledger_entry_id"),
-                billed_units=self._pricing_resp_get(resp, "billed_units") or str(max(1, int(actual_units))),
-                amount=self._pricing_resp_get(resp, "amount"),
-                currency=self._pricing_resp_get(resp, "currency"),
-                billing_mode=self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
-                billing_account_id=self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
-                settlement_mode=self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
-                entitlement_source=self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
-                disabled_reason=None,
+                artifact_summary or build_pricing_summary(pricing),
             )
-            await self._persist_pricing_block(job_id, pricing)
             return pricing
         except Exception as e:
             logger.exception(
@@ -772,6 +2218,8 @@ class FusionOrchestrator:
         pricing: Dict[str, Any],
         reason: str,
     ) -> Dict[str, Any]:
+        if self._is_internal_child_pricing(pricing):
+            return pricing
         if not self._pricing_enabled():
             return pricing
 
@@ -805,40 +2253,64 @@ class FusionOrchestrator:
         ).strip() or self._fusion_pricing_leaf_sku_code()
 
         try:
-            resp = await self.pricing_client.release(
-                PricingReleaseRequest(
-                    user_id=str(user_id),
-                    reservation_id=reservation_id,
-                    reason=reason,
-                    external_ref_type="studio_job",
-                    external_ref_id=str(job_id),
-                    idempotency_key=f"svc-fusion:job:{job_id}:release",
-                    meta={
-                        "variant_code": variant_code,
-                        "sku_code": variant_code,
-                        "leaf_sku_code": leaf_sku_code,
-                        "minutes": str(pricing.get("estimated_units") or "1"),
-                        "service_action": pricing.get("service_action"),
-                    },
-                )
+            release_meta = {
+                "variant_code": variant_code,
+                "sku_code": variant_code,
+                "leaf_sku_code": leaf_sku_code,
+                "minutes": str(pricing.get("estimated_units") or "1"),
+                "service_action": pricing.get("service_action"),
+            }
+            release_spec = PricingReleaseSpec(
+                user_id=str(user_id),
+                reservation_id=reservation_id,
+                reason=reason,
+                external_ref_id=str(job_id),
+                idempotency_key=f"svc-fusion:job:{job_id}:release",
+                meta=release_meta,
+            )
+            resp = await self.pricing_client.release(build_release_request(release_spec))
+            release_artifact = make_released_artifact(
+                resp,
+                base_pricing=pricing,
+                meta=release_meta,
             )
             release_status = str(self._pricing_resp_get(resp, "status", "released") or "released")
-            pricing = self._merge_pricing_block(
+
+            pricing = dict(pricing or {})
+            artifact_pricing = dict(self._coerce_dict(release_artifact.get("pricing")))
+            artifact_summary = dict(self._coerce_dict(release_artifact.get("pricing_summary")))
+            pricing.update(artifact_pricing)
+
+            pricing["enabled"] = True
+            pricing["state"] = "released"
+            pricing["variant_code"] = self._pricing_resp_get(resp, "variant_code") or variant_code
+            pricing["sku_code"] = self._pricing_resp_get(resp, "variant_code") or variant_code
+            pricing["leaf_sku_code"] = self._pricing_resp_get(resp, "sku_code") or leaf_sku_code
+            pricing["release_status"] = release_status
+            pricing["reservation_status"] = release_status
+            pricing["amount"] = self._pricing_resp_get(resp, "amount") or pricing.get("amount")
+            pricing["currency"] = self._pricing_resp_get(resp, "currency") or pricing.get("currency")
+            pricing["billing_mode"] = self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode")
+            pricing["billing_account_id"] = self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id")
+            pricing["settlement_mode"] = self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode")
+            pricing["pricing_mode"] = self._pricing_resp_get(resp, "pricing_mode") or pricing.get("pricing_mode")
+            pricing["entitlement_source"] = self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source")
+            pricing["entitlement_reason"] = self._pricing_resp_get(resp, "entitlement_reason") or pricing.get("entitlement_reason")
+            pricing["tier_code"] = self._pricing_resp_get(resp, "tier_code") or pricing.get("tier_code")
+            pricing["disabled_reason"] = None
+            pricing["error"] = None
+            pricing["error_code"] = None
+
+            meta_block = dict(self._coerce_dict(pricing.get("meta")))
+            meta_block.update(release_meta)
+            pricing["meta"] = meta_block
+            pricing = self._canonicalize_pricing_entitlement(pricing, resp=resp)
+
+            await self._persist_pricing_block(
+                job_id,
                 pricing,
-                state="released",
-                variant_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
-                sku_code=self._pricing_resp_get(resp, "variant_code") or variant_code,
-                leaf_sku_code=self._pricing_resp_get(resp, "sku_code") or leaf_sku_code,
-                release_status=release_status,
-                reservation_status=release_status,
-                released_units=self._pricing_resp_get(resp, "released_units"),
-                billing_mode=self._pricing_resp_get(resp, "billing_mode") or pricing.get("billing_mode"),
-                billing_account_id=self._pricing_resp_get(resp, "billing_account_id") or pricing.get("billing_account_id"),
-                settlement_mode=self._pricing_resp_get(resp, "settlement_mode") or pricing.get("settlement_mode"),
-                entitlement_source=self._pricing_resp_get(resp, "entitlement_source") or pricing.get("entitlement_source"),
-                disabled_reason=None,
+                artifact_summary or build_pricing_summary(pricing),
             )
-            await self._persist_pricing_block(job_id, pricing)
             return pricing
         except Exception as e:
             logger.exception(
@@ -861,8 +2333,7 @@ class FusionOrchestrator:
         Create a new fusion job.
 
         IMPORTANT:
-        - Prefer stable IDs (artifact IDs / heygen_talking_photo_id / image_key) for hashing.
-        - If a URL is provided (SAS), strip query string for stability.
+        - Prefer stable IDs (artifact IDs / blob paths / stripped URLs) for hashing.
         - Pricing-enabled jobs start as pricing_pending and only become queued after reserve succeeds.
         - Insufficient credits is a soft product block: return a blocked job with job_id.
         """
@@ -871,14 +2342,15 @@ class FusionOrchestrator:
         voice_audio = getattr(req, "voice_audio", None)
         audio_artifact_id = getattr(voice_audio, "audio_artifact_id", None) if voice_audio else None
 
+        provider_name = self._resolve_provider_name(getattr(req, "provider", None))
+        payload = dict(req.model_dump())
+        payload["provider"] = provider_name
+        internal_child = self._is_internal_child_request_payload(payload)
+
         stable_spec: Dict[str, Any] = {
-            "provider": req.provider,
+            "provider": provider_name,
             "voice_mode": req.voice_mode.value,
             "face_artifact_id": str(face_artifact_id) if face_artifact_id else None,
-            "heygen_talking_photo_id": (
-                req.heygen_talking_photo_id.strip() if req.heygen_talking_photo_id else None
-            ),
-            "image_key": (req.image_key.strip() if req.image_key else None),
             "audio_artifact_id": str(audio_artifact_id) if audio_artifact_id else None,
             "face_image_url_base": (
                 _url_base(str(req.face_image_url)) if getattr(req, "face_image_url", None) else None
@@ -889,7 +2361,7 @@ class FusionOrchestrator:
             "voice_id": req.voice_tts.voice_id if req.voice_tts else None,
             "script": req.voice_tts.script if req.voice_tts else None,
             "video": req.video.model_dump(),
-            "payload_version": f"{settings.HEYGEN_AV4_PAYLOAD_VERSION}.v2",
+            "provider_options": self._coerce_dict(payload.get("provider_options")),
         }
 
         disable_create_dedupe = str(os.getenv("DF_FUSION_DISABLE_CREATE_DEDUPE", "0")).strip().lower() in {
@@ -904,20 +2376,25 @@ class FusionOrchestrator:
         stable_spec = {k: v for k, v in stable_spec.items() if v is not None}
         req_hash = request_hash(stable_spec)
 
-        pricing_enabled = self._pricing_enabled()
+        pricing_enabled = self._pricing_enabled() and not internal_child
         initial_status = "pricing_pending" if pricing_enabled else "queued"
+        logger.info("fusion.create_job start user_id=%s provider=%s voice_mode=%s pricing_enabled=%s internal_child=%s has_face_artifact_id=%s has_audio_artifact_id=%s has_face_image_url=%s", user_id, provider_name, req.voice_mode.value, pricing_enabled, internal_child, bool(face_artifact_id), bool(audio_artifact_id), bool(getattr(req, "face_image_url", None)))
 
         job_id = await self.jobs.insert_job(
             user_id=user_id,
             request_hash=req_hash,
-            payload=req.model_dump(),
+            payload=payload,
             initial_status=initial_status,
         )
 
-        pricing = self._build_initial_pricing_block(req)
+        pricing = (
+            self._build_internal_child_pricing_block(req=req, payload_json=payload, provider_name=provider_name)
+            if internal_child
+            else self._build_initial_pricing_block(req)
+        )
         await self._persist_pricing_block(job_id, pricing)
 
-        if self._pricing_required() and not pricing_enabled:
+        if not internal_child and self._pricing_required() and not pricing_enabled:
             reason = self._pricing_disabled_reason()
             pricing = self._merge_pricing_block(
                 pricing,
@@ -936,6 +2413,29 @@ class FusionOrchestrator:
             except Exception:
                 logger.exception("fusion_set_failed_status_pricing_disabled", extra={"job_id": job_id})
             raise PricingClientError(reason)
+
+        provider_disabled_reason = None
+        if provider_name == "heygen_av4" and HeyGenService is None:
+            provider_disabled_reason = self._provider_disabled_message("heygen_av4")
+
+        if provider_disabled_reason:
+            pricing = self._merge_pricing_block(
+                pricing,
+                state="disabled",
+                error=provider_disabled_reason,
+                disabled_reason=provider_disabled_reason,
+            )
+            await self._persist_pricing_block(job_id, pricing)
+            try:
+                await self.jobs.set_status(
+                    job_id,
+                    "blocked",
+                    error_code="PROVIDER_DISABLED",
+                    error_message=provider_disabled_reason,
+                )
+            except Exception:
+                logger.exception("fusion_set_blocked_status_provider_disabled", extra={"job_id": job_id})
+            return job_id
 
         if pricing_enabled:
             try:
@@ -967,162 +2467,186 @@ class FusionOrchestrator:
 
                 raise
 
+        logger.info("fusion.create_job queued job_id=%s provider=%s initial_status=%s", job_id, provider_name, initial_status)
         return job_id
-
 
 
     async def _resolve_face_url(self, job_id: str, req: FusionJobCreate) -> str:
         """
         Resolve face input to a fetchable URL/SAS.
 
-        Priority:
-          1) req.face_image_url
-          2) req.face_artifact_id -> mint fresh SAS
+        Production rule:
+          - if face_artifact_id is present, prefer it and mint a fresh SAS
+          - else if a direct Azure Blob URL is supplied, refresh the SAS
+          - else return the direct URL unchanged
         """
-        if getattr(req, "face_image_url", None):
-            return str(req.face_image_url)
-
         face_artifact_id = getattr(req, "face_artifact_id", None)
-        if not face_artifact_id:
-            raise ValueError("Provide face_image_url or face_artifact_id")
 
-        row = await self.artifacts.get_artifact_by_id(str(face_artifact_id))
-        if not row:
-            raise ValueError(f"face_artifact_not_found: {face_artifact_id}")
+        if face_artifact_id:
+            row = await self.artifacts.get_artifact_by_id(str(face_artifact_id))
+            if not row:
+                raise ValueError(f"face_artifact_not_found: {face_artifact_id}")
 
-        kind = str(row.get("kind") or "")
-        if kind and kind not in ("face", "image", "face_image"):
-            logger.warning(
-                "face_artifact_kind_unexpected",
-                extra={"job_id": job_id, "kind": kind, "artifact_id": str(face_artifact_id)},
+            kind = str(row.get("kind") or "")
+            if kind and kind not in ("face", "image", "face_image"):
+                logger.warning(
+                    "face_artifact_kind_unexpected",
+                    extra={"job_id": job_id, "kind": kind, "artifact_id": str(face_artifact_id)},
+                )
+
+            face_url = await self.artifact_service.mint_read_sas_for_artifact(
+                dict(row),
+                ttl_hours=self._sas_ttl_hours(),
             )
 
-        face_url = await self.artifact_service.mint_read_sas_for_artifact(
-            dict(row),
-            ttl_hours=self._sas_ttl_hours(),
-        )
+            await self.artifacts.add_artifact(
+                job_id,
+                "resolved_face_sas_url",
+                face_url,
+                content_type="text/uri-list",
+                meta_json={"source": "artifact_id", "artifact_id": str(face_artifact_id)},
+            )
+            return str(face_url)
 
-        await self.artifacts.add_artifact(
-            job_id,
-            "resolved_face_sas_url",
-            face_url,
-            content_type="text/uri-list",
-            meta_json={"source": "artifact_id", "artifact_id": str(face_artifact_id)},
-        )
-        return str(face_url)
+        direct_face_url = getattr(req, "face_image_url", None)
+        if direct_face_url:
+            refreshed_face_url = await self._refresh_input_url_if_azure_blob(str(direct_face_url))
+            if refreshed_face_url and refreshed_face_url != str(direct_face_url):
+                await self.artifacts.add_artifact(
+                    job_id,
+                    "resolved_face_sas_url",
+                    refreshed_face_url,
+                    content_type="text/uri-list",
+                    meta_json={"source": "face_image_url_refresh"},
+                )
+            return str(refreshed_face_url or direct_face_url)
+
+        raise ValueError("Provide face_image_url or face_artifact_id")
+
 
     async def _resolve_audio_url(self, job_id: str, req: FusionJobCreate) -> str:
         """
         Resolve audio input to a fetchable Azure Blob SAS URL.
-        """
-        if req.voice_audio and req.voice_audio.audio_url:
-            return str(req.voice_audio.audio_url)
 
+        Production rule:
+          - if voice_audio.audio_artifact_id or audio_asset_id is present, prefer it and mint a fresh SAS
+          - else if a direct Azure Blob URL is supplied, refresh the SAS
+          - else return the direct URL unchanged
+        """
         audio_artifact_id = None
-        if req.voice_audio and getattr(req.voice_audio, "audio_artifact_id", None):
-            audio_artifact_id = str(req.voice_audio.audio_artifact_id)
+        direct_audio_url = None
+        if req.voice_audio:
+            direct_audio_url = str(req.voice_audio.audio_url) if getattr(req.voice_audio, 'audio_url', None) else None
+            audio_artifact_id = (
+                str(getattr(req.voice_audio, 'audio_artifact_id', None) or '').strip()
+                or str(getattr(req.voice_audio, 'audio_asset_id', None) or '').strip()
+                or None
+            )
 
-        if not audio_artifact_id:
-            raise ValueError("voice_mode=audio requires voice_audio.audio_url or voice_audio.audio_artifact_id")
+        if audio_artifact_id:
+            row = await self.artifacts.get_artifact_by_id(audio_artifact_id)  # type: ignore[attr-defined]
+            if not row:
+                raise ValueError(f"audio_artifact_not_found: {audio_artifact_id}")
 
-        row = await self.artifacts.get_artifact_by_id(audio_artifact_id)  # type: ignore[attr-defined]
-        if not row:
-            raise ValueError(f"audio_artifact_not_found: {audio_artifact_id}")
-
-        audio_url = await self.artifact_service.mint_read_sas_for_artifact(
-            dict(row),
-            ttl_hours=self._sas_ttl_hours(),
-        )
-
-        await self.artifacts.add_artifact(
-            job_id,
-            "resolved_audio_sas_url",
-            audio_url,
-            content_type="text/uri-list",
-            meta_json={"source": "voice_audio.audio_artifact_id", "artifact_id": audio_artifact_id},
-        )
-        return str(audio_url)
-
-    async def _resolve_talking_photo_id(self, job_id: str, req: FusionJobCreate) -> str:
-        """
-        Resolve HeyGen talking_photo_id.
-
-        Preferred:
-          1) req.heygen_talking_photo_id
-          2) req.image_key (back-compat alias only if caller already stores talking_photo_id there)
-
-        Best-effort fallback:
-          3) resolve face URL and call existing HeyGenAssetsClient; if it returns a real
-             talking_photo_id / avatar_id / photo_avatar_id, use it.
-             If it only returns image_key, we record it for diagnostics but fail clearly.
-        """
-        if getattr(req, "heygen_talking_photo_id", None):
-            talking_photo_id = str(req.heygen_talking_photo_id).strip()
-            if not talking_photo_id:
-                raise ValueError("heygen_talking_photo_id is empty after strip")
+            audio_url = await self.artifact_service.mint_read_sas_for_artifact(
+                dict(row),
+                ttl_hours=self._sas_ttl_hours(),
+            )
 
             await self.artifacts.add_artifact(
                 job_id,
-                "heygen_talking_photo_id",
-                talking_photo_id,
-                content_type="text/plain",
-                meta_json={"source": "request_payload"},
+                "resolved_audio_sas_url",
+                audio_url,
+                content_type="text/uri-list",
+                meta_json={"source": "voice_audio.audio_artifact_id", "artifact_id": audio_artifact_id},
             )
-            return talking_photo_id
+            return str(audio_url)
 
-        if getattr(req, "image_key", None):
-            talking_photo_id = str(req.image_key).strip()
-            if talking_photo_id:
+        if direct_audio_url:
+            refreshed_audio_url = await self._refresh_input_url_if_azure_blob(direct_audio_url)
+            if refreshed_audio_url and refreshed_audio_url != direct_audio_url:
                 await self.artifacts.add_artifact(
                     job_id,
-                    "heygen_talking_photo_id",
-                    talking_photo_id,
-                    content_type="text/plain",
-                    meta_json={"source": "request_payload.image_key_alias"},
+                    "resolved_audio_sas_url",
+                    refreshed_audio_url,
+                    content_type="text/uri-list",
+                    meta_json={"source": "voice_audio.audio_url_refresh"},
                 )
-                return talking_photo_id
+            return str(refreshed_audio_url or direct_audio_url)
 
-        face_url = await self._resolve_face_url(job_id, req)
-        img_upload = await self.assets.create_talking_photo_from_url(face_url)
+        raise ValueError("voice_mode=audio requires voice_audio.audio_url or voice_audio.audio_artifact_id")
 
-        talking_photo_id = _extract_talking_photo_id(img_upload)
-        if talking_photo_id:
-            await self.artifacts.add_artifact(
-                job_id,
-                "heygen_talking_photo_id",
-                talking_photo_id,
-                content_type="text/plain",
-                meta_json={"provider": "heygen", "upload": img_upload},
-            )
-            return talking_photo_id
+    async def _resolve_talking_photo_id(self, job_id: str, req: FusionJobCreate) -> str:
+        raise ValueError("heygen_talking_photo_id flow is retired; use Hedra provider inputs instead")
 
-        image_key = (img_upload.get("data") or {}).get("image_key") or img_upload.get("image_key")
-        if image_key:
-            await self.artifacts.add_artifact(
-                job_id,
-                "heygen_image_key",
-                str(image_key),
-                content_type="text/plain",
-                meta_json={"provider": "heygen", "upload": img_upload},
-            )
-
-        raise ValueError(
-            "heygen_talking_photo_id is required for AV4/talking-photo flow. "
-            "Provide req.heygen_talking_photo_id (avatar look id), or upgrade HeyGenAssetsClient "
-            "to create/return a Photo Avatar talking_photo_id instead of only image_key."
+    async def _resolve_reference_image_urls(
+        self,
+        job_id: str,
+        payload_json: Dict[str, Any],
+    ) -> List[str]:
+        provider_options = self._coerce_dict(payload_json.get("provider_options"))
+        direct_urls = payload_json.get("reference_image_urls") or provider_options.get("reference_image_urls") or []
+        artifact_ids = (
+            payload_json.get("reference_image_artifact_ids")
+            or provider_options.get("reference_image_artifact_ids")
+            or []
         )
+
+        out: List[str] = []
+        seen = set()
+
+        def _append(url: Optional[str]) -> None:
+            if not url:
+                return
+            u = str(url).strip()
+            if not u or u in seen:
+                return
+            seen.add(u)
+            out.append(u)
+
+        if isinstance(direct_urls, list):
+            for item in direct_urls:
+                if item:
+                    _append(str(item))
+
+        if isinstance(artifact_ids, list):
+            for artifact_id in artifact_ids:
+                if not artifact_id:
+                    continue
+                row = await self.artifacts.get_artifact_by_id(str(artifact_id))
+                if not row:
+                    logger.warning(
+                        "reference_image_artifact_not_found",
+                        extra={"job_id": job_id, "artifact_id": str(artifact_id)},
+                    )
+                    continue
+                sas_url = await self.artifact_service.mint_read_sas_for_artifact(
+                    dict(row),
+                    ttl_hours=self._sas_ttl_hours(),
+                )
+                await self.artifacts.add_artifact(
+                    job_id,
+                    "resolved_reference_image_sas_url",
+                    sas_url,
+                    content_type="text/uri-list",
+                    meta_json={"source": "reference_image_artifact_id", "artifact_id": str(artifact_id)},
+                )
+                _append(str(sas_url))
+
+        return out
 
     # -------------------------------------------------------------------------
     # Job runner
     # -------------------------------------------------------------------------
     async def run_job(self, job_id: str) -> None:
+        logger.info("fusion.run_job start job_id=%s", job_id)
         job = await self.jobs.get_job(job_id)
         if not job:
             logger.warning("job_not_found", extra={"job_id": job_id})
             return
 
         status = str(job.get("status") or "")
-        if status in ("succeeded", "failed", "canceled"):
+        if status in ("blocked", "succeeded", "failed", "canceled"):
             logger.info("job_terminal_skip", extra={"job_id": job_id, "status": status})
             return
 
@@ -1134,27 +2658,50 @@ class FusionOrchestrator:
 
         req = FusionJobCreate.model_validate(payload_json)
 
-        provider_name = "heygen_av4"
+        provider_name = self._resolve_provider_name(payload_json.get("provider") or getattr(req, "provider", None))
+        logger.info("fusion.run_job loaded job_id=%s provider=%s status=%s voice_mode=%s", job_id, provider_name, status, req.voice_mode.value)
+        provider: Optional[ProviderClient] = None
+        provider_version = "direct.v2" if provider_name == "heygen_av4" else "v1"
+        if provider_name != "heygen_av4":
+            provider = self._get_provider(provider_name)
+            provider_version = str(getattr(provider, "provider_version", "v1") or "v1")
+
         req_hash = str(job["request_hash"])
-        idem = provider_idempotency_key(
-            provider_name,
-            f"{settings.HEYGEN_AV4_PAYLOAD_VERSION}.v2",
-            req_hash,
-        )
+        idem = provider_idempotency_key(provider_name, provider_version, req_hash)
         provider_idem = f"{idem}:{job_id}"
 
         run_id: Optional[str] = None
         provider_job_id: Optional[str] = None
-        talking_photo_id: Optional[str] = None
-        audio_url_to_use: Optional[str] = None
-        last_poll = None
+        last_poll: Optional[ProviderPollResult] = None
         performance_id: Optional[str] = None
+        prepared: Optional[ProviderPrepareResult] = None
         pricing: Dict[str, Any] = {}
 
         user_id = str(job.get("user_id") or "").strip()
 
         try:
-            if self._pricing_required() and not self._pricing_enabled():
+            pricing = await self._load_latest_pricing(job_id)
+            internal_child = self._is_internal_child_pricing(pricing) or self._is_internal_child_request_payload(payload_json)
+
+            # Backstop for longform child jobs created through older route/client shapes:
+            # if the payload carries nested suppression markers but the persisted pricing
+            # block is still a normal billable block, rewrite it before enforcing reserve.
+            if internal_child and not self._is_internal_child_pricing(pricing):
+                pricing = self._build_internal_child_pricing_block(
+                    req=req,
+                    payload_json=payload_json,
+                    provider_name=provider_name,
+                )
+                await self._persist_pricing_block(job_id, pricing)
+                logger.info(
+                    "fusion.run_job_internal_child_pricing_suppressed job_id=%s provider=%s parent_job_id=%s segment_id=%s",
+                    job_id,
+                    provider_name,
+                    pricing.get("parent_longform_job_id") or pricing.get("billing_parent_job_id"),
+                    pricing.get("segment_id"),
+                )
+
+            if (not internal_child) and self._pricing_required() and not self._pricing_enabled():
                 reason = self._pricing_disabled_reason()
                 await self.jobs.set_status(
                     job_id,
@@ -1164,8 +2711,7 @@ class FusionOrchestrator:
                 )
                 return
 
-            pricing = await self._load_latest_pricing(job_id)
-            if self._pricing_enabled():
+            if self._pricing_enabled() and not internal_child:
                 latest_pricing = await self._await_reserved_pricing(job_id)
                 if latest_pricing:
                     pricing = latest_pricing
@@ -1191,51 +2737,270 @@ class FusionOrchestrator:
                     )
                     return
 
-            await self.steps.upsert_step(job_id, StepCode.provider_submit.value, "running", attempt=0)
-
-            talking_photo_id = await self._resolve_talking_photo_id(job_id, req)
-
-            if req.voice_mode.value == "audio":
-                audio_url_to_use = await self._resolve_audio_url(job_id, req)
-
-                await self.artifacts.add_artifact(
-                    job_id,
-                    "provider_audio_ref",
-                    audio_url_to_use,
-                    content_type="text/uri-list",
-                    meta_json={"provider": "azure_blob"},
+            if provider_name == "heygen_av4":
+                provider_timeout_s = max(
+                    300,
+                    int(os.getenv("DF_FUSION_HEYGEN_TIMEOUT_SECONDS", "600") or "600"),
                 )
-
-                await self.artifacts.add_artifact(
-                    job_id,
-                    "heygen_audio_url",
-                    audio_url_to_use,
-                    content_type="text/uri-list",
-                    meta_json={"provider": "azure_blob"},
+                poll_interval_s = max(
+                    3,
+                    int(os.getenv("DF_FUSION_PROVIDER_POLL_SECONDS", "5") or "5"),
                 )
-
-            video_title = f"desifaces_fusion_{job_id}"
-            av4_payload = build_av4_payload(
-                req,
-                talking_photo_id=talking_photo_id,
-                video_title=video_title,
-                audio_url_override=audio_url_to_use,
-            )
-
-            try:
-                await self.steps.upsert_step(
-                    job_id,
-                    StepCode.provider_submit.value,
-                    "running",
-                    attempt=0,
-                    meta_json={
-                        "talking_photo_id": talking_photo_id,
-                        "audio_url_present": bool(audio_url_to_use),
-                        "idempotency_key": provider_idem,
+                retry_after_s = max(
+                    30,
+                    int(os.getenv("DF_FUSION_HEYGEN_RETRY_AFTER_SECONDS", "60") or "60"),
+                )
+                logger.info(
+                    "fusion_provider_routing",
+                    extra={
+                        "job_id": job_id,
+                        "provider": provider_name,
+                        "provider_version": provider_version,
+                        "provider_timeout_s": provider_timeout_s,
+                        "poll_interval_s": poll_interval_s,
                     },
                 )
-            except Exception:
-                pass
+                await self.steps.upsert_step(job_id, StepCode.provider_submit.value, "running", attempt=0)
+
+                existing = self._coerce_dict(await self.runs.get_by_idempotency_key(provider_idem))
+                existing_provider_job_id = str(existing.get("provider_job_id") or "").strip()
+                if existing_provider_job_id:
+                    provider_job_id = existing_provider_job_id
+                    run_id = str(existing.get("id") or "") or None
+                    submit_meta = self._coerce_dict(existing.get("meta_json"))
+                    logger.info(
+                        "reuse_provider_job_same_job_only",
+                        extra={"job_id": job_id, "provider_job_id": provider_job_id, "idempotency_key": provider_idem},
+                    )
+                else:
+                    request_json = {
+                        "provider": provider_name,
+                        "voice_mode": req.voice_mode.value,
+                        "video": req.video.model_dump(),
+                        "prompt_preview": self._extract_video_direction_prompt(payload_json)[:160] or None,
+                    }
+                    run_id = await self.runs.create_run(
+                        job_id=job_id,
+                        provider=provider_name,
+                        idempotency_key=provider_idem,
+                        request_json=request_json,
+                    )
+                    logger.info("fusion.heygen submit start job_id=%s provider_idem=%s", job_id, provider_idem)
+                    heygen_submit = await self._run_heygen_direct_job(
+                        job_id=job_id,
+                        req=req,
+                        provider_idem=provider_idem,
+                        payload_json=payload_json,
+                    )
+                    provider_job_id = str(heygen_submit.get("provider_job_id") or "").strip()
+                    submit_meta = self._coerce_dict(heygen_submit.get("submit_meta"))
+                    raw_response = self._coerce_dict(heygen_submit.get("raw_response"))
+                    if run_id:
+                        await self.runs.mark_submitted(run_id, provider_job_id or provider_idem, raw_response)
+                        await self.runs.update_status(
+                            run_id,
+                            "processing",
+                            meta_json={
+                                "raw": raw_response,
+                                "provider_job_id": provider_job_id,
+                                "provider": provider_name,
+                                "submit_meta": submit_meta,
+                            },
+                        )
+
+                    await self.steps.upsert_step(
+                        job_id,
+                        StepCode.provider_submit.value,
+                        "succeeded",
+                        attempt=0,
+                        meta_json={
+                            "provider": provider_name,
+                            "provider_job_id": provider_job_id,
+                            "idempotency_key": provider_idem,
+                            "submit_meta": submit_meta,
+                        },
+                    )
+
+                await self.jobs.set_status(job_id, "processing")
+                await self._persist_light_status(job_id, provider=provider_name, provider_job_id=provider_job_id or provider_idem, provider_status="processing")
+
+                performance_id = await self.perfs.upsert_performance(
+                    user_id=str(job["user_id"]),
+                    provider=provider_name,
+                    provider_job_id=provider_job_id or provider_idem,
+                    status="processing",
+                    share_url=None,
+                    meta_json={
+                        "job_id": job_id,
+                        "request_hash": req_hash,
+                        "idempotency_key": provider_idem,
+                        "voice_mode": req.voice_mode.value,
+                        "provider_version": provider_version,
+                        "prompt_preview": self._extract_video_direction_prompt(payload_json)[:160] or None,
+                    },
+                )
+                await self.perfs.upsert_fusion_job_output(job_id, performance_id)
+                await self.steps.upsert_step(
+                    job_id,
+                    StepCode.provider_poll.value,
+                    "running",
+                    attempt=0,
+                    meta_json={"provider_job_id": provider_job_id, "provider": provider_name},
+                )
+
+                started = asyncio.get_running_loop().time()
+                last_status = None
+                poll_errors = 0
+                while True:
+                    elapsed = asyncio.get_running_loop().time() - started
+                    if elapsed > provider_timeout_s:
+                        logger.error("fusion.heygen poll timeout job_id=%s provider_job_id=%s elapsed_s=%s last_status=%s", job_id, provider_job_id, int(elapsed), last_status)
+                        await self._mark_job_processing_for_retry(
+                            job_id=job_id,
+                            provider_name=provider_name,
+                            provider_job_id=provider_job_id or provider_idem,
+                            run_id=run_id,
+                            performance_id=performance_id,
+                            user_id=str(job["user_id"]),
+                            reason="heygen_poll_timeout_pending_retry",
+                            retry_after_s=retry_after_s,
+                            meta_json={"elapsed_s": int(elapsed)},
+                        )
+                        return
+
+                    try:
+                        poll_data = await self._poll_heygen_direct_job(provider_job_id or provider_idem)
+                        poll_errors = 0
+                    except Exception as exc:
+                        poll_errors += 1
+                        if poll_errors >= 5:
+                            await self._mark_job_processing_for_retry(
+                                job_id=job_id,
+                                provider_name=provider_name,
+                                provider_job_id=provider_job_id or provider_idem,
+                                run_id=run_id,
+                                performance_id=performance_id,
+                                user_id=str(job["user_id"]),
+                                reason="heygen_poll_error_pending_retry",
+                                retry_after_s=retry_after_s,
+                                meta_json={"poll_errors": poll_errors, "last_error": str(exc)},
+                            )
+                            return
+                        await asyncio.sleep(_adaptive_provider_poll_interval_seconds(elapsed_s=elapsed, provider_name=provider_name, base_interval_s=poll_interval_s))
+                        continue
+
+                    raw_status = str(poll_data.get("status") or "").strip()
+                    normalized_status = _normalize_provider_status(raw_status)
+                    video_url = str(poll_data.get("video_url") or "").strip()
+                    if raw_status != last_status:
+                        logger.info("fusion.heygen poll transition job_id=%s provider_job_id=%s raw_status=%s normalized_status=%s elapsed_s=%s has_video_url=%s", job_id, provider_job_id, raw_status, normalized_status, int(elapsed), bool(video_url))
+                    last_poll = ProviderPollResult(
+                        status=normalized_status if normalized_status != "unknown" else (raw_status or "processing"),
+                        video_url=video_url or None,
+                        raw_response=self._coerce_dict(poll_data.get("raw_response")),
+                        error_message=self._string_or_none(poll_data.get("error_message")),
+                    )
+
+                    if run_id and raw_status != last_status:
+                        last_status = raw_status
+                        try:
+                            await self.runs.update_status(
+                                run_id,
+                                normalized_status if normalized_status != "unknown" else (raw_status or "processing"),
+                                meta_json={
+                                    "raw": poll_data.get("raw_response"),
+                                    "provider_job_id": provider_job_id,
+                                    "raw_status": raw_status,
+                                    "normalized_status": normalized_status,
+                                    "provider": provider_name,
+                                },
+                            )
+                        except Exception:
+                            logger.warning(
+                                "provider_run_status_update_failed",
+                                extra={"job_id": job_id, "run_id": run_id},
+                            )
+
+                    if video_url:
+                        await self.steps.upsert_step(job_id, StepCode.provider_poll.value, "succeeded", attempt=0)
+                        break
+
+                    if normalized_status == "processing":
+                        await self._persist_light_status(job_id, provider=provider_name, provider_job_id=provider_job_id, provider_status=normalized_status)
+                        await asyncio.sleep(_adaptive_provider_poll_interval_seconds(elapsed_s=elapsed, provider_name=provider_name, base_interval_s=poll_interval_s))
+                        continue
+
+                    if normalized_status == "failed":
+                        raise RuntimeError(poll_data.get("error_message") or f"HeyGen failed with status={raw_status!r}")
+
+                    if normalized_status == "canceled":
+                        raise RuntimeError(f"HeyGen canceled with status={raw_status!r}")
+
+                    if normalized_status == "succeeded":
+                        raise RuntimeError("HeyGen returned succeeded but video_url is missing")
+
+                    await self._persist_light_status(job_id, provider=provider_name, provider_job_id=provider_job_id, provider_status=normalized_status)
+                    await asyncio.sleep(_adaptive_provider_poll_interval_seconds(elapsed_s=elapsed, provider_name=provider_name, base_interval_s=poll_interval_s))
+
+                await self.steps.upsert_step(job_id, StepCode.finalize.value, "running", attempt=0)
+                logger.info("fusion finalize start job_id=%s provider=%s provider_job_id=%s video_url=%s", job_id, provider_name, provider_job_id, _preview_url(last_poll.video_url if last_poll else None))
+                final_video_url = await self.artifact_service.persist_video_artifact(
+                    str(last_poll.video_url),
+                    user_id=str(job["user_id"]),
+                    job_id=job_id,
+                    provider_job_id=provider_job_id or provider_idem,
+                )
+                await self.artifacts.add_artifact(
+                    job_id,
+                    "video",
+                    final_video_url,
+                    content_type="video/mp4",
+                    meta_json={
+                        "provider": provider_name,
+                        "provider_job_id": provider_job_id or provider_idem,
+                        "provider_meta": submit_meta,
+                    },
+                )
+                await self._persist_thumbnail_fallback_artifact(
+                    job_id=job_id,
+                    req=req,
+                    provider_name=provider_name,
+                    provider_job_id=provider_job_id or provider_idem,
+                )
+                await self._persist_light_status(job_id, provider=provider_name, provider_job_id=provider_job_id or provider_idem, provider_status="succeeded", primary_video_url=final_video_url)
+
+                if performance_id:
+                    try:
+                        await self.perfs.mark_ready(
+                            performance_id,
+                            share_url=None,
+                            meta_json={
+                                "job_id": job_id,
+                                "provider_job_id": provider_job_id or provider_idem,
+                                "video_url": final_video_url,
+                                "status": "ready",
+                                "user_id": str(job["user_id"]),
+                                "provider": provider_name,
+                            },
+                        )
+                    except Exception:
+                        logger.warning(
+                            "perf_mark_ready_failed",
+                            extra={"job_id": job_id, "performance_id": performance_id},
+                        )
+
+                pricing = await self._commit_pricing_for_job(
+                    job_id=job_id,
+                    user_id=user_id,
+                    pricing=pricing,
+                    actual_units=self._requested_billed_units(req),
+                )
+
+                await self.steps.upsert_step(job_id, StepCode.finalize.value, "succeeded", attempt=0)
+                await self.jobs.set_status(job_id, "succeeded")
+                return
+
+            await self.steps.upsert_step(job_id, StepCode.provider_submit.value, "running", attempt=0)
 
             existing = self._coerce_dict(await self.runs.get_by_idempotency_key(provider_idem))
             existing_provider_job_id = str(existing.get("provider_job_id") or "").strip()
@@ -1248,20 +3013,87 @@ class FusionOrchestrator:
                     extra={"job_id": job_id, "provider_job_id": provider_job_id, "idempotency_key": provider_idem},
                 )
             else:
+                resolved_face_url = await self._resolve_face_url(job_id, req)
+                resolved_audio_url = None
+                has_explicit_voice_audio = bool(
+                    req.voice_audio and (
+                        getattr(req.voice_audio, "audio_url", None)
+                        or getattr(req.voice_audio, "audio_artifact_id", None)
+                        or getattr(req.voice_audio, "audio_asset_id", None)
+                    )
+                )
+                if req.voice_mode.value == "audio" and has_explicit_voice_audio:
+                    resolved_audio_url = await self._resolve_audio_url(job_id, req)
+                    await self.artifacts.add_artifact(
+                        job_id,
+                        "provider_audio_ref",
+                        resolved_audio_url,
+                        content_type="text/uri-list",
+                        meta_json={"provider": provider_name},
+                    )
+
+                cached_prepared = await self._load_provider_prepare_cache(job_id, provider_name=provider_name)
+                if cached_prepared is not None:
+                    prepared = cached_prepared
+                    logger.info("fusion provider prepare cache hit job_id=%s provider=%s request_keys=%s", job_id, provider_name, sorted((prepared.request_json or {}).keys()))
+                else:
+                    reference_image_urls = await self._resolve_reference_image_urls(job_id, payload_json)
+                    logger.info("fusion provider inputs job_id=%s provider=%s face_url=%s has_audio=%s reference_image_count=%s", job_id, provider_name, _preview_url(resolved_face_url), bool(resolved_audio_url), len(reference_image_urls))
+
+                    prepared = await provider.prepare(
+                        ProviderPrepareInput(
+                            job_id=job_id,
+                            user_id=user_id,
+                            request_payload=payload_json,
+                            resolved_face_url=resolved_face_url,
+                            resolved_audio_url=resolved_audio_url,
+                            reference_image_urls=reference_image_urls,
+                        )
+                    )
+                    await self._persist_provider_prepare_cache(
+                        job_id,
+                        provider_name=prepared.provider_name,
+                        provider_version=prepared.provider_version,
+                        request_json=prepared.request_json,
+                        submit_meta=prepared.submit_meta,
+                        resolved_face_url=resolved_face_url,
+                        resolved_audio_url=resolved_audio_url,
+                        reference_image_urls=reference_image_urls,
+                    )
+
+                logger.info("fusion provider prepared job_id=%s provider=%s prepared=%s", job_id, provider_name, self._prepared_log_meta(prepared))
+                try:
+                    await self.steps.upsert_step(
+                        job_id,
+                        StepCode.provider_submit.value,
+                        "running",
+                        attempt=0,
+                        meta_json={
+                            "provider": prepared.provider_name,
+                            "provider_version": prepared.provider_version,
+                            "idempotency_key": provider_idem,
+                            "submit_meta": prepared.submit_meta,
+                        },
+                    )
+                except Exception:
+                    pass
+
                 run_id = await self.runs.create_run(
                     job_id=job_id,
                     provider=provider_name,
                     idempotency_key=provider_idem,
-                    request_json=av4_payload,
+                    request_json=prepared.request_json,
                 )
-                submit_res = await self.provider.submit(av4_payload, provider_idem)
+                logger.info("fusion provider submit start job_id=%s provider=%s provider_idem=%s", job_id, provider_name, provider_idem)
+                submit_res: ProviderSubmitResult = await provider.submit(prepared.request_json, provider_idem)
                 provider_job_id = submit_res.provider_job_id
+                logger.info("fusion provider submit ok job_id=%s provider=%s provider_job_id=%s raw_response_keys=%s", job_id, provider_name, provider_job_id, sorted(self._coerce_dict(submit_res.raw_response).keys()))
                 if not provider_job_id:
-                    raise HeyGenApiError("provider_job_id missing after submit")
+                    raise FusionProviderError("provider_job_id missing after submit")
                 await self.runs.mark_submitted(run_id, provider_job_id, submit_res.raw_response)
 
             if not provider_job_id:
-                raise HeyGenApiError("provider_job_id missing after submit/reuse")
+                raise FusionProviderError("provider_job_id missing after submit/reuse")
 
             await self.steps.upsert_step(
                 job_id,
@@ -1269,9 +3101,10 @@ class FusionOrchestrator:
                 "succeeded",
                 attempt=0,
                 meta_json={
+                    "provider": provider_name,
                     "provider_job_id": provider_job_id,
                     "idempotency_key": provider_idem,
-                    "talking_photo_id": talking_photo_id,
+                    "submit_meta": prepared.submit_meta if prepared else {},
                 },
             )
 
@@ -1285,9 +3118,8 @@ class FusionOrchestrator:
                     "job_id": job_id,
                     "request_hash": req_hash,
                     "idempotency_key": provider_idem,
-                    "talking_photo_id": talking_photo_id,
                     "voice_mode": req.voice_mode.value,
-                    "payload_version": f"{settings.HEYGEN_AV4_PAYLOAD_VERSION}.v2",
+                    "provider_version": provider_version,
                 },
             )
             await self.perfs.upsert_fusion_job_output(job_id, performance_id)
@@ -1297,7 +3129,7 @@ class FusionOrchestrator:
                 StepCode.provider_poll.value,
                 "running",
                 attempt=0,
-                meta_json={"provider_job_id": provider_job_id},
+                meta_json={"provider_job_id": provider_job_id, "provider": provider_name},
             )
 
             started = asyncio.get_running_loop().time()
@@ -1309,16 +3141,31 @@ class FusionOrchestrator:
             while True:
                 elapsed = asyncio.get_running_loop().time() - started
                 if elapsed > provider_timeout_s:
-                    raise HeyGenApiError(f"Provider polling timed out after {int(elapsed)}s")
+                    logger.error("fusion provider poll timeout job_id=%s provider=%s provider_job_id=%s elapsed_s=%s last_status=%s last_poll=%s", job_id, provider_name, provider_job_id, int(elapsed), last_status, self._poll_log_meta(last_poll))
+                    recovered = await self._attempt_provider_timeout_recovery(
+                        provider=provider,
+                        provider_name=provider_name,
+                        provider_job_id=provider_job_id,
+                        job_id=job_id,
+                        attempts=3,
+                        sleep_s=2.0,
+                    )
+                    recovered_video_url = str(getattr(recovered, "video_url", None) or "").strip() if recovered else ""
+                    if recovered_video_url:
+                        logger.info("fusion provider timeout recovery succeeded job_id=%s provider=%s provider_job_id=%s video_url=%s", job_id, provider_name, provider_job_id, _preview_url(recovered_video_url))
+                        last_poll = recovered
+                        break
+                    raise FusionProviderError("Provider polling timed out after %ss provider=%s provider_job_id=%s last_status=%s" % (int(elapsed), provider_name, provider_job_id, last_status or "<unset>"))
 
                 try:
-                    poll = await self.provider.poll(provider_job_id)
+                    poll = await provider.poll(provider_job_id)
                     poll_errors = 0
                 except Exception as exc:
                     poll_errors += 1
+                    logger.warning("fusion provider poll error job_id=%s provider=%s provider_job_id=%s poll_errors=%s error=%s", job_id, provider_name, provider_job_id, poll_errors, str(exc))
                     if poll_errors >= 5:
-                        raise HeyGenApiError(f"Provider poll failed repeatedly: {exc}") from exc
-                    await asyncio.sleep(poll_interval_s)
+                        raise FusionProviderError("Provider poll failed repeatedly provider=%s provider_job_id=%s: %s" % (provider_name, provider_job_id, exc)) from exc
+                    await asyncio.sleep(_adaptive_provider_poll_interval_seconds(elapsed_s=elapsed, provider_name=provider_name, base_interval_s=poll_interval_s))
                     continue
 
                 last_poll = poll
@@ -1326,6 +3173,9 @@ class FusionOrchestrator:
                 raw_status = str(getattr(poll, "status", None) or "").strip()
                 normalized_status = _normalize_provider_status(raw_status)
                 video_url = str(getattr(poll, "video_url", None) or "").strip()
+                if raw_status != last_status:
+                    logger.info("fusion provider poll transition job_id=%s provider=%s provider_job_id=%s raw_status=%s normalized_status=%s elapsed_s=%s has_video_url=%s error_message=%s", job_id, provider_name, provider_job_id, raw_status, normalized_status, int(elapsed), bool(video_url), getattr(poll, "error_message", None))
+                    await self._persist_light_status(job_id, provider=provider_name, provider_job_id=provider_job_id, provider_status=normalized_status or raw_status, error_message=getattr(poll, "error_message", None))
 
                 if run_id and raw_status != last_status:
                     last_status = raw_status
@@ -1338,6 +3188,7 @@ class FusionOrchestrator:
                                 "provider_job_id": provider_job_id,
                                 "raw_status": raw_status,
                                 "normalized_status": normalized_status,
+                                "provider": provider_name,
                             },
                         )
                     except Exception:
@@ -1356,13 +3207,14 @@ class FusionOrchestrator:
                                 "provider_job_id": provider_job_id,
                                 "raw_status": raw_status,
                                 "normalized_status": normalized_status,
+                                "provider": provider_name,
                             },
                         )
                     await self.steps.upsert_step(job_id, StepCode.provider_poll.value, "succeeded", attempt=0)
                     break
 
                 if normalized_status == "processing":
-                    await asyncio.sleep(poll_interval_s)
+                    await asyncio.sleep(_adaptive_provider_poll_interval_seconds(elapsed_s=elapsed, provider_name=provider_name, base_interval_s=poll_interval_s))
                     continue
 
                 if normalized_status == "failed":
@@ -1376,9 +3228,10 @@ class FusionOrchestrator:
                                 "provider_job_id": provider_job_id,
                                 "raw_status": raw_status,
                                 "normalized_status": normalized_status,
+                                "provider": provider_name,
                             },
                         )
-                    raise HeyGenApiError(poll.error_message or f"Provider failed with status={raw_status!r}")
+                    raise FusionProviderError(poll.error_message or f"Provider failed with status={raw_status!r}")
 
                 if normalized_status == "canceled":
                     if run_id:
@@ -1391,9 +3244,10 @@ class FusionOrchestrator:
                                 "provider_job_id": provider_job_id,
                                 "raw_status": raw_status,
                                 "normalized_status": normalized_status,
+                                "provider": provider_name,
                             },
                         )
-                    raise HeyGenApiError(f"Provider canceled with status={raw_status!r}")
+                    raise FusionProviderError(f"Provider canceled with status={raw_status!r}")
 
                 if normalized_status == "succeeded":
                     if run_id:
@@ -1406,11 +3260,13 @@ class FusionOrchestrator:
                                 "provider_job_id": provider_job_id,
                                 "raw_status": raw_status,
                                 "normalized_status": normalized_status,
+                                "provider": provider_name,
                             },
                         )
-                    raise HeyGenApiError("Provider returned succeeded but video_url is missing")
+                    raise FusionProviderError("Provider returned succeeded but video_url is missing")
 
-                await asyncio.sleep(poll_interval_s)
+                await self._persist_light_status(job_id, provider=provider_name, provider_job_id=provider_job_id, provider_status=normalized_status)
+                await asyncio.sleep(_adaptive_provider_poll_interval_seconds(elapsed_s=elapsed, provider_name=provider_name, base_interval_s=poll_interval_s))
 
             await self.steps.upsert_step(job_id, StepCode.finalize.value, "running", attempt=0)
 
@@ -1429,33 +3285,25 @@ class FusionOrchestrator:
                 meta_json={
                     "provider": provider_name,
                     "provider_job_id": provider_job_id,
-                    "talking_photo_id": talking_photo_id,
+                    "provider_meta": prepared.submit_meta if prepared else {},
                 },
             )
+            await self._persist_thumbnail_fallback_artifact(
+                job_id=job_id,
+                req=req,
+                provider_name=provider_name,
+                provider_job_id=provider_job_id,
+            )
+            await self._persist_light_status(job_id, provider=provider_name, provider_job_id=provider_job_id, provider_status="succeeded", primary_video_url=final_video_url)
 
-            share_url_val: Optional[str] = None
-            try:
-                get_share = getattr(self.provider, "get_share_url", None)
-                if callable(get_share):
-                    share = await get_share(provider_job_id)
-                    share_url = (share or {}).get("share_url")
-                    if share_url:
-                        share_url_val = str(share_url)
-                        await self.artifacts.add_artifact(
-                            job_id,
-                            "share_url",
-                            share_url_val,
-                            content_type="text/uri-list",
-                            meta_json={
-                                "provider": provider_name,
-                                "provider_job_id": provider_job_id,
-                                "raw": (share or {}).get("raw"),
-                            },
-                        )
-            except Exception as e:
-                logger.warning(
-                    "share_url_failed",
-                    extra={"job_id": job_id, "provider_job_id": provider_job_id, "error": str(e)},
+            share_url_val: Optional[str] = getattr(last_poll, "share_url", None) or None
+            if share_url_val:
+                await self.artifacts.add_artifact(
+                    job_id,
+                    "share_url",
+                    share_url_val,
+                    content_type="text/uri-list",
+                    meta_json={"provider": provider_name, "provider_job_id": provider_job_id},
                 )
 
             if performance_id:
@@ -1469,6 +3317,7 @@ class FusionOrchestrator:
                             "video_url": final_video_url,
                             "status": "ready",
                             "user_id": str(job["user_id"]),
+                            "provider": provider_name,
                         },
                     )
                 except Exception:
@@ -1481,11 +3330,12 @@ class FusionOrchestrator:
                 job_id=job_id,
                 user_id=user_id,
                 pricing=pricing,
-                actual_units=1,
+                actual_units=self._requested_billed_units(req),
             )
 
             await self.steps.upsert_step(job_id, StepCode.finalize.value, "succeeded", attempt=0)
             await self.jobs.set_status(job_id, "succeeded")
+            logger.info("fusion.run_job succeeded job_id=%s provider=%s provider_job_id=%s final_video_url=%s", job_id, provider_name, provider_job_id, _preview_url(final_video_url))
             return
 
         except Exception as e:
@@ -1499,18 +3349,19 @@ class FusionOrchestrator:
                     "error": msg,
                     "provider_job_id": provider_job_id,
                     "run_id": run_id,
-                    "talking_photo_id": talking_photo_id,
                     "performance_id": performance_id,
+                    "provider": provider_name,
                 },
             )
 
             try:
-                pricing = await self._release_pricing_for_job(
-                    job_id=job_id,
-                    user_id=user_id,
-                    pricing=pricing,
-                    reason=code.lower(),
-                )
+                if not self._is_internal_child_pricing(pricing):
+                    pricing = await self._release_pricing_for_job(
+                        job_id=job_id,
+                        user_id=user_id,
+                        pricing=pricing,
+                        reason=code.lower(),
+                    )
             except Exception:
                 logger.exception("fusion_pricing_release_in_except_failed", extra={"job_id": job_id})
 
@@ -1524,10 +3375,22 @@ class FusionOrchestrator:
                             "error": msg,
                             "provider_job_id": provider_job_id,
                             "user_id": str(job["user_id"]),
+                            "provider": provider_name,
                         },
                     )
             except Exception:
                 pass
+
+            try:
+                await self._persist_light_status(
+                    job_id,
+                    provider=provider_name,
+                    provider_job_id=provider_job_id,
+                    provider_status=("provider_degraded_retrying" if code == "PROVIDER_DEGRADED" else "failed"),
+                    error_message=msg,
+                )
+            except Exception:
+                logger.warning("fusion_light_status_update_failed_on_error", extra={"job_id": job_id})
 
             await self.jobs.set_status(job_id, "failed", error_code=code, error_message=msg)
 
@@ -1544,6 +3407,7 @@ class FusionOrchestrator:
                             "request_hash": req_hash,
                             "idempotency_key": provider_idem,
                             "user_id": str(job["user_id"]),
+                            "provider": provider_name,
                         },
                     )
                     await self.perfs.upsert_fusion_job_output(job_id, performance_id)
@@ -1553,7 +3417,7 @@ class FusionOrchestrator:
                         performance_id,
                         error_code=code,
                         error_message=msg,
-                        meta_json={"job_id": job_id, "user_id": str(job["user_id"])},
+                        meta_json={"job_id": job_id, "user_id": str(job["user_id"]), "provider": provider_name},
                     )
             except Exception:
                 logger.warning(

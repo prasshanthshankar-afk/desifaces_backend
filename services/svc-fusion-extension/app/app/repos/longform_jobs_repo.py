@@ -1,7 +1,9 @@
+
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
 import json
+from typing import Any, Dict, List, Optional
+
 import asyncpg
 
 
@@ -19,9 +21,6 @@ def _normalize_bearer(token: Optional[str]) -> Optional[str]:
 
 
 def _norm_gender_mode(v: Optional[str]) -> str:
-    """
-    DB is NOT NULL DEFAULT 'auto'. We always return a concrete value.
-    """
     s = (v or "").strip().lower()
     if not s:
         return "auto"
@@ -37,6 +36,10 @@ def _norm_gender(v: Optional[str]) -> Optional[str]:
     if s not in ("male", "female"):
         raise ValueError(f"invalid voice_gender: {v}")
     return s
+
+
+def _jsonb(value: Optional[Dict[str, Any]]) -> str:
+    return json.dumps(value or {})
 
 
 class LongformJobsRepo:
@@ -57,17 +60,13 @@ class LongformJobsRepo:
         tags: Dict[str, Any],
         total_segments: int,
         auth_token: Optional[str] = None,
-        voice_gender_mode: Optional[str] = None,  # "auto" | "manual"
-        voice_gender: Optional[str] = None,       # "male" | "female" | None
+        voice_gender_mode: Optional[str] = None,
+        voice_gender: Optional[str] = None,
     ) -> str:
-        voice_cfg_json = json.dumps(voice_cfg or {})
-        tags_json = json.dumps(tags or {})
         auth_token_norm = _normalize_bearer(auth_token)
-
         vg = _norm_gender(voice_gender)
         vgm = _norm_gender_mode(voice_gender_mode)
 
-        # If caller specifies gender explicitly, force manual.
         if vg:
             vgm = "manual"
 
@@ -112,8 +111,8 @@ class LongformJobsRepo:
             aspect_ratio,
             int(segment_seconds),
             int(max_segment_seconds),
-            voice_cfg_json,
-            tags_json,
+            _jsonb(voice_cfg),
+            _jsonb(tags),
             script_text,
             int(total_segments),
             auth_token_norm,
@@ -122,15 +121,78 @@ class LongformJobsRepo:
         )
         return str(row["id"])
 
-    async def get_job(self, conn: asyncpg.Connection, job_id: str, user_id: str) -> Optional[asyncpg.Record]:
+    async def get_job(self, conn: asyncpg.Connection, job_id: str, user_id: Optional[str] = None) -> Optional[asyncpg.Record]:
+        if user_id:
+            return await conn.fetchrow(
+                """
+                select *
+                from public.longform_jobs
+                where id = $1::uuid and user_id = $2::uuid
+                """,
+                job_id,
+                user_id,
+            )
         return await conn.fetchrow(
             """
             select *
             from public.longform_jobs
-            where id = $1::uuid and user_id = $2::uuid
+            where id = $1::uuid
             """,
             job_id,
+        )
+
+    async def list_jobs(self, conn: asyncpg.Connection, user_id: str, limit: int = 20) -> List[asyncpg.Record]:
+        return await conn.fetch(
+            """
+            select *
+            from public.longform_jobs
+            where user_id = $1::uuid
+            order by created_at desc
+            limit $2::int
+            """,
             user_id,
+            int(limit),
+        )
+
+    async def set_status(
+        self,
+        conn: asyncpg.Connection,
+        job_id: str,
+        status: str,
+        *,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        await conn.execute(
+            """
+            update public.longform_jobs
+            set
+              status = $2::text,
+              error_code = coalesce($3::text, error_code),
+              error_message = case
+                when $4::text is null then error_message
+                else left($4::text, 4000)
+              end
+            where id = $1::uuid
+            """,
+            job_id,
+            status,
+            error_code,
+            error_message,
+        )
+
+    async def set_counts(self, conn: asyncpg.Connection, job_id: str, total_segments: int, completed_segments: int) -> None:
+        await conn.execute(
+            """
+            update public.longform_jobs
+            set
+              total_segments = $2::int,
+              completed_segments = $3::int
+            where id = $1::uuid
+            """,
+            job_id,
+            int(total_segments),
+            int(completed_segments),
         )
 
     async def bump_completed(self, conn: asyncpg.Connection, job_id: str) -> None:
@@ -146,4 +208,49 @@ class LongformJobsRepo:
             where id = $1::uuid
             """,
             job_id,
+        )
+
+    async def set_final(self, conn: asyncpg.Connection, job_id: str, storage_path: str, signed_url: str) -> None:
+        await conn.execute(
+            """
+            update public.longform_jobs
+            set
+              final_storage_path = $2::text,
+              final_video_url = $3::text
+            where id = $1::uuid
+            """,
+            job_id,
+            storage_path,
+            signed_url,
+        )
+
+    async def update_tags(self, conn: asyncpg.Connection, job_id: str, tags: Dict[str, Any]) -> None:
+        await conn.execute(
+            """
+            update public.longform_jobs
+            set tags = $2::jsonb
+            where id = $1::uuid
+            """,
+            job_id,
+            _jsonb(tags),
+        )
+
+    async def merge_tags(self, conn: asyncpg.Connection, job_id: str, patch: Dict[str, Any]) -> None:
+        await conn.execute(
+            """
+            update public.longform_jobs
+            set tags = coalesce(tags, '{}'::jsonb) || $2::jsonb
+            where id = $1::uuid
+            """,
+            job_id,
+            _jsonb(patch),
+        )
+
+    async def mark_failed(self, conn: asyncpg.Connection, job_id: str, *, error_code: str, error_message: str) -> None:
+        await self.set_status(
+            conn,
+            job_id,
+            "failed",
+            error_code=error_code,
+            error_message=error_message,
         )

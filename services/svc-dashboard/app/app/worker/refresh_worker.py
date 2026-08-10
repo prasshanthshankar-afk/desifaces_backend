@@ -1,11 +1,16 @@
+from __future__ import annotations
+
 import asyncio
+import logging
 import signal
-import asyncpg
 from typing import List
 
-from app.settings import settings
-from app.db import init_db_pool, close_db_pool, get_pool
+import asyncpg
 
+from app.db import close_db_pool, get_pool, init_db_pool
+from app.settings import settings
+
+logger = logging.getLogger("dashboard_refresh_worker")
 
 _stop = False
 
@@ -34,11 +39,9 @@ async def process_batch(conn: asyncpg.Connection, batch_size: int) -> int:
 
         user_ids: List[str] = [str(r["user_id"]) for r in rows]
 
-        # Refresh each user cache
         for uid in user_ids:
             await conn.execute("select public.fn_dashboard_refresh_home_cache($1::uuid)", uid)
 
-        # Delete processed
         await conn.execute(
             "delete from public.dashboard_refresh_requests where user_id = any($1::uuid[])",
             user_ids,
@@ -51,17 +54,18 @@ async def run():
     await init_db_pool(settings.DATABASE_URL)
     pool = get_pool()
 
-    while not _stop and settings.DASHBOARD_WORKER_ENABLED:
-        try:
-            async with pool.acquire() as conn:
-                n = await process_batch(conn, settings.DASHBOARD_WORKER_BATCH_SIZE)
-            if n == 0:
-                await asyncio.sleep(settings.DASHBOARD_WORKER_POLL_SECONDS)
-        except Exception:
-            # Keep worker alive; backoff slightly
-            await asyncio.sleep(1.5)
-
-    await close_db_pool()
+    try:
+        while not _stop and settings.DASHBOARD_WORKER_ENABLED:
+            try:
+                async with pool.acquire() as conn:
+                    processed = await process_batch(conn, settings.DASHBOARD_WORKER_BATCH_SIZE)
+                if processed == 0:
+                    await asyncio.sleep(settings.DASHBOARD_WORKER_POLL_SECONDS)
+            except Exception as exc:
+                logger.exception("dashboard refresh worker batch failed: %s", exc)
+                await asyncio.sleep(1.5)
+    finally:
+        await close_db_pool()
 
 
 def main():

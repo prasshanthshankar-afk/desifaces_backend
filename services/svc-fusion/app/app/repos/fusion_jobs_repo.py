@@ -105,3 +105,42 @@ class FusionJobsRepo:
         """
         async with self.pool.acquire() as conn:
             await conn.execute(sql, job_id, status, error_code, error_message)
+
+    async def claim_stale_processing_jobs(
+        self,
+        studio_type: str,
+        *,
+        limit: int,
+        stale_seconds: int,
+        claim_ttl_seconds: int,
+        owner: str,
+    ) -> List[str]:
+        sql = """
+        WITH cand AS (
+            SELECT id
+            FROM studio_jobs
+            WHERE studio_type = $1
+              AND status = 'processing'
+              AND updated_at < now() - make_interval(secs => $2::int)
+              AND COALESCE(NULLIF(meta_json->>'recovery_claimed_at', '')::timestamptz, to_timestamp(0))
+                    < now() - make_interval(secs => $3::int)
+            ORDER BY updated_at
+            FOR UPDATE SKIP LOCKED
+            LIMIT $4
+        )
+        UPDATE studio_jobs j
+        SET meta_json = COALESCE(j.meta_json, '{}'::jsonb)
+                        || jsonb_build_object(
+                             'recovery_claimed_at', now()::text,
+                             'recovery_owner', $5::text,
+                             'recovery_reason', 'stale_processing',
+                             'recovery_attempts', COALESCE((NULLIF(j.meta_json->>'recovery_attempts', ''))::int, 0) + 1
+                           ),
+            updated_at = now()
+        FROM cand
+        WHERE j.id = cand.id
+        RETURNING j.id::text
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, studio_type, stale_seconds, claim_ttl_seconds, limit, owner)
+        return [str(r['id']) for r in rows]

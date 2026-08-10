@@ -45,11 +45,35 @@ class AudioWorker:
                         logger.info("Audio job finished %s", job_id)
                     except Exception as e:
                         logger.exception("Audio job failed %s", job_id)
-                        # Optional: backoff + requeue
+
+                        # The orchestrator owns the business lifecycle.
+                        # If it already terminalized the job (for example after
+                        # releasing pricing), never resurrect that job by
+                        # changing it back to queued.
                         try:
-                            await self.jobs.requeue_job(job_id, delay_seconds=15, error_code="worker_exception", error_message=str(e))
+                            current = await self.jobs.get_job(job_id)
+                            current_status = str(
+                                (current or {}).get("status") or ""
+                            ).strip().lower()
+
+                            if current_status == "running":
+                                await self.jobs.requeue_job(
+                                    job_id,
+                                    delay_seconds=15,
+                                    error_code="worker_exception",
+                                    error_message=str(e),
+                                )
+                            else:
+                                logger.info(
+                                    "Not requeueing audio job %s status=%s",
+                                    job_id,
+                                    current_status or "unknown",
+                                )
                         except Exception:
-                            logger.exception("Failed to requeue job %s", job_id)
+                            logger.exception(
+                                "Failed to evaluate/requeue job %s",
+                                job_id,
+                            )
 
             except Exception:
                 logger.exception("Worker loop error")

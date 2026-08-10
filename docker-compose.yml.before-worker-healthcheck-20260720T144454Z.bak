@@ -1,0 +1,1507 @@
+name: desifaces
+
+x-common-env: &common_env
+  env_file:
+    - ./infra/.env
+
+x-common-python-service: &python_service
+  <<: *common_env
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 20s
+  networks: [df-net]
+  depends_on:
+    desifaces-db:
+      condition: service_healthy
+    desifaces-redis:
+      condition: service_started
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-one-shot-python-job: &one_shot_python_job
+  <<: *common_env
+  init: true
+  restart: "no"
+  stop_grace_period: 20s
+  networks: [df-net]
+  depends_on:
+    desifaces-db:
+      condition: service_healthy
+    desifaces-redis:
+      condition: service_started
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-notification-env: &notification_env
+  DF_NOTIFICATION_PUSH_PROVIDER: ${DF_NOTIFICATION_PUSH_PROVIDER:-expo}
+  DF_EXPO_PUSH_URL: ${DF_EXPO_PUSH_URL:-https://exp.host/--/api/v2/push/send}
+
+  DF_NOTIFICATION_EMAIL_PROVIDER: ${DF_NOTIFICATION_EMAIL_PROVIDER:-smtp}
+  DF_SMTP_HOST: ${DF_SMTP_HOST:-smtp-relay.gmail.com}
+  DF_SMTP_PORT: ${DF_SMTP_PORT:-587}
+  DF_SMTP_USERNAME: ${DF_SMTP_USERNAME:-}
+  DF_SMTP_PASSWORD: ${DF_SMTP_PASSWORD:-}
+  DF_SMTP_USE_TLS: ${DF_SMTP_USE_TLS:-1}
+  DF_SMTP_EHLO_DOMAIN: ${DF_SMTP_EHLO_DOMAIN:-mail.desifaces.ai}
+
+  DF_EMAIL_FROM: ${DF_EMAIL_FROM:-noreply@desifaces.ai}
+  DF_SUPPORT_EMAIL_TO: ${DF_SUPPORT_EMAIL_TO:-support@desifaces.ai}
+
+  DF_NOTIFICATION_BATCH_LIMIT: ${DF_NOTIFICATION_BATCH_LIMIT:-100}
+  DF_NOTIFICATION_HTTP_TIMEOUT_SEC: ${DF_NOTIFICATION_HTTP_TIMEOUT_SEC:-20}
+  DF_NOTIFICATION_STALE_PROCESSING_AFTER_MINUTES: ${DF_NOTIFICATION_STALE_PROCESSING_AFTER_MINUTES:-20}
+
+x-python-http-healthcheck: &python_http_healthcheck
+  test:
+    - CMD-SHELL
+    - >-
+      python -c "import os, urllib.request;
+      urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"PORT\"]}/api/health', timeout=3);
+      print('ok')"
+  interval: 5s
+  timeout: 3s
+  retries: 30
+
+services:
+  # -------------------------
+  # Database
+  # -------------------------
+  desifaces-db:
+    image: pgvector/pgvector:pg16
+    container_name: desifaces-db
+    networks: [df-net]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-desifaces}
+      POSTGRES_USER: ${POSTGRES_USER:-desifaces_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-desifaces_mahadev}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "15432:5432"
+    volumes:
+      - df_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # -------------------------
+  # Redis
+  # -------------------------
+  desifaces-redis:
+    image: redis:7-alpine
+    container_name: desifaces-redis
+    networks: [df-net]
+    expose:
+      - "6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - df_redisdata:/data
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # -------------------------
+  # Core API
+  # -------------------------
+  svc-core:
+    <<: *python_service
+    container_name: df-svc-core
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_healthy
+    build:
+      context: ./services/svc-core/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8000"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      REFRESH_TOKEN_HMAC_SECRET: ${REFRESH_TOKEN_HMAC_SECRET}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+      PYTHONPATH: "/app"
+
+      # pricing bootstrap for new free users
+      DF_PRICING_INTERNAL_URL: ${DF_PRICING_INTERNAL_URL:-http://svc-pricing:8009}
+      DF_PRICING_INTERNAL_BEARER: ${DF_PRICING_INTERNAL_BEARER}
+      SVC_TO_SVC_BEARER: ${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}
+
+      <<: *notification_env
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
+    expose: ["8000"]
+    ports: ["8000:8000"]
+    healthcheck:
+      <<: *python_http_healthcheck
+      start_period: 15s
+
+  # -------------------------
+  # Core Notification Dispatcher Job (one-shot, externally scheduled)
+  # -------------------------
+  svc-core-notification-worker:
+    <<: *one_shot_python_job
+    profiles: ["ops"]
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-core:
+        condition: service_healthy
+      svc-pricing:
+        condition: service_healthy
+    build:
+      context: ./services/svc-core/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+      <<: *notification_env
+    command: ["python", "-m", "app.scripts.run_notification_dispatcher", "--limit", "200"]
+
+  # -------------------------
+  # Fusion API
+  # -------------------------
+  svc-fusion:
+    <<: *python_service
+    container_name: df-svc-fusion
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
+    build:
+      context: .
+      dockerfile: services/svc-fusion/app/Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8002"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      PYTHONPATH: "/app"
+
+      DF_FUSION_STUDIO_ENABLED: ${DF_FUSION_STUDIO_ENABLED:-true}
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      REFRESH_TOKEN_HMAC_SECRET: ${REFRESH_TOKEN_HMAC_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
+      HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
+      HEYGEN_ENABLE_VIDEO_LIST_FALLBACK: ${HEYGEN_ENABLE_VIDEO_LIST_FALLBACK:-1}
+      HEYGEN_SUBMIT_PATH: ${HEYGEN_SUBMIT_PATH:-}
+
+      DF_FUSION_DISABLE_CREATE_DEDUPE: ${DF_FUSION_DISABLE_CREATE_DEDUPE:-1}
+      DF_FUSION_PROVIDER_TIMEOUT_SECONDS: ${DF_FUSION_PROVIDER_TIMEOUT_SECONDS:-360}
+      DF_FUSION_PROVIDER_POLL_SECONDS: ${DF_FUSION_PROVIDER_POLL_SECONDS:-5}
+      FUSION_JOB_TIMEOUT_SECONDS: ${FUSION_JOB_TIMEOUT_SECONDS:-420}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
+    expose: ["8002"]
+    ports: ["8002:8002"]
+    healthcheck:
+      <<: *python_http_healthcheck
+      start_period: 20s
+
+  # -------------------------
+  # Fusion Worker
+  # -------------------------
+  svc-fusion-worker:
+    <<: *python_service
+    container_name: df-svc-fusion-worker
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
+    build:
+      context: .
+      dockerfile: services/svc-fusion/app/Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      PYTHONPATH: "/app"
+
+      HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
+      HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
+      HEYGEN_ENABLE_VIDEO_LIST_FALLBACK: ${HEYGEN_ENABLE_VIDEO_LIST_FALLBACK:-1}
+      HEYGEN_SUBMIT_PATH: ${HEYGEN_SUBMIT_PATH:-}
+
+      DF_FUSION_STUDIO_ENABLED: ${DF_FUSION_STUDIO_ENABLED:-true}
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      REFRESH_TOKEN_HMAC_SECRET: ${REFRESH_TOKEN_HMAC_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      DF_FUSION_PROVIDER_TIMEOUT_SECONDS: ${DF_FUSION_PROVIDER_TIMEOUT_SECONDS:-360}
+      DF_FUSION_PROVIDER_POLL_SECONDS: ${DF_FUSION_PROVIDER_POLL_SECONDS:-5}
+      FUSION_JOB_TIMEOUT_SECONDS: ${FUSION_JOB_TIMEOUT_SECONDS:-420}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
+    command: ["bash", "-lc", "python -m app.workers.fusion_worker"]
+
+  # -------------------------
+  # Face API
+  # -------------------------
+  svc-face:
+    <<: *python_service
+    container_name: df-svc-face
+    build:
+      context: .
+      dockerfile: services/svc-face/app/Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8003"
+      UVICORN_WORKERS: ${SVC_FACE_UVICORN_WORKERS:-2}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      FACE_OUTPUT_CONTAINER: ${FACE_OUTPUT_CONTAINER:-face-output}
+      PYTHONPATH: "/app"
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      FAL_API_KEY: ${FAL_API_KEY}
+      FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
+
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT}
+
+      AZURE_CONTENT_MODERATOR_ENDPOINT: ${AZURE_CONTENT_MODERATOR_ENDPOINT}
+      AZURE_CONTENT_MODERATOR_KEY: ${AZURE_CONTENT_MODERATOR_KEY}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
+
+    command:
+      [
+        "bash",
+        "-lc",
+        "uvicorn app.main:app --host 0.0.0.0 --port $${PORT} --workers $${UVICORN_WORKERS:-2} --log-level $${LOG_LEVEL:-info}"
+      ]
+    expose: ["8003"]
+    ports: ["8003:8003"]
+    healthcheck:
+      <<: *python_http_healthcheck
+      start_period: 30s
+
+  # -------------------------
+  # Face Worker
+  # -------------------------
+  svc-face-worker:
+    <<: *python_service
+    container_name: df-svc-face-worker
+    build:
+      context: .
+      dockerfile: services/svc-face/app/Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      FACE_OUTPUT_CONTAINER: ${FACE_OUTPUT_CONTAINER:-face-output}
+      PYTHONPATH: "/app"
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+
+      FAL_API_KEY: ${FAL_API_KEY}
+      FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
+
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT}
+
+      AZURE_CONTENT_MODERATOR_ENDPOINT: ${AZURE_CONTENT_MODERATOR_ENDPOINT}
+      AZURE_CONTENT_MODERATOR_KEY: ${AZURE_CONTENT_MODERATOR_KEY}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
+
+    # Background worker: verify the container's main process exists.
+    healthcheck:
+      test: ["CMD-SHELL", "test -r /proc/1/status"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+
+    command: ["bash", "-lc", "python -m app.workers.face_worker"]
+
+  # -------------------------
+  # Pricing API
+  # -------------------------
+  svc-pricing:
+    <<: *python_service
+    container_name: df-svc-pricing
+    build:
+      context: ./services/svc-pricing/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8009"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      DF_APPLE_IAP_ENABLE: "true"
+      DF_APPLE_IAP_VERIFICATION_MODE: "decode_only"
+
+      # Google Play Billing / Android IAP verification.
+      # The JSON file is mounted below as read-only and must never be committed to Git.
+      DF_GOOGLE_PLAY_IAP_ENABLE: "${DF_GOOGLE_PLAY_IAP_ENABLE:-1}"
+      GOOGLE_PLAY_PACKAGE_NAME: "${GOOGLE_PLAY_PACKAGE_NAME:-ai.desifaces.app}"
+      GOOGLE_PLAY_VALIDATE_PURCHASES: "${GOOGLE_PLAY_VALIDATE_PURCHASES:-1}"
+      GOOGLE_PLAY_ACKNOWLEDGE_PURCHASES: "${GOOGLE_PLAY_ACKNOWLEDGE_PURCHASES:-1}"
+      GOOGLE_PLAY_VERIFICATION_MODE: "${GOOGLE_PLAY_VERIFICATION_MODE:-google_api}"
+      GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH: "${GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH:-/run/secrets/google_play_service_account.json}"
+
+      DF_PRICING_INTERNAL_BEARER: ${DF_PRICING_INTERNAL_BEARER}
+      DF_PRICING_ALLOWED_SERVICES: ${DF_PRICING_ALLOWED_SERVICES:-svc-core,svc-face,svc-fusion,svc-fusion-extension,svc-audio,svc-commerce,svc-music,svc-marketing}
+    volumes:
+      - /opt/desifaces/secrets/google_play_service_account.json:/run/secrets/google_play_service_account.json:ro
+    expose: ["8009"]
+    ports: ["8009:8009"]
+    command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8009}"]
+    healthcheck:
+      <<: *python_http_healthcheck
+      start_period: 30s
+
+  # -------------------------
+  # Commerce API
+  # -------------------------
+  svc-commerce:
+    <<: *python_service
+    container_name: df-svc-commerce
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
+    build:
+      context: .
+      dockerfile: services/svc-commerce/app/Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8008"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      PYTHONPATH: "/app"
+      
+
+      COMMERCE_SAREE_BLENDER_ENGINE: ${COMMERCE_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
+      DF_SAREE_BLENDER_ENGINE: ${DF_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
+
+      COMMERCE_SAREE_STRICT: ${COMMERCE_SAREE_STRICT:-1}
+      COMMERCE_ENABLE_SAREE_DRAPE_PROVIDER: ${COMMERCE_ENABLE_SAREE_DRAPE_PROVIDER:-1}
+      COMMERCE_ENABLE_SAREE_PLATFORM_MODEL_AUTO_PICK: ${COMMERCE_ENABLE_SAREE_PLATFORM_MODEL_AUTO_PICK:-1}
+
+      COMMERCE_SAREE_TEMPLATE_PATH: ${COMMERCE_SAREE_TEMPLATE_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/nivi.blend}
+      COMMERCE_SAREE_ALPHA_MASK_PATH: ${COMMERCE_SAREE_ALPHA_MASK_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/masks/saree_alpha.png}
+      COMMERCE_SAREE_PALLU_MASK_PATH: ${COMMERCE_SAREE_PALLU_MASK_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/masks/pallu_alpha.png}
+
+      COMMERCE_SAREE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
+      DF_SAREE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
+      DF_SAREE_TEMPLATE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
+      DF_SAREE_RUN_DIR_BASE: /var/cache/df_saree_drape_runs
+
+      DF_SAREE_VALIDATE_TEMPLATE: ${DF_SAREE_VALIDATE_TEMPLATE:-1}
+      DF_SAREE_REQUIRE_RENDER_META_OK: ${DF_SAREE_REQUIRE_RENDER_META_OK:-1}
+      DF_SAREE_QC_ENABLED: ${DF_SAREE_QC_ENABLED:-1}
+      DF_SAREE_RENDER_ENGINE_FALLBACK: ${DF_SAREE_RENDER_ENGINE_FALLBACK:-BLENDER_EEVEE_NEXT}
+
+      DF_SAREE_TEXTURE_TILE: ${DF_SAREE_TEXTURE_TILE:-1}
+      DF_SAREE_TEXTURE_TILE_SIZE: ${DF_SAREE_TEXTURE_TILE_SIZE:-1024}
+      DF_SAREE_TEXTURE_TILE_BG_THRESH: ${DF_SAREE_TEXTURE_TILE_BG_THRESH:-28}
+
+      COMMERCE_SAREE_ANCHOR_WARP: ${COMMERCE_SAREE_ANCHOR_WARP:-1}
+      DF_SAREE_ANCHOR_WARP: ${DF_SAREE_ANCHOR_WARP:-1}
+
+      COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE: ${COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE:-0}
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      PRICING_SERVICE_URL: ${PRICING_SERVICE_URL:-}
+      COMMERCE_QUOTE_TTL_SECONDS: ${COMMERCE_QUOTE_TTL_SECONDS:-900}
+      COMMERCE_CREDIT_USD_RATE: ${COMMERCE_CREDIT_USD_RATE:-0.03}
+      COMMERCE_CREDIT_INR_RATE: ${COMMERCE_CREDIT_INR_RATE:-2.5}
+      COMMERCE_CREDITS_PER_IMAGE: ${COMMERCE_CREDITS_PER_IMAGE:-30}
+      COMMERCE_CREDITS_PER_VIDEO: ${COMMERCE_CREDITS_PER_VIDEO:-120}
+      COMMERCE_CREDITS_PER_CHANNEL_EXPORT: ${COMMERCE_CREDITS_PER_CHANNEL_EXPORT:-10}
+      COMMERCE_CREDITS_MARKETPLACE_PACK: ${COMMERCE_CREDITS_MARKETPLACE_PACK:-25}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
+      DF_PRICING_VARIANT_COMMERCE: ${DF_PRICING_VARIANT_COMMERCE:-}
+      DF_PRICING_VARIANT_COMMERCE_APPAREL: ${DF_PRICING_VARIANT_COMMERCE_APPAREL:-COMMERCE_VTON_APPAREL_STANDARD}
+      DF_PRICING_VARIANT_COMMERCE_APPAREL_PREMIUM: ${DF_PRICING_VARIANT_COMMERCE_APPAREL_PREMIUM:-COMMERCE_VTON_APPAREL_PREMIUM}
+      DF_PRICING_VARIANT_COMMERCE_SAREE: ${DF_PRICING_VARIANT_COMMERCE_SAREE:-COMMERCE_VTON_SAREE_PREMIUM}
+      DF_PRICING_VARIANT_COMMERCE_FMCG: ${DF_PRICING_VARIANT_COMMERCE_FMCG:-COMMERCE_VTON_FMCG_STANDARD}
+      DF_PRICING_VARIANT_COMMERCE_ELECTRONICS: ${DF_PRICING_VARIANT_COMMERCE_ELECTRONICS:-COMMERCE_VTON_ELECTRONICS_STANDARD}
+      DF_PRICING_VARIANT_COMMERCE_MIXED: ${DF_PRICING_VARIANT_COMMERCE_MIXED:-COMMERCE_VTON_MULTI_ITEM}
+
+      DF_PRICING_LEAF_SKU_COMMERCE: ${DF_PRICING_LEAF_SKU_COMMERCE:-}
+      DF_PRICING_LEAF_SKU_COMMERCE_APPAREL: ${DF_PRICING_LEAF_SKU_COMMERCE_APPAREL:-COMMERCE_VTON_RUN}
+      DF_PRICING_LEAF_SKU_COMMERCE_SAREE: ${DF_PRICING_LEAF_SKU_COMMERCE_SAREE:-COMMERCE_VTON_RUN}
+      DF_PRICING_LEAF_SKU_COMMERCE_FMCG: ${DF_PRICING_LEAF_SKU_COMMERCE_FMCG:-COMMERCE_VTON_RUN}
+      DF_PRICING_LEAF_SKU_COMMERCE_ELECTRONICS: ${DF_PRICING_LEAF_SKU_COMMERCE_ELECTRONICS:-COMMERCE_VTON_RUN}
+      DF_PRICING_LEAF_SKU_COMMERCE_MIXED: ${DF_PRICING_LEAF_SKU_COMMERCE_MIXED:-COMMERCE_VTON_RUN}
+
+      FAL_API_KEY: ${FAL_API_KEY:-}
+      FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
+      FAL_KEY: ${FAL_KEY:-}
+      FAL_AUTH_MODE: ${FAL_AUTH_MODE:-key}
+
+      COMMERCE_ENABLE_REAL_PROVIDERS: ${COMMERCE_ENABLE_REAL_PROVIDERS:-1}
+      COMMERCE_VTON_PROVIDER: ${COMMERCE_VTON_PROVIDER:-fal}
+      COMMERCE_MAX_PROVIDER_IMAGES: ${COMMERCE_MAX_PROVIDER_IMAGES:-1}
+      COMMERCE_DEMO_MODE: ${COMMERCE_DEMO_MODE:-0}
+
+      COMMERCE_FAL_BASE_URL: ${COMMERCE_FAL_BASE_URL:-https://queue.fal.run}
+      COMMERCE_FAL_FASHN_ENDPOINT_ID: ${COMMERCE_FAL_FASHN_ENDPOINT_ID:-fal-ai/fashn/tryon/v1.6}
+      COMMERCE_FAL_ENDPOINT_ID: ${COMMERCE_FAL_ENDPOINT_ID:-fal-ai/leffa/virtual-tryon}
+
+      COMMERCE_FAL_HTTP_TIMEOUT_S: ${COMMERCE_FAL_HTTP_TIMEOUT_S:-180}
+      COMMERCE_FAL_POLL_TIMEOUT_S: ${COMMERCE_FAL_POLL_TIMEOUT_S:-900}
+      COMMERCE_FAL_POLL_SECS: ${COMMERCE_FAL_POLL_SECS:-1.5}
+      COMMERCE_FAL_POLL_LOGS: ${COMMERCE_FAL_POLL_LOGS:-0}
+
+      COMMERCE_NON_SAREE_PROVIDER_ORDER: ${COMMERCE_NON_SAREE_PROVIDER_ORDER:-imageapps_v2,fashn,catvton}
+      COMMERCE_ENABLE_IMAGEAPPS_V2_VTON: ${COMMERCE_ENABLE_IMAGEAPPS_V2_VTON:-1}
+      COMMERCE_ENABLE_CATVTON: ${COMMERCE_ENABLE_CATVTON:-1}
+      COMMERCE_VTON_QC_ENABLE: ${COMMERCE_VTON_QC_ENABLE:-1}
+      COMMERCE_VTON_QC_FAIL_OPEN: ${COMMERCE_VTON_QC_FAIL_OPEN:-1}
+      COMMERCE_INDIAN_NON_SAREE_STRICT: ${COMMERCE_INDIAN_NON_SAREE_STRICT:-0}
+      COMMERCE_ENABLE_INDIAN_NON_SAREE_GENERIC_FALLBACK: ${COMMERCE_ENABLE_INDIAN_NON_SAREE_GENERIC_FALLBACK:-1}
+
+      COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR: ${COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR:-1}
+      COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN: ${COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN:-1}
+      COMMERCE_PLATFORM_MODELS_TOP_K: ${COMMERCE_PLATFORM_MODELS_TOP_K:-10}
+
+      COMMERCE_DEMO_HUMAN_IMAGE_URL: ${COMMERCE_DEMO_HUMAN_IMAGE_URL:-}
+      COMMERCE_DEMO_GARMENT_IMAGE_URL: ${COMMERCE_DEMO_GARMENT_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/tshirt.jpg}
+      COMMERCE_FAL_CLOTH_TYPE: ${COMMERCE_FAL_CLOTH_TYPE:-upper}
+
+      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://svc-fusion:8002}
+      SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://svc-audio:8004}
+
+    volumes:
+      - df_saree_templates_cache:/var/cache/df_saree_templates
+      - df_saree_drape_runs:/var/cache/df_saree_drape_runs
+
+    command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8008}"]
+    expose: ["8008"]
+    ports: ["8008:8008"]
+    healthcheck:
+      <<: *python_http_healthcheck
+      start_period: 20s
+
+  # -------------------------
+  # Commerce Worker
+  # -------------------------
+  svc-commerce-worker:
+    <<: *python_service
+    container_name: df-svc-commerce-worker
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
+    build:
+      context: .
+      dockerfile: services/svc-commerce/app/Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      PYTHONPATH: "/app"
+
+      HF_HOME: /var/cache/huggingface
+      HF_HUB_CACHE: /var/cache/huggingface/hub
+      HF_TOKEN: ${HF_TOKEN:-}
+
+      COMMERCE_SAREE_BLENDER_ENGINE: ${COMMERCE_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
+      DF_SAREE_BLENDER_ENGINE: ${DF_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
+
+      COMMERCE_SAREE_STRICT: ${COMMERCE_SAREE_STRICT:-1}
+      COMMERCE_ENABLE_SAREE_DRAPE_PROVIDER: ${COMMERCE_ENABLE_SAREE_DRAPE_PROVIDER:-1}
+      COMMERCE_ENABLE_SAREE_PLATFORM_MODEL_AUTO_PICK: ${COMMERCE_ENABLE_SAREE_PLATFORM_MODEL_AUTO_PICK:-1}
+
+      COMMERCE_SAREE_TEMPLATE_PATH: ${COMMERCE_SAREE_TEMPLATE_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/nivi.blend}
+      COMMERCE_SAREE_ALPHA_MASK_PATH: ${COMMERCE_SAREE_ALPHA_MASK_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/masks/saree_alpha.png}
+      COMMERCE_SAREE_PALLU_MASK_PATH: ${COMMERCE_SAREE_PALLU_MASK_PATH:-az://commerce-training/drape_templates/saree/nivi/v1/masks/pallu_alpha.png}
+
+      COMMERCE_SAREE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
+      DF_SAREE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
+      DF_SAREE_TEMPLATE_CACHE_DIR: ${COMMERCE_SAREE_CACHE_DIR:-/var/cache/df_saree_templates}
+      DF_SAREE_RUN_DIR_BASE: /var/cache/df_saree_drape_runs
+
+      DF_SAREE_VALIDATE_TEMPLATE: ${DF_SAREE_VALIDATE_TEMPLATE:-1}
+      DF_SAREE_REQUIRE_RENDER_META_OK: ${DF_SAREE_REQUIRE_RENDER_META_OK:-1}
+      DF_SAREE_QC_ENABLED: ${DF_SAREE_QC_ENABLED:-1}
+      DF_SAREE_QC_BLACK_THRESH: ${DF_SAREE_QC_BLACK_THRESH:-10}
+      DF_SAREE_QC_OVERLAY_ALPHA_MIN_MAX: ${DF_SAREE_QC_OVERLAY_ALPHA_MIN_MAX:-8}
+      DF_SAREE_RENDER_ENGINE_FALLBACK: ${DF_SAREE_RENDER_ENGINE_FALLBACK:-BLENDER_EEVEE_NEXT}
+
+      DF_SAREE_TEXTURE_TILE: ${DF_SAREE_TEXTURE_TILE:-1}
+      DF_SAREE_TEXTURE_TILE_SIZE: ${DF_SAREE_TEXTURE_TILE_SIZE:-1024}
+      DF_SAREE_TEXTURE_TILE_BG_THRESH: ${DF_SAREE_TEXTURE_TILE_BG_THRESH:-28}
+
+      COMMERCE_SAREE_ANCHOR_WARP: ${COMMERCE_SAREE_ANCHOR_WARP:-1}
+      DF_SAREE_ANCHOR_WARP: ${DF_SAREE_ANCHOR_WARP:-1}
+
+      DF_SAREE_KEEP_RUN_DIR: ${DF_SAREE_KEEP_RUN_DIR:-0}
+      DF_SAREE_UPLOAD_DEBUG_OVERLAY: ${DF_SAREE_UPLOAD_DEBUG_OVERLAY:-0}
+      DF_SAREE_UPLOAD_DEBUG_OVERLAY_WARPED: ${DF_SAREE_UPLOAD_DEBUG_OVERLAY_WARPED:-0}
+
+      COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE: ${COMMERCE_ENFORCE_FULL_BODY_FOR_SAREE:-0}
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      PRICING_SERVICE_URL: ${PRICING_SERVICE_URL:-}
+      COMMERCE_QUOTE_TTL_SECONDS: ${COMMERCE_QUOTE_TTL_SECONDS:-900}
+      COMMERCE_CREDIT_USD_RATE: ${COMMERCE_CREDIT_USD_RATE:-0.03}
+      COMMERCE_CREDIT_INR_RATE: ${COMMERCE_CREDIT_INR_RATE:-2.5}
+      COMMERCE_CREDITS_PER_IMAGE: ${COMMERCE_CREDITS_PER_IMAGE:-30}
+      COMMERCE_CREDITS_PER_VIDEO: ${COMMERCE_CREDITS_PER_VIDEO:-120}
+      COMMERCE_CREDITS_PER_CHANNEL_EXPORT: ${COMMERCE_CREDITS_PER_CHANNEL_EXPORT:-10}
+      COMMERCE_CREDITS_MARKETPLACE_PACK: ${COMMERCE_CREDITS_MARKETPLACE_PACK:-25}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
+      DF_PRICING_VARIANT_COMMERCE: ${DF_PRICING_VARIANT_COMMERCE:-}
+      DF_PRICING_VARIANT_COMMERCE_APPAREL: ${DF_PRICING_VARIANT_COMMERCE_APPAREL:-COMMERCE_VTON_APPAREL_STANDARD}
+      DF_PRICING_VARIANT_COMMERCE_APPAREL_PREMIUM: ${DF_PRICING_VARIANT_COMMERCE_APPAREL_PREMIUM:-COMMERCE_VTON_APPAREL_PREMIUM}
+      DF_PRICING_VARIANT_COMMERCE_SAREE: ${DF_PRICING_VARIANT_COMMERCE_SAREE:-COMMERCE_VTON_SAREE_PREMIUM}
+      DF_PRICING_VARIANT_COMMERCE_FMCG: ${DF_PRICING_VARIANT_COMMERCE_FMCG:-COMMERCE_VTON_FMCG_STANDARD}
+      DF_PRICING_VARIANT_COMMERCE_ELECTRONICS: ${DF_PRICING_VARIANT_COMMERCE_ELECTRONICS:-COMMERCE_VTON_ELECTRONICS_STANDARD}
+      DF_PRICING_VARIANT_COMMERCE_MIXED: ${DF_PRICING_VARIANT_COMMERCE_MIXED:-COMMERCE_VTON_MULTI_ITEM}
+
+      DF_PRICING_LEAF_SKU_COMMERCE: ${DF_PRICING_LEAF_SKU_COMMERCE:-}
+      DF_PRICING_LEAF_SKU_COMMERCE_APPAREL: ${DF_PRICING_LEAF_SKU_COMMERCE_APPAREL:-COMMERCE_VTON_RUN}
+      DF_PRICING_LEAF_SKU_COMMERCE_SAREE: ${DF_PRICING_LEAF_SKU_COMMERCE_SAREE:-COMMERCE_VTON_RUN}
+      DF_PRICING_LEAF_SKU_COMMERCE_FMCG: ${DF_PRICING_LEAF_SKU_COMMERCE_FMCG:-COMMERCE_VTON_RUN}
+      DF_PRICING_LEAF_SKU_COMMERCE_ELECTRONICS: ${DF_PRICING_LEAF_SKU_COMMERCE_ELECTRONICS:-COMMERCE_VTON_RUN}
+      DF_PRICING_LEAF_SKU_COMMERCE_MIXED: ${DF_PRICING_LEAF_SKU_COMMERCE_MIXED:-COMMERCE_VTON_RUN}
+
+      FAL_API_KEY: ${FAL_API_KEY:-}
+      FAL_MODEL: ${FAL_MODEL:-fal-ai/flux-pro/v1.1}
+      FAL_KEY: ${FAL_KEY:-}
+      FAL_AUTH_MODE: ${FAL_AUTH_MODE:-key}
+
+      COMMERCE_ENABLE_REAL_PROVIDERS: ${COMMERCE_ENABLE_REAL_PROVIDERS:-1}
+      COMMERCE_VTON_PROVIDER: ${COMMERCE_VTON_PROVIDER:-fal}
+      COMMERCE_MAX_PROVIDER_IMAGES: ${COMMERCE_MAX_PROVIDER_IMAGES:-1}
+      COMMERCE_DEMO_MODE: ${COMMERCE_DEMO_MODE:-0}
+
+      COMMERCE_FAL_BASE_URL: ${COMMERCE_FAL_BASE_URL:-https://queue.fal.run}
+      COMMERCE_FAL_FASHN_ENDPOINT_ID: ${COMMERCE_FAL_FASHN_ENDPOINT_ID:-fal-ai/fashn/tryon/v1.6}
+      COMMERCE_FAL_ENDPOINT_ID: ${COMMERCE_FAL_ENDPOINT_ID:-fal-ai/leffa/virtual-tryon}
+
+      COMMERCE_FAL_HTTP_TIMEOUT_S: ${COMMERCE_FAL_HTTP_TIMEOUT_S:-180}
+      COMMERCE_FAL_POLL_TIMEOUT_S: ${COMMERCE_FAL_POLL_TIMEOUT_S:-900}
+      COMMERCE_FAL_POLL_SECS: ${COMMERCE_FAL_POLL_SECS:-1.5}
+      COMMERCE_FAL_POLL_LOGS: ${COMMERCE_FAL_POLL_LOGS:-0}
+
+      COMMERCE_NON_SAREE_PROVIDER_ORDER: ${COMMERCE_NON_SAREE_PROVIDER_ORDER:-imageapps_v2,fashn,catvton}
+      COMMERCE_ENABLE_IMAGEAPPS_V2_VTON: ${COMMERCE_ENABLE_IMAGEAPPS_V2_VTON:-1}
+      COMMERCE_ENABLE_CATVTON: ${COMMERCE_ENABLE_CATVTON:-1}
+      COMMERCE_VTON_QC_ENABLE: ${COMMERCE_VTON_QC_ENABLE:-1}
+      COMMERCE_VTON_QC_FAIL_OPEN: ${COMMERCE_VTON_QC_FAIL_OPEN:-1}
+      COMMERCE_INDIAN_NON_SAREE_STRICT: ${COMMERCE_INDIAN_NON_SAREE_STRICT:-0}
+      COMMERCE_ENABLE_INDIAN_NON_SAREE_GENERIC_FALLBACK: ${COMMERCE_ENABLE_INDIAN_NON_SAREE_GENERIC_FALLBACK:-1}
+
+      COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR: ${COMMERCE_ENABLE_PLATFORM_MODEL_SELECTOR:-1}
+      COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN: ${COMMERCE_PLATFORM_MODEL_FORCE_WHEN_MISSING_HUMAN:-1}
+      COMMERCE_PLATFORM_MODELS_TOP_K: ${COMMERCE_PLATFORM_MODELS_TOP_K:-10}
+
+      COMMERCE_DEMO_HUMAN_IMAGE_URL: ${COMMERCE_DEMO_HUMAN_IMAGE_URL:-}
+      COMMERCE_DEMO_GARMENT_IMAGE_URL: ${COMMERCE_DEMO_GARMENT_IMAGE_URL:-https://storage.googleapis.com/falserverless/catvton/tshirt.jpg}
+      COMMERCE_FAL_CLOTH_TYPE: ${COMMERCE_FAL_CLOTH_TYPE:-upper}
+
+      WORKER_POLL_SECS: ${COMMERCE_WORKER_POLL_SECS:-1.5}
+      WORKER_BATCH_SIZE: ${COMMERCE_WORKER_BATCH_SIZE:-1}
+
+    volumes:
+      - df_saree_templates_cache:/var/cache/df_saree_templates
+      - df_saree_drape_runs:/var/cache/df_saree_drape_runs
+      - df_hf_cache:/var/cache/huggingface
+      - ./tmp:/host_tmp:ro
+
+    command: ["bash", "-lc", "python -m app.workers.commerce_worker"]
+
+  # -------------------------
+  # Audio API
+  # -------------------------
+  svc-audio:
+    <<: *python_service
+    container_name: df-svc-audio
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
+    build:
+      context: .
+      dockerfile: services/svc-audio/app/Dockerfile
+    image: desifaces-svc-audio
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8004"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      # Required for DB-backed Studio Coach serving/ranking. svc-audio imports
+      # shared LLM modules from the repo-mounted services/shared tree.
+      PYTHONPATH: "/app:/app/services/shared:/app/services/shared/llm:/app/services/shared/python"
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+      JWT_ALG: ${JWT_ALG:-HS256}
+
+      AZURE_SPEECH_KEY: ${AZURE_SPEECH_KEY}
+      AZURE_SPEECH_REGION: ${AZURE_SPEECH_REGION:-eastus}
+      AZURE_TRANSLATOR_KEY: ${AZURE_TRANSLATOR_KEY}
+      AZURE_TRANSLATOR_ENDPOINT: ${AZURE_TRANSLATOR_ENDPOINT:-https://api.cognitive.microsofttranslator.com}
+      AZURE_TRANSLATOR_REGION: ${AZURE_TRANSLATOR_REGION:-eastus}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AUDIO_OUTPUT_CONTAINER: ${AUDIO_OUTPUT_CONTAINER:-audio-output}
+      AUDIO_SAS_HOURS: ${AUDIO_SAS_HOURS:-24}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
+
+    volumes:
+      # Read-only shared code mount for Studio Coach ranker/tips.
+      - ./services/shared:/app/services/shared:ro
+
+    expose: ["8004"]
+    ports: ["8004:8004"]
+    healthcheck:
+      <<: *python_http_healthcheck
+      start_period: 20s
+
+  # -------------------------
+  # Audio Worker
+  # -------------------------
+  svc-audio-worker:
+    <<: *python_service
+    container_name: df-svc-audio-worker
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
+    build:
+      context: .
+      dockerfile: services/svc-audio/app/Dockerfile
+    image: desifaces-svc-audio-worker
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      # Keep worker runtime aligned with svc-audio API.
+      PYTHONPATH: "/app:/app/services/shared:/app/services/shared/llm:/app/services/shared/python"
+
+      AUDIO_STUDIO_TYPE: "audio"
+      WORKER_POLL_SECS: "1.5"
+      WORKER_BATCH_SIZE: "1"
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+      JWT_ALG: ${JWT_ALG:-HS256}
+
+      AZURE_SPEECH_KEY: ${AZURE_SPEECH_KEY}
+      AZURE_SPEECH_REGION: ${AZURE_SPEECH_REGION:-eastus}
+      AZURE_TRANSLATOR_KEY: ${AZURE_TRANSLATOR_KEY}
+      AZURE_TRANSLATOR_ENDPOINT: ${AZURE_TRANSLATOR_ENDPOINT:-https://api.cognitive.microsofttranslator.com}
+      AZURE_TRANSLATOR_REGION: ${AZURE_TRANSLATOR_REGION:-eastus}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AUDIO_OUTPUT_CONTAINER: ${AUDIO_OUTPUT_CONTAINER:-audio-output}
+      AUDIO_SAS_HOURS: ${AUDIO_SAS_HOURS:-24}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
+
+    volumes:
+      # Read-only shared code mount for any shared Audio/Studio Coach runtime imports.
+      - ./services/shared:/app/services/shared:ro
+
+    command: ["bash", "-lc", "python -m app.workers.audio_worker"]
+
+  # -------------------------
+  # Dashboard API
+  # -------------------------
+  svc-dashboard:
+    <<: *python_service
+    container_name: df-svc-dashboard
+    build:
+      context: ./services/svc-dashboard/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      HOST: "0.0.0.0"
+      PORT: "8005"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app/app"
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: "HS256"
+      DASHBOARD_STALE_SECONDS: ${DASHBOARD_STALE_SECONDS:-30}
+      DASHBOARD_FORCE_REFRESH_ON_MISS: ${DASHBOARD_FORCE_REFRESH_ON_MISS:-true}
+    expose: ["8005"]
+    ports: ["8005:8005"]
+    healthcheck:
+      <<: *python_http_healthcheck
+      start_period: 20s
+
+  svc-dashboard-worker:
+    <<: *python_service
+    container_name: df-svc-dashboard-worker
+    build:
+      context: ./services/svc-dashboard/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app/app"
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: "HS256"
+      DASHBOARD_WORKER_ENABLED: "true"
+      DASHBOARD_WORKER_POLL_SECONDS: ${DASHBOARD_WORKER_POLL_SECONDS:-0.75}
+      DASHBOARD_WORKER_BATCH_SIZE: ${DASHBOARD_WORKER_BATCH_SIZE:-50}
+    command: ["bash", "-lc", "python -m app.worker.refresh_worker"]
+
+  # -------------------------
+  # Fusion Extension (Longform) API
+  # -------------------------
+  svc-fusion-extension:
+    <<: *python_service
+    container_name: df-svc-fusion-extension
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
+    build:
+      context: .
+      dockerfile: services/svc-fusion-extension/app/Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8006"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://svc-fusion:8002}
+      SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://svc-audio:8004}
+      SVC_TO_SVC_BEARER: ${SVC_TO_SVC_BEARER}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AZURE_FINAL_VIDEO_CONTAINER: ${AZURE_FINAL_VIDEO_CONTAINER:-video-output}
+      FINAL_SAS_TTL_SECONDS: ${FINAL_SAS_TTL_SECONDS:-1296000}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
+      DEFAULT_SEGMENT_SECONDS: ${DEFAULT_SEGMENT_SECONDS:-60}
+      MAX_SEGMENT_SECONDS: ${MAX_SEGMENT_SECONDS:-120}
+      MAX_INFLIGHT_SEGMENTS_PER_JOB: ${MAX_INFLIGHT_SEGMENTS_PER_JOB:-2}
+      MAX_TOTAL_SEGMENTS_PER_JOB: ${MAX_TOTAL_SEGMENTS_PER_JOB:-500}
+
+      FAL_KEY: ${FAL_KEY:-}
+      DF_FUSION_PROVIDER: ${DF_FUSION_PROVIDER:-omnihuman_v15}
+      DF_OMNIHUMAN_MODEL_ID: ${DF_OMNIHUMAN_MODEL_ID:-fal-ai/bytedance/omnihuman/v1.5}
+      DF_OMNIHUMAN_MAX_AUDIO_SECONDS: ${DF_OMNIHUMAN_MAX_AUDIO_SECONDS:-30}
+      DF_OMNIHUMAN_FREE_RESOLUTION: ${DF_OMNIHUMAN_FREE_RESOLUTION:-720p}
+      DF_OMNIHUMAN_PAID_RESOLUTION: ${DF_OMNIHUMAN_PAID_RESOLUTION:-1080p}
+      DF_OMNIHUMAN_DEFAULT_TURBO_MODE: ${DF_OMNIHUMAN_DEFAULT_TURBO_MODE:-0}
+
+      AUDIO_POLL_SECONDS: ${AUDIO_POLL_SECONDS:-1.5}
+      AUDIO_TIMEOUT_SECONDS: ${AUDIO_TIMEOUT_SECONDS:-300}
+      FUSION_POLL_SECONDS: ${FUSION_POLL_SECONDS:-3.0}
+      FUSION_TIMEOUT_SECONDS: ${FUSION_TIMEOUT_SECONDS:-900}
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
+    expose: ["8006"]
+    ports: ["8006:8006"]
+    healthcheck:
+      <<: *python_http_healthcheck
+      start_period: 20s
+
+  svc-fusion-extension-worker:
+    <<: *python_service
+    container_name: df-svc-fusion-extension-worker
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
+    build:
+      context: .
+      dockerfile: services/svc-fusion-extension/app/Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      SVC_TO_SVC_BEARER: ${SVC_TO_SVC_BEARER}
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://svc-fusion:8002}
+      SVC_AUDIO_BASE_URL: ${SVC_AUDIO_BASE_URL:-http://svc-audio:8004}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AZURE_FINAL_VIDEO_CONTAINER: ${AZURE_FINAL_VIDEO_CONTAINER:-video-output}
+      FINAL_SAS_TTL_SECONDS: ${FINAL_SAS_TTL_SECONDS:-1296000}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
+      WORKER_ENABLED: "true"
+      WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-1.0}
+      WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-10}
+
+      DEFAULT_SEGMENT_SECONDS: ${DEFAULT_SEGMENT_SECONDS:-60}
+      MAX_SEGMENT_SECONDS: ${MAX_SEGMENT_SECONDS:-120}
+      MAX_INFLIGHT_SEGMENTS_PER_JOB: ${MAX_INFLIGHT_SEGMENTS_PER_JOB:-2}
+      MAX_TOTAL_SEGMENTS_PER_JOB: ${MAX_TOTAL_SEGMENTS_PER_JOB:-500}
+
+      FAL_KEY: ${FAL_KEY:-}
+      DF_FUSION_PROVIDER: ${DF_FUSION_PROVIDER:-omnihuman_v15}
+      DF_OMNIHUMAN_MODEL_ID: ${DF_OMNIHUMAN_MODEL_ID:-fal-ai/bytedance/omnihuman/v1.5}
+      DF_OMNIHUMAN_MAX_AUDIO_SECONDS: ${DF_OMNIHUMAN_MAX_AUDIO_SECONDS:-30}
+      DF_OMNIHUMAN_FREE_RESOLUTION: ${DF_OMNIHUMAN_FREE_RESOLUTION:-720p}
+      DF_OMNIHUMAN_PAID_RESOLUTION: ${DF_OMNIHUMAN_PAID_RESOLUTION:-1080p}
+      DF_OMNIHUMAN_DEFAULT_TURBO_MODE: ${DF_OMNIHUMAN_DEFAULT_TURBO_MODE:-0}
+
+      AUDIO_POLL_SECONDS: ${AUDIO_POLL_SECONDS:-1.5}
+      AUDIO_TIMEOUT_SECONDS: ${AUDIO_TIMEOUT_SECONDS:-300}
+      FUSION_POLL_SECONDS: ${FUSION_POLL_SECONDS:-3.0}
+      FUSION_TIMEOUT_SECONDS: ${FUSION_TIMEOUT_SECONDS:-900}
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
+    command: ["bash", "-lc", "python -m app.workers.longform_worker"]
+
+  svc-fusion-extension-stitch-worker:
+    <<: *python_service
+    container_name: df-svc-fusion-extension-stitch-worker
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
+    build:
+      context: .
+      dockerfile: services/svc-fusion-extension/app/Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AZURE_FINAL_VIDEO_CONTAINER: ${AZURE_FINAL_VIDEO_CONTAINER:-video-output}
+      FINAL_SAS_TTL_SECONDS: ${FINAL_SAS_TTL_SECONDS:-1296000}
+
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
+      STITCH_WORKER_ENABLED: "true"
+      STITCH_WORKER_POLL_SECONDS: ${STITCH_WORKER_POLL_SECONDS:-2.0}
+      STITCH_WORKER_BATCH_SIZE: ${STITCH_WORKER_BATCH_SIZE:-2}
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
+    command: ["bash", "-lc", "python -m app.workers.stitch_worker"]
+
+  # -------------------------
+  # Music API
+  # -------------------------
+  svc-music:
+    <<: *python_service
+    container_name: df-svc-music
+    build:
+      context: ./services/svc-music/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "/app"
+
+      PORT: "8000"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      MUSIC_OUTPUT_CONTAINER: ${MUSIC_OUTPUT_CONTAINER:-music-output}
+      MUSIC_SAS_HOURS: ${MUSIC_SAS_HOURS:-24}
+
+      HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
+      HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
+
+      SVC_FACE_URL: ${SVC_FACE_URL:-http://svc-face:8003}
+      SVC_FACE_BEARER_TOKEN: ${SVC_FACE_BEARER_TOKEN:-}
+
+      SVC_FACE_TIMEOUT_SECS: ${SVC_FACE_TIMEOUT_SECS:-60}
+      SVC_FACE_POLL_SECS: ${SVC_FACE_POLL_SECS:-2}
+      SVC_FACE_WAIT_TIMEOUT_SECS: ${SVC_FACE_WAIT_TIMEOUT_SECS:-180}
+      DF_FUSION_BEARER_TOKEN: "${DF_FUSION_BEARER_TOKEN:-}"
+      DF_X_USER_ID: "${DF_X_USER_ID:-}"
+
+    command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT}"]
+    expose: ["8000"]
+    ports: ["8007:8000"]
+    healthcheck:
+      <<: *python_http_healthcheck
+      start_period: 25s
+
+  # -------------------------
+  # Music Worker
+  # -------------------------
+  svc-music-worker:
+    <<: *python_service
+    container_name: df-svc-music-worker
+    build:
+      context: ./services/svc-music/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "/app"
+
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      MUSIC_OUTPUT_CONTAINER: ${MUSIC_OUTPUT_CONTAINER:-music-output}
+      MUSIC_SAS_HOURS: ${MUSIC_SAS_HOURS:-24}
+
+      HEYGEN_API_KEY: ${DF_HEYGEN_API_KEY}
+      HEYGEN_BASE_URL: ${DF_HEYGEN_BASE_URL:-https://api.heygen.com}
+
+      WORKER_POLL_SECS: ${MUSIC_WORKER_POLL_SECS:-1.5}
+
+      SVC_FACE_URL: ${SVC_FACE_URL:-http://svc-face:8003}
+      SVC_FACE_TIMEOUT_SECS: ${SVC_FACE_TIMEOUT_SECS:-60}
+      SVC_FACE_POLL_SECS: ${SVC_FACE_POLL_SECS:-2}
+      SVC_FACE_WAIT_TIMEOUT_SECS: ${SVC_FACE_WAIT_TIMEOUT_SECS:-180}
+      SVC_FACE_BEARER_TOKEN: ${SVC_FACE_BEARER_TOKEN:-}
+      DF_FUSION_BEARER_TOKEN: "${DF_FUSION_BEARER_TOKEN:-}"
+      DF_X_USER_ID: "${DF_X_USER_ID:-}"
+
+    command: ["bash", "-lc", "python -m app.workers.music_worker"]
+
+  # -------------------------
+  # Marketing API
+  # -------------------------
+  svc-marketing:
+    <<: *python_service
+    container_name: df-svc-marketing
+    build:
+      context: ./services/svc-marketing/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PORT: "8010"
+
+      POSTGRES_DSN: ${DATABASE_URL}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+
+      AUTH_MODE: ${MARKETING_AUTH_MODE:-none}
+      CORE_URL: ${CORE_URL:-http://svc-core:8000}
+      CORE_INTROSPECT_PATH: ${CORE_INTROSPECT_PATH:-/api/auth/introspect}
+
+      ADMIN_MARKETING_USER_ID: ${ADMIN_MARKETING_USER_ID:-}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AZURE_OUTPUT_CONTAINER: ${MARKETING_OUTPUT_CONTAINER:-marketing-output}
+      AZURE_BLOB_PREFIX: ${MARKETING_BLOB_PREFIX:-marketing}
+      OUTPUT_DIR: ${MARKETING_OUTPUT_DIR:-/tmp/df_marketing_output}
+
+      SVC_FACE_URL: ${SVC_FACE_URL_MARKETING:-http://svc-face:8003}
+      SVC_FUSION_URL: ${SVC_FUSION_URL_MARKETING:-http://svc-fusion:8002}
+      SVC_MUSIC_URL: ${SVC_MUSIC_URL_MARKETING:-http://svc-music:8000}
+      SVC_COMMERCE_URL: ${SVC_COMMERCE_URL_MARKETING:-http://svc-commerce:8008}
+
+      FACE_CREATE_PATH: ${MARKETING_FACE_CREATE_PATH:-/api/face/creator/generate}
+      FACE_STATUS_PATH_TMPL: ${MARKETING_FACE_STATUS_TMPL:-/api/face/creator/jobs/{job_id}/status}
+
+      FUSION_CREATE_PATH: ${MARKETING_FUSION_CREATE_PATH:-/jobs}
+      FUSION_STATUS_PATH_TMPL: ${MARKETING_FUSION_STATUS_TMPL:-/jobs/{job_id}}
+
+      MUSIC_GENERATE_PATH: ${MARKETING_MUSIC_GENERATE_PATH:-/api/music/generate}
+      MUSIC_STATUS_PATH_TMPL: ${MARKETING_MUSIC_STATUS_TMPL:-/api/music/jobs/{job_id}/status}
+
+      COMMERCE_PROMO_PATH: ${MARKETING_COMMERCE_PROMO_PATH:-/api/commerce/promo/generate}
+      COMMERCE_STATUS_PATH_TMPL: ${MARKETING_COMMERCE_STATUS_TMPL:-/api/commerce/jobs/{job_id}/status}
+
+      ENABLE_PUBLISH_IG: ${ENABLE_PUBLISH_IG:-0}
+      ENABLE_PUBLISH_YT: ${ENABLE_PUBLISH_YT:-0}
+
+      IG_ACCESS_TOKEN: ${IG_ACCESS_TOKEN:-}
+      IG_BUSINESS_ACCOUNT_ID: ${IG_BUSINESS_ACCOUNT_ID:-}
+
+      YT_CLIENT_SECRET: ${YT_CLIENT_SECRET:-}
+      YT_REFRESH_TOKEN: ${YT_REFRESH_TOKEN:-}
+
+      LLM_MODE: ${MARKETING_LLM_MODE:-none}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${MARKETING_OPENAI_MODEL:-gpt-4.1-mini}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+
+      ENABLE_OPTIMIZER: ${MARKETING_ENABLE_OPTIMIZER:-1}
+      OPTIMIZER_INTERVAL_SECONDS: ${MARKETING_OPTIMIZER_INTERVAL_SECONDS:-21600}
+      OPTIMIZER_LOOKBACK_DAYS: ${MARKETING_OPTIMIZER_LOOKBACK_DAYS:-14}
+
+      PYTHONPATH: "/app"
+    volumes:
+      - df_marketing_output:/tmp/df_marketing_output
+    expose: ["8010"]
+    ports: ["8010:8010"]
+    command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8010}"]
+    healthcheck:
+      <<: *python_http_healthcheck
+      start_period: 20s
+
+  # -------------------------
+  # Marketing Worker
+  # -------------------------
+  svc-marketing-worker:
+    <<: *python_service
+    container_name: df-svc-marketing-worker
+    build:
+      context: ./services/svc-marketing/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+
+      POSTGRES_DSN: ${DATABASE_URL}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+
+      AUTH_MODE: ${MARKETING_AUTH_MODE:-none}
+      CORE_URL: ${CORE_URL:-http://svc-core:8000}
+      CORE_INTROSPECT_PATH: ${CORE_INTROSPECT_PATH:-/api/auth/introspect}
+
+      ADMIN_MARKETING_USER_ID: ${ADMIN_MARKETING_USER_ID:-}
+
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
+      AZURE_OUTPUT_CONTAINER: ${MARKETING_OUTPUT_CONTAINER:-marketing-output}
+      AZURE_BLOB_PREFIX: ${MARKETING_BLOB_PREFIX:-marketing}
+      OUTPUT_DIR: ${MARKETING_OUTPUT_DIR:-/tmp/df_marketing_output}
+
+      SVC_FACE_URL: ${SVC_FACE_URL_MARKETING:-http://svc-face:8003}
+      SVC_FUSION_URL: ${SVC_FUSION_URL_MARKETING:-http://svc-fusion:8002}
+      SVC_MUSIC_URL: ${SVC_MUSIC_URL_MARKETING:-http://svc-music:8000}
+      SVC_COMMERCE_URL: ${SVC_COMMERCE_URL_MARKETING:-http://svc-commerce:8008}
+
+      FACE_STATUS_PATH_PREFIX: ${FACE_STATUS_PATH_PREFIX}
+      FACE_POLL_INTERVAL_S: ${FACE_POLL_INTERVAL_S}
+      FACE_POLL_TIMEOUT_S: ${FACE_POLL_TIMEOUT_S}
+
+      FACE_CREATE_PATH: ${MARKETING_FACE_CREATE_PATH:-/api/face/creator/generate}
+      FACE_STATUS_PATH_TMPL: ${MARKETING_FACE_STATUS_TMPL:-/api/face/creator/jobs/{job_id}/status}
+
+      FUSION_CREATE_PATH: ${MARKETING_FUSION_CREATE_PATH:-/jobs}
+      FUSION_STATUS_PATH_TMPL: ${MARKETING_FUSION_STATUS_TMPL:-/jobs/{job_id}}
+
+      MUSIC_GENERATE_PATH: ${MARKETING_MUSIC_GENERATE_PATH:-/api/music/generate}
+      MUSIC_STATUS_PATH_TMPL: ${MARKETING_MUSIC_STATUS_TMPL:-/api/music/jobs/{job_id}/status}
+
+      COMMERCE_PROMO_PATH: ${MARKETING_COMMERCE_PROMO_PATH:-/api/commerce/promo/generate}
+      COMMERCE_STATUS_PATH_TMPL: ${MARKETING_COMMERCE_STATUS_TMPL:-/api/commerce/jobs/{job_id}/status}
+
+      ENABLE_PUBLISH_IG: ${ENABLE_PUBLISH_IG:-0}
+      ENABLE_PUBLISH_YT: ${ENABLE_PUBLISH_YT:-0}
+
+      IG_ACCESS_TOKEN: ${IG_ACCESS_TOKEN:-}
+      IG_BUSINESS_ACCOUNT_ID: ${IG_BUSINESS_ACCOUNT_ID:-}
+
+      YT_CLIENT_SECRET: ${YT_CLIENT_SECRET:-}
+      YT_REFRESH_TOKEN: ${YT_REFRESH_TOKEN:-}
+
+      LLM_MODE: ${MARKETING_LLM_MODE:-none}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${MARKETING_OPENAI_MODEL:-gpt-4.1-mini}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+
+      WORKER_POLL_SECONDS: ${MARKETING_WORKER_POLL_SECONDS:-2}
+      PYTHONPATH: "/app"
+    volumes:
+      - df_marketing_output:/tmp/df_marketing_output
+    command: ["bash", "-lc", "python -m app.workers.marketing_worker"]
+
+  # -------------------------
+  # Marketing Scheduler
+  # -------------------------
+  svc-marketing-scheduler:
+    <<: *python_service
+    container_name: df-svc-marketing-scheduler
+    build:
+      context: ./services/svc-marketing/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+
+      POSTGRES_DSN: ${DATABASE_URL}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+
+      ADMIN_MARKETING_USER_ID: ${ADMIN_MARKETING_USER_ID:-}
+
+      PYTHONPATH: "/app"
+    command: ["bash", "-lc", "python -m app.workers.marketing_scheduler"]
+
+  # -------------------------
+  # Marketing Optimizer
+  # -------------------------
+  svc-marketing-optimizer:
+    <<: *python_service
+    container_name: df-svc-marketing-optimizer
+    build:
+      context: ./services/svc-marketing/app
+      dockerfile: Dockerfile
+    profiles: ["marketing-optimizer"]
+    restart: "no"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+
+      POSTGRES_DSN: ${DATABASE_URL}
+      DATABASE_URL: ${DATABASE_URL}
+
+      ENABLE_OPTIMIZER: ${MARKETING_ENABLE_OPTIMIZER:-1}
+      OPTIMIZER_INTERVAL_SECONDS: ${MARKETING_OPTIMIZER_INTERVAL_SECONDS:-21600}
+      OPTIMIZER_LOOKBACK_DAYS: ${MARKETING_OPTIMIZER_LOOKBACK_DAYS:-14}
+
+      PYTHONPATH: "/app"
+    command: ["bash", "-lc", "python -m app.workers.marketing_optimizer"]
+
+  # -------------------------
+  # Shared Studio Coach LLM Refresh Worker
+  # -------------------------
+  svc-studio-coach-refresh-worker:
+    <<: *python_service
+    container_name: df-svc-studio-coach-refresh-worker
+    build:
+      context: ./services/svc-core/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+
+      DATABASE_URL: ${DATABASE_URL}
+      POSTGRES_DSN: ${DATABASE_URL}
+
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+
+      DF_STUDIO_COACH_REFRESH_ENABLED: ${DF_STUDIO_COACH_REFRESH_ENABLED:-true}
+      DF_STUDIO_COACH_AUTO_ACTIVATE: ${DF_STUDIO_COACH_AUTO_ACTIVATE:-false}
+      DF_STUDIO_COACH_REFRESH_INTERVAL_SECONDS: ${DF_STUDIO_COACH_REFRESH_INTERVAL_SECONDS:-21600}
+      DF_STUDIO_COACH_REFRESH_MAX_TIPS: ${DF_STUDIO_COACH_REFRESH_MAX_TIPS:-8}
+      DF_STUDIO_COACH_LLM_PROVIDER: ${DF_STUDIO_COACH_LLM_PROVIDER:-openai}
+      DF_STUDIO_COACH_LLM_MODEL: ${DF_STUDIO_COACH_LLM_MODEL:-gpt-4.1-mini}
+      DF_STUDIO_COACH_REFRESH_CONTEXTS_JSON: >-
+        [
+          {"studio":"face","modes":["text-to-image","image-to-image"],"locales":["en"]},
+          {"studio":"audio","modes":["tts"],"locales":["en"]},
+          {"studio":"fusion","modes":["talking_video","cinematic_video_direction"],"locales":["en"]}
+        ]
+
+      # The worker runs shared code from /app/services/shared/llm directly.
+      # Do not use desifaces_shared.llm here; this repo's shared llm package is mounted below.
+      PYTHONPATH: "/app:/app/services/shared:/app/services/shared/llm"
+    volumes:
+      - ./services/shared:/app/services/shared:ro
+    command:
+      - bash
+      - -lc
+      - |-
+        set -euo pipefail
+        echo "[studio-coach] verifying repo-aligned shared files"
+        ls -l /app/services/shared/llm/studio_coach.py
+        ls -l /app/services/shared/llm/studio_coach_refresh.py
+        cd /app/services/shared/llm
+        python - <<'PY'
+        from __future__ import annotations
+
+        import asyncio
+        import json
+        import os
+        import signal
+        import sys
+        from typing import Any, Dict, List
+
+        import asyncpg
+
+        sys.path.insert(0, "/app/services/shared/llm")
+        from studio_coach_refresh import RefreshConfig, refresh_many
+
+
+        def _env_int(name: str, default: int) -> int:
+            try:
+                return int(str(os.getenv(name, str(default))).strip())
+            except Exception:
+                return default
+
+
+        def _env_bool(name: str, default: bool = False) -> bool:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+        def _contexts() -> List[Dict[str, Any]]:
+            raw = os.getenv("DF_STUDIO_COACH_REFRESH_CONTEXTS_JSON") or ""
+            if raw.strip():
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [x for x in parsed if isinstance(x, dict)]
+            return [
+                {"studio": "face", "modes": ["text-to-image", "image-to-image"], "locales": ["en"]},
+                {"studio": "audio", "modes": ["tts"], "locales": ["en"]},
+                {"studio": "fusion", "modes": ["talking_video", "cinematic_video_direction"], "locales": ["en"]},
+            ]
+
+
+        async def _pool() -> asyncpg.Pool:
+            dsn = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_DSN")
+            if not dsn:
+                raise RuntimeError("DATABASE_URL is required")
+            return await asyncpg.create_pool(
+                dsn=dsn,
+                min_size=1,
+                max_size=max(1, _env_int("DF_STUDIO_COACH_REFRESH_DB_POOL_MAX", 3)),
+            )
+
+
+        async def main() -> None:
+            interval = max(300, _env_int("DF_STUDIO_COACH_REFRESH_INTERVAL_SECONDS", 21600))
+            run_once = _env_bool("DF_STUDIO_COACH_REFRESH_RUN_ONCE", False)
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, stop.set)
+                except NotImplementedError:
+                    pass
+
+            config = RefreshConfig.from_env()
+            print(json.dumps({"event": "studio_coach_refresh_worker_started", "contexts": _contexts(), "enabled": config.enabled, "auto_activate": config.auto_activate}), flush=True)
+            pool = await _pool()
+            try:
+                while not stop.is_set():
+                    all_results = []
+                    for ctx in _contexts():
+                        studio = str(ctx.get("studio") or "").strip()
+                        modes = [str(x).strip() for x in (ctx.get("modes") or []) if str(x).strip()]
+                        locales = [str(x).strip() for x in (ctx.get("locales") or ["en"]) if str(x).strip()]
+                        if not studio or not modes:
+                            continue
+                        results = await refresh_many(pool, studios=[studio], modes=modes, locales=locales, config=config)
+                        all_results.extend(results)
+                    print(json.dumps({"event": "studio_coach_refresh_complete", "results": [r.model_dump() for r in all_results]}, default=str), flush=True)
+                    if run_once:
+                        break
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=interval)
+                    except asyncio.TimeoutError:
+                        continue
+            finally:
+                await pool.close()
+
+
+        asyncio.run(main())
+        PY
+
+networks:
+  df-net:
+    name: df-net
+    driver: bridge
+
+volumes:
+  df_pgdata:
+  df_redisdata:
+  df_saree_templates_cache:
+  df_saree_drape_runs:
+  df_hf_cache:
+  df_marketing_output:

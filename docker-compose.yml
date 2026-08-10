@@ -21,6 +21,42 @@ x-common-python-service: &python_service
       max-size: "10m"
       max-file: "3"
 
+x-one-shot-python-job: &one_shot_python_job
+  <<: *common_env
+  init: true
+  restart: "no"
+  stop_grace_period: 20s
+  networks: [df-net]
+  depends_on:
+    desifaces-db:
+      condition: service_healthy
+    desifaces-redis:
+      condition: service_started
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-notification-env: &notification_env
+  DF_NOTIFICATION_PUSH_PROVIDER: ${DF_NOTIFICATION_PUSH_PROVIDER:-expo}
+  DF_EXPO_PUSH_URL: ${DF_EXPO_PUSH_URL:-https://exp.host/--/api/v2/push/send}
+
+  DF_NOTIFICATION_EMAIL_PROVIDER: ${DF_NOTIFICATION_EMAIL_PROVIDER:-smtp}
+  DF_SMTP_HOST: ${DF_SMTP_HOST:-smtp-relay.gmail.com}
+  DF_SMTP_PORT: ${DF_SMTP_PORT:-587}
+  DF_SMTP_USERNAME: ${DF_SMTP_USERNAME:-}
+  DF_SMTP_PASSWORD: ${DF_SMTP_PASSWORD:-}
+  DF_SMTP_USE_TLS: ${DF_SMTP_USE_TLS:-1}
+  DF_SMTP_EHLO_DOMAIN: ${DF_SMTP_EHLO_DOMAIN:-mail.desifaces.ai}
+
+  DF_EMAIL_FROM: ${DF_EMAIL_FROM:-noreply@desifaces.ai}
+  DF_SUPPORT_EMAIL_TO: ${DF_SUPPORT_EMAIL_TO:-support@desifaces.ai}
+
+  DF_NOTIFICATION_BATCH_LIMIT: ${DF_NOTIFICATION_BATCH_LIMIT:-100}
+  DF_NOTIFICATION_HTTP_TIMEOUT_SEC: ${DF_NOTIFICATION_HTTP_TIMEOUT_SEC:-20}
+  DF_NOTIFICATION_STALE_PROCESSING_AFTER_MINUTES: ${DF_NOTIFICATION_STALE_PROCESSING_AFTER_MINUTES:-20}
+
 x-python-http-healthcheck: &python_http_healthcheck
   test:
     - CMD-SHELL
@@ -87,6 +123,13 @@ services:
   svc-core:
     <<: *python_service
     container_name: df-svc-core
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_healthy
     build:
       context: ./services/svc-core/app
       dockerfile: Dockerfile
@@ -103,11 +146,48 @@ services:
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
       PYTHONPATH: "/app"
+
+      # pricing bootstrap for new free users
+      DF_PRICING_INTERNAL_URL: ${DF_PRICING_INTERNAL_URL:-http://svc-pricing:8009}
+      DF_PRICING_INTERNAL_BEARER: ${DF_PRICING_INTERNAL_BEARER}
+      SVC_TO_SVC_BEARER: ${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}
+
+      <<: *notification_env
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
     expose: ["8000"]
     ports: ["8000:8000"]
     healthcheck:
       <<: *python_http_healthcheck
       start_period: 15s
+
+  # -------------------------
+  # Core Notification Dispatcher Job (one-shot, externally scheduled)
+  # -------------------------
+  svc-core-notification-worker:
+    <<: *one_shot_python_job
+    profiles: ["ops"]
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-core:
+        condition: service_healthy
+      svc-pricing:
+        condition: service_healthy
+    build:
+      context: ./services/svc-core/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+      <<: *notification_env
+    command: ["python", "-m", "app.scripts.run_notification_dispatcher", "--limit", "200"]
 
   # -------------------------
   # Fusion API
@@ -135,6 +215,7 @@ services:
       PYTHONPATH: "/app"
 
       DF_FUSION_STUDIO_ENABLED: ${DF_FUSION_STUDIO_ENABLED:-true}
+      DF_VEED_FABRIC_MODEL_ID: ${DF_VEED_FABRIC_MODEL_ID:-veed/fabric-1.0}
 
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
@@ -170,6 +251,8 @@ services:
   # -------------------------
   svc-fusion-worker:
     <<: *python_service
+    healthcheck:
+      disable: true
     container_name: df-svc-fusion-worker
     depends_on:
       desifaces-db:
@@ -195,6 +278,7 @@ services:
       HEYGEN_SUBMIT_PATH: ${HEYGEN_SUBMIT_PATH:-}
 
       DF_FUSION_STUDIO_ENABLED: ${DF_FUSION_STUDIO_ENABLED:-true}
+      DF_VEED_FABRIC_MODEL_ID: ${DF_VEED_FABRIC_MODEL_ID:-veed/fabric-1.0}
 
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALG: ${JWT_ALG:-HS256}
@@ -228,6 +312,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
       PORT: "8003"
+      UVICORN_WORKERS: ${SVC_FACE_UVICORN_WORKERS:-2}
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
@@ -254,11 +339,20 @@ services:
       DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
       DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
 
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
+
+    command:
+      [
+        "bash",
+        "-lc",
+        "uvicorn app.main:app --host 0.0.0.0 --port $${PORT} --workers $${UVICORN_WORKERS:-2} --log-level $${LOG_LEVEL:-info}"
+      ]
     expose: ["8003"]
     ports: ["8003:8003"]
     healthcheck:
       <<: *python_http_healthcheck
-      start_period: 20s
+      start_period: 30s
 
   # -------------------------
   # Face Worker
@@ -296,6 +390,17 @@ services:
       DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
       DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
 
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
+
+    # Background worker: verify the container's main process exists.
+    healthcheck:
+      test: ["CMD-SHELL", "test -r /proc/1/status"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+
     command: ["bash", "-lc", "python -m app.workers.face_worker"]
 
   # -------------------------
@@ -321,8 +426,22 @@ services:
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
 
+      DF_APPLE_IAP_ENABLE: "true"
+      DF_APPLE_IAP_VERIFICATION_MODE: "decode_only"
+
+      # Google Play Billing / Android IAP verification.
+      # The JSON file is mounted below as read-only and must never be committed to Git.
+      DF_GOOGLE_PLAY_IAP_ENABLE: "${DF_GOOGLE_PLAY_IAP_ENABLE:-1}"
+      GOOGLE_PLAY_PACKAGE_NAME: "${GOOGLE_PLAY_PACKAGE_NAME:-ai.desifaces.app}"
+      GOOGLE_PLAY_VALIDATE_PURCHASES: "${GOOGLE_PLAY_VALIDATE_PURCHASES:-1}"
+      GOOGLE_PLAY_ACKNOWLEDGE_PURCHASES: "${GOOGLE_PLAY_ACKNOWLEDGE_PURCHASES:-1}"
+      GOOGLE_PLAY_VERIFICATION_MODE: "${GOOGLE_PLAY_VERIFICATION_MODE:-google_api}"
+      GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH: "${GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH:-/run/secrets/google_play_service_account.json}"
+
       DF_PRICING_INTERNAL_BEARER: ${DF_PRICING_INTERNAL_BEARER}
-      DF_PRICING_ALLOWED_SERVICES: ${DF_PRICING_ALLOWED_SERVICES:-svc-face,svc-fusion,svc-audio,svc-commerce,svc-music,svc-marketing}
+      DF_PRICING_ALLOWED_SERVICES: ${DF_PRICING_ALLOWED_SERVICES:-svc-core,svc-face,svc-fusion,svc-fusion-extension,svc-audio,svc-commerce,svc-music,svc-marketing}
+    volumes:
+      - /opt/desifaces/secrets/google_play_service_account.json:/run/secrets/google_play_service_account.json:ro
     expose: ["8009"]
     ports: ["8009:8009"]
     command: ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8009}"]
@@ -352,8 +471,10 @@ services:
       PORT: "8008"
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
+      
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING}
       PYTHONPATH: "/app"
+      
 
       COMMERCE_SAREE_BLENDER_ENGINE: ${COMMERCE_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
       DF_SAREE_BLENDER_ENGINE: ${DF_SAREE_BLENDER_ENGINE:-BLENDER_EEVEE_NEXT}
@@ -391,7 +512,6 @@ services:
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
 
-      # legacy/local quote knobs can remain for quote preview
       PRICING_SERVICE_URL: ${PRICING_SERVICE_URL:-}
       COMMERCE_QUOTE_TTL_SECONDS: ${COMMERCE_QUOTE_TTL_SECONDS:-900}
       COMMERCE_CREDIT_USD_RATE: ${COMMERCE_CREDIT_USD_RATE:-0.03}
@@ -401,14 +521,12 @@ services:
       COMMERCE_CREDITS_PER_CHANNEL_EXPORT: ${COMMERCE_CREDITS_PER_CHANNEL_EXPORT:-10}
       COMMERCE_CREDITS_MARKETPLACE_PACK: ${COMMERCE_CREDITS_MARKETPLACE_PACK:-25}
 
-      # shared pricing client for reserve / commit / release
       DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
       DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
       DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
       DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
       DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
 
-      # optional commerce-specific override knobs
       DF_PRICING_VARIANT_COMMERCE: ${DF_PRICING_VARIANT_COMMERCE:-}
       DF_PRICING_VARIANT_COMMERCE_APPAREL: ${DF_PRICING_VARIANT_COMMERCE_APPAREL:-COMMERCE_VTON_APPAREL_STANDARD}
       DF_PRICING_VARIANT_COMMERCE_APPAREL_PREMIUM: ${DF_PRICING_VARIANT_COMMERCE_APPAREL_PREMIUM:-COMMERCE_VTON_APPAREL_PREMIUM}
@@ -642,7 +760,9 @@ services:
       PORT: "8004"
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
-      PYTHONPATH: "/app"
+      # Required for DB-backed Studio Coach serving/ranking. svc-audio imports
+      # shared LLM modules from the repo-mounted services/shared tree.
+      PYTHONPATH: "/app:/app/services/shared:/app/services/shared/llm:/app/services/shared/python"
 
       JWT_SECRET: ${JWT_SECRET}
       JWT_ISSUER: ${JWT_ISSUER:-desifaces}
@@ -651,6 +771,8 @@ services:
 
       AZURE_SPEECH_KEY: ${AZURE_SPEECH_KEY}
       AZURE_SPEECH_REGION: ${AZURE_SPEECH_REGION:-eastus}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      SARVAM_API_KEY: ${SARVAM_API_KEY:-}
       AZURE_TRANSLATOR_KEY: ${AZURE_TRANSLATOR_KEY}
       AZURE_TRANSLATOR_ENDPOINT: ${AZURE_TRANSLATOR_ENDPOINT:-https://api.cognitive.microsofttranslator.com}
       AZURE_TRANSLATOR_REGION: ${AZURE_TRANSLATOR_REGION:-eastus}
@@ -665,6 +787,13 @@ services:
       DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
       DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
 
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
+
+    volumes:
+      # Read-only shared code mount for Studio Coach ranker/tips.
+      - ./services/shared:/app/services/shared:ro
+
     expose: ["8004"]
     ports: ["8004:8004"]
     healthcheck:
@@ -676,6 +805,8 @@ services:
   # -------------------------
   svc-audio-worker:
     <<: *python_service
+    healthcheck:
+      disable: true
     container_name: df-svc-audio-worker
     depends_on:
       desifaces-db:
@@ -693,7 +824,8 @@ services:
       PYTHONUNBUFFERED: "1"
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
-      PYTHONPATH: "/app"
+      # Keep worker runtime aligned with svc-audio API.
+      PYTHONPATH: "/app:/app/services/shared:/app/services/shared/llm:/app/services/shared/python"
 
       AUDIO_STUDIO_TYPE: "audio"
       WORKER_POLL_SECS: "1.5"
@@ -706,6 +838,8 @@ services:
 
       AZURE_SPEECH_KEY: ${AZURE_SPEECH_KEY}
       AZURE_SPEECH_REGION: ${AZURE_SPEECH_REGION:-eastus}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      SARVAM_API_KEY: ${SARVAM_API_KEY:-}
       AZURE_TRANSLATOR_KEY: ${AZURE_TRANSLATOR_KEY}
       AZURE_TRANSLATOR_ENDPOINT: ${AZURE_TRANSLATOR_ENDPOINT:-https://api.cognitive.microsofttranslator.com}
       AZURE_TRANSLATOR_REGION: ${AZURE_TRANSLATOR_REGION:-eastus}
@@ -719,6 +853,13 @@ services:
       DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
       DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
       DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
+
+    volumes:
+      # Read-only shared code mount for any shared Audio/Studio Coach runtime imports.
+      - ./services/shared:/app/services/shared:ro
 
     command: ["bash", "-lc", "python -m app.workers.audio_worker"]
 
@@ -750,6 +891,8 @@ services:
 
   svc-dashboard-worker:
     <<: *python_service
+    healthcheck:
+      disable: true
     container_name: df-svc-dashboard-worker
     build:
       context: ./services/svc-dashboard/app
@@ -772,9 +915,16 @@ services:
   svc-fusion-extension:
     <<: *python_service
     container_name: df-svc-fusion-extension
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
     build:
-      context: ./services/svc-fusion-extension/app
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/svc-fusion-extension/app/Dockerfile
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
@@ -796,15 +946,32 @@ services:
       AZURE_FINAL_VIDEO_CONTAINER: ${AZURE_FINAL_VIDEO_CONTAINER:-video-output}
       FINAL_SAS_TTL_SECONDS: ${FINAL_SAS_TTL_SECONDS:-1296000}
 
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
       DEFAULT_SEGMENT_SECONDS: ${DEFAULT_SEGMENT_SECONDS:-60}
       MAX_SEGMENT_SECONDS: ${MAX_SEGMENT_SECONDS:-120}
       MAX_INFLIGHT_SEGMENTS_PER_JOB: ${MAX_INFLIGHT_SEGMENTS_PER_JOB:-2}
       MAX_TOTAL_SEGMENTS_PER_JOB: ${MAX_TOTAL_SEGMENTS_PER_JOB:-500}
 
+      FAL_KEY: ${FAL_KEY:-}
+      DF_FUSION_PROVIDER: ${DF_FUSION_PROVIDER:-omnihuman_v15}
+      DF_OMNIHUMAN_MODEL_ID: ${DF_OMNIHUMAN_MODEL_ID:-fal-ai/bytedance/omnihuman/v1.5}
+      DF_OMNIHUMAN_MAX_AUDIO_SECONDS: ${DF_OMNIHUMAN_MAX_AUDIO_SECONDS:-30}
+      DF_OMNIHUMAN_FREE_RESOLUTION: ${DF_OMNIHUMAN_FREE_RESOLUTION:-720p}
+      DF_OMNIHUMAN_PAID_RESOLUTION: ${DF_OMNIHUMAN_PAID_RESOLUTION:-1080p}
+      DF_OMNIHUMAN_DEFAULT_TURBO_MODE: ${DF_OMNIHUMAN_DEFAULT_TURBO_MODE:-0}
+
       AUDIO_POLL_SECONDS: ${AUDIO_POLL_SECONDS:-1.5}
       AUDIO_TIMEOUT_SECONDS: ${AUDIO_TIMEOUT_SECONDS:-300}
       FUSION_POLL_SECONDS: ${FUSION_POLL_SECONDS:-3.0}
       FUSION_TIMEOUT_SECONDS: ${FUSION_TIMEOUT_SECONDS:-900}
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
     expose: ["8006"]
     ports: ["8006:8006"]
     healthcheck:
@@ -814,9 +981,16 @@ services:
   svc-fusion-extension-worker:
     <<: *python_service
     container_name: df-svc-fusion-extension-worker
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
     build:
-      context: ./services/svc-fusion-extension/app
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/svc-fusion-extension/app/Dockerfile
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
@@ -838,6 +1012,12 @@ services:
       AZURE_FINAL_VIDEO_CONTAINER: ${AZURE_FINAL_VIDEO_CONTAINER:-video-output}
       FINAL_SAS_TTL_SECONDS: ${FINAL_SAS_TTL_SECONDS:-1296000}
 
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
       WORKER_ENABLED: "true"
       WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-1.0}
       WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-10}
@@ -847,18 +1027,36 @@ services:
       MAX_INFLIGHT_SEGMENTS_PER_JOB: ${MAX_INFLIGHT_SEGMENTS_PER_JOB:-2}
       MAX_TOTAL_SEGMENTS_PER_JOB: ${MAX_TOTAL_SEGMENTS_PER_JOB:-500}
 
+      FAL_KEY: ${FAL_KEY:-}
+      DF_FUSION_PROVIDER: ${DF_FUSION_PROVIDER:-omnihuman_v15}
+      DF_OMNIHUMAN_MODEL_ID: ${DF_OMNIHUMAN_MODEL_ID:-fal-ai/bytedance/omnihuman/v1.5}
+      DF_OMNIHUMAN_MAX_AUDIO_SECONDS: ${DF_OMNIHUMAN_MAX_AUDIO_SECONDS:-30}
+      DF_OMNIHUMAN_FREE_RESOLUTION: ${DF_OMNIHUMAN_FREE_RESOLUTION:-720p}
+      DF_OMNIHUMAN_PAID_RESOLUTION: ${DF_OMNIHUMAN_PAID_RESOLUTION:-1080p}
+      DF_OMNIHUMAN_DEFAULT_TURBO_MODE: ${DF_OMNIHUMAN_DEFAULT_TURBO_MODE:-0}
+
       AUDIO_POLL_SECONDS: ${AUDIO_POLL_SECONDS:-1.5}
       AUDIO_TIMEOUT_SECONDS: ${AUDIO_TIMEOUT_SECONDS:-300}
       FUSION_POLL_SECONDS: ${FUSION_POLL_SECONDS:-3.0}
       FUSION_TIMEOUT_SECONDS: ${FUSION_TIMEOUT_SECONDS:-900}
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
     command: ["bash", "-lc", "python -m app.workers.longform_worker"]
 
   svc-fusion-extension-stitch-worker:
     <<: *python_service
     container_name: df-svc-fusion-extension-stitch-worker
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-pricing:
+        condition: service_started
     build:
-      context: ./services/svc-fusion-extension/app
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/svc-fusion-extension/app/Dockerfile
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
@@ -875,9 +1073,18 @@ services:
       AZURE_FINAL_VIDEO_CONTAINER: ${AZURE_FINAL_VIDEO_CONTAINER:-video-output}
       FINAL_SAS_TTL_SECONDS: ${FINAL_SAS_TTL_SECONDS:-1296000}
 
+      DF_PRICING_ENABLED: ${DF_PRICING_ENABLED:-true}
+      DF_PRICING_REQUIRED: ${DF_PRICING_REQUIRED:-1}
+      DF_PRICING_URL: ${DF_PRICING_URL:-http://svc-pricing:8009}
+      DF_PRICING_TIMEOUT_S: ${DF_PRICING_TIMEOUT_S:-10}
+      DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
+
       STITCH_WORKER_ENABLED: "true"
       STITCH_WORKER_POLL_SECONDS: ${STITCH_WORKER_POLL_SECONDS:-2.0}
       STITCH_WORKER_BATCH_SIZE: ${STITCH_WORKER_BATCH_SIZE:-2}
+
+      DF_NOTIFICATIONS_URL: ${DF_NOTIFICATIONS_URL:-http://svc-core:8000}
+      DF_NOTIFICATIONS_BEARER: ${DF_NOTIFICATIONS_BEARER:-${SVC_TO_SVC_BEARER:-${DF_PRICING_INTERNAL_BEARER}}}
     command: ["bash", "-lc", "python -m app.workers.stitch_worker"]
 
   # -------------------------
@@ -1158,6 +1365,147 @@ services:
 
       PYTHONPATH: "/app"
     command: ["bash", "-lc", "python -m app.workers.marketing_optimizer"]
+
+  # -------------------------
+  # Shared Studio Coach LLM Refresh Worker
+  # -------------------------
+  svc-studio-coach-refresh-worker:
+    <<: *python_service
+    healthcheck:
+      disable: true
+    container_name: df-svc-studio-coach-refresh-worker
+    build:
+      context: ./services/svc-core/app
+      dockerfile: Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+
+      DATABASE_URL: ${DATABASE_URL}
+      POSTGRES_DSN: ${DATABASE_URL}
+
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+
+      DF_STUDIO_COACH_REFRESH_ENABLED: ${DF_STUDIO_COACH_REFRESH_ENABLED:-true}
+      DF_STUDIO_COACH_AUTO_ACTIVATE: ${DF_STUDIO_COACH_AUTO_ACTIVATE:-false}
+      DF_STUDIO_COACH_REFRESH_INTERVAL_SECONDS: ${DF_STUDIO_COACH_REFRESH_INTERVAL_SECONDS:-21600}
+      DF_STUDIO_COACH_REFRESH_MAX_TIPS: ${DF_STUDIO_COACH_REFRESH_MAX_TIPS:-8}
+      DF_STUDIO_COACH_LLM_PROVIDER: ${DF_STUDIO_COACH_LLM_PROVIDER:-openai}
+      DF_STUDIO_COACH_LLM_MODEL: ${DF_STUDIO_COACH_LLM_MODEL:-gpt-4.1-mini}
+      DF_STUDIO_COACH_REFRESH_CONTEXTS_JSON: >-
+        [
+          {"studio":"face","modes":["text-to-image","image-to-image"],"locales":["en"]},
+          {"studio":"audio","modes":["tts"],"locales":["en"]},
+          {"studio":"fusion","modes":["talking_video","cinematic_video_direction"],"locales":["en"]}
+        ]
+
+      # The worker runs shared code from /app/services/shared/llm directly.
+      # Do not use desifaces_shared.llm here; this repo's shared llm package is mounted below.
+      PYTHONPATH: "/app:/app/services/shared:/app/services/shared/llm"
+    volumes:
+      - ./services/shared:/app/services/shared:ro
+    command:
+      - bash
+      - -lc
+      - |-
+        set -euo pipefail
+        echo "[studio-coach] verifying repo-aligned shared files"
+        ls -l /app/services/shared/llm/studio_coach.py
+        ls -l /app/services/shared/llm/studio_coach_refresh.py
+        cd /app/services/shared/llm
+        python - <<'PY'
+        from __future__ import annotations
+
+        import asyncio
+        import json
+        import os
+        import signal
+        import sys
+        from typing import Any, Dict, List
+
+        import asyncpg
+
+        sys.path.insert(0, "/app/services/shared/llm")
+        from studio_coach_refresh import RefreshConfig, refresh_many
+
+
+        def _env_int(name: str, default: int) -> int:
+            try:
+                return int(str(os.getenv(name, str(default))).strip())
+            except Exception:
+                return default
+
+
+        def _env_bool(name: str, default: bool = False) -> bool:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+        def _contexts() -> List[Dict[str, Any]]:
+            raw = os.getenv("DF_STUDIO_COACH_REFRESH_CONTEXTS_JSON") or ""
+            if raw.strip():
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [x for x in parsed if isinstance(x, dict)]
+            return [
+                {"studio": "face", "modes": ["text-to-image", "image-to-image"], "locales": ["en"]},
+                {"studio": "audio", "modes": ["tts"], "locales": ["en"]},
+                {"studio": "fusion", "modes": ["talking_video", "cinematic_video_direction"], "locales": ["en"]},
+            ]
+
+
+        async def _pool() -> asyncpg.Pool:
+            dsn = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_DSN")
+            if not dsn:
+                raise RuntimeError("DATABASE_URL is required")
+            return await asyncpg.create_pool(
+                dsn=dsn,
+                min_size=1,
+                max_size=max(1, _env_int("DF_STUDIO_COACH_REFRESH_DB_POOL_MAX", 3)),
+            )
+
+
+        async def main() -> None:
+            interval = max(300, _env_int("DF_STUDIO_COACH_REFRESH_INTERVAL_SECONDS", 21600))
+            run_once = _env_bool("DF_STUDIO_COACH_REFRESH_RUN_ONCE", False)
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, stop.set)
+                except NotImplementedError:
+                    pass
+
+            config = RefreshConfig.from_env()
+            print(json.dumps({"event": "studio_coach_refresh_worker_started", "contexts": _contexts(), "enabled": config.enabled, "auto_activate": config.auto_activate}), flush=True)
+            pool = await _pool()
+            try:
+                while not stop.is_set():
+                    all_results = []
+                    for ctx in _contexts():
+                        studio = str(ctx.get("studio") or "").strip()
+                        modes = [str(x).strip() for x in (ctx.get("modes") or []) if str(x).strip()]
+                        locales = [str(x).strip() for x in (ctx.get("locales") or ["en"]) if str(x).strip()]
+                        if not studio or not modes:
+                            continue
+                        results = await refresh_many(pool, studios=[studio], modes=modes, locales=locales, config=config)
+                        all_results.extend(results)
+                    print(json.dumps({"event": "studio_coach_refresh_complete", "results": [r.model_dump() for r in all_results]}, default=str), flush=True)
+                    if run_once:
+                        break
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=interval)
+                    except asyncio.TimeoutError:
+                        continue
+            finally:
+                await pool.close()
+
+
+        asyncio.run(main())
+        PY
 
 networks:
   df-net:

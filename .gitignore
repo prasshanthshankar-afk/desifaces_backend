@@ -1,2 +1,13 @@
 infra/.env
 ./infra/.env
+tmp/
+infra/.env.bak.*
+*.out
+*.log
+*.pem
+*.p12
+*.key
+
+# Python generated files
+__pycache__/
+*.py[cod]

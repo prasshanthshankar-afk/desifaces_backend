@@ -38,6 +38,21 @@ def _clean_bearer(token: str) -> str:
     return value
 
 
+def _disabled_payload(response_type: Type[T]) -> dict:
+    payload = {"status": "disabled", "message": "Pricing disabled"}
+    if hasattr(response_type, "model_fields"):
+        fields = getattr(response_type, "model_fields", {})
+        if "pricing" in fields:
+            payload["pricing"] = {
+                "state": "disabled",
+                "enabled": False,
+                "message": "Pricing disabled",
+            }
+        if "pricing_summary" in fields:
+            payload["pricing_summary"] = {}
+    return payload
+
+
 @dataclass(frozen=True)
 class PricingClientConfig:
     enabled: bool
@@ -91,11 +106,11 @@ class SvcPricingClient:
         user_id: Optional[str] = None,
     ) -> T:
         if not self.enabled:
-            return response_type.model_validate({"status": "disabled"})
+            return response_type.model_validate(_disabled_payload(response_type))
 
         url = f"{self.config.base_url}{path}"
 
-        async with httpx.AsyncClient(timeout=self.config.timeout_s) as client:
+        async with httpx.AsyncClient(timeout=self.config.timeout_s, follow_redirects=True) as client:
             response = await client.post(
                 url,
                 json=payload.model_dump(mode="json", exclude_none=True),

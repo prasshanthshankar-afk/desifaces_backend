@@ -37,7 +37,41 @@ class CatalogSyncService:
 
     @staticmethod
     def _base_lang_from_locale(locale: str) -> str:
-        return (locale.split("-", 1)[0] or "").strip().lower()
+        return (
+            (locale or "")
+            .strip()
+            .replace("_", "-")
+            .split("-", 1)[0]
+            .strip()
+            .lower()
+        )
+
+    @staticmethod
+    def _region_from_locale(locale: str) -> str | None:
+        parts = [
+            part.strip()
+            for part in (locale or "")
+            .strip()
+            .replace("_", "-")
+            .split("-")
+            if part.strip()
+        ]
+
+        if len(parts) < 2:
+            return None
+
+        candidate = parts[-1]
+
+        # BCP-47 region subtag:
+        #   2 alphabetic characters, or
+        #   3 numeric characters.
+        if len(candidate) == 2 and candidate.isalpha():
+            return candidate.upper()
+
+        if len(candidate) == 3 and candidate.isdigit():
+            return candidate
+
+        return None
 
     # ----------------------------
     # 1) Speech voices inventory
@@ -77,22 +111,111 @@ class CatalogSyncService:
                     supports_styles = bool(style_list)
 
                     base_lang = self._base_lang_from_locale(locale)
+                    region_code = self._region_from_locale(locale)
                     meta_json = json.dumps(v)
 
-                    # Ensure locale exists (keep is_enabled true)
+                    # Ensure the normalized language master exists before
+                    # assigning the FK-backed language_code to a discovered
+                    # locale. Provider locale syntax supplies identity only;
+                    # no geography/language mapping is hard-coded here.
+                    if base_lang:
+                        await conn.execute(
+                            """
+                            INSERT INTO public.tts_languages(
+                              language_code,
+                              is_enabled,
+                              source,
+                              source_version,
+                              meta_json
+                            )
+                            VALUES(
+                              $1,
+                              true,
+                              'provider_catalog',
+                              'azure_speech_live',
+                              jsonb_build_object(
+                                'generated_from_provider_locale',
+                                true
+                              )
+                            )
+                            ON CONFLICT(language_code) DO NOTHING
+                            """,
+                            base_lang,
+                        )
+
+                    # Ensure locale exists and persist normalized language /
+                    # region facts derived from the provider's locale tag.
                     await conn.execute(
                         """
-                        INSERT INTO public.tts_locales
-                          (locale, translator_lang, tts_supported, translate_supported, is_enabled, display_name, native_name, meta_json)
-                        VALUES
-                          ($1, $2, true, false, true, NULL, NULL, '{}'::jsonb)
-                        ON CONFLICT (locale) DO UPDATE
-                          SET translator_lang = COALESCE(public.tts_locales.translator_lang, EXCLUDED.translator_lang),
-                              tts_supported   = true,
-                              is_enabled      = true
+                        INSERT INTO public.tts_locales(
+                          locale,
+                          translator_lang,
+                          tts_supported,
+                          translate_supported,
+                          is_enabled,
+                          display_name,
+                          native_name,
+                          meta_json,
+                          language_code,
+                          region_code,
+                          catalog_source,
+                          source_version,
+                          discovered_at,
+                          last_seen_at
+                        )
+                        VALUES(
+                          $1,
+                          $2,
+                          true,
+                          false,
+                          true,
+                          NULL,
+                          NULL,
+                          '{}'::jsonb,
+                          $2,
+                          $3,
+                          'provider_catalog',
+                          'azure_speech_live',
+                          now(),
+                          now()
+                        )
+                        ON CONFLICT(locale) DO UPDATE
+                          SET translator_lang = COALESCE(
+                                NULLIF(BTRIM(public.tts_locales.translator_lang), ''),
+                                EXCLUDED.translator_lang
+                              ),
+                              language_code = COALESCE(
+                                NULLIF(BTRIM(public.tts_locales.language_code), ''),
+                                EXCLUDED.language_code
+                              ),
+                              region_code = COALESCE(
+                                NULLIF(BTRIM(public.tts_locales.region_code), ''),
+                                EXCLUDED.region_code
+                              ),
+                              tts_supported = true,
+                              is_enabled = true,
+                              source_version = CASE
+                                WHEN NULLIF(
+                                  BTRIM(public.tts_locales.catalog_source),
+                                  ''
+                                ) IS NULL
+                                  OR public.tts_locales.catalog_source =
+                                     EXCLUDED.catalog_source
+                                THEN EXCLUDED.source_version
+                                ELSE public.tts_locales.source_version
+                              END,
+                              catalog_source = COALESCE(
+                                NULLIF(
+                                  BTRIM(public.tts_locales.catalog_source),
+                                  ''
+                                ),
+                                EXCLUDED.catalog_source
+                              ),
+                              last_seen_at = now()
                         """,
                         locale,
                         base_lang,
+                        region_code,
                     )
 
                     # Upsert voice
@@ -120,6 +243,119 @@ class CatalogSyncService:
                     upserted += 1
 
         return upserted
+
+    async def sync_speech_capabilities(self) -> Tuple[int, int, int]:
+        """Bridge discovered Azure voices into provider-neutral capability masterdata."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                model_locales = await conn.execute(
+                    """
+                    INSERT INTO public.tts_model_locale_capabilities(
+                      provider_code,model_code,locale,
+                      provider_locale_code,accent_code,
+                      support_level,is_enabled,is_approved,
+                      source,source_version,last_seen_at,meta_json
+                    )
+                    SELECT
+                      $1::text,m.model_code,v.locale,
+                      v.locale,NULL,
+                      'supported',true,true,
+                      'provider_catalog','azure_speech_live',now(),
+                      jsonb_build_object('provider',$1::text)
+                    FROM public.tts_provider_models m
+                    CROSS JOIN (
+                      SELECT DISTINCT locale
+                      FROM public.tts_voices
+                      WHERE provider=$1::text
+                        AND locale IS NOT NULL
+                    ) v
+                    WHERE m.provider_code=$1::text
+                      AND m.is_enabled=true
+                    ON CONFLICT(provider_code,model_code,locale)
+                    DO UPDATE SET
+                      provider_locale_code=EXCLUDED.provider_locale_code,
+                      support_level='supported',
+                      is_enabled=true,
+                      is_approved=true,
+                      source='provider_catalog',
+                      source_version='azure_speech_live',
+                      last_seen_at=now(),
+                      updated_at=now()
+                    """,
+                    self.PROVIDER,
+                )
+
+                voice_models = await conn.execute(
+                    """
+                    INSERT INTO public.tts_voice_model_capabilities(
+                      provider_code,voice_id,model_code,
+                      is_enabled,is_approved,supports_styles,
+                      source,source_version,
+                      discovered_at,last_seen_at,meta_json
+                    )
+                    SELECT
+                      $1::text,v.id,m.model_code,
+                      true,true,v.supports_styles,
+                      'provider_catalog','azure_speech_live',
+                      now(),now(),
+                      jsonb_build_object('provider',$1::text)
+                    FROM public.tts_voices v
+                    CROSS JOIN public.tts_provider_models m
+                    WHERE v.provider=$1::text
+                      AND m.provider_code=$1::text
+                      AND m.is_enabled=true
+                    ON CONFLICT(provider_code,voice_id,model_code)
+                    DO UPDATE SET
+                      is_enabled=true,
+                      is_approved=true,
+                      supports_styles=EXCLUDED.supports_styles,
+                      source='provider_catalog',
+                      source_version='azure_speech_live',
+                      last_seen_at=now(),
+                      updated_at=now()
+                    """,
+                    self.PROVIDER,
+                )
+
+                voice_locales = await conn.execute(
+                    """
+                    INSERT INTO public.tts_voice_locale_capabilities(
+                      voice_id,locale,accent_code,
+                      is_native_fit,is_recommended,
+                      is_enabled,is_approved,quality_score,
+                      source,source_version,last_seen_at,
+                      meta_json,selection_priority
+                    )
+                    SELECT
+                      v.id,v.locale,'',
+                      true,false,
+                      true,true,0.9000,
+                      'provider_catalog','azure_speech_live',now(),
+                      jsonb_build_object('provider',$1::text),0
+                    FROM public.tts_voices v
+                    WHERE v.provider=$1::text
+                      AND v.locale IS NOT NULL
+                    ON CONFLICT(voice_id,locale,accent_code)
+                    DO UPDATE SET
+                      is_native_fit=true,
+                      is_enabled=true,
+                      is_approved=true,
+                      quality_score=COALESCE(
+                        public.tts_voice_locale_capabilities.quality_score,
+                        EXCLUDED.quality_score
+                      ),
+                      source='provider_catalog',
+                      source_version='azure_speech_live',
+                      last_seen_at=now(),
+                      updated_at=now()
+                    """,
+                    self.PROVIDER,
+                )
+
+        def count(tag: str) -> int:
+            return int(tag.split()[-1])
+
+        return count(model_locales), count(voice_models), count(voice_locales)
 
     # ----------------------------
     # 2) Translator languages inventory
@@ -197,10 +433,8 @@ class CatalogSyncService:
                            SELECT 1
                              FROM public.tts_voices v
                             WHERE v.locale = l.locale
-                              AND v.provider = $1
                        )
-                    """,
-                    self.PROVIDER,
+                    """
                 )
                 reconciled = int(res1.split()[-1]) if res1.startswith("UPDATE") else 0
 
@@ -245,6 +479,7 @@ class CatalogSyncService:
     # ----------------------------
     async def sync_all(self) -> SyncSummary:
         speech_upserted = await self.sync_speech_voices()
+        await self.sync_speech_capabilities()
         langs_seen, locales_touched = await self.sync_translator_languages()
         locales_reconciled, defaults_set = await self.reconcile_locales()
 

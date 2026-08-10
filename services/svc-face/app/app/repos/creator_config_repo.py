@@ -357,7 +357,11 @@ class CreatorPlatformConfigRepo(BaseRepository):
         if not cols:
             return []
 
-        q = f"SELECT {', '.join(cols)} FROM {table} WHERE is_active = true"
+        q = (
+            f"SELECT {', '.join(cols)} FROM {table} "
+            "WHERE is_active = true "
+            "AND left(code, 4) <> 'geo_'"
+        )
         order_bits: List[str] = []
         if "sort_order" in cols:
             order_bits.append("sort_order")

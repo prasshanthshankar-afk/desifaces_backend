@@ -29,6 +29,19 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class AspectRatio(str, Enum):
+    PORTRAIT = "9:16"
+    LANDSCAPE = "16:9"
+    SQUARE = "1:1"
+
+
+class ImageSizeHint(str, Enum):
+    AUTO = "auto"
+    SQUARE_1024 = "1024x1024"
+    PORTRAIT_1024x1536 = "1024x1536"
+    LANDSCAPE_1536x1024 = "1536x1024"
+
+
 # ============================================================================
 # LEGACY COMPATIBILITY MODELS (for existing routes)
 # ============================================================================
@@ -133,6 +146,10 @@ class CreatorPlatformRequest(BaseModel):
       - New path: source_image_asset_id (returned by /api/face/assets/upload)
         If source_image_asset_id is present and source_image_url is missing,
         we automatically mirror asset_id into source_image_url so older code paths work.
+
+    Framing support:
+      - Frontend should send aspect_ratio as the canonical framing control
+      - image_size_hint is provider-facing / derived, not something normal users need to pick
     """
     model_config = ConfigDict(extra="ignore")
 
@@ -162,6 +179,13 @@ class CreatorPlatformRequest(BaseModel):
     clothing_style_code: Optional[str] = None
     platform_code: Optional[str] = None
 
+    # Framing / composition controls
+    shot_type_code: Optional[str] = None
+    aspect_ratio: AspectRatio = AspectRatio.PORTRAIT
+
+    # Internal/provider-facing image size hint.
+    image_size_hint: Optional[ImageSizeHint] = None
+
     # Generation control
     num_variants: int = Field(default=4, ge=1, le=8)
     user_prompt: Optional[str] = Field(default=None, max_length=1500)
@@ -175,21 +199,76 @@ class CreatorPlatformRequest(BaseModel):
     source_image_url: Optional[str] = None
     source_image_asset_id: Optional[str] = None
 
-    preservation_strength: float = Field(0.75, ge=0.0, le=1.0)
-    # higher = preserve identity more (minimal change)
+    preservation_strength: float = Field(0.995, ge=0.0, le=1.0)
+    identity_lock: bool = Field(default=False)
+    identity_lock_level: Optional[str] = None
+    preserve_source_identity: bool = Field(default=False)
+    preserve_source_gender: bool = Field(default=False)
+    gender_lock_mode: Optional[str] = None
+    allowed_i2i_changes: Optional[list[str]] = None
+    forbidden_i2i_changes: Optional[list[str]] = None
+    identity_lock_instructions: Optional[str] = Field(default=None, max_length=1500)
 
     # Future-proof knobs
     facial_features: Dict[str, str] = Field(default_factory=dict)
     preferred_variations: List[str] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_aliases(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        out = dict(data)
+
+        if not (str(out.get("use_case_code") or "").strip()) and str(out.get("use_case") or "").strip():
+            out["use_case_code"] = out.get("use_case")
+
+        if not (str(out.get("shot_type_code") or "").strip()) and str(out.get("shot_type") or "").strip():
+            out["shot_type_code"] = out.get("shot_type")
+
+        if not (str(out.get("context_code") or "").strip()) and str(out.get("context") or "").strip():
+            out["context_code"] = out.get("context")
+
+        if not (str(out.get("style_code") or "").strip()) and str(out.get("style") or "").strip():
+            out["style_code"] = out.get("style")
+
+        raw_ratio = str(out.get("aspect_ratio") or "").strip().lower()
+        if raw_ratio in {"portrait", "vertical"}:
+            out["aspect_ratio"] = AspectRatio.PORTRAIT.value
+        elif raw_ratio in {"landscape", "horizontal"}:
+            out["aspect_ratio"] = AspectRatio.LANDSCAPE.value
+        elif raw_ratio in {"square"}:
+            out["aspect_ratio"] = AspectRatio.SQUARE.value
+
+        if not out.get("image_size_hint") and out.get("size"):
+            out["image_size_hint"] = out.get("size")
+
+        return out
+
+    @staticmethod
+    def _default_size_for_aspect_ratio(aspect_ratio: AspectRatio) -> ImageSizeHint:
+        if aspect_ratio == AspectRatio.SQUARE:
+            return ImageSizeHint.SQUARE_1024
+        if aspect_ratio == AspectRatio.LANDSCAPE:
+            return ImageSizeHint.LANDSCAPE_1536x1024
+        return ImageSizeHint.PORTRAIT_1024x1536
+
+    @staticmethod
+    def _is_size_compatible_with_aspect_ratio(
+        aspect_ratio: AspectRatio,
+        image_size_hint: ImageSizeHint,
+    ) -> bool:
+        if image_size_hint == ImageSizeHint.AUTO:
+            return True
+        if aspect_ratio == AspectRatio.SQUARE:
+            return image_size_hint == ImageSizeHint.SQUARE_1024
+        if aspect_ratio == AspectRatio.LANDSCAPE:
+            return image_size_hint == ImageSizeHint.LANDSCAPE_1536x1024
+        return image_size_hint == ImageSizeHint.PORTRAIT_1024x1536
+
     @model_validator(mode="after")
     def _normalize_subjects(self):
-        """
-        Keep request permissive (no 422s) and normalize defaults:
-          - single_person: if subjects missing, synthesize 1 subject from gender (if provided)
-          - two_people: if subjects missing, synthesize 2 subjects with unknown genders
-        Prompt engine can decide details when genders are unknown.
-        """
         if self.subject_composition_code == "single_person":
             if not self.subjects:
                 self.subjects = [SubjectSpec(gender=self.gender)]
@@ -202,9 +281,16 @@ class CreatorPlatformRequest(BaseModel):
             if len(self.subjects) == 1:
                 self.subjects = [self.subjects[0], SubjectSpec()]
 
-        # Bridge: if new field provided, mirror into source_image_url for older code paths.
         if (not (self.source_image_url or "").strip()) and (self.source_image_asset_id or "").strip():
             self.source_image_url = (self.source_image_asset_id or "").strip()
+
+        if self.image_size_hint is None:
+            self.image_size_hint = self._default_size_for_aspect_ratio(self.aspect_ratio)
+        else:
+            if not self._is_size_compatible_with_aspect_ratio(self.aspect_ratio, self.image_size_hint):
+                raise ValueError(
+                    f"image_size_hint {self.image_size_hint.value} is incompatible with aspect_ratio {self.aspect_ratio.value}"
+                )
 
         return self
 
@@ -215,9 +301,6 @@ class CreatorPlatformRequest(BaseModel):
 
 
 class PricingConfirmationModel(BaseModel):
-    """
-    Passed by the frontend to prove the user saw and confirmed a preview.
-    """
     model_config = ConfigDict(extra="ignore")
 
     quote_id: str
@@ -228,11 +311,6 @@ class PricingConfirmationModel(BaseModel):
 
 
 class CreatorGenerateRequest(BaseModel):
-    """
-    New wrapped generate request.
-    Keep legacy compatibility by still allowing routes to accept CreatorPlatformRequest
-    during migration, but this is the target contract.
-    """
     model_config = ConfigDict(extra="ignore")
 
     studio: str = "face"
@@ -244,11 +322,13 @@ class PricingStateView(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     state: str
+    enabled: Optional[bool] = None
 
     quote_id: Optional[str] = None
     quote_expires_at: Optional[str] = None
     preview_fingerprint: Optional[str] = None
     reservation_id: Optional[str] = None
+    variant_code: Optional[str] = None
 
     service_name: Optional[str] = None
     service_action: Optional[str] = None
@@ -264,7 +344,6 @@ class PricingStateView(BaseModel):
     estimated_amount: Optional[str] = None
     final_amount: Optional[str] = None
 
-    # Backward-compatible raw money field from current pricing block
     amount: Optional[str] = None
     currency: Optional[str] = None
     ledger_entry_id: Optional[str] = None
@@ -277,6 +356,9 @@ class PricingStateView(BaseModel):
     entitlement_reason: Optional[str] = None
     tier_code: Optional[str] = None
 
+    source: Optional[str] = None
+    reason: Optional[str] = None
+    summary: Dict[str, Any] = Field(default_factory=dict)
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -327,7 +409,6 @@ class JobCreatedResponse(BaseModel):
     estimated_completion_time: str
     config: Dict[str, Any]
 
-    # New standardized pricing response block
     pricing: Optional[PricingStateView] = None
 
 
@@ -353,7 +434,6 @@ class JobStatusResponse(BaseModel):
     variants: Optional[List[GeneratedVariant]] = None
     error: Optional[str] = None
 
-    # New standardized pricing blocks
     pricing: Optional[PricingStateView] = None
     pricing_summary: Optional[PricingSummaryView] = None
 

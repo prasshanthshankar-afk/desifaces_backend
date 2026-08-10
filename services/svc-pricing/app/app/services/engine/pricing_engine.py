@@ -193,8 +193,8 @@ async def _select_pricebook(
           and channel = $2
           and effective_from <= now()
           and (effective_to is null or effective_to > now())
-          and (country_code is null or country_code = $3 or $3 = '')
-          and (tier_code is null or tier_code = $4)
+          and (country_code is null or country_code = '' or country_code = $3 or $3 = '')
+          and (tier_code is null or tier_code = '' or tier_code = $4)
         order by
           case when $3 <> '' and country_code = $3 then 1 else 0 end desc,
           case when tier_code = $4 then 1 else 0 end desc,
