@@ -236,7 +236,8 @@ def test_video_media_and_compatibility_response_separate_provider_execution() ->
         model="provider-model",
         state=ProviderExecutionState.SUCCEEDED,
         provider_request_id="provider-job-123",
-        created_at=now if False else None,
+        started_at=now,
+        completed_at=now,
     )
 
     response = fusion_job_to_compatibility_response(
