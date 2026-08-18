@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -156,3 +157,16 @@ def test_director_claim_uses_integer_safe_lease_interval():
         assert conn.args == (900,)
 
     asyncio.run(run())
+
+
+def test_shared_studio_artifact_trigger_is_record_shape_safe():
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "migrations"
+        / "2026_08_18_v3_studio_hitl_hardening.sql"
+    ).read_text(encoding="utf-8")
+    start = migration.index("CREATE OR REPLACE FUNCTION public.df_v3_validate_studio_artifact()")
+    end = migration.index("DROP TRIGGER IF EXISTS trg_df_v3_studio_input_artifact", start)
+    function_sql = migration[start:end]
+    assert "NEW.source_stage_run_id" not in function_sql
+    assert "to_jsonb(NEW)->>'source_stage_run_id'" in function_sql
