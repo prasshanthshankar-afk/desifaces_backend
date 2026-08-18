@@ -1,0 +1,190 @@
+name: desifaces-v3
+
+services:
+
+  # -------------------------------------------------------------------
+  # Infrastructure
+  # -------------------------------------------------------------------
+
+  desifaces-db:
+    container_name: desifaces-v3-db
+
+    # V3 must never fall through to the V2/base Compose defaults.
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?V3 POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?V3 POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?V3 POSTGRES_PASSWORD is required}
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    ports: !override
+      - "127.0.0.1:25432:5432"
+
+  desifaces-redis:
+    container_name: desifaces-v3-redis
+
+
+  # -------------------------------------------------------------------
+  # APIs
+  # -------------------------------------------------------------------
+
+  svc-core:
+    container_name: df-v3-svc-core
+    ports: !override
+      - "127.0.0.1:18000:8000"
+
+  svc-fusion:
+    container_name: df-v3-svc-fusion
+    ports: !override
+      - "127.0.0.1:18002:8002"
+
+  svc-face:
+    container_name: df-v3-svc-face
+    ports: !override
+      - "127.0.0.1:18003:8003"
+
+  svc-audio:
+    container_name: df-v3-svc-audio
+    image: desifaces-v3-svc-audio
+    ports: !override
+      - "127.0.0.1:18004:8004"
+
+  svc-dashboard:
+    container_name: df-v3-svc-dashboard
+    ports: !override
+      - "127.0.0.1:18005:8005"
+
+  svc-fusion-extension:
+    container_name: df-v3-svc-fusion-extension
+    ports: !override
+      - "127.0.0.1:18006:8006"
+
+  svc-music:
+    container_name: df-v3-svc-music
+    ports: !override
+      - "127.0.0.1:18007:8000"
+
+  svc-commerce:
+    container_name: df-v3-svc-commerce
+    ports: !override
+      - "127.0.0.1:18008:8008"
+
+  svc-pricing:
+    container_name: df-v3-svc-pricing
+    ports: !override
+      - "127.0.0.1:18009:8009"
+
+  svc-marketing:
+    container_name: df-v3-svc-marketing
+    ports: !override
+      - "127.0.0.1:18010:8010"
+
+
+  # -------------------------------------------------------------------
+  # Execution workers
+  #
+  # IMPORTANT:
+  # These are intentionally behind a V3-only profile.
+  #
+  # A plain:
+  #
+  #   docker compose ... up
+  #
+  # must NOT activate provider-calling/background workers.
+  # -------------------------------------------------------------------
+
+  svc-core-notification-worker:
+    container_name: df-v3-svc-core-notification-worker
+    profiles: !override ["v3-execution"]
+
+  svc-face-worker:
+    container_name: df-v3-svc-face-worker
+    profiles: !override ["v3-execution"]
+
+  svc-audio-worker:
+    container_name: df-v3-svc-audio-worker
+    image: desifaces-v3-svc-audio-worker
+    profiles: !override ["v3-execution"]
+
+  svc-fusion-worker:
+    container_name: df-v3-svc-fusion-worker
+    profiles: !override ["v3-execution"]
+
+  svc-commerce-worker:
+    container_name: df-v3-svc-commerce-worker
+    profiles: !override ["v3-execution"]
+
+  svc-dashboard-worker:
+    container_name: df-v3-svc-dashboard-worker
+    profiles: !override ["v3-execution"]
+
+  svc-fusion-extension-worker:
+    container_name: df-v3-svc-fusion-extension-worker
+    profiles: !override ["v3-execution"]
+
+  svc-fusion-extension-stitch-worker:
+    container_name: df-v3-svc-fusion-extension-stitch-worker
+    profiles: !override ["v3-execution"]
+
+  svc-music-worker:
+    container_name: df-v3-svc-music-worker
+    profiles: !override ["v3-execution"]
+
+  svc-marketing-worker:
+    container_name: df-v3-svc-marketing-worker
+    profiles: !override ["v3-execution"]
+
+  svc-marketing-scheduler:
+    container_name: df-v3-svc-marketing-scheduler
+    profiles: !override ["v3-execution"]
+
+  svc-studio-coach-refresh-worker:
+    container_name: df-v3-svc-studio-coach-refresh-worker
+    profiles: !override ["v3-execution"]
+
+
+# ---------------------------------------------------------------------
+# V3-only network
+#
+# Internal service names remain unchanged:
+#   svc-core
+#   svc-face
+#   svc-audio
+#   svc-fusion
+#   desifaces-db
+#   desifaces-redis
+#
+# Docker DNS resolves them only within df-v3-net.
+# ---------------------------------------------------------------------
+
+networks:
+  df-net:
+    name: df-v3-net
+    driver: bridge
+
+
+# ---------------------------------------------------------------------
+# Persistent state
+# ---------------------------------------------------------------------
+
+volumes:
+
+  # Existing certified V3-C2B PostgreSQL volume.
+  # External prevents Compose from owning/deleting it.
+  df_pgdata:
+    external: true
+    name: desifaces-v3_df_pgdata
+
+  df_redisdata:
+    name: desifaces-v3_df_redisdata
+
+  df_saree_templates_cache:
+    name: desifaces-v3_df_saree_templates_cache
+
+  df_saree_drape_runs:
+    name: desifaces-v3_df_saree_drape_runs
+
+  df_hf_cache:
+    name: desifaces-v3_df_hf_cache
+
+  df_marketing_output:
+    name: desifaces-v3_df_marketing_output

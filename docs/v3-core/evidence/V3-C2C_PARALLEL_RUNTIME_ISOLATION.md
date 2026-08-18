@@ -1,7 +1,7 @@
 # V3 EIP Evidence Record — Parallel Runtime Isolation
 
 Change-ID: `V3-C2C`
-Status: `DRAFT`
+Status: `IMPLEMENTATION_IN_PROGRESS`
 Owner: `#v3-core`
 Date: `2026-08-17`
 
@@ -254,3 +254,59 @@ Pending.
 ## 16. Freeze statement
 
 Current freeze: V3-C2C may not start the inherited V2 Compose definition unchanged. V2 remains running and untouched. V3 must use its already isolated PostgreSQL clone and must establish separate project/network/Redis/ports/writable volumes/configuration before the V3 application stack is started. The exact runtime mappings remain DRAFT until the live VM probe closes the evidence gaps listed in section 4.
+
+
+## V3-C2C Implementation 2 — Infrastructure Certification
+
+Infrastructure adoption has been certified on the Azure development VM.
+
+Certified topology:
+
+- V2 Compose project remains `desifaces-dev`.
+- V2 network remains `df-net`.
+- V3 Compose project is `desifaces-v3`.
+- V3 network is `df-v3-net`.
+- V3 PostgreSQL container is `desifaces-v3-db`.
+- V3 PostgreSQL database is `desifaces_v3`.
+- V3 PostgreSQL user is `desifaces_v3_admin`.
+- V3 PostgreSQL host binding is `127.0.0.1:25432`.
+- V3 PostgreSQL persistent volume is `desifaces-v3_df_pgdata`.
+- V3 Redis container is `desifaces-v3-redis`.
+- V3 Redis persistent volume is `desifaces-v3_df_redisdata`.
+- V3 Redis begins with an empty logical DB 0 and AOF persistence enabled.
+- V3 infrastructure resolves internal aliases `desifaces-db` and
+  `desifaces-redis` only inside the isolated V3 network.
+- V3 execution workers remain profile-gated and disabled by default.
+- No V3 application API container was started during infrastructure adoption.
+
+Certification results:
+
+- `V3_INFRA_PRECONDITIONS=PASS`
+- `V3_DB_STORAGE_GUARD=PASS`
+- `V3_COMPOSE_DB_HEALTH=PASS`
+- `V3_DB_COMPOSE_OWNERSHIP=PASS`
+- `V3_DB_NETWORK_ISOLATION=PASS`
+- `V3_DB_DATA_PARITY_AFTER_ADOPTION=PASS`
+- `V3_REDIS_PING=PASS`
+- `V3_REDIS_EMPTY=PASS`
+- `V3_REDIS_AOF=PASS`
+- `V3_REDIS_VOLUME=PASS`
+- `V3_REDIS_NETWORK_ISOLATION=PASS`
+- `V3_INTERNAL_DNS=PASS`
+- `V2_V3_VOLUME_ISOLATION=PASS`
+- `POSTGRES_PORT_ISOLATION=PASS`
+- `V3_APPLICATION_CONTAINERS=NONE`
+- `V2_HEALTH_UNCHANGED=PASS`
+
+Runtime evidence:
+
+`/home/azureuser/backups/eip/v3-c2c-infra-adoption-20260818T012304Z`
+
+The PostgreSQL table-count signature before and after Compose adoption was
+identical:
+
+`068c10c9c9117841e783a29607adda3e8e07ef484b0a119f3859dbcf638b7e94`
+
+This certifies infrastructure isolation only. V3 API startup and execution
+workers remain separately gated.
+
