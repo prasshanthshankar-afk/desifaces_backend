@@ -135,3 +135,24 @@ def test_asyncpg_update_tag_parsing_is_exact():
     assert _updated_rows("UPDATE 0") == 0
     assert _updated_rows("UPDATE 1") == 1
     assert _updated_rows("UPDATE 10") == 10
+
+
+def test_director_claim_uses_integer_safe_lease_interval():
+    from app.run_store import DirectorRunStore
+
+    class CaptureConn:
+        query = None
+        args = None
+
+        async def fetchrow(self, query, *args):
+            self.query = query
+            self.args = args
+            return None
+
+    async def run():
+        conn = CaptureConn()
+        await DirectorRunStore().claim_next(conn, lease_seconds=900)
+        assert "make_interval(secs => $1::integer)" in conn.query
+        assert conn.args == (900,)
+
+    asyncio.run(run())
