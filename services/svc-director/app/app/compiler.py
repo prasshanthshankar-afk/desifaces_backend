@@ -32,6 +32,8 @@ class CanonicalStoryCompiler:
 
     IDs are deterministic per Director thread, making replay/retry safe. Existing
     account/project identity comes from retrieval/tool context, never from LLM output.
+    A model-supplied participant UUID is accepted only when that exact participant
+    already exists in the authenticated account/project; otherwise it is ignored.
     """
 
     def __init__(self, pool) -> None:
@@ -121,14 +123,39 @@ class CanonicalStoryCompiler:
 
                 participants: list[Participant] = []
                 for index, item in enumerate(plan.participants):
-                    participant_id = item.participant_id or by_name.get(item.display_name) or _id(
+                    participant_id = by_name.get(item.display_name)
+                    row = None
+
+                    if item.participant_id is not None:
+                        # Model output may echo an ID from retrieved context, but it
+                        # cannot introduce an arbitrary durable identity.
+                        row = await conn.fetchrow(
+                            """
+                            select * from public.v3_participants
+                            where participant_id=$1 and account_id=$2 and project_id=$3
+                              and lifecycle_state='active'
+                            """,
+                            item.participant_id,
+                            account_id,
+                            project_id,
+                        )
+                        if row:
+                            participant_id = UUID(str(row["participant_id"]))
+
+                    participant_id = participant_id or _id(
                         thread_id, "participant", f"{index}:{item.display_name}"
                     )
-                    row = await conn.fetchrow(
-                        "select * from public.v3_participants where participant_id=$1 and account_id=$2",
-                        participant_id,
-                        account_id,
-                    )
+                    if row is None:
+                        row = await conn.fetchrow(
+                            """
+                            select * from public.v3_participants
+                            where participant_id=$1 and account_id=$2 and project_id=$3
+                            """,
+                            participant_id,
+                            account_id,
+                            project_id,
+                        )
+
                     if row:
                         participant = Participant(
                             participant_id=row["participant_id"],
