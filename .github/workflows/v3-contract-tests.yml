@@ -16,6 +16,8 @@ on:
       - "migrations/2026_08_18_v3_*.sql"
       - "test/test_v3_*.py"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
+      - "scripts/v3-c4-c6-certify.sh"
+      - "scripts/v3-c45-runtime-certify.py"
       - "docker-compose.v3.yml"
       - ".github/workflows/v3-contract-tests.yml"
   pull_request:
@@ -32,6 +34,8 @@ on:
       - "migrations/2026_08_18_v3_*.sql"
       - "test/test_v3_*.py"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
+      - "scripts/v3-c4-c6-certify.sh"
+      - "scripts/v3-c45-runtime-certify.py"
       - "docker-compose.v3.yml"
       - ".github/workflows/v3-contract-tests.yml"
 
@@ -68,14 +72,18 @@ jobs:
             services/svc-pricing/app/app/services/v3_pricing_adapter_shadow.py \
             services/svc-pricing/app/app/api/v3_adapter_probe.py \
             services/svc-pricing/app/app/services/subscription_credit_integrity_service.py \
-            services/svc-pricing/app/app/services/subscription_reconciler_loop.py
+            services/svc-pricing/app/app/services/subscription_reconciler_loop.py \
+            services/svc-pricing/app/app/tools/v3_c6_certify.py \
+            scripts/v3-c45-runtime-certify.py
 
-      - name: Validate C3 certification script syntax
-        run: bash -n scripts/v3-c3-authenticated-adapter-certify.sh
+      - name: Validate certification shell syntax
+        run: |
+          bash -n scripts/v3-c3-authenticated-adapter-certify.sh
+          bash -n scripts/v3-c4-c6-certify.sh
 
       - name: Run canonical foundation unit tests
         env:
-          PYTHONPATH: .
+          PYTHONPATH: .:services/shared:services/shared/python
         run: |
           python -m pytest -q \
             test/test_v3_adapter_primitives.py \
