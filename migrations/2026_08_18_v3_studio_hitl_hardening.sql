@@ -28,6 +28,13 @@ ALTER TABLE public.v3_studio_stage_runs ADD CONSTRAINT ck_v3_studio_stage_type_s
 
 -- Every Studio artifact must stay inside the workflow billing account. If an
 -- input comes from another stage, that stage must belong to this same workflow.
+--
+-- IMPORTANT: this trigger function is attached to BOTH the input and output
+-- relations. v3_studio_stage_outputs does not have source_stage_run_id, so the
+-- optional input-only field must be extracted through to_jsonb(NEW) rather than
+-- referenced directly as NEW.source_stage_run_id. PL/pgSQL/SQL expression
+-- evaluation must not depend on boolean short-circuiting across different NEW
+-- record shapes.
 CREATE OR REPLACE FUNCTION public.df_v3_validate_studio_artifact()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
@@ -35,29 +42,41 @@ DECLARE
   v_target_account uuid;
   v_media_account uuid;
   v_source_workflow uuid;
+  v_source_stage_run_id uuid;
 BEGIN
   SELECT s.workflow_id,w.account_id INTO v_target_workflow,v_target_account
   FROM public.v3_studio_stage_runs s
   JOIN public.v3_studio_workflows w ON w.workflow_id=s.workflow_id
   WHERE s.stage_run_id=NEW.stage_run_id;
-  SELECT account_id INTO v_media_account FROM public.media_assets WHERE id=NEW.media_id;
+
+  SELECT account_id INTO v_media_account
+  FROM public.media_assets
+  WHERE id=NEW.media_id;
+
   IF v_target_workflow IS NULL OR v_media_account IS NULL OR v_target_account<>v_media_account THEN
     RAISE EXCEPTION 'v3_studio_artifact_account_mismatch:stage=% media=%', NEW.stage_run_id, NEW.media_id;
   END IF;
-  IF TG_TABLE_NAME='v3_studio_stage_inputs' AND NEW.source_stage_run_id IS NOT NULL THEN
-    SELECT workflow_id INTO v_source_workflow
-    FROM public.v3_studio_stage_runs WHERE stage_run_id=NEW.source_stage_run_id;
-    IF v_source_workflow IS NULL OR v_source_workflow<>v_target_workflow THEN
-      RAISE EXCEPTION 'v3_studio_input_cross_workflow:stage=% source=%', NEW.stage_run_id, NEW.source_stage_run_id;
+
+  IF TG_TABLE_NAME='v3_studio_stage_inputs' THEN
+    v_source_stage_run_id := nullif(to_jsonb(NEW)->>'source_stage_run_id','')::uuid;
+    IF v_source_stage_run_id IS NOT NULL THEN
+      SELECT workflow_id INTO v_source_workflow
+      FROM public.v3_studio_stage_runs
+      WHERE stage_run_id=v_source_stage_run_id;
+      IF v_source_workflow IS NULL OR v_source_workflow<>v_target_workflow THEN
+        RAISE EXCEPTION 'v3_studio_input_cross_workflow:stage=% source=%', NEW.stage_run_id, v_source_stage_run_id;
+      END IF;
     END IF;
   END IF;
   RETURN NEW;
 END;
 $$;
+
 DROP TRIGGER IF EXISTS trg_df_v3_studio_input_artifact ON public.v3_studio_stage_inputs;
 CREATE TRIGGER trg_df_v3_studio_input_artifact
 BEFORE INSERT OR UPDATE OF stage_run_id,media_id,source_stage_run_id ON public.v3_studio_stage_inputs
 FOR EACH ROW EXECUTE FUNCTION public.df_v3_validate_studio_artifact();
+
 DROP TRIGGER IF EXISTS trg_df_v3_studio_output_artifact ON public.v3_studio_stage_outputs;
 CREATE TRIGGER trg_df_v3_studio_output_artifact
 BEFORE INSERT OR UPDATE OF stage_run_id,media_id ON public.v3_studio_stage_outputs
