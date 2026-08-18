@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS public.v3_studio_stage_runs (
   scene_id uuid REFERENCES public.v3_scenes(scene_id) ON DELETE RESTRICT,
   dialogue_turn_id uuid REFERENCES public.v3_dialogue_turns(turn_id) ON DELETE RESTRICT,
   state text NOT NULL DEFAULT 'pending',
-  generation_request_id uuid REFERENCES public.v3_generation_requests(generation_request_id) ON DELETE SET NULL,
+  generation_request_id uuid REFERENCES public.v3_generation_requests(generation_id) ON DELETE SET NULL,
   generation_job_id uuid REFERENCES public.v3_generation_jobs(job_id) ON DELETE SET NULL,
   metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
