@@ -25,6 +25,7 @@ COPY . /repo
 # keep runtime import layout expected by uvicorn app.main:app
 COPY services/svc-fusion/app/app /app/app
 COPY services/shared/python/desifaces_shared /app/desifaces_shared
+COPY services/shared/df_contracts /app/df_contracts
 
 EXPOSE 8002
 
