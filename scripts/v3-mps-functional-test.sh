@@ -36,7 +36,7 @@ for _ in $(seq 1 45); do
 done
 if [ -z "$HEALTH" ]; then
   echo "MPS_FUNCTIONAL_FAIL=director_health_timeout"
-  docker logs --tail 80 df-v3-svc-director 2>&1 | sed -E 's/(sk-[A-Za-z0-9_-]{12})[A-Za-z0-9_-]*/\1...REDACTED/g' || true
+  docker logs --tail 120 df-v3-svc-director 2>&1 | sed -E 's/(sk-[A-Za-z0-9_-]{12})[A-Za-z0-9_-]*/\1...REDACTED/g' || true
   exit 1
 fi
 
@@ -54,7 +54,17 @@ fi
 
 echo "MPS_FUNCTIONAL_LIVE_DIRECTOR_PRECHECK=PASS"
 
+set +e
 docker exec df-v3-svc-director python -m app.tools.v3_mps_functional_test
+FUNCTIONAL_RC=$?
+set -e
+if [ "$FUNCTIONAL_RC" -ne 0 ]; then
+  echo "MPS_FUNCTIONAL_DIRECTOR_LOGS_BEGIN"
+  docker logs --tail 180 df-v3-svc-director 2>&1 \
+    | sed -E 's/(sk-[A-Za-z0-9_-]{12})[A-Za-z0-9_-]*/\1...REDACTED/g'
+  echo "MPS_FUNCTIONAL_DIRECTOR_LOGS_END"
+  exit "$FUNCTIONAL_RC"
+fi
 
 if docker ps --format '{{.Names}}' | grep -Eq '^df-v3-.*(worker|scheduler)'; then
   echo "MPS_FUNCTIONAL_FAIL=v3_execution_worker_running"
