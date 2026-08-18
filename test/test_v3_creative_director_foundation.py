@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from df_contracts.v3.director import (
     CreationContextScope,
@@ -134,6 +135,16 @@ class FakeCompiler:
         )
 
 
+def _input(thread_id: str):
+    return {
+        "run_id": str(uuid4()),
+        "thread_id": thread_id,
+        "account_id": str(uuid4()),
+        "owner_user_id": str(uuid4()),
+        "brief": CreativeBrief(text="Create a two-person family conversation", locale="ta-IN").model_dump(mode="json"),
+    }
+
+
 def _run_director():
     async def run():
         runtime = CreativeDirectorRuntime(
@@ -144,17 +155,10 @@ def _run_director():
             require_human_review=False,
         )
         graph = build_creative_director_graph(runtime, checkpointer=InMemorySaver())
-        account_id = uuid4()
-        owner_user_id = uuid4()
+        thread_id = "director-test-thread"
         return await graph.ainvoke(
-            {
-                "run_id": str(uuid4()),
-                "thread_id": "director-test-thread",
-                "account_id": str(account_id),
-                "owner_user_id": str(owner_user_id),
-                "brief": CreativeBrief(text="Create a two-person family conversation", locale="ta-IN").model_dump(mode="json"),
-            },
-            {"configurable": {"thread_id": "director-test-thread"}},
+            _input(thread_id),
+            {"configurable": {"thread_id": thread_id}},
         )
 
     return asyncio.run(run())
@@ -192,3 +196,28 @@ def test_assistant_context_can_focus_on_current_scene_and_participant():
     assert context.active_participant_id == participant_id
     assert {item["scene_id"] for item in context.dialogue_context} == {str(scene_id)}
     assert participant_id in context.participant_ids
+
+
+def test_director_can_interrupt_for_review_and_resume_same_thread():
+    async def run():
+        runtime = CreativeDirectorRuntime(
+            retriever=FakeRetriever(),
+            planner=FakePlanner(),
+            critic=FakeCritic(),
+            compiler=FakeCompiler(),
+            require_human_review=True,
+        )
+        graph = build_creative_director_graph(runtime, checkpointer=InMemorySaver())
+        thread_id = "director-hitl-thread"
+        config = {"configurable": {"thread_id": thread_id}}
+        first = await graph.ainvoke(_input(thread_id), config)
+        assert first.get("__interrupt__")
+        snapshot = await graph.aget_state(config)
+        assert snapshot.tasks
+        assert any(getattr(task, "interrupts", ()) for task in snapshot.tasks)
+
+        resumed = await graph.ainvoke(Command(resume={"approved": True, "feedback": ""}), config)
+        assert resumed["phase"] == "ready"
+        assert resumed["workspace"]["story_id"] == resumed["assistant_context"]["story_id"]
+
+    asyncio.run(run())
