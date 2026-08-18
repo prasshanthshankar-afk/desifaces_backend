@@ -74,8 +74,9 @@ class HybridCreativeRetriever:
     async def retrieve(self, *, brief: CreativeBrief, state: dict[str, Any]) -> dict[str, Any]:
         account_raw = state.get("account_id")
         owner_raw = state.get("owner_user_id")
-        if not account_raw or not owner_raw:
-            raise RuntimeError("director_actor_context_required")
+        thread_id = str(state.get("thread_id") or "").strip()
+        if not account_raw or not owner_raw or not thread_id:
+            raise RuntimeError("director_actor_and_thread_context_required")
         account_id = UUID(str(account_raw))
         owner_user_id = UUID(str(owner_raw))
 
@@ -83,6 +84,7 @@ class HybridCreativeRetriever:
             structured: dict[str, Any] = {
                 "account_id": str(account_id),
                 "owner_user_id": str(owner_user_id),
+                "thread_id": thread_id,
             }
             refs: list[str] = []
 
@@ -153,7 +155,7 @@ class HybridCreativeRetriever:
                 account_id,
                 brief.project_id,
                 brief.story_id,
-                str(state.get("thread_id") or ""),
+                thread_id,
                 brief.text,
                 refs,
                 len(knowledge),
@@ -164,4 +166,5 @@ class HybridCreativeRetriever:
                 "refs": refs,
                 "structured": structured,
                 "creative_knowledge": knowledge,
+                "thread_id": thread_id,
             }
