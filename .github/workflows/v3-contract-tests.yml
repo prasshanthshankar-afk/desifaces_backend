@@ -107,4 +107,5 @@ jobs:
             test/test_v3_media_generation_foundation.py \
             test/test_v3_subscription_cycle.py \
             test/test_v3_multiperson_story_foundation.py \
-            test/test_v3_creative_director_foundation.py
+            test/test_v3_creative_director_foundation.py \
+            test/test_v3_participant_ref_normalization.py
