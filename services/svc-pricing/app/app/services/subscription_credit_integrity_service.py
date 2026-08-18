@@ -39,14 +39,13 @@ def _as_utc(value: Any) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
-def _apple_legacy_cycle_keys(period_start: Any) -> list[str]:
-    """Cycle keys used by the existing Apple service-level reconciler.
+def _period_iso(value: Any) -> str | None:
+    dt = _as_utc(value)
+    return dt.isoformat() if dt is not None else None
 
-    Apple confirmation/notification paths historically use YYYY-MM for monthly
-    and YYYY for yearly subscriptions. The older DB-level sync uses a full UTC
-    period-start timestamp. Either representation can therefore prove that the
-    already-persisted Apple period has been reconciled.
-    """
+
+def _apple_legacy_cycle_keys(period_start: Any) -> list[str]:
+    """Cycle keys used by the existing Apple service-level reconciler."""
     start = _as_utc(period_start)
     if start is None:
         return []
@@ -135,7 +134,7 @@ async def _audit(
         cycle_key,
         plan_code,
         action,
-        json.dumps(result, default=str),
+        result,
     )
 
 
@@ -147,11 +146,15 @@ async def repair_active_subscription_credit_cycles(
     """Repair missed current-period credit reconciliation without inventing periods.
 
     Only subscription periods already persisted as active are considered. Stripe
-    uses the same cycle key as entitlement sync. Google requires the DB-approved
-    period-end identity because its purchase token/start time can remain constant
-    across renewals. Apple accepts either its existing service-level month/year
-    key or the DB-level period-start source-ref as proof of an already-correct
-    current period, preventing a watchdog run from resetting spent credits.
+    uses the same cycle key as entitlement sync. For Apple/Google, current-period
+    evidence can come from either the DB-level ``subscription_cycle:*`` source-ref
+    or a service-level plan reconciliation lot whose metadata carries the exact
+    persisted period end (period start is the fallback when end is unavailable).
+
+    This period-aware check is important for Google Play: the purchase token and
+    original startTime can remain constant while expiryTime advances. A spent lot
+    from the previous period therefore does not match the new current_period_end
+    and is repaired, while an already-correct current-period lot is never reset.
     """
     rows = await _list_active_contexts(conn, limit=limit)
     results: List[Dict[str, Any]] = []
@@ -214,6 +217,8 @@ async def repair_active_subscription_credit_cycles(
             cycle = native_cycle_key(provider, period_start, period_end)
             expected_ref = native_source_ref(provider, gateway_subscription_id, period_start, period_end)
             legacy_apple_keys = _apple_legacy_cycle_keys(period_start) if provider == "apple_iap" else []
+            period_start_iso = _period_iso(period_start)
+            period_end_iso = _period_iso(period_end)
 
             existing = await conn.fetchrow(
                 """
@@ -227,6 +232,17 @@ async def repair_active_subscription_credit_cycles(
                   and (
                     source_ref=$2
                     or ($3::text[] <> '{}'::text[] and metadata_json->>'cycle_key'=any($3::text[]))
+                    or (
+                      jsonb_typeof(metadata_json)='object'
+                      and $4::text is not null
+                      and metadata_json->>'current_period_end'=$4::text
+                    )
+                    or (
+                      jsonb_typeof(metadata_json)='object'
+                      and $4::text is null
+                      and $5::text is not null
+                      and metadata_json->>'current_period_start'=$5::text
+                    )
                   )
                 order by created_at desc
                 limit 1
@@ -234,6 +250,8 @@ async def repair_active_subscription_credit_cycles(
                 user_id,
                 expected_ref,
                 legacy_apple_keys,
+                period_end_iso,
+                period_start_iso,
             )
             if existing:
                 result = {
@@ -241,6 +259,8 @@ async def repair_active_subscription_credit_cycles(
                     "action": "current_cycle_present",
                     "source_ref": _record_get(existing, "source_ref"),
                     "evidence_cycle_key": _record_get(existing, "cycle_key"),
+                    "period_start": period_start_iso,
+                    "period_end": period_end_iso,
                 }
                 action = "current_cycle_present"
             else:
