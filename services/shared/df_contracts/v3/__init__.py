@@ -53,6 +53,18 @@ from .domain import (
     StoryRef,
     UserRef,
 )
+from .face_adapter import (
+    FaceGenerateAdapterResult,
+    FaceGenerationParameters,
+    FaceMode,
+    FacePricingConfirmationCompat,
+    FaceSeedMode,
+    FaceSubject,
+    adapt_face_generate_request,
+    face_job_to_compatibility_response,
+    make_face_source_media_asset,
+    normalize_face_parameters,
+)
 
 __all__ = [
     "AccountRef",
@@ -67,6 +79,12 @@ __all__ = [
     "EntitlementState",
     "EntityState",
     "ErrorCode",
+    "FaceGenerateAdapterResult",
+    "FaceGenerationParameters",
+    "FaceMode",
+    "FacePricingConfirmationCompat",
+    "FaceSeedMode",
+    "FaceSubject",
     "GenerationJob",
     "GenerationKind",
     "GenerationRequest",
@@ -91,10 +109,14 @@ __all__ = [
     "StoryRef",
     "UserRef",
     "V3ContractModel",
+    "adapt_face_generate_request",
     "derive_idempotency_key",
+    "face_job_to_compatibility_response",
     "make_api_error",
+    "make_face_source_media_asset",
     "make_request_context",
     "normalize_error_code",
+    "normalize_face_parameters",
     "normalize_job_state",
     "stable_payload_digest",
 ]
