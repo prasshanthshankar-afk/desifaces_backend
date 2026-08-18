@@ -36,6 +36,8 @@ from .common import (
 )
 from .commerce import (
     CreditEntryType,
+    CreditReservation,
+    CreditReservationState,
     CreditTransaction,
     Entitlement,
     EntitlementState,
@@ -88,6 +90,14 @@ from .fusion_adapter import (
     make_fusion_video_media_asset,
     normalize_fusion_parameters,
 )
+from .pricing_adapter import (
+    PricingQuoteBridgeResult,
+    PricingReservationBridgeResult,
+    adapt_pricing_preview_response,
+    adapt_pricing_reserve_response,
+    canonical_quote_id,
+    credit_transaction_from_commit,
+)
 
 __all__ = [
     "AccountRef",
@@ -102,6 +112,8 @@ __all__ = [
     "AudioTranslationTone",
     "ConversationRef",
     "CreditEntryType",
+    "CreditReservation",
+    "CreditReservationState",
     "CreditTransaction",
     "Entitlement",
     "EntitlementState",
@@ -132,6 +144,8 @@ __all__ = [
     "ParticipantRef",
     "PriceMoney",
     "PricingQuote",
+    "PricingQuoteBridgeResult",
+    "PricingReservationBridgeResult",
     "ProjectRef",
     "ProviderExecution",
     "ProviderExecutionState",
@@ -146,7 +160,11 @@ __all__ = [
     "adapt_audio_tts_request",
     "adapt_face_generate_request",
     "adapt_fusion_generate_request",
+    "adapt_pricing_preview_response",
+    "adapt_pricing_reserve_response",
     "audio_job_to_compatibility_response",
+    "canonical_quote_id",
+    "credit_transaction_from_commit",
     "derive_idempotency_key",
     "face_job_to_compatibility_response",
     "fusion_job_to_compatibility_response",
