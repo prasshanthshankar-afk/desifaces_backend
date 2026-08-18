@@ -29,7 +29,7 @@ export DF_V3_E2E_TEST_USER_EMAIL
 
 # Fast source regression gate. No provider call yet.
 docker run --rm -v "$PWD:/repo" -w /repo desifaces-v3-svc-fusion \
-  sh -lc 'pip install -q pytest langgraph==1.2.9 httpx && PYTHONPATH=/repo:/repo/services/shared:/repo/services/shared/python:/repo/services/svc-director/app python -m pytest -q test/test_v3_participant_face_bridge.py test/test_v3_participant_ref_normalization.py test/test_v3_studio_hitl_workflow.py'
+  sh -lc 'pip install -q pytest langgraph==1.2.9 httpx && PYTHONPATH=/repo:/repo/services/shared:/repo/services/shared/python:/repo/services/svc-director/app:/repo/services/svc-face/app python -m pytest -q test/test_v3_participant_face_bridge.py test/test_v3_participant_ref_normalization.py test/test_v3_studio_hitl_workflow.py test/test_v3_face_creator_config_hydration.py'
 echo "MPS2_VISUAL_TARGETED_UNIT=PASS"
 
 DB_NAME="$(docker exec desifaces-v3-db sh -lc 'psql -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select current_database()"')"
@@ -104,9 +104,13 @@ fi
 echo "MPS2_VISUAL_FACE_MODEL=PASS:$FACE_MODEL"
 
 # V3 storage namespaces are infrastructure, not per-job state. Create the
-# configured private Face input/output containers idempotently and fail closed
-# unless both are explicitly V3-isolated names.
+# configured private Face input/output containers idempotently, fail closed
+# unless both are explicitly V3-isolated names, then prove write/read/delete.
 docker exec df-v3-svc-face python -m app.tools.v3_mps2_prepare_visual_storage
+
+# Fail before pricing/provider execution if any creator masterdata row used by
+# Face falls back from its declared runtime model to an untyped dict.
+docker exec df-v3-svc-face python -m app.tools.v3_mps2_audit_creator_config_hydration
 
 # Pricing must remain real. Do not inject fake balance or bypass reservations.
 # Reuse the certified C6 period-aware integrity repair, which can only reconcile
