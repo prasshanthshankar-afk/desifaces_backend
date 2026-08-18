@@ -32,10 +32,19 @@ class DirectorRunState(StrEnum):
     FAILED = "failed"
 
 
+class CreationContextScope(StrEnum):
+    STORY = "story"
+    SCENE = "scene"
+    PARTICIPANT = "participant"
+    SCENE_PARTICIPANT = "scene_participant"
+
+
 class CreativeBrief(V3ContractModel):
     text: str = Field(min_length=1, max_length=12000)
     project_id: UUID | None = None
     story_id: UUID | None = None
+    focus_scene_id: UUID | None = None
+    focus_participant_id: UUID | None = None
     locale: str | None = Field(default=None, max_length=50)
     desired_duration_seconds: int | None = Field(default=None, ge=1, le=14400)
     desired_scene_count: int | None = Field(default=None, ge=1, le=200)
@@ -203,6 +212,8 @@ class CreationContextBundle(V3ContractModel):
     project_id: UUID
     story_id: UUID | None = None
     active_scene_id: UUID | None = None
+    active_participant_id: UUID | None = None
+    context_scope: CreationContextScope = CreationContextScope.STORY
     participant_ids: tuple[UUID, ...] = ()
     creation_type: str
     title: str | None = None
