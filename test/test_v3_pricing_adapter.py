@@ -41,16 +41,8 @@ def test_legacy_quote_id_gets_stable_canonical_uuid_only_in_pricing_bridge() -> 
     user_id = uuid4()
     payload = _preview_payload()
 
-    a = adapt_pricing_preview_response(
-        payload,
-        account_id=account_id,
-        user_id=user_id,
-    )
-    b = adapt_pricing_preview_response(
-        payload,
-        account_id=account_id,
-        user_id=user_id,
-    )
+    a = adapt_pricing_preview_response(payload, account_id=account_id, user_id=user_id)
+    b = adapt_pricing_preview_response(payload, account_id=account_id, user_id=user_id)
 
     expected = canonical_quote_id(
         account_id=account_id,
@@ -102,15 +94,35 @@ def test_preview_maps_credits_money_pricebook_and_expiry() -> None:
     assert result.quote.expires_at > now
 
 
-def test_preview_without_fingerprint_generates_stable_fingerprint() -> None:
+def test_preview_without_fingerprint_ignores_volatile_quote_fields() -> None:
     account_id = uuid4()
     user_id = uuid4()
-    payload = _preview_payload()
-    payload.pop("preview_fingerprint")
-    payload["quote_breakdown"].pop("preview_fingerprint", None)
+    pricebook_id = str(uuid4())
 
-    a = adapt_pricing_preview_response(payload, account_id=account_id, user_id=user_id)
-    b = adapt_pricing_preview_response(payload, account_id=account_id, user_id=user_id)
+    a_payload = _preview_payload(quote_id="qt_first")
+    a_payload.pop("preview_fingerprint")
+    a_payload["quote_expires_at"] = "2026-08-18T03:00:00+00:00"
+    a_payload["quote_breakdown"]["pricebook_id"] = pricebook_id
+    a_payload["quote_breakdown"].update(
+        {
+            "quote_id": "qt_first",
+            "quote_expires_at": "2026-08-18T03:00:00+00:00",
+        }
+    )
+
+    b_payload = _preview_payload(quote_id="qt_second")
+    b_payload.pop("preview_fingerprint")
+    b_payload["quote_expires_at"] = "2026-08-18T03:10:00+00:00"
+    b_payload["quote_breakdown"]["pricebook_id"] = pricebook_id
+    b_payload["quote_breakdown"].update(
+        {
+            "quote_id": "qt_second",
+            "quote_expires_at": "2026-08-18T03:10:00+00:00",
+        }
+    )
+
+    a = adapt_pricing_preview_response(a_payload, account_id=account_id, user_id=user_id)
+    b = adapt_pricing_preview_response(b_payload, account_id=account_id, user_id=user_id)
 
     assert len(a.quote.fingerprint) == 64
     assert a.quote.fingerprint == b.quote.fingerprint
