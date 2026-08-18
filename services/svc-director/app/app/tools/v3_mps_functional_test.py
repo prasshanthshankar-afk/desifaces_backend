@@ -107,12 +107,16 @@ async def _seed_rag(conn: asyncpg.Connection, marker: str) -> tuple[UUID, UUID]:
 async def _poll_run(client: httpx.AsyncClient, thread_id: str, target: set[str], timeout_s: int = 900) -> dict:
     deadline = time.monotonic() + timeout_s
     last: dict = {}
+    previous_state: str | None = None
     while time.monotonic() < deadline:
         response = await client.get(f"/api/director/runs/{thread_id}")
         if response.status_code != 200:
             raise RuntimeError(f"FUNCTIONAL_FAIL=poll_run:{response.status_code}:{response.text[:1000]}")
         last = response.json()
         state = str(last.get("state") or "")
+        if state != previous_state:
+            print(f"FUNCTIONAL_DIRECTOR_STATE={state}", flush=True)
+            previous_state = state
         if state == "failed":
             raise RuntimeError(f"FUNCTIONAL_FAIL=director_failed:{last.get('errors')}")
         if state in target:
@@ -122,6 +126,18 @@ async def _poll_run(client: httpx.AsyncClient, thread_id: str, target: set[str],
 
 
 async def _cleanup(conn, *, source_id, story_id, project_id, thread_id) -> None:
+    # Studio stages hold RESTRICT references to scenes/participants. Remove the
+    # synthetic workflow first so those stage rows cascade away before Story /
+    # Project cleanup. This preserves production FK strictness while making the
+    # functional harness dependency-safe.
+    if story_id:
+        await conn.execute("delete from public.v3_studio_workflows where story_id=$1", story_id)
+    elif project_id:
+        await conn.execute(
+            "delete from public.v3_studio_workflows where project_id=$1 and story_id is null",
+            project_id,
+        )
+
     if thread_id:
         await conn.execute("delete from public.v3_director_retrieval_events where thread_id=$1", thread_id)
         await conn.execute("delete from public.v3_director_runs where thread_id=$1", thread_id)
