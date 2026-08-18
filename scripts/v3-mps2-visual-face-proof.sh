@@ -24,7 +24,7 @@ export DF_DIRECTOR_LLM_MODEL="${DF_DIRECTOR_LLM_MODEL:-gpt-5.6}"
 # Canonical V3 E2E media actor. Passwords/credentials are deliberately never
 # stored in this repository; the proof resolves the user from V3 DB and uses a
 # short-lived locally signed test JWT.
-DF_V3_E2E_TEST_USER_EMAIL="test_apple_iap_test1@desifaces.ai"
+DF_V3_E2E_TEST_USER_EMAIL="user_apple_iap_test1@desifaces.ai"
 export DF_V3_E2E_TEST_USER_EMAIL
 
 # Fast source regression gate. No provider call yet.
