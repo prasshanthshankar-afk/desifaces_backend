@@ -18,6 +18,8 @@ on:
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
       - "scripts/v3-c45-runtime-certify.py"
+      - "scripts/v3-multiperson-story-certify.sh"
+      - "scripts/v3-multiperson-story-runtime-certify.py"
       - "docker-compose.v3.yml"
       - ".github/workflows/v3-contract-tests.yml"
   pull_request:
@@ -36,6 +38,8 @@ on:
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
       - "scripts/v3-c45-runtime-certify.py"
+      - "scripts/v3-multiperson-story-certify.sh"
+      - "scripts/v3-multiperson-story-runtime-certify.py"
       - "docker-compose.v3.yml"
       - ".github/workflows/v3-contract-tests.yml"
 
@@ -74,12 +78,14 @@ jobs:
             services/svc-pricing/app/app/services/subscription_credit_integrity_service.py \
             services/svc-pricing/app/app/services/subscription_reconciler_loop.py \
             services/svc-pricing/app/app/tools/v3_c6_certify.py \
-            scripts/v3-c45-runtime-certify.py
+            scripts/v3-c45-runtime-certify.py \
+            scripts/v3-multiperson-story-runtime-certify.py
 
       - name: Validate certification shell syntax
         run: |
           bash -n scripts/v3-c3-authenticated-adapter-certify.sh
           bash -n scripts/v3-c4-c6-certify.sh
+          bash -n scripts/v3-multiperson-story-certify.sh
 
       - name: Run canonical foundation unit tests
         env:
@@ -93,4 +99,5 @@ jobs:
             test/test_v3_pricing_adapter.py \
             test/test_v3_account_context.py \
             test/test_v3_media_generation_foundation.py \
-            test/test_v3_subscription_cycle.py
+            test/test_v3_subscription_cycle.py \
+            test/test_v3_multiperson_story_foundation.py
