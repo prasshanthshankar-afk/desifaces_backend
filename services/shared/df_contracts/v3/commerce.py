@@ -28,6 +28,13 @@ class CreditEntryType(StrEnum):
     EXPIRY = "expiry"
 
 
+class CreditReservationState(StrEnum):
+    RESERVED = "reserved"
+    COMMITTED = "committed"
+    RELEASED = "released"
+    EXPIRED = "expired"
+
+
 class PriceMoney(V3ContractModel):
     currency: str = Field(min_length=3, max_length=3)
     amount_minor: int = Field(ge=0)
@@ -44,6 +51,21 @@ class PricingQuote(V3ContractModel):
     fingerprint: str = Field(min_length=8, max_length=500)
     expires_at: datetime
     created_at: datetime
+
+
+class CreditReservation(V3ContractModel):
+    reservation_id: UUID
+    account_id: UUID
+    user_id: UUID
+    quote_id: UUID
+    state: CreditReservationState
+    reserved_credits: int = Field(ge=0)
+    reference_type: str | None = Field(default=None, max_length=100)
+    reference_id: str | None = Field(default=None, max_length=500)
+    idempotency_key: str | None = Field(default=None, max_length=200)
+    expires_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
 
 
 class Entitlement(V3ContractModel):
