@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 from uuid import UUID
 
@@ -28,6 +29,28 @@ def _record_get(row: Any, key: str, default: Any = None) -> Any:
         return default if value is None else value
     except Exception:
         return default
+
+
+def _as_utc(value: Any) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _apple_legacy_cycle_keys(period_start: Any) -> list[str]:
+    """Cycle keys used by the existing Apple service-level reconciler.
+
+    Apple confirmation/notification paths historically use YYYY-MM for monthly
+    and YYYY for yearly subscriptions. The older DB-level sync uses a full UTC
+    period-start timestamp. Either representation can therefore prove that the
+    already-persisted Apple period has been reconciled.
+    """
+    start = _as_utc(period_start)
+    if start is None:
+        return []
+    return [f"{start.year:04d}-{start.month:02d}", f"{start.year:04d}"]
 
 
 async def _list_active_contexts(conn: asyncpg.Connection, *, limit: int) -> List[Any]:
@@ -121,16 +144,14 @@ async def repair_active_subscription_credit_cycles(
     *,
     limit: int = 200,
 ) -> Dict[str, Any]:
-    """Idempotently repair missing credit-cycle reconciliation for active plans.
+    """Repair missed current-period credit reconciliation without inventing periods.
 
-    This function NEVER advances a subscription period and NEVER invents a
-    provider renewal. It only reconciles periods already persisted as active by
-    Stripe/Apple/Google processing.
-
-    Stripe uses the same cycle key as ``sync_subscription_and_entitlement``.
-    Native IAP uses the existing ``df_sync_subscription_cycle_credits`` function,
-    but only when the expected current-cycle lot is absent, preventing an
-    integrity sweep from resetting spend within an already-correct cycle.
+    Only subscription periods already persisted as active are considered. Stripe
+    uses the same cycle key as entitlement sync. Google requires the DB-approved
+    period-end identity because its purchase token/start time can remain constant
+    across renewals. Apple accepts either its existing service-level month/year
+    key or the DB-level period-start source-ref as proof of an already-correct
+    current period, preventing a watchdog run from resetting spent credits.
     """
     rows = await _list_active_contexts(conn, limit=limit)
     results: List[Dict[str, Any]] = []
@@ -151,11 +172,7 @@ async def repair_active_subscription_credit_cycles(
 
         if provider == "stripe":
             if period_start is None or period_end is None:
-                results.append({
-                    "user_id": str(user_id),
-                    "provider": provider,
-                    "action": "skipped_missing_period",
-                })
+                results.append({"user_id": str(user_id), "provider": provider, "action": "skipped_missing_period"})
                 continue
             cycle = stripe_cycle_key(gateway_subscription_id, period_start, period_end)
             result = await reconcile_included_plan_credits(
@@ -186,34 +203,45 @@ async def repair_active_subscription_credit_cycles(
                 action=action,
                 result=result,
             )
-            results.append({
-                "user_id": str(user_id),
-                "provider": provider,
-                "cycle_key": cycle,
-                "action": action,
-            })
+            results.append({"user_id": str(user_id), "provider": provider, "cycle_key": cycle, "action": action})
             continue
 
         if provider in {"apple_iap", "google_play"}:
+            if period_start is None and period_end is None:
+                results.append({"user_id": str(user_id), "provider": provider, "action": "skipped_missing_period"})
+                continue
+
             cycle = native_cycle_key(provider, period_start, period_end)
             expected_ref = native_source_ref(provider, gateway_subscription_id, period_start, period_end)
+            legacy_apple_keys = _apple_legacy_cycle_keys(period_start) if provider == "apple_iap" else []
+
             existing = await conn.fetchrow(
                 """
-                select id
+                select id, source_ref, metadata_json->>'cycle_key' as cycle_key
                 from public.pricing_credit_lots
                 where user_id=$1
                   and bucket_type='included'
                   and source_type='plan_grant'
-                  and source_ref=$2
                   and status='active'
                   and (expires_at is null or expires_at>now())
+                  and (
+                    source_ref=$2
+                    or ($3::text[] <> '{}'::text[] and metadata_json->>'cycle_key'=any($3::text[]))
+                  )
+                order by created_at desc
                 limit 1
                 """,
                 user_id,
                 expected_ref,
+                legacy_apple_keys,
             )
             if existing:
-                result = {"ok": True, "action": "current_cycle_present", "source_ref": expected_ref}
+                result = {
+                    "ok": True,
+                    "action": "current_cycle_present",
+                    "source_ref": _record_get(existing, "source_ref"),
+                    "evidence_cycle_key": _record_get(existing, "cycle_key"),
+                }
                 action = "current_cycle_present"
             else:
                 sync_row = await conn.fetchrow(
@@ -242,22 +270,9 @@ async def repair_active_subscription_credit_cycles(
                 action=action,
                 result=result,
             )
-            results.append({
-                "user_id": str(user_id),
-                "provider": provider,
-                "cycle_key": cycle,
-                "action": action,
-            })
+            results.append({"user_id": str(user_id), "provider": provider, "cycle_key": cycle, "action": action})
             continue
 
-        results.append({
-            "user_id": str(user_id),
-            "provider": provider,
-            "action": "skipped_unsupported_provider",
-        })
+        results.append({"user_id": str(user_id), "provider": provider, "action": "skipped_unsupported_provider"})
 
-    return {
-        "ok": True,
-        "count": len(results),
-        "results": results,
-    }
+    return {"ok": True, "count": len(results), "results": results}
