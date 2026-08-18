@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
@@ -49,6 +49,8 @@ class CreativeCompiler(Protocol):
 class DirectorState(TypedDict, total=False):
     run_id: str
     thread_id: str
+    account_id: str
+    owner_user_id: str
     phase: str
     brief: dict[str, Any]
     retrieved_context: dict[str, Any]
@@ -79,6 +81,8 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
 
     Graph checkpoints are orchestration memory. Canonical StoryGraph persistence
     remains the business system of record and is written only by ``compiler``.
+    Authenticated account/user identity is explicit graph state so resume/poll
+    never depends on out-of-band request context.
     """
 
     async def retrieve_context(state: DirectorState) -> DirectorState:
