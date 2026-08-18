@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 import asyncpg
+from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from .config import settings
@@ -31,7 +32,11 @@ async def open_checkpoint_pool() -> AsyncConnectionPool:
             min_size=1,
             max_size=5,
             open=False,
-            kwargs={"autocommit": True},
+            kwargs={
+                "autocommit": True,
+                "prepare_threshold": 0,
+                "row_factory": dict_row,
+            },
         )
         await _checkpoint_pool.open(wait=True)
     return _checkpoint_pool
