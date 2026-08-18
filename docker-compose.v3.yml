@@ -41,6 +41,8 @@ services:
 
   svc-face:
     container_name: df-v3-svc-face
+    environment:
+      DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED: "true"
     ports: !override
       - "127.0.0.1:18003:8003"
 
