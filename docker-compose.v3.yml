@@ -49,6 +49,8 @@ services:
   svc-audio:
     container_name: df-v3-svc-audio
     image: desifaces-v3-svc-audio
+    environment:
+      DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED: "true"
     ports: !override
       - "127.0.0.1:18004:8004"
 
