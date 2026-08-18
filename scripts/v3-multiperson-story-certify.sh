@@ -37,9 +37,13 @@ docker exec desifaces-v3-db sh -lc 'pg_dump -Fc -U "$POSTGRES_USER" -d "$POSTGRE
 sha256sum "$BACKUP_DIR/desifaces_v3_pre_multiperson_story.dump" > "$BACKUP_DIR/desifaces_v3_pre_multiperson_story.dump.sha256"
 echo "MULTIPERSON_STORY_PRE_MIGRATION_BACKUP=PASS"
 
-docker exec -i desifaces-v3-db sh -lc 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
-  < migrations/2026_08_18_v3_multiperson_story_foundation.sql >/dev/null
-echo "MULTIPERSON_STORY_MIGRATION=PASS"
+for migration in \
+  migrations/2026_08_18_v3_multiperson_story_foundation.sql \
+  migrations/2026_08_18_v3_multiperson_story_hardening.sql
+do
+  docker exec -i desifaces-v3-db sh -lc 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$migration" >/dev/null
+  echo "MULTIPERSON_STORY_MIGRATION_PASS=$migration"
+done
 
 # Rebuild only Fusion API because certification imports shared contracts/stores.
 # Execution workers remain disabled.
