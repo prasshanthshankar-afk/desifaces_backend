@@ -45,8 +45,8 @@ cleanup_worker() {
 }
 trap cleanup_worker EXIT
 
-# Explicitly start only the APIs/runners needed for this visual proof.
-# Enabling the profile does NOT authorize unrelated workers because services are named.
+# Start only the services/runners required by this proof. Other execution workers
+# remain off even though the profile is enabled because services are named.
 COMPOSE_PARALLEL_LIMIT=1 ./scripts/v3-compose.sh \
   --profile v3-orchestration \
   --profile v3-execution \
@@ -97,15 +97,14 @@ if [ "$FACE_MODEL" != "gpt-image-2" ]; then
 fi
 echo "MPS2_VISUAL_FACE_MODEL=PASS:$FACE_MODEL"
 
-# The Python proof is intentionally interactive unless the explicit approval env
-# flags are set. It first displays the Director plan, then the Face pricing.
+# Interactive unless explicit test-only approval flags are supplied.
 set +e
 docker exec -i \
   -e MPS2_FACE_MODEL_RESOLVED="$FACE_MODEL" \
   -e MPS2_DIRECTOR_PLAN_APPROVED="${MPS2_DIRECTOR_PLAN_APPROVED:-}" \
   -e MPS2_FACE_GENERATION_APPROVED="${MPS2_FACE_GENERATION_APPROVED:-}" \
   df-v3-svc-director \
-  python -m app.tools.v3_mps2_visual_face_proof
+  python -m app.tools.v3_mps2_visual_face_proof_v2
 RC=$?
 set -e
 
