@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 from uuid import UUID
 
@@ -10,6 +11,30 @@ from langchain_openai import OpenAIEmbeddings
 from df_contracts.v3.director import CreativeBrief
 from desifaces_shared.v3.creation_context import build_creation_context
 from desifaces_shared.v3.story_store import CanonicalStoryStore
+
+
+def _lexical_websearch_query(text: str, *, max_terms: int = 16) -> str:
+    """Create a tolerant OR query for long creative briefs.
+
+    ``plainto_tsquery`` over a full paragraph effectively requires every lexical
+    term to occur in the same knowledge chunk, which is too strict for RAG. Use a
+    bounded set of distinct terms and PostgreSQL's safe websearch parser instead.
+    Semantic retrieval remains preferred when embeddings are configured.
+    """
+
+    seen: set[str] = set()
+    terms: list[str] = []
+    for raw in re.findall(r"[A-Za-z0-9_]+", text):
+        token = raw.lower()
+        if len(token) < 3 or token in seen:
+            continue
+        seen.add(token)
+        terms.append(token)
+        if len(terms) >= max_terms:
+            break
+    if not terms:
+        return '"creative"'
+    return " OR ".join(f'"{term}"' for term in terms)
 
 
 class HybridCreativeRetriever:
@@ -28,17 +53,23 @@ class HybridCreativeRetriever:
 
     async def _semantic_chunks(self, conn, query: str, *, limit: int = 8) -> list[dict[str, Any]]:
         if not self._embeddings:
+            lexical_query = _lexical_websearch_query(query)
             rows = await conn.fetch(
                 """
                 select c.chunk_id,s.source_type,s.source_key,s.title,c.content,c.locale,c.tags,c.metadata_json
                 from public.v3_creative_knowledge_chunks c
                 join public.v3_creative_knowledge_sources s on s.source_id=c.source_id
                 where c.is_active=true and s.is_active=true
-                  and to_tsvector('simple',c.content) @@ plainto_tsquery('simple',$1)
-                order by ts_rank(to_tsvector('simple',c.content),plainto_tsquery('simple',$1)) desc
+                  and to_tsvector('simple',coalesce(s.title,'') || ' ' || c.content)
+                      @@ websearch_to_tsquery('simple',$1)
+                order by ts_rank(
+                  to_tsvector('simple',coalesce(s.title,'') || ' ' || c.content),
+                  websearch_to_tsquery('simple',$1)
+                ) desc,
+                c.created_at desc
                 limit $2
                 """,
-                query,
+                lexical_query,
                 limit,
             )
         else:
