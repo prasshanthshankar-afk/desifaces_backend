@@ -23,6 +23,7 @@ from .db import close_pools, open_business_pool, open_checkpoint_pool
 from .run_store import DirectorRunNotFound, DirectorRunStore
 from .runtime import create_director_graph
 from .security import DirectorAuthContext, get_director_auth
+from .studio_routes import router as studio_router
 
 
 class ResumeIn(BaseModel):
@@ -109,6 +110,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="desifaces V3 Creative Director", version="3.0", lifespan=lifespan)
+app.include_router(studio_router)
 
 
 @app.get("/api/health")
