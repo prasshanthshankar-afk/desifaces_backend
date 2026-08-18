@@ -9,6 +9,7 @@ on:
       - "services/shared/df_contracts/**"
       - "services/shared/python/desifaces_shared/identity/**"
       - "services/svc-face/app/**"
+      - "services/svc-audio/app/**"
       - "test/test_v3_*.py"
       - "docker-compose.v3.yml"
       - ".github/workflows/v3-contract-tests.yml"
@@ -19,6 +20,7 @@ on:
       - "services/shared/df_contracts/**"
       - "services/shared/python/desifaces_shared/identity/**"
       - "services/svc-face/app/**"
+      - "services/svc-audio/app/**"
       - "test/test_v3_*.py"
       - "docker-compose.v3.yml"
       - ".github/workflows/v3-contract-tests.yml"
@@ -41,13 +43,15 @@ jobs:
       - name: Install focused test dependencies
         run: python -m pip install --disable-pip-version-check pytest "pydantic>=2,<3"
 
-      - name: Compile V3 contract and Face adapter code
+      - name: Compile V3 contract and compatibility adapter code
         run: |
           python -m compileall -q \
             services/shared/df_contracts \
             services/shared/python/desifaces_shared/identity \
             services/svc-face/app/app/services/v3_face_adapter_shadow.py \
-            services/svc-face/app/app/api/v3_adapter_probe.py
+            services/svc-face/app/app/api/v3_adapter_probe.py \
+            services/svc-audio/app/app/services/v3_audio_adapter_shadow.py \
+            services/svc-audio/app/app/api/v3_adapter_probe.py
 
       - name: Run canonical adapter unit tests
         env:
@@ -56,4 +60,5 @@ jobs:
           python -m pytest -q \
             test/test_v3_adapter_primitives.py \
             test/test_v3_face_adapter.py \
+            test/test_v3_audio_adapter.py \
             test/test_v3_account_context.py
