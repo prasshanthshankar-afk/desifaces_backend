@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from typing import Any
 from uuid import UUID
@@ -11,6 +12,9 @@ from app.tools import v3_mps2_visual_face_proof_v2 as proof
 
 
 REQUIRED_CREDITS = 10
+TEST_USER_EMAIL = str(
+    os.getenv("DF_V3_E2E_TEST_USER_EMAIL") or "test_apple_iap_test1@desifaces.ai"
+).strip().lower()
 _ALLOWED_GENDERS = {"male", "female"}
 _SENSITIVE_KEY_TOKENS = {
     "account", "billing", "credential", "email", "password", "payment",
@@ -137,6 +141,9 @@ def compile_face_input(
 
 
 async def _active_actor(pool) -> tuple[UUID, UUID]:
+    if not TEST_USER_EMAIL:
+        raise RuntimeError("MPS2_VISUAL_PRECHECK_FAIL=test_user_email_missing")
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -148,26 +155,37 @@ async def _active_actor(pool) -> tuple[UUID, UUID]:
               from public.pricing_credit_lots
               group by user_id
             )
-            select bam.user_id,bam.billing_account_id,s.available_credits
+            select bam.user_id,bam.billing_account_id,
+                   coalesce(s.available_credits,0)::numeric as available_credits,
+                   lower(u.email) as email
             from public.pricing_billing_account_members bam
             join public.pricing_billing_accounts ba on ba.id=bam.billing_account_id
             join core.users u on u.id=bam.user_id
-            join spendable s on s.user_id=bam.user_id
+            left join spendable s on s.user_id=bam.user_id
             where bam.status='active' and ba.status='active'
-              and s.available_credits >= $1::numeric
-            order by s.available_credits desc,
-              bam.is_default desc,
+              and lower(u.email)=lower($1::text)
+            order by bam.is_default desc,
               case bam.role when 'owner' then 0 when 'finance_admin' then 1 else 2 end,
               bam.created_at asc
             limit 1
             """,
-            REQUIRED_CREDITS,
+            TEST_USER_EMAIL,
         )
     if not row:
         raise RuntimeError(
-            f"MPS2_VISUAL_PRECHECK_FAIL=no_active_actor_with_{REQUIRED_CREDITS}_spendable_credits"
+            f"MPS2_VISUAL_PRECHECK_FAIL=canonical_test_actor_not_found:{TEST_USER_EMAIL}"
         )
-    print(f"MPS2_VISUAL_ACTOR_BALANCE=PASS:available_credits={row['available_credits']}")
+    available = int(row["available_credits"] or 0)
+    if available < REQUIRED_CREDITS:
+        raise RuntimeError(
+            "MPS2_VISUAL_PRECHECK_FAIL=canonical_test_actor_underfunded:"
+            f"required={REQUIRED_CREDITS}:available={available}"
+        )
+    if str(row["email"] or "").strip().lower() != TEST_USER_EMAIL:
+        raise RuntimeError("MPS2_VISUAL_PRECHECK_FAIL=canonical_test_actor_email_mismatch")
+
+    print(f"MPS2_VISUAL_TEST_ACTOR=PASS:email={TEST_USER_EMAIL}")
+    print(f"MPS2_VISUAL_ACTOR_BALANCE=PASS:available_credits={available}")
     return UUID(str(row["user_id"])), UUID(str(row["billing_account_id"]))
 
 
