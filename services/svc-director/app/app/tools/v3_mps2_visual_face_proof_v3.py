@@ -21,7 +21,9 @@ _SENSITIVE_KEY_TOKENS = {
     "phone", "secret", "token", "user",
 }
 _VISUAL_PRIORITY = (
+    "identity type",
     "identity brief",
+    "presentation",
     "portrait framing",
     "expression",
     "face shape",
@@ -32,15 +34,18 @@ _VISUAL_PRIORITY = (
     "nose",
     "lips",
     "jaw and chin",
+    "hair styling",
     "hair",
     "lighting",
     "distinguishing cues",
+    "rendering",
     "photorealism",
+    "wardrobe",
     "body reference",
     "resemblance constraint",
     "identity independence",
 )
-_CONTINUITY_PRIORITY = ("identity lock", "wardrobe lock")
+_CONTINUITY_PRIORITY = ("identity", "identity lock", "wardrobe", "wardrobe lock")
 
 
 def _sensitive(key: str) -> bool:
@@ -48,6 +53,10 @@ def _sensitive(key: str) -> bool:
         token for token in re.split(r"[^a-z0-9]+", str(key or "").strip().lower()) if token
     }
     return bool(tokens & _SENSITIVE_KEY_TOKENS) or "id" in tokens
+
+
+def _normalized_key(value: str) -> str:
+    return re.sub(r"[_-]+", " ", str(value or "").strip().lower()).strip()
 
 
 def _safe_map(value: dict[str, Any] | None) -> dict[str, str]:
@@ -58,7 +67,7 @@ def _safe_map(value: dict[str, Any] | None) -> dict[str, str]:
             continue
         text = str(raw_value).strip()
         if text:
-            out[key.lower()] = text[:420]
+            out[_normalized_key(key)] = text[:420]
     return out
 
 
@@ -93,9 +102,10 @@ def compile_face_input(
 ) -> dict[str, Any]:
     """Identity-first Face prompt compiler for the MPS2 visual proof.
 
-    Story mechanics do not consume the provider prompt budget. Identity geometry,
-    expression, hair, lighting, distinguishing cues, photorealism and continuity
-    are prioritized as complete sentences; the prompt is never blindly truncated.
+    Story mechanics do not consume the provider prompt budget. Director field
+    names are normalized so both snake_case and human-readable keys survive into
+    the Face prompt. Complete identity sentences are prioritized; no blind string
+    truncation is used.
     """
     hint = dict(participant_hint or {})
     gender = _explicit_gender(hint)
