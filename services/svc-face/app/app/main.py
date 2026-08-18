@@ -7,7 +7,15 @@ from fastapi import FastAPI
 
 from app.api import build_router
 from app.db import close_pool, get_pool
-from app.services.v3_face_adapter_shadow import face_v3_shadow_enabled
+
+
+def _v3_face_adapter_probe_enabled() -> bool:
+    return str(os.getenv("DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED", "false")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def create_app() -> FastAPI:
@@ -24,8 +32,9 @@ def create_app() -> FastAPI:
 
     # V3 adapter certification is an additive, read-only dev/runtime probe.  It is
     # disabled by default and excluded from OpenAPI so the certified public Face
-    # contract remains unchanged.
-    if face_v3_shadow_enabled():
+    # contract remains unchanged.  Import lazily so existing V2/local startup does
+    # not depend on V3 contract packaging when the feature is off.
+    if _v3_face_adapter_probe_enabled():
         from app.api.v3_adapter_probe import router as v3_adapter_probe_router
 
         app.include_router(v3_adapter_probe_router)
