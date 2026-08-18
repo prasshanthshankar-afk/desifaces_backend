@@ -154,6 +154,8 @@ class GenerationRequest(V3ContractModel):
     account_id: UUID
     requested_by_user_id: UUID
     project_id: UUID | None = None
+    story_id: UUID | None = None
+    scene_id: UUID | None = None
     kind: GenerationKind
     participant_ids: tuple[UUID, ...] = ()
     source_media_ids: tuple[UUID, ...] = ()
