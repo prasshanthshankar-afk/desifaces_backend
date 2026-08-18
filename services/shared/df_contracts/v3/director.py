@@ -21,6 +21,8 @@ from .story import DialogueTurnKind
 
 
 class DirectorRunState(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
     DRAFTING = "drafting"
     RETRIEVING = "retrieving"
     PLANNING = "planning"
