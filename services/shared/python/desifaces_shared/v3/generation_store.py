@@ -66,6 +66,23 @@ def _json(value: Any) -> str:
     return json.dumps(value, default=str, separators=(",", ":"), sort_keys=True)
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    try:
+        return dict(value)
+    except Exception:
+        return {}
+
+
 @dataclass(frozen=True)
 class GenerationPersistenceResult:
     generation_id: UUID
@@ -408,11 +425,7 @@ class CanonicalGenerationStore:
         lease_seconds: int = 120,
         generation_kinds: Sequence[str] = (),
     ) -> UUID | None:
-        """Atomically claim one runnable root/child job.
-
-        C2C keeps execution workers disabled; this method is the future worker
-        primitive and has no effect unless a worker explicitly calls it.
-        """
+        """Atomically claim one runnable job without exceeding retry budget."""
         row = await conn.fetchrow(
             """
             with candidate as (
@@ -421,6 +434,7 @@ class CanonicalGenerationStore:
               join public.v3_generation_requests r on r.generation_id=j.generation_id
               where j.state in ('submitted','queued')
                 and j.available_at <= now()
+                and j.attempt_count < j.max_attempts
                 and (coalesce(array_length($1::text[],1),0)=0 or r.generation_kind = any($1::text[]))
                 and (j.lease_expires_at is null or j.lease_expires_at <= now())
               order by j.available_at asc, j.created_at asc
@@ -476,8 +490,12 @@ class CanonicalGenerationStore:
         return GenerationJob(
             job_id=UUID(str(_row_get(row, "job_id"))),
             generation_id=UUID(str(_row_get(row, "generation_id"))),
+            parent_job_id=UUID(str(_row_get(row, "parent_job_id"))) if _row_get(row, "parent_job_id") else None,
+            job_type=str(_row_get(row, "job_type", "root")),
             state=JobState(str(_row_get(row, "state"))),
             progress_percent=_row_get(row, "progress_percent"),
+            attempt_count=int(_row_get(row, "attempt_count", 0)),
+            max_attempts=int(_row_get(row, "max_attempts", 3)),
             provider_execution_ids=tuple(UUID(str(_row_get(item, "execution_id"))) for item in provider_rows),
             output_media_ids=tuple(UUID(str(_row_get(item, "media_id"))) for item in output_rows),
             error_code=_row_get(row, "error_code"),
@@ -525,8 +543,9 @@ class CanonicalGenerationStore:
             model=_row_get(row, "model"),
             state=ProviderExecutionState(str(_row_get(row, "state"))),
             provider_request_id=_row_get(row, "provider_request_id"),
+            idempotency_key=_row_get(row, "idempotency_key"),
             attempt=int(_row_get(row, "attempt", 1)),
-            metadata=json.loads(_json(_row_get(row, "metadata_json", {}))) if _row_get(row, "metadata_json") is not None else {},
+            metadata=_as_dict(_row_get(row, "metadata_json", {})),
             started_at=_row_get(row, "started_at"),
             completed_at=_row_get(row, "completed_at"),
         )
