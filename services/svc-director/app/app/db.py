@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional
+import json
+from typing import Any, Optional
 
 import asyncpg
 from psycopg.rows import dict_row
@@ -12,6 +13,30 @@ _business_pool: Optional[asyncpg.Pool] = None
 _checkpoint_pool: Optional[AsyncConnectionPool] = None
 
 
+def _encode_json_compat(value: Any) -> str:
+    """Encode Python JSON while tolerating pre-serialized object/list values."""
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw:
+            try:
+                decoded = json.loads(raw)
+                if isinstance(decoded, (dict, list)):
+                    return raw
+            except Exception:
+                pass
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+async def _init_business_codecs(conn: asyncpg.Connection) -> None:
+    for type_name in ("json", "jsonb"):
+        await conn.set_type_codec(
+            type_name,
+            encoder=_encode_json_compat,
+            decoder=json.loads,
+            schema="pg_catalog",
+        )
+
+
 async def open_business_pool() -> asyncpg.Pool:
     global _business_pool
     if _business_pool is None:
@@ -20,6 +45,7 @@ async def open_business_pool() -> asyncpg.Pool:
             min_size=1,
             max_size=10,
             command_timeout=60,
+            init=_init_business_codecs,
         )
     return _business_pool
 
