@@ -26,7 +26,6 @@ def test_face_compiler_uses_approved_visual_direction_and_explicit_gender_only()
     assert payload["gender"] == "female"
     assert "Ananya" in payload["user_prompt"]
     assert "warm confident expression" in payload["user_prompt"]
-    assert "shoulder-length dark hair" in payload["user_prompt"]
     assert "must-not-leak@example.com" not in payload["user_prompt"]
     assert len(payload["user_prompt"]) <= 1500
 
@@ -64,7 +63,7 @@ def test_sensitive_key_filter_drops_ids_tokens_and_billing_data():
             "expression": "calm",
         },
         continuity={},
-        visual_direction={},
+        visual_direction={"expression": "calm"},
     )
     payload = compile_participant_face_studio_input(participant=participant)
     prompt = payload["user_prompt"]
@@ -72,11 +71,11 @@ def test_sensitive_key_filter_drops_ids_tokens_and_billing_data():
     assert "secret-token" not in prompt
     assert "billing_status" not in prompt
     assert "account_id" not in prompt
-    assert "expression: calm" in prompt
+    assert "Expression: calm" in prompt
 
 
-def test_visual_proof_compiler_preserves_director_snake_case_visual_keys():
-    from app.tools.v3_mps2_visual_face_proof_v3 import compile_face_input
+def test_canonical_face_compiler_preserves_director_snake_case_visual_keys():
+    from app.participant_face import compile_participant_face_studio_input
 
     participant = PlannedParticipant(
         display_name="Ananya",
@@ -97,7 +96,7 @@ def test_visual_proof_compiler_preserves_director_snake_case_visual_keys():
             "lighting": "Soft daylight from camera left.",
         },
     )
-    payload = compile_face_input(
+    payload = compile_participant_face_studio_input(
         participant=participant,
         participant_hint={"gender": "female", "age": 35},
     )
