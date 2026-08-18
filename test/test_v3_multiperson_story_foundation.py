@@ -165,10 +165,10 @@ def test_story_graph_rejects_duplicate_scene_sequence() -> None:
         created_at=now(),
         updated_at=now(),
     )
+    payload = graph.model_dump()
+    payload["scenes"] = [*payload["scenes"], second.model_dump()]
     with pytest.raises(ValidationError):
-        graph.model_copy(update={"scenes": graph.scenes + (second,)}).model_validate(
-            graph.model_copy(update={"scenes": graph.scenes + (second,)}).model_dump()
-        )
+        StoryGraph.model_validate(payload)
 
 
 def test_generation_request_links_story_scene_and_participants() -> None:
