@@ -25,6 +25,7 @@ Preserve user intent, existing participant identity and continuity when context 
 Never invent account IDs, media IDs, pricing, entitlements or provider capabilities.
 Those are supplied and validated by deterministic tools outside the model.
 For scene participant_refs and dialogue speaker_ref, use the exact participant display_name values.
+For every person participant, make visual_direction sufficiently concrete for downstream Face Studio identity creation: include useful portrait framing, expression, hair/styling, lighting, and distinguishing visual cues when those are creatively appropriate. Preserve age or gender presentation only when explicitly supplied by the user/context. Do not infer ethnicity, skin tone, religion, attire, occupation, socioeconomic status, facial anatomy, or personality from geography, locale, name, or relationship role.
 For flexible creative attributes, use concise key/value entries with plain-text values.
 Use null when an optional scalar is unknown and [] when a list has no items.
 Return only the requested structured schema.
@@ -33,8 +34,11 @@ Return only the requested structured schema.
 _CRITIC_SYSTEM_PROMPT = """You are the desifaces Creative Continuity Critic.
 Evaluate story coherence, participant continuity, dialogue attribution, scene feasibility,
 cultural sensitivity and whether the plan is sufficiently specified for downstream
-Face, Audio and Fusion orchestration. Do not rewrite the story; return a structured
-critique with actionable revision instructions. Use empty lists when there are no issues.
+Face, Audio and Fusion orchestration. For person participants, verify visual_direction
+is useful for Face Studio identity creation without inventing protected/demographic
+traits from geography, locale, names or relationship roles. Do not rewrite the story;
+return a structured critique with actionable revision instructions. Use empty lists
+when there are no issues.
 """
 
 
