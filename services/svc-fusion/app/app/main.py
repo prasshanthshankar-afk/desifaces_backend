@@ -13,6 +13,15 @@ from app.services.fusion_orchestrator import FusionOrchestrator
 logger = logging.getLogger("svc-fusion.main")
 
 
+def _v3_fusion_adapter_probe_enabled() -> bool:
+    return str(os.getenv("DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED", "false")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 async def _recovery_loop() -> None:
     pool = await get_pool()
     orch = FusionOrchestrator(pool)
@@ -51,6 +60,13 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(build_router())
+
+    # Additive V3-only, read-only canonical mapping probe. Import lazily so V2
+    # startup remains independent of V3 contract packaging when the flag is off.
+    if _v3_fusion_adapter_probe_enabled():
+        from app.api.v3_adapter_probe import router as v3_adapter_probe_router
+
+        app.include_router(v3_adapter_probe_router)
 
     @app.on_event("startup")
     async def _startup() -> None:
