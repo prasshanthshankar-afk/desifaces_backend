@@ -10,7 +10,7 @@ from desifaces_shared.v3.story_store import StoryGraphNotFound
 from desifaces_shared.v3.studio_workflow_store import CanonicalStudioWorkflowStore, StudioWorkflowError
 
 from .security import DirectorAuthContext, get_director_auth
-from .studio_workflow import build_story_studio_workflow
+from .studio_workflow import build_direct_studio_workflow, build_story_studio_workflow
 
 router = APIRouter()
 store = CanonicalStudioWorkflowStore()
@@ -19,6 +19,41 @@ store = CanonicalStudioWorkflowStore()
 class ReviewIn(BaseModel):
     decision: ReviewDecision
     feedback: str | None = Field(default=None, max_length=12000)
+
+
+@router.post(
+    "/api/director/projects/{project_id}/participants/{participant_id}/studio-workflows",
+    response_model=StudioWorkflowView,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_direct_studio_workflow(
+    project_id: UUID,
+    participant_id: UUID,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    pool = request.app.state.business_pool
+    async with pool.acquire() as conn:
+        participant = await conn.fetchrow(
+            """select participant_id from public.v3_participants
+            where participant_id=$1 and project_id=$2 and account_id=$3 and lifecycle_state='active'""",
+            participant_id, project_id, auth.account_id,
+        )
+        if not participant:
+            raise HTTPException(status_code=404, detail="participant_not_found")
+        try:
+            async with conn.transaction():
+                workflow_id = await build_direct_studio_workflow(
+                    conn,
+                    account_id=auth.account_id,
+                    owner_user_id=auth.user_id,
+                    project_id=project_id,
+                    participant_id=participant_id,
+                    store=store,
+                )
+                return await store.get_workflow(conn, workflow_id=workflow_id, account_id=auth.account_id)
+        except StudioWorkflowError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post(
@@ -36,15 +71,10 @@ async def create_story_studio_workflow(
         async with pool.acquire() as conn:
             async with conn.transaction():
                 graph = await request.app.state.story_store.get_story_graph(
-                    conn,
-                    story_id=story_id,
-                    account_id=auth.account_id,
+                    conn, story_id=story_id, account_id=auth.account_id,
                 )
                 workflow_id = await build_story_studio_workflow(
-                    conn,
-                    graph=graph,
-                    owner_user_id=auth.user_id,
-                    store=store,
+                    conn, graph=graph, owner_user_id=auth.user_id, store=store,
                 )
                 return await store.get_workflow(conn, workflow_id=workflow_id, account_id=auth.account_id)
     except StoryGraphNotFound as exc:
@@ -78,31 +108,23 @@ async def review_studio_output(
     pool = request.app.state.business_pool
     async with pool.acquire() as conn:
         workflow_id = await conn.fetchval(
-            """
-            select w.workflow_id
+            """select w.workflow_id
             from public.v3_studio_review_items r
             join public.v3_studio_stage_runs s on s.stage_run_id=r.stage_run_id
             join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
-            where r.review_item_id=$1 and w.account_id=$2
-            """,
-            review_item_id,
-            auth.account_id,
+            where r.review_item_id=$1 and w.account_id=$2""",
+            review_item_id, auth.account_id,
         )
         if not workflow_id:
             raise HTTPException(status_code=404, detail="studio_review_not_found")
         try:
             async with conn.transaction():
                 await store.review_output(
-                    conn,
-                    review_item_id=review_item_id,
-                    reviewer_user_id=auth.user_id,
-                    decision=body.decision,
-                    feedback=body.feedback,
+                    conn, review_item_id=review_item_id, reviewer_user_id=auth.user_id,
+                    decision=body.decision, feedback=body.feedback,
                 )
                 return await store.get_workflow(
-                    conn,
-                    workflow_id=UUID(str(workflow_id)),
-                    account_id=auth.account_id,
+                    conn, workflow_id=UUID(str(workflow_id)), account_id=auth.account_id,
                 )
         except StudioWorkflowError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
