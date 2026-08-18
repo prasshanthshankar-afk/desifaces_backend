@@ -1,7 +1,7 @@
 # V3 EIP Evidence Record — Parallel Runtime Isolation
 
 Change-ID: `V3-C2C`
-Status: `IMPLEMENTATION_IN_PROGRESS`
+Status: `CERTIFIED`
 Owner: `#v3-core`
 Date: `2026-08-17`
 
@@ -310,3 +310,39 @@ identical:
 This certifies infrastructure isolation only. V3 API startup and execution
 workers remain separately gated.
 
+
+## V3-C2C API Tier Certification
+
+The parallel V3 API runtime has been certified.
+
+Certified runtime:
+- `svc-core` -> `127.0.0.1:18000`
+- `svc-fusion` -> `127.0.0.1:18002`
+- `svc-face` -> `127.0.0.1:18003`
+- `svc-audio` -> `127.0.0.1:18004`
+- `svc-dashboard` -> `127.0.0.1:18005`
+- `svc-fusion-extension` -> `127.0.0.1:18006`
+- `svc-music` -> `127.0.0.1:18007`
+- `svc-commerce` -> `127.0.0.1:18008`
+- `svc-pricing` -> `127.0.0.1:18009`
+- `svc-marketing` -> `127.0.0.1:18010`
+
+Certification:
+- `ALL_V3_API_HEALTH=PASS`
+- `V3_CONNECTION_TARGETS=PASS`
+- `V3_BACKGROUND_SIDE_EFFECT_GUARDS=PASS`
+- `V3_NETWORK_ISOLATION=PASS`
+- `V3_EXECUTION_GUARD=PASS`
+- `V3_PORT_ISOLATION=PASS`
+- `V2_COEXISTENCE=PASS`
+
+Bootstrap safety:
+- `DF_SUBSCRIPTION_RECONCILER_ENABLED=false`
+- `FUSION_RECOVERY_ENABLED=false`
+- `WORKER_ENABLED=false`
+- `STITCH_WORKER_ENABLED=false`
+
+All V3 execution workers and schedulers remain disabled. Worker activation
+requires separate certification and is not part of the API-tier bootstrap.
+
+V3-C2C parallel runtime isolation is CERTIFIED.

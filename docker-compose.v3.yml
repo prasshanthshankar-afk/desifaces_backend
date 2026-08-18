@@ -34,6 +34,8 @@ services:
 
   svc-fusion:
     container_name: df-v3-svc-fusion
+    environment:
+      FUSION_RECOVERY_ENABLED: "false"
     ports: !override
       - "127.0.0.1:18002:8002"
 
@@ -55,6 +57,9 @@ services:
 
   svc-fusion-extension:
     container_name: df-v3-svc-fusion-extension
+    environment:
+      WORKER_ENABLED: "false"
+      STITCH_WORKER_ENABLED: "false"
     ports: !override
       - "127.0.0.1:18006:8006"
 
