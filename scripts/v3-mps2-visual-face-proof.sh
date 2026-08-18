@@ -97,6 +97,12 @@ if [ "$FACE_MODEL" != "gpt-image-2" ]; then
 fi
 echo "MPS2_VISUAL_FACE_MODEL=PASS:$FACE_MODEL"
 
+# Pricing must remain real. Do not inject fake balance or bypass reservations.
+# Reuse the certified C6 period-aware integrity repair, which can only reconcile
+# already-persisted active subscription periods, then require >=10 spendable
+# credits before the visual runner is allowed to create two 5-credit Face jobs.
+docker exec df-v3-svc-pricing python -m app.tools.v3_mps2_prepare_visual_pricing
+
 # Interactive unless explicit test-only approval flags are supplied.
 set +e
 docker exec -i \
@@ -104,7 +110,7 @@ docker exec -i \
   -e MPS2_DIRECTOR_PLAN_APPROVED="${MPS2_DIRECTOR_PLAN_APPROVED:-}" \
   -e MPS2_FACE_GENERATION_APPROVED="${MPS2_FACE_GENERATION_APPROVED:-}" \
   df-v3-svc-director \
-  python -m app.tools.v3_mps2_visual_face_proof_v2
+  python -m app.tools.v3_mps2_visual_face_proof_v3
 RC=$?
 set -e
 
