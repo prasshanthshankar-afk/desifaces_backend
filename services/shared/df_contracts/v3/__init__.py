@@ -3,6 +3,14 @@
 Import contracts from this package rather than capability implementation modules.
 """
 
+from .adapters import (
+    derive_idempotency_key,
+    make_api_error,
+    make_request_context,
+    normalize_error_code,
+    normalize_job_state,
+    stable_payload_digest,
+)
 from .common import (
     ActorType,
     ApiEnvelope,
@@ -83,4 +91,10 @@ __all__ = [
     "StoryRef",
     "UserRef",
     "V3ContractModel",
+    "derive_idempotency_key",
+    "make_api_error",
+    "make_request_context",
+    "normalize_error_code",
+    "normalize_job_state",
+    "stable_payload_digest",
 ]
