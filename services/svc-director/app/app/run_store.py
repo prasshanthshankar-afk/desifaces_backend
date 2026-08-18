@@ -53,7 +53,7 @@ class DirectorRunStore:
             )
             update public.v3_director_runs r
             set state='running',attempt_count=r.attempt_count+1,claimed_at=now(),
-                lease_expires_at=now()+($1::text || ' seconds')::interval,updated_at=now()
+                lease_expires_at=now()+make_interval(secs => $1::integer),updated_at=now()
             from candidate c where r.run_id=c.run_id returning r.*""",
             int(lease_seconds),
         )
