@@ -8,20 +8,16 @@ services:
 
   desifaces-db:
     container_name: desifaces-v3-db
-
-    # V3 must never fall through to the V2/base Compose defaults.
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?V3 POSTGRES_DB is required}
       POSTGRES_USER: ${POSTGRES_USER:?V3 POSTGRES_USER is required}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?V3 POSTGRES_PASSWORD is required}
       PGDATA: /var/lib/postgresql/data/pgdata
-
     ports: !override
       - "127.0.0.1:25432:5432"
 
   desifaces-redis:
     container_name: desifaces-v3-redis
-
 
   # -------------------------------------------------------------------
   # APIs
@@ -95,8 +91,9 @@ services:
     ports: !override
       - "127.0.0.1:18010:8010"
 
-  # V3-only creative orchestration. This service plans/retrieves/checkpoints and
-  # compiles canonical Story state; it does not run Face/Audio/Fusion workers.
+  # V3-only creative orchestration API. HTTP is control-plane only: create,
+  # inspect and resume durable Director runs; LLM execution occurs in the
+  # orchestration runner below.
   svc-director:
     container_name: df-v3-svc-director
     image: desifaces-v3-svc-director
@@ -123,18 +120,37 @@ services:
     ports: !override
       - "127.0.0.1:18011:8011"
 
+  # Long-running LLM/RAG/LangGraph execution is deliberately outside the HTTP
+  # process. This is an orchestration runner, not a Face/Audio/Fusion provider
+  # worker, and therefore has its own explicit profile.
+  svc-director-worker:
+    container_name: df-v3-svc-director-worker
+    image: desifaces-v3-svc-director
+    build:
+      context: .
+      dockerfile: services/svc-director/app/Dockerfile.v3
+    profiles: !override ["v3-orchestration"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?V3 DATABASE_URL is required}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DF_DIRECTOR_LLM_MODEL: ${DF_DIRECTOR_LLM_MODEL:-}
+      DF_DIRECTOR_EMBEDDING_MODEL: ${DF_DIRECTOR_EMBEDDING_MODEL:-}
+      DF_DIRECTOR_REVIEW_REQUIRED: ${DF_DIRECTOR_REVIEW_REQUIRED:-true}
+      DF_DIRECTOR_MAX_REVISIONS: ${DF_DIRECTOR_MAX_REVISIONS:-3}
+      DF_DIRECTOR_CHECKPOINTER_AUTO_SETUP: "true"
+      LANGGRAPH_STRICT_MSGPACK: "true"
+    depends_on:
+      - desifaces-db
+    networks:
+      - df-net
+    command: ["python", "-m", "app.worker"]
 
   # -------------------------------------------------------------------
-  # Execution workers
-  #
-  # IMPORTANT:
-  # These are intentionally behind a V3-only profile.
-  #
-  # A plain:
-  #
-  #   docker compose ... up
-  #
-  # must NOT activate provider-calling/background workers.
+  # Provider/background execution workers
   # -------------------------------------------------------------------
 
   svc-core-notification-worker:
@@ -186,36 +202,12 @@ services:
     container_name: df-v3-svc-studio-coach-refresh-worker
     profiles: !override ["v3-execution"]
 
-
-# ---------------------------------------------------------------------
-# V3-only network
-#
-# Internal service names remain unchanged:
-#   svc-core
-#   svc-face
-#   svc-audio
-#   svc-fusion
-#   svc-director
-#   desifaces-db
-#   desifaces-redis
-#
-# Docker DNS resolves them only within df-v3-net.
-# ---------------------------------------------------------------------
-
 networks:
   df-net:
     name: df-v3-net
     driver: bridge
 
-
-# ---------------------------------------------------------------------
-# Persistent state
-# ---------------------------------------------------------------------
-
 volumes:
-
-  # Existing certified V3-C2B PostgreSQL volume.
-  # External prevents Compose from owning/deleting it.
   df_pgdata:
     external: true
     name: desifaces-v3_df_pgdata
