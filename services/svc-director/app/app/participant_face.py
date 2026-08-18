@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -322,11 +323,14 @@ class ParticipantFaceBinder:
             """,
             participant_id,
             media_asset_id,
-            {
-                "source": "svc-face",
-                "compatibility_face_job_id": face_job_id,
-                "face_profile_id": face_profile_id,
-            },
+            json.dumps(
+                {
+                    "source": "svc-face",
+                    "compatibility_face_job_id": face_job_id,
+                    "face_profile_id": face_profile_id,
+                },
+                ensure_ascii=False,
+            ),
         )
         await conn.execute(
             """
@@ -337,11 +341,14 @@ class ParticipantFaceBinder:
             """,
             participant_id,
             media_asset_id,
-            {
-                "face_source": "svc-face",
-                "face_job_id": face_job_id,
-                "face_profile_id": face_profile_id,
-            },
+            json.dumps(
+                {
+                    "face_source": "svc-face",
+                    "face_job_id": face_job_id,
+                    "face_profile_id": face_profile_id,
+                },
+                ensure_ascii=False,
+            ),
             account_id,
         )
         await conn.execute(
@@ -351,11 +358,14 @@ class ParticipantFaceBinder:
             where stage_run_id=$1
             """,
             stage_run_id,
-            {
-                "compatibility_face_job_id": face_job_id,
-                "face_profile_id": face_profile_id,
-                "prompt_used": prompt_used[:1500],
-            },
+            json.dumps(
+                {
+                    "compatibility_face_job_id": face_job_id,
+                    "face_profile_id": face_profile_id,
+                    "prompt_used": prompt_used[:1500],
+                },
+                ensure_ascii=False,
+            ),
         )
         return await self.store.attach_output(
             conn,
