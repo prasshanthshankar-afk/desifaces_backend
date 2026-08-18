@@ -46,6 +46,7 @@ from .commerce import (
 )
 from .director import (
     CreationContextBundle,
+    CreationContextScope,
     CreativeBrief,
     CreativeCritique,
     CreativeStoryPlan,
@@ -140,6 +141,7 @@ __all__ = [
     "AudioTranslationTone",
     "ConversationRef",
     "CreationContextBundle",
+    "CreationContextScope",
     "CreativeBrief",
     "CreativeCritique",
     "CreativeStoryPlan",
