@@ -103,6 +103,11 @@ if [ "$FACE_MODEL" != "gpt-image-2" ]; then
 fi
 echo "MPS2_VISUAL_FACE_MODEL=PASS:$FACE_MODEL"
 
+# V3 storage namespaces are infrastructure, not per-job state. Create the
+# configured private Face input/output containers idempotently and fail closed
+# unless both are explicitly V3-isolated names.
+docker exec df-v3-svc-face python -m app.tools.v3_mps2_prepare_visual_storage
+
 # Pricing must remain real. Do not inject fake balance or bypass reservations.
 # Reuse the certified C6 period-aware integrity repair, which can only reconcile
 # already-persisted active subscription periods, then require >=10 spendable
