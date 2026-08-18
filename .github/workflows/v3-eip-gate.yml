@@ -1,0 +1,101 @@
+name: V3 EIP Engineering Gate
+
+on:
+  pull_request:
+    branches:
+      - desifaces-v3
+
+permissions:
+  contents: read
+
+jobs:
+  eip-evidence-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect material V3 changes
+        id: material
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > /tmp/v3-changed-files.txt
+
+          echo "Changed files:"
+          cat /tmp/v3-changed-files.txt
+
+          # Material implementation/architecture areas. Governance/evidence-only
+          # changes do not trigger themselves.
+          if grep -Eq '^(services/|migrations/|infra/|docker-compose[^/]*\.ya?ml$|docs/v3-core/V3_CORE_ARCHITECTURE\.md$)' /tmp/v3-changed-files.txt; then
+            echo "required=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "required=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require changed EIP evidence record
+        if: steps.material.outputs.required == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          mapfile -t EVIDENCE_FILES < <(
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
+              | grep '^docs/v3-core/evidence/.*\.md$' \
+              | grep -v '/EIP_EVIDENCE_TEMPLATE\.md$' || true
+          )
+
+          if [ "${#EVIDENCE_FILES[@]}" -eq 0 ]; then
+            echo "::error::Material V3 changes require a changed EIP evidence record under docs/v3-core/evidence/."
+            exit 1
+          fi
+
+          printf 'Evidence records changed:\n'
+          printf '  %s\n' "${EVIDENCE_FILES[@]}"
+
+          for FILE in "${EVIDENCE_FILES[@]}"; do
+            if [ ! -f "$FILE" ]; then
+              echo "::error file=$FILE::Evidence record was deleted; a material V3 change requires a present evidence record."
+              exit 1
+            fi
+
+            REQUIRED_PATTERNS=(
+              '^Change-ID:'
+              '^Status:'
+              '^## 2\. EIP source'
+              '^## 3\. V2 current-state evidence'
+              '^## 4\. Evidence gaps'
+              '^## 5\. V3 disposition'
+              '^## 6\. #v3-core architecture decision'
+              '^## 13\. Compatibility / migration strategy'
+              '^## 14\. Test and certification plan'
+            )
+
+            for PATTERN in "${REQUIRED_PATTERNS[@]}"; do
+              if ! grep -Eq "$PATTERN" "$FILE"; then
+                echo "::error file=$FILE::Missing mandatory EIP evidence field/section matching: $PATTERN"
+                exit 1
+              fi
+            done
+
+            if grep -Eq '^Change-ID:[[:space:]]*`?<V3-' "$FILE"; then
+              echo "::error file=$FILE::Change-ID is still the template placeholder."
+              exit 1
+            fi
+
+            if grep -Eq '^Status:[[:space:]]*`?(DRAFT \| READY \| CERTIFIED)' "$FILE"; then
+              echo "::error file=$FILE::Status is still the template placeholder."
+              exit 1
+            fi
+          done
+
+          echo "EIP evidence gate: PASS"
