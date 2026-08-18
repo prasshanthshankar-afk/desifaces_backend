@@ -75,6 +75,45 @@ def test_sensitive_key_filter_drops_ids_tokens_and_billing_data():
     assert "expression: calm" in prompt
 
 
+def test_visual_proof_compiler_preserves_director_snake_case_visual_keys():
+    from app.tools.v3_mps2_visual_face_proof_v3 import compile_face_input
+
+    participant = PlannedParticipant(
+        display_name="Ananya",
+        role="daughter",
+        persona={"agency": "story-only detail that should not consume face prompt budget"},
+        continuity={
+            "identity": "lock the same shoulder-length silhouette",
+            "wardrobe": "muted teal blouse",
+        },
+        visual_direction={
+            "identity_type": "Distinct photorealistic recurring person.",
+            "portrait_framing": "Head-and-shoulders portrait at eye level.",
+            "presentation": "35-year-old woman with shoulder-length dark hair.",
+            "hair_styling": "Clean side part with a small silver clip.",
+            "distinguishing_cues": "Round translucent-frame glasses.",
+            "rendering": "Natural skin and hair texture with no beauty filter.",
+            "expression": "Attentive and thoughtful.",
+            "lighting": "Soft daylight from camera left.",
+        },
+    )
+    payload = compile_face_input(
+        participant=participant,
+        participant_hint={"gender": "female", "age": 35},
+    )
+    prompt = payload["user_prompt"]
+
+    assert "Head-and-shoulders portrait at eye level" in prompt
+    assert "35-year-old woman with shoulder-length dark hair" in prompt
+    assert "Clean side part with a small silver clip" in prompt
+    assert "Round translucent-frame glasses" in prompt
+    assert "Natural skin and hair texture with no beauty filter" in prompt
+    assert "lock the same shoulder-length silhouette" in prompt
+    assert "story-only detail" not in prompt
+    assert not prompt.endswith("...")
+    assert len(prompt) <= 1500
+
+
 def test_generated_face_is_candidate_until_hitl_approval():
     from app.participant_face import ParticipantFaceBinder, promote_approved_face_candidate
 
