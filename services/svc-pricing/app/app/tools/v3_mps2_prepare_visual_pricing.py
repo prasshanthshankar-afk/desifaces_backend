@@ -10,7 +10,7 @@ from app.services.subscription_credit_integrity_service import repair_active_sub
 
 REQUIRED_CREDITS = Decimal("10")
 TEST_USER_EMAIL = str(
-    os.getenv("DF_V3_E2E_TEST_USER_EMAIL") or "test_apple_iap_test1@desifaces.ai"
+    os.getenv("DF_V3_E2E_TEST_USER_EMAIL") or "user_apple_iap_test1@desifaces.ai"
 ).strip().lower()
 
 
