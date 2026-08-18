@@ -17,11 +17,14 @@ fi
 
 if [ -z "${DF_DIRECTOR_LLM_MODEL:-}" ] && [ -f infra/.env ]; then
   FILE_MODEL="$(awk -F= '$1 == "DF_DIRECTOR_LLM_MODEL" {sub(/^[^=]*=/, ""); print}' infra/.env | tail -n 1 | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
-  if [ -n "$FILE_MODEL" ]; then
-    export DF_DIRECTOR_LLM_MODEL="$FILE_MODEL"
-  fi
+  if [ -n "$FILE_MODEL" ]; then export DF_DIRECTOR_LLM_MODEL="$FILE_MODEL"; fi
 fi
 export DF_DIRECTOR_LLM_MODEL="${DF_DIRECTOR_LLM_MODEL:-gpt-5.6}"
+
+# Fast targeted regression gate before touching DB/runtime.
+docker run --rm -v "$PWD:/repo" -w /repo desifaces-v3-svc-fusion \
+  sh -lc 'pip install -q pytest langgraph==1.2.9 && PYTHONPATH=/repo:/repo/services/shared:/repo/services/shared/python:/repo/services/svc-director/app python -m pytest -q test/test_v3_participant_ref_normalization.py test/test_v3_studio_hitl_workflow.py'
+echo "MPS_FUNCTIONAL_TARGETED_UNIT=PASS"
 
 DB_NAME="$(docker exec desifaces-v3-db sh -lc 'psql -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select current_database()"')"
 if [ "$DB_NAME" != "desifaces_v3" ]; then
@@ -30,17 +33,20 @@ if [ "$DB_NAME" != "desifaces_v3" ]; then
 fi
 echo "MPS_FUNCTIONAL_DB_TARGET=PASS"
 
-docker exec -i desifaces-v3-db sh -lc 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
-  < migrations/2026_08_18_v3_studio_hitl_workflow.sql >/dev/null
+for migration in \
+  migrations/2026_08_18_v3_studio_hitl_workflow.sql \
+  migrations/2026_08_18_v3_studio_hitl_hardening.sql
+do
+  docker exec -i desifaces-v3-db sh -lc 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$migration" >/dev/null
+  echo "MPS_FUNCTIONAL_MIGRATION_PASS=$migration"
+done
 echo "MPS_FUNCTIONAL_STUDIO_HITL_SCHEMA=PASS"
 
 COMPOSE_PARALLEL_LIMIT=1 ./scripts/v3-compose.sh --profile v3-orchestration up -d --no-deps --build svc-director svc-director-worker
 
 HEALTH=""
 for _ in $(seq 1 45); do
-  if HEALTH="$(curl -fsS 127.0.0.1:18011/api/health 2>/dev/null)"; then
-    break
-  fi
+  if HEALTH="$(curl -fsS 127.0.0.1:18011/api/health 2>/dev/null)"; then break; fi
   sleep 2
 done
 if [ -z "$HEALTH" ]; then
@@ -75,12 +81,10 @@ FUNCTIONAL_RC=$?
 set -e
 if [ "$FUNCTIONAL_RC" -ne 0 ]; then
   echo "MPS_FUNCTIONAL_DIRECTOR_API_LOGS_BEGIN"
-  docker logs --tail 120 df-v3-svc-director 2>&1 \
-    | sed -E 's/(sk-[A-Za-z0-9_-]{12})[A-Za-z0-9_-]*/\1...REDACTED/g'
+  docker logs --tail 120 df-v3-svc-director 2>&1 | sed -E 's/(sk-[A-Za-z0-9_-]{12})[A-Za-z0-9_-]*/\1...REDACTED/g'
   echo "MPS_FUNCTIONAL_DIRECTOR_API_LOGS_END"
   echo "MPS_FUNCTIONAL_DIRECTOR_RUNNER_LOGS_BEGIN"
-  docker logs --tail 220 df-v3-svc-director-worker 2>&1 \
-    | sed -E 's/(sk-[A-Za-z0-9_-]{12})[A-Za-z0-9_-]*/\1...REDACTED/g'
+  docker logs --tail 220 df-v3-svc-director-worker 2>&1 | sed -E 's/(sk-[A-Za-z0-9_-]{12})[A-Za-z0-9_-]*/\1...REDACTED/g'
   echo "MPS_FUNCTIONAL_DIRECTOR_RUNNER_LOGS_END"
   exit "$FUNCTIONAL_RC"
 fi
