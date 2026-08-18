@@ -202,6 +202,7 @@ async def get_run(
 @app.get("/api/director/stories/{story_id}/workspace", response_model=StoryWorkspaceView)
 async def get_story_workspace(
     story_id: UUID,
+    active_scene_id: UUID | None = None,
     auth: DirectorAuthContext = Depends(get_director_auth),
 ):
     pool = app.state.business_pool
@@ -210,8 +211,11 @@ async def get_story_workspace(
             graph = await app.state.story_store.get_story_graph(conn, story_id=story_id, account_id=auth.account_id)
     except StoryGraphNotFound as exc:
         raise HTTPException(status_code=404, detail="story_not_found") from exc
+    if active_scene_id is not None and all(scene.scene_id != active_scene_id for scene in graph.scenes):
+        raise HTTPException(status_code=404, detail="scene_not_found")
     return build_story_workspace(
         graph,
+        active_scene_id=active_scene_id,
         actions=("edit_story", "generate_faces", "generate_audio", "generate_scene", "ask_assistant"),
     )
 
@@ -219,24 +223,30 @@ async def get_story_workspace(
 @app.get("/api/director/stories/{story_id}/assistant-context", response_model=CreationContextBundle)
 async def get_story_assistant_context(
     story_id: UUID,
+    scene_id: UUID | None = None,
+    participant_id: UUID | None = None,
     auth: DirectorAuthContext = Depends(get_director_auth),
 ):
     pool = app.state.business_pool
     try:
         async with pool.acquire() as conn:
             graph = await app.state.story_store.get_story_graph(conn, story_id=story_id, account_id=auth.account_id)
+        return build_creation_context(
+            graph,
+            active_scene_id=scene_id,
+            active_participant_id=participant_id,
+            allowed_assistant_actions=(
+                "explain_creation",
+                "edit_story",
+                "edit_participant",
+                "edit_dialogue",
+                "generate_faces",
+                "generate_audio",
+                "generate_scene",
+                "check_price",
+            ),
+        )
     except StoryGraphNotFound as exc:
         raise HTTPException(status_code=404, detail="story_not_found") from exc
-    return build_creation_context(
-        graph,
-        allowed_assistant_actions=(
-            "explain_creation",
-            "edit_story",
-            "edit_participant",
-            "edit_dialogue",
-            "generate_faces",
-            "generate_audio",
-            "generate_scene",
-            "check_price",
-        ),
-    )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
