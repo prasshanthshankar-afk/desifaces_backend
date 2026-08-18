@@ -22,6 +22,32 @@ _SENSITIVE_KEY_TOKENS = {
     "phone", "secret", "token", "user",
 }
 _ALLOWED_GENDERS = {"male", "female"}
+_VISUAL_PRIORITY = (
+    "identity type",
+    "identity brief",
+    "presentation",
+    "portrait framing",
+    "expression",
+    "face shape",
+    "brows",
+    "eyes",
+    "eye colour",
+    "eye color",
+    "nose",
+    "lips",
+    "jaw and chin",
+    "hair styling",
+    "hair",
+    "lighting",
+    "distinguishing cues",
+    "rendering",
+    "photorealism",
+    "wardrobe",
+    "body reference",
+    "resemblance constraint",
+    "identity independence",
+)
+_CONTINUITY_PRIORITY = ("identity", "identity lock", "wardrobe", "wardrobe lock")
 
 
 def _key_is_sensitive(key: str) -> bool:
@@ -31,23 +57,20 @@ def _key_is_sensitive(key: str) -> bool:
     return bool(tokens & _SENSITIVE_KEY_TOKENS) or "id" in tokens
 
 
+def _normalized_key(value: str) -> str:
+    return re.sub(r"[_-]+", " ", str(value or "").strip().lower()).strip()
+
+
 def _safe_creative_map(value: dict[str, Any] | None) -> dict[str, str]:
     out: dict[str, str] = {}
-    for raw_key, raw_value in sorted((value or {}).items(), key=lambda item: str(item[0])):
+    for raw_key, raw_value in (value or {}).items():
         key = str(raw_key or "").strip()
         if not key or _key_is_sensitive(key) or raw_value is None:
             continue
         text = str(raw_value).strip()
         if text:
-            out[key] = text[:600]
+            out[_normalized_key(key)] = text[:420]
     return out
-
-
-def _compact_map(label: str, value: dict[str, Any] | None) -> str | None:
-    safe = _safe_creative_map(value)
-    if not safe:
-        return None
-    return f"{label}: " + "; ".join(f"{key}: {text}" for key, text in safe.items())
 
 
 def _explicit_gender(participant_hint: dict[str, Any] | None) -> str | None:
@@ -61,8 +84,17 @@ def _explicit_age(participant_hint: dict[str, Any] | None) -> str | None:
     for key in ("age", "age_range", "age_range_code", "age_presentation"):
         value = hint.get(key)
         if value is not None and str(value).strip():
-            return str(value).strip()[:100]
+            return str(value).strip()[:80]
     return None
+
+
+def _append_prompt(parts: list[str], sentence: str, *, max_chars: int = 1500) -> None:
+    sentence = " ".join(str(sentence or "").split()).strip()
+    if not sentence:
+        return
+    candidate = " ".join([*parts, sentence])
+    if len(candidate) <= max_chars:
+        parts.append(sentence)
 
 
 def compile_participant_face_studio_input(
@@ -72,34 +104,46 @@ def compile_participant_face_studio_input(
     language: str = "en",
     num_variants: int = 1,
 ) -> dict[str, Any]:
-    """Deterministically compile approved Director output into Face Studio input."""
+    """Compile approved Director identity design into Face Studio input.
+
+    The provider prompt is deliberately identity-first. Story mechanics do not
+    consume the limited Face prompt budget. Director field names are normalized
+    so snake_case and human-readable keys compile identically, while sensitive
+    account/user/payment identifiers are excluded. The prompt is built from
+    complete prioritized sentences rather than blindly truncated.
+    """
     hint = dict(participant_hint or {})
     gender = _explicit_gender(hint)
     age = _explicit_age(hint)
+    visual = _safe_creative_map(participant.visual_direction)
+    continuity = _safe_creative_map(participant.continuity)
 
-    parts: list[str] = [
-        f"Create a single-person identity reference portrait for the character {participant.display_name}."
-    ]
-    if participant.role:
-        parts.append(f"Story role: {participant.role}.")
+    parts: list[str] = []
+    _append_prompt(
+        parts,
+        f"Create exactly one photorealistic identity-reference portrait for {participant.display_name}.",
+    )
     if age:
-        parts.append(f"Explicit age guidance from the user: {age}.")
-    for section in (
-        _compact_map("Persona", participant.persona),
-        _compact_map("Approved visual direction", participant.visual_direction),
-        _compact_map("Continuity requirements", participant.continuity),
-    ):
-        if section:
-            parts.append(section + ".")
-    parts.extend([
-        "Show exactly one person; do not include any other story participant.",
-        "Create a clean, high-quality portrait that can serve as the durable visual identity reference for later scenes.",
-        "Do not infer ethnicity, skin tone, religion, attire, occupation, socioeconomic status, facial anatomy, or personality from geography, locale, name, or relationship role.",
-        "Use only the explicit user constraints and approved creative direction above; otherwise choose neutral, non-stereotyped details.",
-    ])
-    prompt = " ".join(parts)
-    if len(prompt) > 1500:
-        prompt = prompt[:1497].rstrip() + "..."
+        _append_prompt(parts, f"Explicit user age: {age}.")
+    _append_prompt(
+        parts,
+        "Do not infer ethnicity, skin tone, religion, attire, occupation, socioeconomic status, facial anatomy, or personality from geography, locale, name, or family relationship.",
+    )
+    _append_prompt(parts, "No other story participant may appear in the image.")
+
+    for key in _VISUAL_PRIORITY:
+        value = visual.get(key)
+        if value:
+            _append_prompt(parts, f"{key.title()}: {value}.")
+    for key in _CONTINUITY_PRIORITY:
+        value = continuity.get(key)
+        if value:
+            _append_prompt(parts, f"{key.title()}: {value}.")
+
+    _append_prompt(
+        parts,
+        "Treat the resulting face as a durable recurring-character identity reference; preserve natural pores, believable eyes, fine hair detail, realistic age detail, and non-synthetic texture.",
+    )
 
     studio_input: dict[str, Any] = {
         "mode": "text-to-image",
@@ -107,7 +151,7 @@ def compile_participant_face_studio_input(
         "subject_composition_code": "single_person",
         "num_variants": max(1, min(int(num_variants), 4)),
         "aspect_ratio": "9:16",
-        "user_prompt": prompt,
+        "user_prompt": " ".join(parts),
     }
     if gender:
         studio_input["gender"] = gender
