@@ -75,6 +75,10 @@ fi
 echo "MPS_FUNCTIONAL_LIVE_DIRECTOR_PRECHECK=PASS"
 echo "MPS_FUNCTIONAL_ASYNC_RUNNER=PASS"
 
+# Deterministic direct-studio proof: synthetic media only, full transaction rollback.
+docker exec df-v3-svc-director python -m app.tools.v3_studio_hitl_runtime_test
+echo "MPS_FUNCTIONAL_DIRECT_STUDIO_HITL=PASS"
+
 set +e
 docker exec df-v3-svc-director python -m app.tools.v3_mps_functional_test
 FUNCTIONAL_RC=$?
