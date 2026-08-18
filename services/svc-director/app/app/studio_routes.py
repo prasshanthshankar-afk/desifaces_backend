@@ -9,6 +9,7 @@ from df_contracts.v3.studio_workflow import ReviewDecision, StudioWorkflowView
 from desifaces_shared.v3.story_store import StoryGraphNotFound
 from desifaces_shared.v3.studio_workflow_store import CanonicalStudioWorkflowStore, StudioWorkflowError
 
+from .participant_face import ParticipantFaceBridgeError, promote_approved_face_candidate
 from .security import DirectorAuthContext, get_director_auth
 from .studio_workflow import build_direct_studio_workflow, build_story_studio_workflow
 
@@ -107,24 +108,51 @@ async def review_studio_output(
         raise HTTPException(status_code=422, detail="review_decision_must_be_terminal")
     pool = request.app.state.business_pool
     async with pool.acquire() as conn:
-        workflow_id = await conn.fetchval(
-            """select w.workflow_id
+        review_target = await conn.fetchrow(
+            """select w.workflow_id,r.stage_run_id,r.media_id,s.stage_type,s.scope_type
             from public.v3_studio_review_items r
             join public.v3_studio_stage_runs s on s.stage_run_id=r.stage_run_id
             join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
             where r.review_item_id=$1 and w.account_id=$2""",
             review_item_id, auth.account_id,
         )
-        if not workflow_id:
+        if not review_target:
             raise HTTPException(status_code=404, detail="studio_review_not_found")
+        workflow_id = UUID(str(review_target["workflow_id"]))
+        stage_run_id = UUID(str(review_target["stage_run_id"]))
+        media_id = UUID(str(review_target["media_id"]))
         try:
             async with conn.transaction():
                 await store.review_output(
-                    conn, review_item_id=review_item_id, reviewer_user_id=auth.user_id,
-                    decision=body.decision, feedback=body.feedback,
+                    conn,
+                    review_item_id=review_item_id,
+                    reviewer_user_id=auth.user_id,
+                    decision=body.decision,
+                    feedback=body.feedback,
                 )
+
+                # Generated Face images are candidates until HITL approval. Only a
+                # completed/approved Face stage may promote the accepted candidate
+                # into v3_participants.primary_face_media_id.
+                if (
+                    body.decision == ReviewDecision.APPROVED
+                    and str(review_target["stage_type"]) == "face"
+                    and str(review_target["scope_type"]) == "participant"
+                ):
+                    stage_state = await conn.fetchval(
+                        "select state from public.v3_studio_stage_runs where stage_run_id=$1",
+                        stage_run_id,
+                    )
+                    if str(stage_state) == "approved":
+                        await promote_approved_face_candidate(
+                            conn,
+                            account_id=auth.account_id,
+                            stage_run_id=stage_run_id,
+                            media_asset_id=media_id,
+                        )
+
                 return await store.get_workflow(
-                    conn, workflow_id=UUID(str(workflow_id)), account_id=auth.account_id,
+                    conn, workflow_id=workflow_id, account_id=auth.account_id,
                 )
-        except StudioWorkflowError as exc:
+        except (StudioWorkflowError, ParticipantFaceBridgeError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
