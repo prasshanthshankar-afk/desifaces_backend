@@ -9,8 +9,8 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     JWT_SECRET: str
     JWT_ALG: str = "HS256"
-    JWT_AUDIENCE: str = "desifaces-api"
-    JWT_ISSUER: str = "desifaces-core"
+    JWT_AUDIENCE: str = "desifaces_clients"
+    JWT_ISSUER: str = "desifaces"
 
     DF_DIRECTOR_LLM_MODEL: str = ""
     DF_DIRECTOR_EMBEDDING_MODEL: str = ""
