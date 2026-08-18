@@ -10,6 +10,7 @@ on:
       - "services/shared/python/desifaces_shared/identity/**"
       - "services/svc-face/app/**"
       - "services/svc-audio/app/**"
+      - "services/svc-fusion/app/**"
       - "test/test_v3_*.py"
       - "docker-compose.v3.yml"
       - ".github/workflows/v3-contract-tests.yml"
@@ -21,6 +22,7 @@ on:
       - "services/shared/python/desifaces_shared/identity/**"
       - "services/svc-face/app/**"
       - "services/svc-audio/app/**"
+      - "services/svc-fusion/app/**"
       - "test/test_v3_*.py"
       - "docker-compose.v3.yml"
       - ".github/workflows/v3-contract-tests.yml"
@@ -51,7 +53,9 @@ jobs:
             services/svc-face/app/app/services/v3_face_adapter_shadow.py \
             services/svc-face/app/app/api/v3_adapter_probe.py \
             services/svc-audio/app/app/services/v3_audio_adapter_shadow.py \
-            services/svc-audio/app/app/api/v3_adapter_probe.py
+            services/svc-audio/app/app/api/v3_adapter_probe.py \
+            services/svc-fusion/app/app/services/v3_fusion_adapter_shadow.py \
+            services/svc-fusion/app/app/api/v3_adapter_probe.py
 
       - name: Run canonical adapter unit tests
         env:
@@ -61,4 +65,5 @@ jobs:
             test/test_v3_adapter_primitives.py \
             test/test_v3_face_adapter.py \
             test/test_v3_audio_adapter.py \
+            test/test_v3_fusion_adapter.py \
             test/test_v3_account_context.py
