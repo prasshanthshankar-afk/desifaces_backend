@@ -17,8 +17,11 @@ CREATE TABLE IF NOT EXISTS public.v3_creative_knowledge_sources (
   is_active boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE(source_type, source_key, coalesce(revision, ''))
+  CONSTRAINT ck_v3_creative_source_type_nonempty CHECK (length(btrim(source_type)) > 0),
+  CONSTRAINT ck_v3_creative_source_key_nonempty CHECK (length(btrim(source_key)) > 0)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_v3_creative_source_revision
+  ON public.v3_creative_knowledge_sources(source_type, source_key, coalesce(revision, ''));
 
 CREATE TABLE IF NOT EXISTS public.v3_creative_knowledge_chunks (
   chunk_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -34,6 +37,7 @@ CREATE TABLE IF NOT EXISTS public.v3_creative_knowledge_chunks (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE(source_id, sequence_no),
+  CONSTRAINT ck_v3_creative_chunk_sequence CHECK (sequence_no >= 0),
   CONSTRAINT ck_v3_creative_chunk_content CHECK (length(btrim(content)) > 0)
 );
 
@@ -55,9 +59,13 @@ CREATE TABLE IF NOT EXISTS public.v3_director_retrieval_events (
   source_refs text[] NOT NULL DEFAULT '{}'::text[],
   result_count integer NOT NULL DEFAULT 0,
   metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-  created_at timestamptz NOT NULL DEFAULT now()
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT ck_v3_director_retrieval_result_count CHECK (result_count >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_v3_director_retrieval_account_created
   ON public.v3_director_retrieval_events(account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_v3_director_retrieval_story_created
+  ON public.v3_director_retrieval_events(story_id, created_at DESC)
+  WHERE story_id IS NOT NULL;
 
 COMMIT;
