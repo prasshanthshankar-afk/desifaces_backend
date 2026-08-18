@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -32,19 +33,35 @@ class ResumeIn(BaseModel):
     feedback: str | None = Field(default=None, max_length=12000)
 
 
+def _coerce_interrupt_value(value: Any) -> dict | None:
+    if value is None:
+        return None
+    raw = getattr(value, "value", value)
+    if isinstance(raw, dict):
+        return raw
+    return {"value": raw if isinstance(raw, (str, int, float, bool)) else str(raw)}
+
+
 def _interrupt_payload(result: dict) -> dict | None:
     raw = result.get("__interrupt__") if isinstance(result, dict) else None
     if not raw:
         return None
     first = raw[0] if isinstance(raw, (list, tuple)) else raw
-    value = getattr(first, "value", None)
-    if isinstance(value, dict):
-        return value
-    return {"value": value if value is not None else str(first)}
+    return _coerce_interrupt_value(first)
 
 
-def _view(thread_id: str, result: dict) -> DirectorRunView:
-    interrupt_payload = _interrupt_payload(result)
+def _snapshot_interrupt(snapshot: Any) -> dict | None:
+    """Recover persisted LangGraph interrupt data for polling UI clients."""
+    for task in tuple(getattr(snapshot, "tasks", ()) or ()):
+        for pending in tuple(getattr(task, "interrupts", ()) or ()):
+            payload = _coerce_interrupt_value(pending)
+            if payload:
+                return payload
+    return None
+
+
+def _view(thread_id: str, result: dict, *, persisted_interrupt: dict | None = None) -> DirectorRunView:
+    interrupt_payload = _interrupt_payload(result) or persisted_interrupt
     workspace_raw = result.get("workspace")
     workspace = StoryWorkspaceView.model_validate(workspace_raw) if workspace_raw else None
     assistant_raw = result.get("assistant_context")
@@ -179,7 +196,7 @@ async def get_run(
         raise HTTPException(status_code=404, detail="director_run_not_found")
     if str(values.get("account_id") or "") != str(auth.account_id) or str(values.get("owner_user_id") or "") != str(auth.user_id):
         raise HTTPException(status_code=404, detail="director_run_not_found")
-    return _view(thread_id, values)
+    return _view(thread_id, values, persisted_interrupt=_snapshot_interrupt(snapshot))
 
 
 @app.get("/api/director/stories/{story_id}/workspace", response_model=StoryWorkspaceView)
