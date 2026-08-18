@@ -15,9 +15,14 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
-# Use the currently configured Director model when present. For this functional
-# gate only, default to the current OpenAI general-purpose model if the project
-# has not yet frozen a different Director model in infra/.env.
+# Respect an already-frozen Director model from the shell or V3 env file.
+# Only the functional test defaults to gpt-5.6 when no project choice exists.
+if [ -z "${DF_DIRECTOR_LLM_MODEL:-}" ] && [ -f infra/.env ]; then
+  FILE_MODEL="$(awk -F= '$1 == "DF_DIRECTOR_LLM_MODEL" {sub(/^[^=]*=/, ""); print}' infra/.env | tail -n 1 | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+  if [ -n "$FILE_MODEL" ]; then
+    export DF_DIRECTOR_LLM_MODEL="$FILE_MODEL"
+  fi
+fi
 export DF_DIRECTOR_LLM_MODEL="${DF_DIRECTOR_LLM_MODEL:-gpt-5.6}"
 
 COMPOSE_PARALLEL_LIMIT=1 ./scripts/v3-compose.sh up -d --no-deps --build svc-director
