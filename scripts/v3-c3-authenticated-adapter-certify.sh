@@ -3,15 +3,9 @@ set -euo pipefail
 
 # V3-C3 authenticated, read-only cross-capability adapter certification.
 #
-# This script:
-# - chooses one existing V3 cloned user with an active billing account;
-# - mints short-lived user JWTs inside the already-running V3 service containers;
-# - invokes only hidden V3 canonical-adapter probes for Face/Audio/Fusion/Pricing;
-# - verifies all four mappings resolve to the same user/account context;
-# - proves selected-user job/media/pricing/ledger state is unchanged before/after;
-# - never prints tokens or secrets;
-# - never submits a generation, executes a provider, reserves/commits/releases credits,
-#   executes pricing, or enables a worker/reconciler.
+# The certification deliberately performs no generation, provider execution,
+# pricing operation, reservation, ledger mutation, media write, bootstrap, or
+# worker/reconciler activation. Tokens and secrets are never printed.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -30,32 +24,90 @@ for container in desifaces-v3-db df-v3-svc-face df-v3-svc-audio df-v3-svc-fusion
   }
 done
 
-IDENTITY_ROW="$({
-  docker exec desifaces-v3-db sh -lc '
-    psql -v ON_ERROR_STOP=1 -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
-      with candidates as (
-        select bam.user_id, bam.billing_account_id, 1 as priority
-        from public.pricing_billing_account_members bam
-        join public.pricing_billing_accounts ba on ba.id = bam.billing_account_id
-        join core.users u on u.id = bam.user_id
-        where bam.status = '\''active'\'' and ba.status = '\''active'\''
-        union all
-        select pca.user_id, pca.billing_account_id, 2 as priority
-        from public.pricing_credit_accounts pca
-        join public.pricing_billing_accounts ba on ba.id = pca.billing_account_id
-        join core.users u on u.id = pca.user_id
-        where pca.billing_account_id is not null and ba.status = '\''active'\''
-      )
-      select user_id::text || '\''|'\'' || billing_account_id::text
-      from candidates
-      order by priority
-      limit 1;
-    "
-  '
-} | tail -n 1)"
+# Mirror desifaces_shared.identity.resolve_account_context exactly enough to
+# choose a certifiable user/account pair:
+#   1. active membership
+#   2. pricing_credit_accounts.billing_account_id
+#   3. active individual account_code=user:<uuid>
+IDENTITY_ROW="$(
+  docker exec -i desifaces-v3-db sh -lc 'psql -v ON_ERROR_STOP=1 -At -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL' | tail -n 1
+WITH candidates AS (
+    SELECT
+        bam.user_id,
+        bam.billing_account_id,
+        1 AS priority,
+        CASE WHEN bam.is_default THEN 0 ELSE 1 END AS default_rank,
+        CASE bam.role
+          WHEN 'owner' THEN 0
+          WHEN 'finance_admin' THEN 1
+          WHEN 'member' THEN 2
+          WHEN 'viewer' THEN 3
+          ELSE 4
+        END AS role_rank,
+        bam.created_at AS created_rank
+    FROM public.pricing_billing_account_members bam
+    JOIN public.pricing_billing_accounts ba
+      ON ba.id = bam.billing_account_id
+    JOIN core.users u
+      ON u.id = bam.user_id
+    WHERE bam.status = 'active'
+      AND ba.status = 'active'
+
+    UNION ALL
+
+    SELECT
+        pca.user_id,
+        pca.billing_account_id,
+        2 AS priority,
+        0 AS default_rank,
+        0 AS role_rank,
+        NULL::timestamptz AS created_rank
+    FROM public.pricing_credit_accounts pca
+    JOIN public.pricing_billing_accounts ba
+      ON ba.id = pca.billing_account_id
+    JOIN core.users u
+      ON u.id = pca.user_id
+    WHERE pca.billing_account_id IS NOT NULL
+      AND ba.status = 'active'
+
+    UNION ALL
+
+    SELECT
+        u.id AS user_id,
+        ba.id AS billing_account_id,
+        3 AS priority,
+        0 AS default_rank,
+        0 AS role_rank,
+        NULL::timestamptz AS created_rank
+    FROM core.users u
+    JOIN public.pricing_billing_accounts ba
+      ON ba.account_code = 'user:' || u.id::text
+    WHERE ba.status = 'active'
+)
+SELECT user_id::text || '|' || billing_account_id::text
+FROM candidates
+ORDER BY priority, default_rank, role_rank, created_rank NULLS LAST, user_id
+LIMIT 1;
+SQL
+)"
 
 if [[ -z "$IDENTITY_ROW" || "$IDENTITY_ROW" != *"|"* ]]; then
   echo "C3_CERT_FAIL=no_active_v3_user_account_context" >&2
+  docker exec -i desifaces-v3-db sh -lc 'psql -v ON_ERROR_STOP=1 -At -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL' >&2 || true
+SELECT
+  'users=' || (SELECT count(*) FROM core.users)::text ||
+  ' billing_accounts=' || (SELECT count(*) FROM public.pricing_billing_accounts)::text ||
+  ' active_billing_accounts=' || (SELECT count(*) FROM public.pricing_billing_accounts WHERE status='active')::text ||
+  ' active_memberships=' || (SELECT count(*) FROM public.pricing_billing_account_members WHERE status='active')::text ||
+  ' credit_account_links=' || (SELECT count(*) FROM public.pricing_credit_accounts WHERE billing_account_id IS NOT NULL)::text ||
+  ' user_code_accounts=' || (
+      SELECT count(*)
+      FROM core.users u
+      JOIN public.pricing_billing_accounts ba
+        ON ba.account_code = 'user:' || u.id::text
+      WHERE ba.status='active'
+  )::text;
+SQL
   exit 1
 fi
 
@@ -88,21 +140,19 @@ AUDIO_TOKEN="$(mint_user_token df-v3-svc-audio)"
 FUSION_TOKEN="$(mint_user_token df-v3-svc-fusion)"
 
 snapshot_user_state() {
-  docker exec -e C3_USER_ID="$USER_ID" desifaces-v3-db sh -lc '
-    psql -v ON_ERROR_STOP=1 -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v uid="$C3_USER_ID" -c "
-      select
-        (select count(*) from public.studio_jobs where user_id = :'\''uid'\''::uuid)::text || '\''|'\'' ||
-        (select count(*) from public.pricing_credit_reservations where user_id = :'\''uid'\''::uuid)::text || '\''|'\'' ||
-        (select count(*) from public.pricing_credit_ledger_events where user_id = :'\''uid'\''::uuid)::text || '\''|'\'' ||
-        (select count(*) from public.media_assets where user_id = :'\''uid'\''::uuid)::text || '\''|'\'' ||
-        coalesce((
-          select balance_credits::text || '\'':'\'' || reserved_credits::text
-          from public.pricing_credit_accounts
-          where user_id = :'\''uid'\''::uuid
-          limit 1
-        ), '\''none'\'');
-    "
-  ' | tail -n 1
+  docker exec -i -e C3_USER_ID="$USER_ID" desifaces-v3-db sh -lc 'psql -v ON_ERROR_STOP=1 -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v uid="$C3_USER_ID"' <<'SQL' | tail -n 1
+SELECT
+  (SELECT count(*) FROM public.studio_jobs WHERE user_id = :'uid'::uuid)::text || '|' ||
+  (SELECT count(*) FROM public.pricing_credit_reservations WHERE user_id = :'uid'::uuid)::text || '|' ||
+  (SELECT count(*) FROM public.pricing_credit_ledger_events WHERE user_id = :'uid'::uuid)::text || '|' ||
+  (SELECT count(*) FROM public.media_assets WHERE user_id = :'uid'::uuid)::text || '|' ||
+  COALESCE((
+    SELECT balance_credits::text || ':' || reserved_credits::text
+    FROM public.pricing_credit_accounts
+    WHERE user_id = :'uid'::uuid
+    LIMIT 1
+  ), 'none');
+SQL
 }
 
 BEFORE_STATE="$(snapshot_user_state)"
@@ -139,7 +189,6 @@ jq -e --arg uid "$USER_ID" --arg aid "$ACCOUNT_ID" '
   .generation_request.kind == "face" and
   .request_context.actor.actor_id == $uid
 ' <<<"$FACE_JSON" >/dev/null
-
 echo "FACE_AUTHENTICATED_MAPPING=PASS"
 
 jq -e --arg uid "$USER_ID" --arg aid "$ACCOUNT_ID" '
@@ -148,7 +197,6 @@ jq -e --arg uid "$USER_ID" --arg aid "$ACCOUNT_ID" '
   .generation_request.kind == "audio" and
   .request_context.actor.actor_id == $uid
 ' <<<"$AUDIO_JSON" >/dev/null
-
 echo "AUDIO_AUTHENTICATED_MAPPING=PASS"
 
 jq -e --arg uid "$USER_ID" --arg aid "$ACCOUNT_ID" '
@@ -157,7 +205,6 @@ jq -e --arg uid "$USER_ID" --arg aid "$ACCOUNT_ID" '
   .generation_request.kind == "fusion" and
   .request_context.actor.actor_id == $uid
 ' <<<"$FUSION_JSON" >/dev/null
-
 echo "FUSION_AUTHENTICATED_MAPPING=PASS"
 
 jq -e --arg uid "$USER_ID" --arg aid "$ACCOUNT_ID" --arg fp "$PRICING_FINGERPRINT" '
@@ -166,7 +213,6 @@ jq -e --arg uid "$USER_ID" --arg aid "$ACCOUNT_ID" --arg fp "$PRICING_FINGERPRIN
   .quote.fingerprint == $fp and
   .legacy_quote_id == "qt_v3c3_readonly"
 ' <<<"$PRICING_JSON" >/dev/null
-
 echo "PRICING_AUTHENTICATED_MAPPING=PASS"
 
 AFTER_STATE="$(snapshot_user_state)"
