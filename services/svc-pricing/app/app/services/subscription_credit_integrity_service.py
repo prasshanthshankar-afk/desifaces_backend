@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from uuid import UUID
 
 import asyncpg
 
 from app.services.entitlements.plan_credit_reconciliation_service import reconcile_included_plan_credits
+from desifaces_shared.v3.subscription_cycle import (
+    native_cycle_key,
+    native_source_ref,
+    normalize_subscription_provider,
+    stripe_cycle_key,
+)
 
 
 def _record_get(row: Any, key: str, default: Any = None) -> Any:
@@ -23,59 +28,6 @@ def _record_get(row: Any, key: str, default: Any = None) -> Any:
         return default if value is None else value
     except Exception:
         return default
-
-
-def _normalize_provider(value: Any) -> str:
-    raw = str(value or "").strip().lower()
-    if raw in {"apple", "app_store", "appstore"}:
-        return "apple_iap"
-    if raw in {"google", "googleplay", "play"}:
-        return "google_play"
-    return raw
-
-
-def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
-
-
-def _format_native_cycle_timestamp(value: Optional[datetime]) -> str:
-    dt = _as_utc(value)
-    if dt is None:
-        return ""
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def stripe_cycle_key(gateway_subscription_id: str, period_start: datetime, period_end: datetime) -> str:
-    """Reconstruct the canonical Stripe cycle key persisted by entitlement sync.
-
-    Stripe payload epochs are stored as timestamptz in the subscription table.
-    UTC integer seconds recreate the original ``<sub>:<start>:<end>`` key.
-    """
-    start = _as_utc(period_start)
-    end = _as_utc(period_end)
-    if start is None or end is None:
-        raise ValueError("stripe_cycle_period_required")
-    return f"{gateway_subscription_id}:{int(start.timestamp())}:{int(end.timestamp())}"
-
-
-def native_cycle_key(provider: str, period_start: Optional[datetime], period_end: Optional[datetime]) -> str:
-    normalized = _normalize_provider(provider)
-    anchor = period_end if normalized == "google_play" else period_start
-    if anchor is None:
-        anchor = period_start or period_end
-    value = _format_native_cycle_timestamp(anchor)
-    if not value:
-        raise ValueError("native_cycle_period_required")
-    return value
-
-
-def native_source_ref(provider: str, gateway_subscription_id: str, period_start: Optional[datetime], period_end: Optional[datetime]) -> str:
-    normalized = _normalize_provider(provider)
-    return f"subscription_cycle:{normalized}:{gateway_subscription_id}:{native_cycle_key(normalized, period_start, period_end)}"
 
 
 async def _list_active_contexts(conn: asyncpg.Connection, *, limit: int) -> List[Any]:
@@ -189,7 +141,7 @@ async def repair_active_subscription_credit_cycles(
         if not billing_account_raw:
             raise RuntimeError(f"subscription_credit_account_context_missing:{user_id}")
         billing_account_id = UUID(str(billing_account_raw))
-        provider = _normalize_provider(_record_get(row, "gateway_provider"))
+        provider = normalize_subscription_provider(_record_get(row, "gateway_provider"))
         gateway_subscription_id = str(_record_get(row, "gateway_subscription_id"))
         period_start = _record_get(row, "current_period_start")
         period_end = _record_get(row, "current_period_end")
