@@ -6,6 +6,7 @@ Owner: `#v3-core / Multi-Person + Story`
 Date: `2026-08-18`
 Canonical V3 baseline: `44675e7c6a4977e23add93628ea44868b1de60a6`
 Implementation branch: `feature/v3-multiperson-core-20260818`
+Companion orchestration evidence: `V3-MPS1B_CREATIVE_DIRECTOR_LANGGRAPH_RAG.md`
 
 ## 1. Product requirement
 
@@ -17,9 +18,10 @@ Create one canonical domain that supports:
 4. persistent character identity across scenes;
 5. ordered dialogue with a durable speaker identity;
 6. multi-scene storytelling;
-7. future Assistant/Director orchestration that can convert natural-language intent into Participants, Scenes, Dialogue and generation jobs.
+7. the MPS1B LangGraph Creative Director that converts natural-language intent into Participants, Scenes, Dialogue, UI projections, Assistant context and later generation jobs.
 
 The architecture MUST NOT fork into separate `single-person` and `multi-person` business domains.
+MPS1 deterministic state and MPS1B agentic orchestration are certified as one combined foundation.
 
 ## 2. EIP evidence
 
@@ -108,7 +110,7 @@ The participant ID—not array position, gender, Face job ID, voice ID or provid
 
 ### 4.4 Story continuity
 
-Continuity belongs to Participant/Story/Scene metadata and future Director policy. A provider prompt may consume it, but providers do not own it.
+Continuity belongs to Participant/Story/Scene metadata and Creative Director policy. A provider prompt may consume it, but providers do not own it.
 
 Examples:
 - identity lock / visual continuity;
@@ -170,6 +172,8 @@ Persistence:
 
 No FastAPI, provider SDK, pricing call, storage write or AI invocation is performed by these shared persistence boundaries.
 
+Agentic orchestration, RAG, UI projection and Assistant context are specified separately but co-certified in `V3-MPS1B_CREATIVE_DIRECTOR_LANGGRAPH_RAG.md`.
+
 ## 7. Compatibility strategy
 
 MPS1 does not remove or rename current Face/Audio/Fusion public routes.
@@ -194,15 +198,17 @@ None in MPS1. No credit reservation/commit is performed. Later multi-person pric
 
 ## 10. Provider impact
 
-None in MPS1. No provider is selected or called. Provider capabilities/limits remain outside the canonical participant cardinality model.
+None in MPS1 deterministic persistence. The MPS1B Creative Director may plan with an LLM, but foundation certification uses deterministic fake model/retrieval adapters and does not invoke a live AI provider. Face/Audio/Fusion provider execution remains disabled.
 
 ## 11. Certification plan
 
 Repository command:
 `scripts/v3-multiperson-story-certify.sh`
 
-Certification must prove:
+Combined MPS1 + MPS1B certification must prove:
 - all V3 unit tests pass before DB mutation;
+- deterministic LangGraph planning/projection test passes without a live LLM;
+- LangGraph review interrupt/resume test passes;
 - migration targets only `desifaces_v3`;
 - pre-migration V3 DB backup/checksum exists;
 - one-participant StoryGraph roundtrip;
@@ -211,20 +217,36 @@ Certification must prove:
 - same Story generation idempotently replays to the same canonical IDs;
 - participant outside the Story is rejected from Story generation;
 - all synthetic Project/Participant/Story/Generation rows roll back;
+- Creative Director RAG schema applies;
+- V3-only `svc-director` starts and creates Postgres checkpoint tables;
+- structured Director run/workspace/Assistant-context API surface exists;
+- UI workspace and Assistant context share canonical Story/Project/Participant IDs;
 - no V3 execution worker/scheduler is activated;
 - Fusion recovery remains disabled;
 - V2 Fusion remains healthy;
 - public V2/V3 Fusion `.paths` parity is unchanged.
 
-Only after those gates pass does MPS1 become `CERTIFIED`.
+Only after those gates pass do MPS1 and MPS1B become `CERTIFIED`.
 
-## 12. Planned implementation sequence after MPS1
+## 12. Implementation sequence
+
+### MPS1B — Creative Director foundation — CURRENT / companion to MPS1
+- LangGraph stateful creative orchestration;
+- schema-constrained LLM plan/critique contracts;
+- hybrid structured + creative RAG;
+- Postgres checkpoints;
+- HITL pause/review/resume;
+- deterministic Story compiler;
+- `StoryWorkspaceView` for UI;
+- focus-aware `CreationContextBundle` for Assistant/chatbot;
+- V3-only `svc-director` API.
 
 ### MPS2 — Participant-aware Face
 - adapt current one-person Face into one Participant;
 - generate/update Face identity for a specific `participant_id`;
 - support 2+ participant identity preparation without relying on list position;
 - maintain identity/continuity across scenes;
+- invoke through Director tool orchestration after approved plan;
 - keep current mobile Face API compatibility.
 
 ### MPS3 — Speaker-aware Audio
@@ -232,7 +254,8 @@ Only after those gates pass does MPS1 become `CERTIFIED`.
 - durable participant voice binding;
 - locale/emotion/delivery per turn;
 - individual audio MediaAssets + ordered timeline/mix;
-- pricing based on actual audio work.
+- pricing based on actual audio work;
+- invoke from approved Director Scene/Dialogue state.
 
 ### MPS4 — Multi-Person Fusion
 - SceneParticipant -> spatial composition;
@@ -240,16 +263,18 @@ Only after those gates pass does MPS1 become `CERTIFIED`.
 - per-person lip sync;
 - non-speaking reactions/gesture direction;
 - one-person remains same execution model with one participant;
-- provider capability routing remains replaceable.
+- provider capability routing remains replaceable;
+- use Director camera/performance/continuity direction as structured input.
 
-### MPS5 — Story/Director orchestration
-- Story -> scene execution plan;
+### MPS5 — Full Story execution orchestration
+- approved Story -> scene execution plan;
 - parent/child C5 GenerationJobs;
 - Face identity reuse;
 - Audio turn generation;
 - Fusion scene rendering;
 - scene stitching/final Story MediaAsset;
-- restart/retry at scene/participant granularity.
+- restart/retry at scene/participant granularity;
+- Director tool nodes monitor and adapt deterministic execution state.
 
 ### MPS6 — Product UI integration
 - participant workspace;
@@ -257,4 +282,4 @@ Only after those gates pass does MPS1 become `CERTIFIED`.
 - dialogue timeline;
 - mobile progressive UX;
 - rich web multi-panel editor;
-- Assistant can construct/edit the same canonical Story graph.
+- Assistant consumes the same canonical creation context and invokes Director/tools for edits/actions.
