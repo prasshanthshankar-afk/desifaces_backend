@@ -6,6 +6,7 @@ from uuid import UUID
 
 from df_contracts.v3.director import (
     CreationContextBundle,
+    CreationContextScope,
     DirectorRunState,
     StoryWorkspaceView,
     WorkspaceDialogueView,
@@ -116,20 +117,61 @@ def build_creation_context(
     graph: StoryGraph,
     *,
     active_scene_id: UUID | None = None,
+    active_participant_id: UUID | None = None,
     generation_context: Sequence[Mapping[str, Any]] = (),
     media_context: Sequence[Mapping[str, Any]] = (),
     pricing_context: Mapping[str, Any] | None = None,
     retrieved_context_refs: Sequence[str] = (),
     allowed_assistant_actions: Sequence[str] = (),
 ) -> CreationContextBundle:
-    """Build the grounded context injected into the Assistant for this creation.
+    """Build a focus-aware grounded context bundle for the Assistant.
 
-    This contains IDs and structured creative state, not hidden prompts or model
-    chain-of-thought. The Assistant may use it for context-specific answers and
-    tool actions while account authorization is still enforced by the APIs.
+    Story scope includes the complete creation. Scene scope narrows dialogue and
+    direction to one scene plus the participants appearing there. Participant
+    scope narrows participant details while retaining summaries of scenes where
+    that participant appears. No hidden prompts or chain-of-thought are exposed.
     """
 
     participants = {p.participant_id: p for p in graph.participants}
+    scenes = {s.scene_id: s for s in graph.scenes}
+    if active_scene_id is not None and active_scene_id not in scenes:
+        raise ValueError(f"assistant_context_scene_not_found:{active_scene_id}")
+    if active_participant_id is not None and active_participant_id not in participants:
+        raise ValueError(f"assistant_context_participant_not_found:{active_participant_id}")
+
+    scene_member_ids: dict[UUID, list[UUID]] = {}
+    participant_scene_ids: dict[UUID, set[UUID]] = {}
+    for membership in graph.scene_participants:
+        scene_member_ids.setdefault(membership.scene_id, []).append(membership.participant_id)
+        participant_scene_ids.setdefault(membership.participant_id, set()).add(membership.scene_id)
+
+    if active_scene_id is not None:
+        selected_scene_ids = {active_scene_id}
+        selected_participant_ids = set(scene_member_ids.get(active_scene_id, ()))
+        if active_participant_id is not None:
+            if active_participant_id not in selected_participant_ids:
+                raise ValueError(
+                    f"assistant_context_participant_not_in_scene:{active_scene_id}:{active_participant_id}"
+                )
+            scope = CreationContextScope.SCENE_PARTICIPANT
+        else:
+            scope = CreationContextScope.SCENE
+    elif active_participant_id is not None:
+        selected_scene_ids = set(participant_scene_ids.get(active_participant_id, set()))
+        selected_participant_ids = {active_participant_id}
+        scope = CreationContextScope.PARTICIPANT
+    else:
+        selected_scene_ids = set(scenes)
+        selected_participant_ids = set(participants)
+        scope = CreationContextScope.STORY
+
+    # Speakers are included even if historical data lacks an explicit scene
+    # membership row. Canonical write paths normally keep both in sync.
+    for turn in graph.dialogue_turns:
+        if turn.scene_id in selected_scene_ids and turn.speaker_participant_id is not None:
+            if scope in {CreationContextScope.STORY, CreationContextScope.SCENE}:
+                selected_participant_ids.add(turn.speaker_participant_id)
+
     participant_context = tuple(
         {
             "participant_id": str(p.participant_id),
@@ -142,7 +184,9 @@ def build_creation_context(
             "continuity": p.continuity,
         }
         for p in graph.participants
+        if p.participant_id in selected_participant_ids
     )
+
     scene_context = tuple(
         {
             "scene_id": str(s.scene_id),
@@ -154,7 +198,9 @@ def build_creation_context(
             "state": s.state.value,
         }
         for s in sorted(graph.scenes, key=lambda x: x.sequence)
+        if s.scene_id in selected_scene_ids
     )
+
     dialogue_context = tuple(
         {
             "turn_id": str(t.turn_id),
@@ -172,9 +218,13 @@ def build_creation_context(
             "emotion": t.emotion_code,
         }
         for t in sorted(graph.dialogue_turns, key=lambda x: (str(x.scene_id), x.sequence))
+        if t.scene_id in selected_scene_ids
     )
+
     continuity_context = {
-        str(p.participant_id): p.continuity for p in graph.participants if p.continuity
+        str(p.participant_id): p.continuity
+        for p in graph.participants
+        if p.participant_id in selected_participant_ids and p.continuity
     }
     summary = graph.story.synopsis or (
         f"{graph.story.title}: {len(graph.participants)} participant(s), "
@@ -186,7 +236,11 @@ def build_creation_context(
         project_id=graph.project.project_id,
         story_id=graph.story.story_id,
         active_scene_id=active_scene_id,
-        participant_ids=tuple(p.participant_id for p in graph.participants),
+        active_participant_id=active_participant_id,
+        context_scope=scope,
+        participant_ids=tuple(
+            p.participant_id for p in graph.participants if p.participant_id in selected_participant_ids
+        ),
         creation_type="story",
         title=graph.story.title,
         concise_summary=summary,
