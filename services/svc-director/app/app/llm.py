@@ -16,6 +16,7 @@ from df_contracts.v3.director import (
     PlannedScene,
 )
 from df_contracts.v3.story import DialogueTurnKind
+from desifaces_shared.v3.participant_refs import normalize_participant_reference
 
 
 _DIRECTOR_SYSTEM_PROMPT = """You are the desifaces Creative Director.
@@ -23,6 +24,7 @@ Create culturally aware, production-ready story plans without stereotyping peopl
 Preserve user intent, existing participant identity and continuity when context is supplied.
 Never invent account IDs, media IDs, pricing, entitlements or provider capabilities.
 Those are supplied and validated by deterministic tools outside the model.
+For scene participant_refs and dialogue speaker_ref, use the exact participant display_name values.
 For flexible creative attributes, use concise key/value entries with plain-text values.
 Use null when an optional scalar is unknown and [] when a list has no items.
 Return only the requested structured schema.
@@ -120,6 +122,8 @@ def _kv(items: list[_WireKV]) -> dict[str, Any]:
 
 
 def _to_canonical_plan(wire: _WireCreativeStoryPlan) -> CreativeStoryPlan:
+    participant_names = tuple(item.display_name for item in wire.participants)
+
     return CreativeStoryPlan(
         title=wire.title,
         logline=wire.logline,
@@ -141,7 +145,10 @@ def _to_canonical_plan(wire: _WireCreativeStoryPlan) -> CreativeStoryPlan:
                 sequence=scene.sequence,
                 title=scene.title,
                 purpose=scene.purpose,
-                participant_refs=tuple(scene.participant_refs),
+                participant_refs=tuple(
+                    normalize_participant_reference(ref, participant_names)
+                    for ref in scene.participant_refs
+                ),
                 setting=_kv(scene.setting),
                 visual_direction=_kv(scene.visual_direction),
                 audio_direction=_kv(scene.audio_direction),
@@ -151,7 +158,10 @@ def _to_canonical_plan(wire: _WireCreativeStoryPlan) -> CreativeStoryPlan:
                     PlannedDialogueTurn(
                         sequence=turn.sequence,
                         kind=turn.kind,
-                        speaker_ref=turn.speaker_ref,
+                        speaker_ref=normalize_participant_reference(
+                            turn.speaker_ref,
+                            participant_names,
+                        ),
                         text=turn.text,
                         locale=turn.locale,
                         emotion=turn.emotion,
