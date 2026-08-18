@@ -36,6 +36,7 @@ services:
     container_name: df-v3-svc-fusion
     environment:
       FUSION_RECOVERY_ENABLED: "false"
+      DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED: "true"
     ports: !override
       - "127.0.0.1:18002:8002"
 
