@@ -8,7 +8,7 @@
 
 Prove the visible desifaces creative chain using real V3 services and real image generation:
 
-`User intent -> svc-director RAG/LLM plan -> human plan approval -> deterministic participant Face requests -> Face pricing -> human pricing approval -> svc-face/gpt-image-2 -> two Face MediaAssets -> canonical Participants -> Face HITL review`
+`User intent -> svc-director RAG/LLM plan -> human plan approval -> deterministic participant Face requests -> Face pricing -> human pricing approval -> svc-face/gpt-image-2 -> two Face candidate MediaAssets -> canonical Participants -> Face HITL review`
 
 This gate is deliberately visual. It is not sufficient to assert that Face stage rows exist; the generated Director plan, Face prompts and final image bytes must be retained for human inspection.
 
@@ -24,14 +24,14 @@ This gate is deliberately visual. It is not sufficient to assert that Face stage
 8. Gender is never inferred from a participant name, relationship role, locale or geography. It is forwarded only when explicitly supplied by user/context.
 9. Geography may inform setting only. It must not infer ethnicity, skin tone, religion, attire, occupation, socioeconomic status, facial anatomy or personality.
 10. Obvious sensitive/account/security metadata is stripped before any participant metadata becomes a provider prompt.
-11. Generated Face output is bound to `v3_participants.primary_face_media_id` and `v3_participant_media(relation='primary_face')`.
-12. Generated Face output is attached to the corresponding Face Studio stage and receives a pending HITL review item.
-13. Face outputs are not auto-approved. Audio must remain blocked until the human approves the selected Face output.
-14. Generated proof images are retained for human inspection; SAS query strings are not stored in the proof manifest/status files.
+11. A newly generated Face is bound to its Participant as `v3_participant_media(relation='reference_face')` and attached to the Participant's Face stage as a candidate output.
+12. An unapproved Face candidate must **not** populate `v3_participants.primary_face_media_id`.
+13. Each generated Face candidate receives a pending HITL review item.
+14. Only after the Face stage reaches `approved` does the selected active/approved candidate get promoted to `v3_participant_media(relation='primary_face')` and `v3_participants.primary_face_media_id`.
+15. Audio must remain blocked until the human approves the selected Face output.
+16. Generated proof images are retained for human inspection; SAS query strings are not stored in the proof manifest/status files.
 
 ## Proof scenario
-
-Intent:
 
 - Ananya — 35-year-old woman, daughter.
 - Ravi — 65-year-old man, father.
@@ -44,30 +44,15 @@ Intent:
 
 ### Gate 1 — Director plan review
 
-The runner displays and stores the actual structured Director output including:
-
-- title / summary
-- participant persona
-- participant continuity
-- participant visual direction
-- voice direction
-- critique
-
-The user must approve the plan before canonical Story compilation unless the explicit test-only environment approval is supplied.
+The runner displays and stores the actual structured Director output including title/summary, participant persona, continuity, visual direction, voice direction, retrieved context references and critique. The user must approve the plan before canonical Story compilation unless an explicit test-only approval environment flag is supplied.
 
 ### Gate 2 — Face pricing / provider execution review
 
-Before any image generation, the runner displays for both participants:
-
-- deterministic Face Studio prompt
-- pricing quote / pricing metadata
-- account balance summary supplied by Face/Pricing APIs
-
-The user must approve provider execution before the two image jobs are created.
+Before any image generation, the runner displays for both participants the deterministic Face Studio prompt and pricing/balance information returned by the existing Face/Pricing APIs. The user must explicitly approve before the two provider jobs are created.
 
 ### Gate 3 — Face HITL review
 
-After generation, each Face is deliberately left with a `pending` Studio review item. The proof ends here. Human visual approval/revision is the next action; Audio is not authorized by this proof.
+After generation, each Face is deliberately left with a `pending` Studio review item and remains a candidate, not the Participant's canonical primary face. The proof ends here. Human visual approval/revision is the next action; Audio is not authorized by this proof.
 
 ## Expected retained artifacts
 
@@ -103,11 +88,12 @@ Under `artifacts/v3-mps2-visual-proof/<UTC timestamp>/`:
 - `MPS2_DIRECTOR_PLAN_COMPILED=PASS`
 - `MPS2_TWO_PARTICIPANT_FACE_STAGES=PASS`
 - `MPS2_DIRECTOR_TO_FACE_REQUESTS_VISIBLE=PASS`
-- two `MPS2_FACE_GENERATED=<participant>...` records
+- two `MPS2_FACE_GENERATED=<participant>...:review=pending` records
 - `MPS2_INTENT_TO_GENERATIVE_PLAN=PASS`
 - `MPS2_GENERATIVE_PLAN_TO_TWO_FACE_REQUESTS=PASS`
 - `MPS2_REAL_GPT_IMAGE_2_TWO_FACES=PASS`
-- `MPS2_PARTICIPANT_PRIMARY_FACE_BINDING=PASS`
+- `MPS2_PARTICIPANT_FACE_CANDIDATE_BINDING=PASS`
+- `MPS2_UNAPPROVED_FACE_NOT_PRIMARY=PASS`
 - `MPS2_FACE_HITL_PENDING_REVIEW=PASS`
 - `V3_MPS2_VISUAL_FACE_PROOF=PASS`
 - `MPS2_VISUAL_ARTIFACT_COPY=PASS`
@@ -115,14 +101,6 @@ Under `artifacts/v3-mps2-visual-proof/<UTC timestamp>/`:
 
 ## Certification boundary
 
-A passing visual proof establishes:
+A passing visual proof establishes real Director intent-to-plan behavior, real generative participant direction, deterministic Director-to-Face compilation, real Face pricing/authenticated generation, real `gpt-image-2` outputs, Participant candidate/MediaAsset binding, and Face-stage HITL pending state.
 
-- real Director intent-to-plan behavior,
-- real generative AI participant direction,
-- deterministic Director-to-Face compilation,
-- real Face pricing and authenticated generation,
-- real `gpt-image-2` outputs,
-- Participant/MediaAsset binding,
-- Face-stage HITL pending state.
-
-It does **not** by itself close full MPS2 certification. Before full MPS2 freeze, verify the Face execution is linked to canonical C5 `GenerationRequest` / `GenerationJob` identifiers and complete continuity/regeneration tests across multiple scenes/variants.
+It does **not** by itself close full MPS2 certification. Before full MPS2 freeze, verify Face execution linkage to canonical C5 `GenerationRequest` / `GenerationJob` identifiers and complete continuity/regeneration tests across multiple scenes/variants. Face approval/promotion should then be functionally exercised before Audio integration begins.
