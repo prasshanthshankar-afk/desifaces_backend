@@ -15,6 +15,19 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
+wait_for_health() {
+  local url="$1"
+  local label="$2"
+  for _ in $(seq 1 30); do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "MULTIPERSON_CERT_FAIL=${label}_health_timeout"
+  return 1
+}
+
 # Contract + deterministic LangGraph proof first. No LLM/provider call occurs.
 docker run --rm \
   -v "$PWD:/repo" \
@@ -52,25 +65,25 @@ echo "CREATIVE_DIRECTOR_RAG_SCHEMA=PASS"
 # Fusion validates shared Story/Generation contracts. Director is a V3-only API.
 # Neither starts provider execution workers.
 COMPOSE_PARALLEL_LIMIT=1 ./scripts/v3-compose.sh up -d --no-deps --build svc-fusion
-until curl -fsS 127.0.0.1:18002/api/health >/dev/null 2>&1; do sleep 2; done
+wait_for_health "http://127.0.0.1:18002/api/health" "v3_fusion"
 echo "MULTIPERSON_STORY_V3_FUSION_HEALTH=PASS"
 
 docker exec df-v3-svc-fusion python /repo/scripts/v3-multiperson-story-runtime-certify.py
 
 COMPOSE_PARALLEL_LIMIT=1 ./scripts/v3-compose.sh up -d --no-deps --build svc-director
-until curl -fsS 127.0.0.1:18011/api/health >/dev/null 2>&1; do sleep 2; done
-DIRECTOR_HEALTH="$(curl -fsS 127.0.0.1:18011/api/health)"
+wait_for_health "http://127.0.0.1:18011/api/health" "v3_director"
+DIRECTOR_HEALTH="$(curl -fsS http://127.0.0.1:18011/api/health)"
 echo "$DIRECTOR_HEALTH" | jq -e '.ok == true and .service == "svc-director" and .langgraph_checkpoint == "postgres"' >/dev/null
 echo "CREATIVE_DIRECTOR_V3_HEALTH=PASS"
 
-CHECKPOINT_TABLES="$(docker exec desifaces-v3-db sh -lc 'psql -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select count(*) from pg_class where relname in ('"'"'checkpoints'"'"','"'"'checkpoint_writes'"'"')"')"
+CHECKPOINT_TABLES="$(docker exec desifaces-v3-db sh -lc 'psql -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select count(*) from pg_class where relname in (\$\$checkpoints\$\$,\$\$checkpoint_writes\$\$)"')"
 if [ "$CHECKPOINT_TABLES" -lt 2 ]; then
   echo "MULTIPERSON_CERT_FAIL=langgraph_checkpoint_schema_missing:$CHECKPOINT_TABLES"
   exit 1
 fi
 echo "CREATIVE_DIRECTOR_POSTGRES_CHECKPOINT=PASS"
 
-DIRECTOR_PATHS="$(curl -fsS 127.0.0.1:18011/openapi.json | jq -r '.paths | keys[]')"
+DIRECTOR_PATHS="$(curl -fsS http://127.0.0.1:18011/openapi.json | jq -r '.paths | keys[]')"
 for path in \
   /api/director/runs \
   '/api/director/runs/{thread_id}' \
@@ -99,10 +112,10 @@ if ! docker inspect df-v3-svc-director --format '{{range .Config.Env}}{{println 
 fi
 echo "MULTIPERSON_STORY_EXECUTION_GUARD=PASS"
 
-curl -fsS 127.0.0.1:8002/api/health >/dev/null
+curl -fsS http://127.0.0.1:8002/api/health >/dev/null
 echo "MULTIPERSON_STORY_V2_FUSION_COEXISTENCE=PASS"
-diff <(curl -fsS 127.0.0.1:8002/openapi.json | jq -S '.paths') \
-     <(curl -fsS 127.0.0.1:18002/openapi.json | jq -S '.paths') >/dev/null
+diff <(curl -fsS http://127.0.0.1:8002/openapi.json | jq -S '.paths') \
+     <(curl -fsS http://127.0.0.1:18002/openapi.json | jq -S '.paths') >/dev/null
 echo "MULTIPERSON_STORY_PUBLIC_API_PARITY=PASS"
 
 echo "STORY_UI_PROJECTION_CONTRACT=PASS"
