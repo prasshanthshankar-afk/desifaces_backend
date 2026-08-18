@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from df_contracts.v3.director import (
@@ -132,38 +132,40 @@ class FakeCompiler:
         )
 
 
-@pytest.mark.asyncio
-async def test_director_produces_canonical_ui_and_assistant_views_from_same_story():
-    runtime = CreativeDirectorRuntime(
-        retriever=FakeRetriever(),
-        planner=FakePlanner(),
-        critic=FakeCritic(),
-        compiler=FakeCompiler(),
-        require_human_review=False,
-    )
-    graph = build_creative_director_graph(runtime, checkpointer=InMemorySaver())
-    account_id = uuid4()
-    owner_user_id = uuid4()
-    state = await graph.ainvoke(
-        {
-            "run_id": str(uuid4()),
-            "thread_id": "director-test-thread",
-            "account_id": str(account_id),
-            "owner_user_id": str(owner_user_id),
-            "brief": CreativeBrief(text="Create a two-person family conversation", locale="ta-IN").model_dump(mode="json"),
-        },
-        {"configurable": {"thread_id": "director-test-thread"}},
-    )
+def test_director_produces_canonical_ui_and_assistant_views_from_same_story():
+    async def run():
+        runtime = CreativeDirectorRuntime(
+            retriever=FakeRetriever(),
+            planner=FakePlanner(),
+            critic=FakeCritic(),
+            compiler=FakeCompiler(),
+            require_human_review=False,
+        )
+        graph = build_creative_director_graph(runtime, checkpointer=InMemorySaver())
+        account_id = uuid4()
+        owner_user_id = uuid4()
+        state = await graph.ainvoke(
+            {
+                "run_id": str(uuid4()),
+                "thread_id": "director-test-thread",
+                "account_id": str(account_id),
+                "owner_user_id": str(owner_user_id),
+                "brief": CreativeBrief(text="Create a two-person family conversation", locale="ta-IN").model_dump(mode="json"),
+            },
+            {"configurable": {"thread_id": "director-test-thread"}},
+        )
 
-    canonical = state["story_graph"]
-    workspace = state["workspace"]
-    assistant = state["assistant_context"]
-    assert state["phase"] == "ready"
-    assert workspace["story_id"] == canonical["story"]["story_id"]
-    assert assistant["story_id"] == canonical["story"]["story_id"]
-    assert workspace["project_id"] == assistant["project_id"] == canonical["project"]["project_id"]
-    assert set(assistant["participant_ids"]) == {p["participant_id"] for p in canonical["participants"]}
-    assert workspace["scenes"][0]["dialogue"][0]["speaker_display_name"] == "Ananya"
-    assert "ask_assistant" in workspace["actions"]
-    assert "edit_dialogue" in assistant["allowed_assistant_actions"]
-    assert "creative_chunk:test" in assistant["retrieved_context_refs"]
+        canonical = state["story_graph"]
+        workspace = state["workspace"]
+        assistant = state["assistant_context"]
+        assert state["phase"] == "ready"
+        assert workspace["story_id"] == canonical["story"]["story_id"]
+        assert assistant["story_id"] == canonical["story"]["story_id"]
+        assert workspace["project_id"] == assistant["project_id"] == canonical["project"]["project_id"]
+        assert set(assistant["participant_ids"]) == {p["participant_id"] for p in canonical["participants"]}
+        assert workspace["scenes"][0]["dialogue"][0]["speaker_display_name"] == "Ananya"
+        assert "ask_assistant" in workspace["actions"]
+        assert "edit_dialogue" in assistant["allowed_assistant_actions"]
+        assert "creative_chunk:test" in assistant["retrieved_context_refs"]
+
+    asyncio.run(run())
