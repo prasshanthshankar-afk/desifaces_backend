@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Iterable, Mapping, Optional, Sequence
 from uuid import UUID, uuid4
 
-from df_contracts.v3.domain import MediaAsset, MediaKind, MediaRole
+from df_contracts.v3.domain import EntityState, MediaAsset, MediaKind, MediaRole
 
 
 class MediaOwnershipError(RuntimeError):
@@ -87,6 +87,14 @@ def normalize_media_role(role: Any, *, kind: Any = None, metadata: Optional[Mapp
     return MediaRole.INTERMEDIATE
 
 
+def normalize_entity_state(value: Any) -> EntityState:
+    raw = str(value or "active").strip().lower()
+    try:
+        return EntityState(raw)
+    except Exception:
+        return EntityState.ACTIVE
+
+
 class CanonicalMediaStore:
     """Persistence boundary for the V3 MediaAsset lifecycle.
 
@@ -115,14 +123,13 @@ class CanonicalMediaStore:
         thumbnail_media_id: UUID | None = None,
         source_media_ids: Sequence[UUID] = (),
         parent_job_id: UUID | None = None,
+        retention_until: datetime | None = None,
         metadata: Optional[Mapping[str, Any]] = None,
         media_id: UUID | None = None,
     ) -> MediaAsset:
         if not str(storage_uri or "").strip():
             raise ValueError("storage_uri_required")
 
-        # Existing schema has per-user content de-duplication when sha256 is
-        # present. Preserve that invariant instead of creating a second asset id.
         if sha256:
             existing = await conn.fetchrow(
                 """
@@ -141,12 +148,14 @@ class CanonicalMediaStore:
                     update public.media_assets
                     set account_id = coalesce(account_id, $2),
                         project_id = coalesce(project_id, $3),
+                        retention_until = coalesce(retention_until, $4),
                         updated_at = now()
                     where id = $1
                     """,
                     existing_id,
                     account_id,
                     project_id,
+                    retention_until,
                 )
                 for sequence_no, source_id in enumerate(source_media_ids):
                     await self.link_lineage(
@@ -163,10 +172,11 @@ class CanonicalMediaStore:
             insert into public.media_assets(
               id, user_id, account_id, project_id, kind, role, lifecycle_state,
               storage_ref, content_type, bytes, sha256, width, height, duration_ms,
-              thumbnail_media_id, parent_generation_job_id, meta_json, created_at, updated_at
+              thumbnail_media_id, parent_generation_job_id, retention_until,
+              meta_json, created_at, updated_at
             )
             values(
-              $1,$2,$3,$4,$5,$6,'active',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,now(),now()
+              $1,$2,$3,$4,$5,$6,'active',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,now(),now()
             )
             """,
             chosen_id,
@@ -184,6 +194,7 @@ class CanonicalMediaStore:
             duration_ms,
             thumbnail_media_id,
             parent_job_id,
+            retention_until,
             json.dumps(dict(metadata or {}), default=str),
         )
 
@@ -198,9 +209,7 @@ class CanonicalMediaStore:
 
     async def get(self, conn, *, media_id: UUID, account_id: UUID | None = None) -> MediaAsset:
         row = await conn.fetchrow(
-            """
-            select * from public.v3_media_assets where media_id = $1
-            """,
+            "select * from public.v3_media_assets where media_id = $1",
             media_id,
         )
         if not row:
@@ -233,21 +242,20 @@ class CanonicalMediaStore:
             project_id=UUID(str(_row_get(row, "project_id"))) if _row_get(row, "project_id") else None,
             kind=normalize_media_kind(_row_get(row, "media_kind"), _row_get(row, "mime_type")),
             role=normalize_media_role(_row_get(row, "role"), metadata=_as_dict(_row_get(row, "metadata"))),
+            lifecycle_state=normalize_entity_state(_row_get(row, "lifecycle_state")),
             mime_type=_row_get(row, "mime_type"),
             storage_uri=str(_row_get(row, "storage_uri")),
+            sha256=_row_get(row, "sha256"),
+            size_bytes=_row_get(row, "bytes"),
+            width=_row_get(row, "width"),
+            height=_row_get(row, "height"),
+            duration_ms=_row_get(row, "duration_ms"),
             thumbnail_media_id=UUID(str(_row_get(row, "thumbnail_media_id"))) if _row_get(row, "thumbnail_media_id") else None,
             source_media_ids=source_ids,
             parent_job_id=UUID(str(_row_get(row, "parent_generation_job_id"))) if _row_get(row, "parent_generation_job_id") else None,
-            metadata={
-                **_as_dict(_row_get(row, "metadata")),
-                "lifecycle_state": _row_get(row, "lifecycle_state"),
-                "sha256": _row_get(row, "sha256"),
-                "bytes": _row_get(row, "bytes"),
-                "width": _row_get(row, "width"),
-                "height": _row_get(row, "height"),
-                "duration_ms": _row_get(row, "duration_ms"),
-                "retention_until": str(_row_get(row, "retention_until")) if _row_get(row, "retention_until") else None,
-            },
+            retention_until=_row_get(row, "retention_until"),
+            deleted_at=_row_get(row, "deleted_at"),
+            metadata=_as_dict(_row_get(row, "metadata")),
             created_at=created_at,
         )
 
