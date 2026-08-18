@@ -18,26 +18,15 @@ class ParticipantFaceBridgeError(RuntimeError):
 
 
 _SENSITIVE_KEY_TOKENS = {
-    "account",
-    "billing",
-    "credential",
-    "email",
-    "password",
-    "payment",
-    "phone",
-    "secret",
-    "token",
-    "user",
+    "account", "billing", "credential", "email", "password", "payment",
+    "phone", "secret", "token", "user",
 }
-
 _ALLOWED_GENDERS = {"male", "female"}
 
 
 def _key_is_sensitive(key: str) -> bool:
     tokens = {
-        token
-        for token in re.split(r"[^a-z0-9]+", str(key or "").strip().lower())
-        if token
+        token for token in re.split(r"[^a-z0-9]+", str(key or "").strip().lower()) if token
     }
     return bool(tokens & _SENSITIVE_KEY_TOKENS) or "id" in tokens
 
@@ -46,14 +35,11 @@ def _safe_creative_map(value: dict[str, Any] | None) -> dict[str, str]:
     out: dict[str, str] = {}
     for raw_key, raw_value in sorted((value or {}).items(), key=lambda item: str(item[0])):
         key = str(raw_key or "").strip()
-        if not key or _key_is_sensitive(key):
-            continue
-        if raw_value is None:
+        if not key or _key_is_sensitive(key) or raw_value is None:
             continue
         text = str(raw_value).strip()
-        if not text:
-            continue
-        out[key] = text[:600]
+        if text:
+            out[key] = text[:600]
     return out
 
 
@@ -61,8 +47,7 @@ def _compact_map(label: str, value: dict[str, Any] | None) -> str | None:
     safe = _safe_creative_map(value)
     if not safe:
         return None
-    body = "; ".join(f"{key}: {text}" for key, text in safe.items())
-    return f"{label}: {body}"
+    return f"{label}: " + "; ".join(f"{key}: {text}" for key, text in safe.items())
 
 
 def _explicit_gender(participant_hint: dict[str, Any] | None) -> str | None:
@@ -87,27 +72,18 @@ def compile_participant_face_studio_input(
     language: str = "en",
     num_variants: int = 1,
 ) -> dict[str, Any]:
-    """Compile an approved Director participant into the existing Face Studio contract.
-
-    This is intentionally deterministic. The LLM may propose creative attributes in
-    ``persona`` / ``visual_direction`` / ``continuity``, but this compiler owns the
-    provider-facing request shape. It never infers gender from a participant name,
-    relationship role, geography or locale, and it strips obvious sensitive-key
-    material before provider submission.
-    """
-
+    """Deterministically compile approved Director output into Face Studio input."""
     hint = dict(participant_hint or {})
     gender = _explicit_gender(hint)
     age = _explicit_age(hint)
 
     parts: list[str] = [
-        f"Create a single-person identity reference portrait for the character {participant.display_name}.",
+        f"Create a single-person identity reference portrait for the character {participant.display_name}."
     ]
     if participant.role:
         parts.append(f"Story role: {participant.role}.")
     if age:
         parts.append(f"Explicit age guidance from the user: {age}.")
-
     for section in (
         _compact_map("Persona", participant.persona),
         _compact_map("Approved visual direction", participant.visual_direction),
@@ -115,16 +91,12 @@ def compile_participant_face_studio_input(
     ):
         if section:
             parts.append(section + ".")
-
-    parts.extend(
-        [
-            "Show exactly one person; do not include any other story participant.",
-            "Create a clean, high-quality portrait that can serve as the durable visual identity reference for later scenes.",
-            "Do not infer ethnicity, skin tone, religion, attire, occupation, socioeconomic status, facial anatomy, or personality from geography, locale, name, or relationship role.",
-            "Use only the explicit user constraints and approved creative direction above; otherwise choose neutral, non-stereotyped details.",
-        ]
-    )
-
+    parts.extend([
+        "Show exactly one person; do not include any other story participant.",
+        "Create a clean, high-quality portrait that can serve as the durable visual identity reference for later scenes.",
+        "Do not infer ethnicity, skin tone, religion, attire, occupation, socioeconomic status, facial anatomy, or personality from geography, locale, name, or relationship role.",
+        "Use only the explicit user constraints and approved creative direction above; otherwise choose neutral, non-stereotyped details.",
+    ])
     prompt = " ".join(parts)
     if len(prompt) > 1500:
         prompt = prompt[:1497].rstrip() + "..."
@@ -154,7 +126,7 @@ class FaceGenerationResult:
 
 
 class FaceStudioClient:
-    """Small HTTP adapter over the existing authenticated Face Studio API."""
+    """HTTP adapter over the existing authenticated Face Studio API."""
 
     def __init__(self, *, base_url: str, timeout_seconds: float = 30.0) -> None:
         self.base_url = base_url.rstrip("/")
@@ -226,8 +198,7 @@ class FaceStudioClient:
                     state_callback(state)
                     last_state = state
                 if state == "succeeded":
-                    variants = list(payload.get("variants") or [])
-                    if not variants:
+                    if not list(payload.get("variants") or []):
                         raise ParticipantFaceBridgeError(f"face_succeeded_without_variants:{job_id}")
                     return payload
                 if state in {"failed", "cancelled", "canceled"}:
@@ -247,9 +218,7 @@ class FaceStudioClient:
         state_callback=None,
     ) -> FaceGenerationResult:
         job_id = await self.create_job(
-            headers=headers,
-            studio_input=studio_input,
-            pricing_preview=pricing_preview,
+            headers=headers, studio_input=studio_input, pricing_preview=pricing_preview,
         )
         status_payload = await self.wait_for_first_variant(
             headers=headers,
@@ -270,7 +239,12 @@ class FaceStudioClient:
 
 
 class ParticipantFaceBinder:
-    """Bind a generated Face MediaAsset to a canonical Participant and HITL Face stage."""
+    """Attach a generated Face candidate to its Participant and HITL Face stage.
+
+    A generated candidate is *not* the canonical primary face until HITL approval.
+    This distinction prevents UI/Assistant/downstream code from mistaking an
+    unreviewed image for an accepted character identity.
+    """
 
     def __init__(self, *, store: CanonicalStudioWorkflowStore | None = None) -> None:
         self.store = store or CanonicalStudioWorkflowStore()
@@ -288,12 +262,10 @@ class ParticipantFaceBinder:
         prompt_used: str,
     ) -> UUID:
         stage = await conn.fetchrow(
-            """
-            select s.stage_run_id,s.workflow_id,s.stage_type,s.scope_type,s.participant_id,w.account_id
+            """select s.stage_run_id,s.workflow_id,s.stage_type,s.scope_type,s.participant_id,w.account_id
             from public.v3_studio_stage_runs s
             join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
-            where s.stage_run_id=$1
-            """,
+            where s.stage_run_id=$1""",
             stage_run_id,
         )
         if not stage or str(stage["account_id"]) != str(account_id):
@@ -303,73 +275,103 @@ class ParticipantFaceBinder:
         if str(stage["participant_id"]) != str(participant_id):
             raise ParticipantFaceBridgeError("face_stage_participant_mismatch")
 
-        media = await conn.fetchrow(
-            "select id,account_id from public.media_assets where id=$1",
-            media_asset_id,
-        )
+        media = await conn.fetchrow("select id,account_id from public.media_assets where id=$1", media_asset_id)
         if not media or str(media["account_id"]) != str(account_id):
             raise ParticipantFaceBridgeError("face_media_account_mismatch")
 
+        candidate_meta = json.dumps({
+            "source": "svc-face",
+            "candidate_state": "awaiting_review",
+            "compatibility_face_job_id": face_job_id,
+            "face_profile_id": face_profile_id,
+        }, ensure_ascii=False)
         await conn.execute(
-            "delete from public.v3_participant_media where participant_id=$1 and relation='primary_face'",
-            participant_id,
-        )
-        await conn.execute(
-            """
-            insert into public.v3_participant_media(participant_id,media_id,relation,sequence_no,metadata_json)
-            values($1,$2,'primary_face',0,$3::jsonb)
+            """insert into public.v3_participant_media(participant_id,media_id,relation,sequence_no,metadata_json)
+            values($1,$2,'reference_face',0,$3::jsonb)
             on conflict(participant_id,media_id,relation)
-            do update set sequence_no=excluded.sequence_no,metadata_json=excluded.metadata_json
-            """,
-            participant_id,
-            media_asset_id,
-            json.dumps(
-                {
-                    "source": "svc-face",
-                    "compatibility_face_job_id": face_job_id,
-                    "face_profile_id": face_profile_id,
-                },
-                ensure_ascii=False,
-            ),
+            do update set sequence_no=excluded.sequence_no,metadata_json=excluded.metadata_json""",
+            participant_id, media_asset_id, candidate_meta,
         )
         await conn.execute(
-            """
-            update public.v3_participants
-            set primary_face_media_id=$2,updated_at=now(),
-                metadata_json=coalesce(metadata_json,'{}'::jsonb) || $3::jsonb
-            where participant_id=$1 and account_id=$4
-            """,
-            participant_id,
-            media_asset_id,
-            json.dumps(
-                {
-                    "face_source": "svc-face",
-                    "face_job_id": face_job_id,
-                    "face_profile_id": face_profile_id,
-                },
-                ensure_ascii=False,
-            ),
-            account_id,
-        )
-        await conn.execute(
-            """
-            update public.v3_studio_stage_runs
+            """update public.v3_studio_stage_runs
             set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $2::jsonb,updated_at=now()
-            where stage_run_id=$1
-            """,
+            where stage_run_id=$1""",
             stage_run_id,
-            json.dumps(
-                {
-                    "compatibility_face_job_id": face_job_id,
-                    "face_profile_id": face_profile_id,
-                    "prompt_used": prompt_used[:1500],
-                },
-                ensure_ascii=False,
-            ),
+            json.dumps({
+                "compatibility_face_job_id": face_job_id,
+                "face_profile_id": face_profile_id,
+                "prompt_used": prompt_used[:1500],
+            }, ensure_ascii=False),
         )
         return await self.store.attach_output(
-            conn,
-            stage_run_id=stage_run_id,
-            media_id=media_asset_id,
-            output_role="primary_face",
+            conn, stage_run_id=stage_run_id, media_id=media_asset_id, output_role="face_candidate",
         )
+
+
+async def promote_approved_face_candidate(
+    conn,
+    *,
+    account_id: UUID,
+    stage_run_id: UUID,
+    media_asset_id: UUID,
+) -> UUID:
+    """Promote an approved Face candidate into the Participant's canonical identity."""
+    row = await conn.fetchrow(
+        """select s.participant_id,s.stage_type,s.scope_type,s.state,w.account_id
+        from public.v3_studio_stage_runs s
+        join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+        where s.stage_run_id=$1""",
+        stage_run_id,
+    )
+    if not row or str(row["account_id"]) != str(account_id):
+        raise ParticipantFaceBridgeError("face_promotion_stage_not_found_or_account_mismatch")
+    if str(row["stage_type"]) != "face" or str(row["scope_type"]) != "participant":
+        raise ParticipantFaceBridgeError("face_promotion_stage_type_scope_mismatch")
+    if str(row["state"]) != "approved":
+        raise ParticipantFaceBridgeError("face_promotion_requires_approved_stage")
+
+    approved = await conn.fetchval(
+        """select exists(
+          select 1 from public.v3_studio_review_items r
+          join public.v3_studio_stage_outputs o
+            on o.stage_run_id=r.stage_run_id and o.media_id=r.media_id
+          where r.stage_run_id=$1 and r.media_id=$2 and r.decision='approved' and o.is_active=true
+        )""",
+        stage_run_id, media_asset_id,
+    )
+    if not approved:
+        raise ParticipantFaceBridgeError("face_promotion_requires_active_approved_output")
+
+    participant_id = UUID(str(row["participant_id"]))
+    await conn.execute(
+        "delete from public.v3_participant_media where participant_id=$1 and relation='primary_face'",
+        participant_id,
+    )
+    await conn.execute(
+        """insert into public.v3_participant_media(participant_id,media_id,relation,sequence_no,metadata_json)
+        values($1,$2,'primary_face',0,$3::jsonb)
+        on conflict(participant_id,media_id,relation)
+        do update set sequence_no=excluded.sequence_no,metadata_json=excluded.metadata_json""",
+        participant_id,
+        media_asset_id,
+        json.dumps({"source": "svc-face", "selected_by": "hitl_review"}, ensure_ascii=False),
+    )
+    await conn.execute(
+        """update public.v3_participants
+        set primary_face_media_id=$2,updated_at=now(),
+            metadata_json=coalesce(metadata_json,'{}'::jsonb) || $3::jsonb
+        where participant_id=$1 and account_id=$4""",
+        participant_id,
+        media_asset_id,
+        json.dumps({"face_selection_state": "approved"}, ensure_ascii=False),
+        account_id,
+    )
+    await conn.execute(
+        """update public.v3_participant_media
+        set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $3::jsonb
+        where participant_id=$1 and media_id=$2 and relation='reference_face'""",
+        participant_id,
+        media_asset_id,
+        json.dumps({"candidate_state": "approved"}, ensure_ascii=False),
+    )
+    return participant_id
