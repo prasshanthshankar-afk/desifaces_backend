@@ -95,6 +95,34 @@ services:
     ports: !override
       - "127.0.0.1:18010:8010"
 
+  # V3-only creative orchestration. This service plans/retrieves/checkpoints and
+  # compiles canonical Story state; it does not run Face/Audio/Fusion workers.
+  svc-director:
+    container_name: df-v3-svc-director
+    image: desifaces-v3-svc-director
+    build:
+      context: .
+      dockerfile: services/svc-director/app/Dockerfile.v3
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?V3 DATABASE_URL is required}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DF_DIRECTOR_LLM_MODEL: ${DF_DIRECTOR_LLM_MODEL:-}
+      DF_DIRECTOR_EMBEDDING_MODEL: ${DF_DIRECTOR_EMBEDDING_MODEL:-}
+      DF_DIRECTOR_REVIEW_REQUIRED: ${DF_DIRECTOR_REVIEW_REQUIRED:-true}
+      DF_DIRECTOR_MAX_REVISIONS: ${DF_DIRECTOR_MAX_REVISIONS:-3}
+      DF_DIRECTOR_CHECKPOINTER_AUTO_SETUP: "true"
+      LANGGRAPH_STRICT_MSGPACK: "true"
+    depends_on:
+      - desifaces-db
+    networks:
+      - df-net
+    ports: !override
+      - "127.0.0.1:18011:8011"
+
 
   # -------------------------------------------------------------------
   # Execution workers
@@ -167,6 +195,7 @@ services:
 #   svc-face
 #   svc-audio
 #   svc-fusion
+#   svc-director
 #   desifaces-db
 #   desifaces-redis
 #
