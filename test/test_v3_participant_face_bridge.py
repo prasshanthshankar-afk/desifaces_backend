@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from uuid import uuid4
 
 from df_contracts.v3.director import PlannedParticipant
@@ -72,3 +73,20 @@ def test_sensitive_key_filter_drops_ids_tokens_and_billing_data():
     assert "billing_status" not in prompt
     assert "account_id" not in prompt
     assert "expression: calm" in prompt
+
+
+def test_generated_face_is_candidate_until_hitl_approval():
+    from app.participant_face import ParticipantFaceBinder, promote_approved_face_candidate
+
+    bind_source = inspect.getsource(ParticipantFaceBinder.bind_generated_face)
+    promote_source = inspect.getsource(promote_approved_face_candidate)
+
+    assert "'reference_face'" in bind_source
+    assert 'output_role="face_candidate"' in bind_source
+    assert "primary_face_media_id" not in bind_source
+
+    assert "face_promotion_requires_approved_stage" in promote_source
+    assert "r.decision='approved'" in promote_source
+    assert "o.is_active=true" in promote_source
+    assert "'primary_face'" in promote_source
+    assert "primary_face_media_id" in promote_source
