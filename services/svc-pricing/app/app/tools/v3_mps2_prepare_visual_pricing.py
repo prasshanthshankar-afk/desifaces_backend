@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from decimal import Decimal
 
 from app.db import ensure_db_pool
@@ -8,9 +9,15 @@ from app.services.subscription_credit_integrity_service import repair_active_sub
 
 
 REQUIRED_CREDITS = Decimal("10")
+TEST_USER_EMAIL = str(
+    os.getenv("DF_V3_E2E_TEST_USER_EMAIL") or "test_apple_iap_test1@desifaces.ai"
+).strip().lower()
 
 
 async def main() -> None:
+    if not TEST_USER_EMAIL:
+        raise RuntimeError("MPS2_PRICING_PREP_FAIL=test_user_email_missing")
+
     pool = await ensure_db_pool()
     async with pool.acquire() as conn:
         # This is not a synthetic credit bypass. Reuse the certified C6 integrity
@@ -38,7 +45,8 @@ async def main() -> None:
               bam.billing_account_id,
               coalesce(s.available_credits,0)::numeric as available_credits,
               lower(coalesce(be.tier_code,'free')) as tier_code,
-              lower(coalesce(be.plan_code,'free')) as plan_code
+              lower(coalesce(be.plan_code,'free')) as plan_code,
+              lower(u.email) as email
             from public.pricing_billing_account_members bam
             join public.pricing_billing_accounts ba on ba.id=bam.billing_account_id
             join core.users u on u.id=bam.user_id
@@ -54,39 +62,32 @@ async def main() -> None:
             ) be on true
             where bam.status='active'
               and ba.status='active'
-              and coalesce(s.available_credits,0) >= $1::numeric
-            order by coalesce(s.available_credits,0) desc,
-                     bam.is_default desc,
+              and lower(u.email)=lower($1::text)
+            order by bam.is_default desc,
                      case bam.role when 'owner' then 0 when 'finance_admin' then 1 else 2 end,
                      bam.created_at asc
             limit 1
             """,
-            REQUIRED_CREDITS,
+            TEST_USER_EMAIL,
         )
         if not row:
-            best = await conn.fetchrow(
-                """
-                select coalesce(max(available),0)::numeric as best_available
-                from (
-                  select coalesce(sum(greatest(l.remaining_amount-l.reserved_amount,0)) filter (
-                    where l.status='active' and (l.expires_at is null or l.expires_at>now())
-                  ),0)::numeric as available
-                  from public.pricing_billing_account_members bam
-                  join public.pricing_billing_accounts ba on ba.id=bam.billing_account_id
-                  left join public.pricing_credit_lots l on l.user_id=bam.user_id
-                  where bam.status='active' and ba.status='active'
-                  group by bam.user_id
-                ) q
-                """
-            )
             raise RuntimeError(
-                "MPS2_PRICING_PREP_FAIL=no_v3_actor_with_required_credits:"
-                f"required={REQUIRED_CREDITS}:best_available={best['best_available'] if best else 0}"
+                f"MPS2_PRICING_PREP_FAIL=canonical_test_actor_not_found:{TEST_USER_EMAIL}"
             )
 
+        available = Decimal(str(row["available_credits"] or 0))
+        if available < REQUIRED_CREDITS:
+            raise RuntimeError(
+                "MPS2_PRICING_PREP_FAIL=canonical_test_actor_underfunded:"
+                f"required={REQUIRED_CREDITS}:available={available}"
+            )
+        if str(row["email"] or "").strip().lower() != TEST_USER_EMAIL:
+            raise RuntimeError("MPS2_PRICING_PREP_FAIL=canonical_test_actor_email_mismatch")
+
+        print(f"MPS2_PRICING_TEST_ACTOR=PASS:email={TEST_USER_EMAIL}")
         print(
             "MPS2_PRICING_ACTOR_READY=PASS:"
-            f"available_credits={row['available_credits']}:"
+            f"available_credits={available}:"
             f"tier={row['tier_code']}:plan={row['plan_code']}"
         )
 
