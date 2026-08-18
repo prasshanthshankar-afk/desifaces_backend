@@ -50,11 +50,14 @@ class HybridCreativeRetriever:
                        (c.embedding <=> $1::vector) as distance
                 from public.v3_creative_knowledge_chunks c
                 join public.v3_creative_knowledge_sources s on s.source_id=c.source_id
-                where c.is_active=true and s.is_active=true and c.embedding is not null
+                where c.is_active=true and s.is_active=true
+                  and c.embedding is not null
+                  and c.embedding_model=$2
                 order by c.embedding <=> $1::vector
-                limit $2
+                limit $3
                 """,
                 vector_literal,
+                self._embedding_model,
                 limit,
             )
         return [
