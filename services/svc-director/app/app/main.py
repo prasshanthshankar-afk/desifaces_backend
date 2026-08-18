@@ -4,9 +4,8 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from df_contracts.v3.director import (
@@ -17,14 +16,12 @@ from df_contracts.v3.director import (
     StoryWorkspaceView,
 )
 from desifaces_shared.v3.creation_context import build_creation_context, build_story_workspace
-from desifaces_shared.v3.director_graph import CreativeDirectorRuntime, build_creative_director_graph
 from desifaces_shared.v3.story_store import CanonicalStoryStore, StoryGraphNotFound
 
-from .compiler import CanonicalStoryCompiler
 from .config import settings
 from .db import close_pools, open_business_pool, open_checkpoint_pool
-from .llm import OpenAICreativeCritic, OpenAICreativePlanner
-from .retrieval import HybridCreativeRetriever
+from .run_store import DirectorRunNotFound, DirectorRunStore
+from .runtime import create_director_graph
 from .security import DirectorAuthContext, get_director_auth
 
 
@@ -42,16 +39,7 @@ def _coerce_interrupt_value(value: Any) -> dict | None:
     return {"value": raw if isinstance(raw, (str, int, float, bool)) else str(raw)}
 
 
-def _interrupt_payload(result: dict) -> dict | None:
-    raw = result.get("__interrupt__") if isinstance(result, dict) else None
-    if not raw:
-        return None
-    first = raw[0] if isinstance(raw, (list, tuple)) else raw
-    return _coerce_interrupt_value(first)
-
-
 def _snapshot_interrupt(snapshot: Any) -> dict | None:
-    """Recover persisted LangGraph interrupt data for polling UI clients."""
     for task in tuple(getattr(snapshot, "tasks", ()) or ()):
         for pending in tuple(getattr(task, "interrupts", ()) or ()):
             payload = _coerce_interrupt_value(pending)
@@ -60,26 +48,36 @@ def _snapshot_interrupt(snapshot: Any) -> dict | None:
     return None
 
 
-def _view(thread_id: str, result: dict, *, persisted_interrupt: dict | None = None) -> DirectorRunView:
-    interrupt_payload = _interrupt_payload(result) or persisted_interrupt
-    workspace_raw = result.get("workspace")
+def _checkpoint_view(thread_id: str, values: dict, *, persisted_interrupt: dict | None = None) -> DirectorRunView:
+    workspace_raw = values.get("workspace")
     workspace = StoryWorkspaceView.model_validate(workspace_raw) if workspace_raw else None
-    assistant_raw = result.get("assistant_context")
+    assistant_raw = values.get("assistant_context")
     assistant_context = CreationContextBundle.model_validate(assistant_raw) if assistant_raw else None
-    phase = DirectorRunState.AWAITING_REVIEW if interrupt_payload else DirectorRunState(
-        str(result.get("phase") or DirectorRunState.DRAFTING.value)
+    phase = DirectorRunState.AWAITING_REVIEW if persisted_interrupt else DirectorRunState(
+        str(values.get("phase") or DirectorRunState.RUNNING.value)
     )
-    run_id_raw = result.get("run_id") or uuid4()
     return DirectorRunView(
-        run_id=UUID(str(run_id_raw)),
+        run_id=UUID(str(values["run_id"])),
         thread_id=thread_id,
         state=phase,
         project_id=workspace.project_id if workspace else None,
         story_id=workspace.story_id if workspace else None,
         workspace=workspace,
         assistant_context=assistant_context,
-        interrupt=interrupt_payload,
-        errors=tuple(str(x) for x in result.get("errors", ())),
+        interrupt=persisted_interrupt,
+        errors=tuple(str(x) for x in values.get("errors", ())),
+    )
+
+
+def _queue_view(row) -> DirectorRunView:
+    state = DirectorRunState(str(row["state"]))
+    return DirectorRunView(
+        run_id=UUID(str(row["run_id"])),
+        thread_id=str(row["thread_id"]),
+        state=state,
+        project_id=UUID(str(row["project_id"])) if row["project_id"] else None,
+        story_id=UUID(str(row["story_id"])) if row["story_id"] else None,
+        errors=(str(row["last_error"]),) if row["last_error"] else (),
     )
 
 
@@ -94,20 +92,13 @@ async def lifespan(app: FastAPI):
     app.state.business_pool = business_pool
     app.state.checkpointer = checkpointer
     app.state.story_store = CanonicalStoryStore()
+    app.state.run_store = DirectorRunStore()
     app.state.director_graph = None
     app.state.director_config_error = None
 
     if settings.DF_DIRECTOR_LLM_MODEL:
         try:
-            runtime = CreativeDirectorRuntime(
-                retriever=HybridCreativeRetriever(business_pool),
-                planner=OpenAICreativePlanner(),
-                critic=OpenAICreativeCritic(),
-                compiler=CanonicalStoryCompiler(business_pool),
-                require_human_review=settings.DF_DIRECTOR_REVIEW_REQUIRED,
-                max_revisions=max(0, settings.DF_DIRECTOR_MAX_REVISIONS),
-            )
-            app.state.director_graph = build_creative_director_graph(runtime, checkpointer=checkpointer)
+            app.state.director_graph = create_director_graph(business_pool, checkpointer)
         except Exception as exc:
             app.state.director_config_error = str(exc)
 
@@ -126,6 +117,7 @@ async def health():
         "ok": True,
         "service": "svc-director",
         "langgraph_checkpoint": "postgres",
+        "execution_mode": "durable_queue",
         "llm_configured": bool(settings.DF_DIRECTOR_LLM_MODEL),
         "embedding_configured": bool(settings.DF_DIRECTOR_EMBEDDING_MODEL),
         "review_required": settings.DF_DIRECTOR_REVIEW_REQUIRED,
@@ -141,46 +133,51 @@ def _graph():
     return graph
 
 
-@app.post("/api/director/runs", response_model=DirectorRunView)
+@app.post("/api/director/runs", response_model=DirectorRunView, status_code=status.HTTP_202_ACCEPTED)
 async def create_run(
     brief: CreativeBrief,
     auth: DirectorAuthContext = Depends(get_director_auth),
 ):
+    if app.state.director_graph is None:
+        raise HTTPException(status_code=503, detail="creative_director_llm_not_configured")
     thread_id = str(uuid4())
     run_id = uuid4()
-    result = await _graph().ainvoke(
-        {
-            "run_id": str(run_id),
-            "thread_id": thread_id,
-            "account_id": str(auth.account_id),
-            "owner_user_id": str(auth.user_id),
-            "phase": DirectorRunState.DRAFTING.value,
-            "brief": brief.model_dump(mode="json"),
-            "revision_count": 0,
-            "errors": [],
-        },
-        {"configurable": {"thread_id": thread_id}},
-    )
-    return _view(thread_id, result)
+    async with app.state.business_pool.acquire() as conn:
+        await app.state.run_store.enqueue(
+            conn,
+            run_id=run_id,
+            thread_id=thread_id,
+            account_id=auth.account_id,
+            owner_user_id=auth.user_id,
+            brief=brief.model_dump(mode="json"),
+        )
+        row = await app.state.run_store.get(
+            conn,
+            thread_id=thread_id,
+            account_id=auth.account_id,
+            owner_user_id=auth.user_id,
+        )
+    return _queue_view(row)
 
 
-@app.post("/api/director/runs/{thread_id}/resume", response_model=DirectorRunView)
+@app.post("/api/director/runs/{thread_id}/resume", response_model=DirectorRunView, status_code=status.HTTP_202_ACCEPTED)
 async def resume_run(
     thread_id: str,
     body: ResumeIn,
     auth: DirectorAuthContext = Depends(get_director_auth),
 ):
-    graph = _graph()
-    config = {"configurable": {"thread_id": thread_id}}
-    snapshot = await graph.aget_state(config)
-    values = dict(snapshot.values or {})
-    if str(values.get("account_id") or "") != str(auth.account_id) or str(values.get("owner_user_id") or "") != str(auth.user_id):
-        raise HTTPException(status_code=404, detail="director_run_not_found")
-    result = await graph.ainvoke(
-        Command(resume={"approved": body.approved, "feedback": body.feedback or ""}),
-        config,
-    )
-    return _view(thread_id, result)
+    try:
+        async with app.state.business_pool.acquire() as conn:
+            row = await app.state.run_store.queue_resume(
+                conn,
+                thread_id=thread_id,
+                account_id=auth.account_id,
+                owner_user_id=auth.user_id,
+                resume_payload={"approved": body.approved, "feedback": body.feedback or ""},
+            )
+    except DirectorRunNotFound as exc:
+        raise HTTPException(status_code=409, detail="director_run_not_awaiting_review") from exc
+    return _queue_view(row)
 
 
 @app.get("/api/director/runs/{thread_id}", response_model=DirectorRunView)
@@ -188,15 +185,28 @@ async def get_run(
     thread_id: str,
     auth: DirectorAuthContext = Depends(get_director_auth),
 ):
+    try:
+        async with app.state.business_pool.acquire() as conn:
+            row = await app.state.run_store.get(
+                conn,
+                thread_id=thread_id,
+                account_id=auth.account_id,
+                owner_user_id=auth.user_id,
+            )
+    except DirectorRunNotFound as exc:
+        raise HTTPException(status_code=404, detail="director_run_not_found") from exc
+
+    db_state = str(row["state"])
+    if db_state in {"queued", "running", "failed", "canceled"}:
+        return _queue_view(row)
+
     graph = _graph()
     config = {"configurable": {"thread_id": thread_id}}
     snapshot = await graph.aget_state(config)
     values = dict(snapshot.values or {})
     if not values:
-        raise HTTPException(status_code=404, detail="director_run_not_found")
-    if str(values.get("account_id") or "") != str(auth.account_id) or str(values.get("owner_user_id") or "") != str(auth.user_id):
-        raise HTTPException(status_code=404, detail="director_run_not_found")
-    return _view(thread_id, values, persisted_interrupt=_snapshot_interrupt(snapshot))
+        return _queue_view(row)
+    return _checkpoint_view(thread_id, values, persisted_interrupt=_snapshot_interrupt(snapshot))
 
 
 @app.get("/api/director/stories/{story_id}/workspace", response_model=StoryWorkspaceView)
