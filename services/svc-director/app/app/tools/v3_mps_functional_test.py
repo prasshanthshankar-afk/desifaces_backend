@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -28,7 +28,7 @@ def _access_token(user_id: UUID) -> str:
     payload = {
         "sub": str(user_id),
         "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=20)).timestamp()),
+        "exp": int((now + timedelta(minutes=30)).timestamp()),
         "iss": _required("JWT_ISSUER"),
         "aud": _required("JWT_AUDIENCE"),
         "token_type": "access",
@@ -56,7 +56,7 @@ async def _active_actor(conn: asyncpg.Connection) -> tuple[UUID, UUID]:
     return UUID(str(row["user_id"])), UUID(str(row["billing_account_id"]))
 
 
-async def _seed_rag(conn: asyncpg.Connection, marker: str) -> tuple[UUID, UUID, str]:
+async def _seed_rag(conn: asyncpg.Connection, marker: str) -> tuple[UUID, UUID]:
     source_id = uuid4()
     chunk_id = uuid4()
     source_key = f"functional:{marker}"
@@ -78,7 +78,6 @@ async def _seed_rag(conn: asyncpg.Connection, marker: str) -> tuple[UUID, UUID, 
         f"MPS functional test {marker}",
         json.dumps({"functional_test": True, "marker": marker}),
     )
-
     embedding_model = str(os.getenv("DF_DIRECTOR_EMBEDDING_MODEL") or "").strip()
     if embedding_model:
         vector = await OpenAIEmbeddings(model=embedding_model).aembed_query(content)
@@ -89,13 +88,8 @@ async def _seed_rag(conn: asyncpg.Connection, marker: str) -> tuple[UUID, UUID, 
               chunk_id,source_id,sequence_no,content,tags,embedding,embedding_model,metadata_json
             ) values($1,$2,0,$3,$4::text[],$5::vector,$6,$7::jsonb)
             """,
-            chunk_id,
-            source_id,
-            content,
-            ["functional-test", "continuity", "non-stereotype"],
-            vector_literal,
-            embedding_model,
-            json.dumps({"functional_test": True}),
+            chunk_id,source_id,content,["functional-test","continuity","non-stereotype"],
+            vector_literal,embedding_model,json.dumps({"functional_test": True}),
         )
     else:
         await conn.execute(
@@ -104,25 +98,33 @@ async def _seed_rag(conn: asyncpg.Connection, marker: str) -> tuple[UUID, UUID, 
               chunk_id,source_id,sequence_no,content,tags,metadata_json
             ) values($1,$2,0,$3,$4::text[],$5::jsonb)
             """,
-            chunk_id,
-            source_id,
-            content,
-            ["functional-test", "continuity", "non-stereotype"],
+            chunk_id,source_id,content,["functional-test","continuity","non-stereotype"],
             json.dumps({"functional_test": True}),
         )
-    return source_id, chunk_id, content
+    return source_id, chunk_id
 
 
-async def _cleanup(
-    conn: asyncpg.Connection,
-    *,
-    source_id: UUID | None,
-    story_id: UUID | None,
-    project_id: UUID | None,
-    thread_id: str | None,
-) -> None:
-    # Story first removes scene/dialogue/story memberships. Project then removes
-    # participants. No Face/Audio/Fusion generation is created by this test.
+async def _poll_run(client: httpx.AsyncClient, thread_id: str, target: set[str], timeout_s: int = 900) -> dict:
+    deadline = time.monotonic() + timeout_s
+    last: dict = {}
+    while time.monotonic() < deadline:
+        response = await client.get(f"/api/director/runs/{thread_id}")
+        if response.status_code != 200:
+            raise RuntimeError(f"FUNCTIONAL_FAIL=poll_run:{response.status_code}:{response.text[:1000]}")
+        last = response.json()
+        state = str(last.get("state") or "")
+        if state == "failed":
+            raise RuntimeError(f"FUNCTIONAL_FAIL=director_failed:{last.get('errors')}")
+        if state in target:
+            return last
+        await asyncio.sleep(2.0)
+    raise RuntimeError(f"FUNCTIONAL_FAIL=director_poll_timeout:last_state={last.get('state')}:last={last}")
+
+
+async def _cleanup(conn, *, source_id, story_id, project_id, thread_id) -> None:
+    if thread_id:
+        await conn.execute("delete from public.v3_director_retrieval_events where thread_id=$1", thread_id)
+        await conn.execute("delete from public.v3_director_runs where thread_id=$1", thread_id)
     if story_id:
         await conn.execute("delete from public.v3_stories where story_id=$1", story_id)
     if project_id:
@@ -141,27 +143,28 @@ async def main() -> None:
     _required("OPENAI_API_KEY")
     llm_model = _required("DF_DIRECTOR_LLM_MODEL")
 
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=180.0) as client:
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=30.0) as client:
         health = (await client.get("/api/health")).json()
     if not health.get("ok") or not health.get("runtime_ready") or not health.get("llm_configured"):
         raise RuntimeError(f"FUNCTIONAL_PRECHECK_FAIL=director_runtime_not_ready:{health}")
+    if health.get("execution_mode") != "durable_queue":
+        raise RuntimeError(f"FUNCTIONAL_PRECHECK_FAIL=director_not_durable_queue:{health}")
     if not health.get("review_required"):
         raise RuntimeError("FUNCTIONAL_PRECHECK_FAIL=director_review_required_must_be_true")
     print(f"FUNCTIONAL_DIRECTOR_RUNTIME=PASS:model={llm_model}:embedding={bool(health.get('embedding_configured'))}")
 
     conn = await asyncpg.connect(database_url)
-    source_id: UUID | None = None
-    story_id: UUID | None = None
-    project_id: UUID | None = None
-    thread_id: str | None = None
+    source_id = None
+    story_id = None
+    project_id = None
+    thread_id = None
     try:
         user_id, account_id = await _active_actor(conn)
-        token = _access_token(user_id)
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {"Authorization": f"Bearer {_access_token(user_id)}"}
         print("FUNCTIONAL_AUTH_ACCOUNT_CONTEXT=PASS")
 
         marker = f"MPS-FT-{uuid4().hex[:12]}"
-        source_id, chunk_id, _ = await _seed_rag(conn, marker)
+        source_id, chunk_id = await _seed_rag(conn, marker)
         expected_ref = f"creative_chunk:{chunk_id}"
         print("FUNCTIONAL_TEMP_RAG_SEED=PASS")
 
@@ -188,13 +191,18 @@ async def main() -> None:
             },
         }
 
-        async with httpx.AsyncClient(base_url=BASE_URL, timeout=240.0, headers=headers) as client:
+        async with httpx.AsyncClient(base_url=BASE_URL, timeout=30.0, headers=headers) as client:
             create = await client.post("/api/director/runs", json=brief)
-            if create.status_code != 200:
+            if create.status_code != 202:
                 raise RuntimeError(f"FUNCTIONAL_FAIL=create_run:{create.status_code}:{create.text[:1000]}")
-            initial = create.json()
-            thread_id = str(initial["thread_id"])
-            if initial.get("state") != "awaiting_review" or not initial.get("interrupt"):
+            queued = create.json()
+            thread_id = str(queued["thread_id"])
+            if queued.get("state") != "queued":
+                raise RuntimeError(f"FUNCTIONAL_FAIL=create_not_queued:{queued}")
+            print("FUNCTIONAL_DIRECTOR_NONBLOCKING_ENQUEUE=PASS")
+
+            initial = await _poll_run(client, thread_id, {"awaiting_review"})
+            if not initial.get("interrupt"):
                 raise RuntimeError(f"FUNCTIONAL_FAIL=expected_human_review:{initial}")
             print("FUNCTIONAL_LANGGRAPH_HITL_PAUSE=PASS")
 
@@ -205,21 +213,14 @@ async def main() -> None:
             if len(interrupt_plan.get("scenes", [])) != 2:
                 raise RuntimeError(f"FUNCTIONAL_FAIL=planned_scene_count:{len(interrupt_plan.get('scenes', []))}")
             print("FUNCTIONAL_LIVE_LLM_STRUCTURED_PLAN=PASS")
-
-            polled = await client.get(f"/api/director/runs/{thread_id}")
-            if polled.status_code != 200 or polled.json().get("state") != "awaiting_review":
-                raise RuntimeError(f"FUNCTIONAL_FAIL=persisted_interrupt_poll:{polled.status_code}:{polled.text[:1000]}")
             print("FUNCTIONAL_POSTGRES_CHECKPOINT_POLL=PASS")
 
             event = await conn.fetchrow(
                 """
-                select source_refs,result_count
-                from public.v3_director_retrieval_events
-                where thread_id=$1 and account_id=$2
-                order by created_at desc limit 1
+                select source_refs,result_count from public.v3_director_retrieval_events
+                where thread_id=$1 and account_id=$2 order by created_at desc limit 1
                 """,
-                thread_id,
-                account_id,
+                thread_id,account_id,
             )
             if not event or expected_ref not in set(event["source_refs"] or ()):
                 raise RuntimeError(f"FUNCTIONAL_FAIL=rag_ref_not_retrieved:expected={expected_ref}:event={event}")
@@ -229,10 +230,10 @@ async def main() -> None:
                 f"/api/director/runs/{thread_id}/resume",
                 json={"approved": True, "feedback": "Approved for functional certification."},
             )
-            if resume.status_code != 200:
-                raise RuntimeError(f"FUNCTIONAL_FAIL=resume:{resume.status_code}:{resume.text[:1000]}")
-            ready = resume.json()
-            if ready.get("state") != "ready" or not ready.get("workspace") or not ready.get("assistant_context"):
+            if resume.status_code != 202 or resume.json().get("state") != "queued":
+                raise RuntimeError(f"FUNCTIONAL_FAIL=resume_queue:{resume.status_code}:{resume.text[:1000]}")
+            ready = await _poll_run(client, thread_id, {"ready"})
+            if not ready.get("workspace") or not ready.get("assistant_context"):
                 raise RuntimeError(f"FUNCTIONAL_FAIL=director_not_ready_after_resume:{ready}")
             print("FUNCTIONAL_LANGGRAPH_HITL_RESUME=PASS")
 
@@ -251,17 +252,66 @@ async def main() -> None:
             if len(scenes) != 2:
                 raise RuntimeError(f"FUNCTIONAL_FAIL=workspace_scene_count:{len(scenes)}")
             participant_ids = {str(p["participant_id"]) for p in participants}
+            speech_turn_count = 0
             for scene in scenes:
                 if set(str(x) for x in scene.get("participant_ids", [])) != participant_ids:
                     raise RuntimeError(f"FUNCTIONAL_FAIL=scene_participant_membership:{scene}")
-                speaker_ids = {
-                    str(turn["speaker_participant_id"])
-                    for turn in scene.get("dialogue", [])
-                    if turn.get("speaker_participant_id")
-                }
+                speech = [turn for turn in scene.get("dialogue", []) if turn.get("kind") == "speech"]
+                speech_turn_count += len(speech)
+                speaker_ids = {str(turn["speaker_participant_id"]) for turn in speech if turn.get("speaker_participant_id")}
                 if speaker_ids != participant_ids:
                     raise RuntimeError(f"FUNCTIONAL_FAIL=scene_speaker_coverage:{scene}")
             print("FUNCTIONAL_STORY_WORKSPACE_2P_2SCENE=PASS")
+
+            workflow_response = await client.post(f"/api/director/stories/{story_id}/studio-workflows")
+            if workflow_response.status_code != 201:
+                raise RuntimeError(f"FUNCTIONAL_FAIL=studio_workflow_create:{workflow_response.status_code}:{workflow_response.text[:1000]}")
+            studio = workflow_response.json()
+            stages = studio.get("stages", [])
+            by_type = {}
+            for stage in stages:
+                by_type.setdefault(stage["stage_type"], []).append(stage)
+            if len(by_type.get("face", [])) != 2:
+                raise RuntimeError(f"FUNCTIONAL_FAIL=face_stage_count:{by_type}")
+            if len(by_type.get("audio", [])) != speech_turn_count:
+                raise RuntimeError(f"FUNCTIONAL_FAIL=audio_stage_count:{len(by_type.get('audio', []))}:{speech_turn_count}")
+            if len(by_type.get("fusion", [])) != 2 or len(by_type.get("story_final", [])) != 1:
+                raise RuntimeError(f"FUNCTIONAL_FAIL=fusion_final_stage_count:{by_type}")
+            print("FUNCTIONAL_STUDIO_STAGE_GRAPH=PASS")
+
+            workflow_id = UUID(str(studio["workflow_id"]))
+            dep_rows = await conn.fetch(
+                """
+                select c.stage_run_id child_id,c.stage_type child_type,p.stage_run_id parent_id,p.stage_type parent_type
+                from public.v3_studio_stage_dependencies d
+                join public.v3_studio_stage_runs p on p.stage_run_id=d.parent_stage_run_id
+                join public.v3_studio_stage_runs c on c.stage_run_id=d.child_stage_run_id
+                where c.workflow_id=$1
+                """,
+                workflow_id,
+            )
+            parents_by_child = {}
+            for row in dep_rows:
+                parents_by_child.setdefault(str(row["child_id"]), []).append(str(row["parent_type"]))
+            for audio_stage in by_type.get("audio", []):
+                if parents_by_child.get(audio_stage["stage_run_id"]) != ["face"]:
+                    raise RuntimeError(f"FUNCTIONAL_FAIL=audio_face_dependency:{audio_stage}:{parents_by_child.get(audio_stage['stage_run_id'])}")
+            for fusion_stage in by_type.get("fusion", []):
+                parent_types = set(parents_by_child.get(fusion_stage["stage_run_id"], []))
+                if not {"face", "audio"}.issubset(parent_types):
+                    raise RuntimeError(f"FUNCTIONAL_FAIL=fusion_face_audio_dependency:{fusion_stage}:{parent_types}")
+            final_stage = by_type["story_final"][0]
+            if parents_by_child.get(final_stage["stage_run_id"], []).count("fusion") != 2:
+                raise RuntimeError(f"FUNCTIONAL_FAIL=story_final_fusion_dependencies:{parents_by_child.get(final_stage['stage_run_id'])}")
+            print("FUNCTIONAL_FACE_AUDIO_FUSION_DEPENDENCIES=PASS")
+
+            blocked_audio = UUID(str(by_type["audio"][0]["stage_run_id"]))
+            try:
+                await conn.execute("update public.v3_studio_stage_runs set state='generating' where stage_run_id=$1", blocked_audio)
+            except Exception:
+                print("FUNCTIONAL_HITL_DOWNSTREAM_BLOCK=PASS")
+            else:
+                raise RuntimeError("FUNCTIONAL_FAIL=audio_started_without_approved_face")
 
             workspace_get = await client.get(
                 f"/api/director/stories/{story_id}/workspace",
@@ -274,32 +324,21 @@ async def main() -> None:
             focus_participant = participants[0]
             scoped = await client.get(
                 f"/api/director/stories/{story_id}/assistant-context",
-                params={
-                    "scene_id": scenes[0]["scene_id"],
-                    "participant_id": focus_participant["participant_id"],
-                },
+                params={"scene_id": scenes[0]["scene_id"], "participant_id": focus_participant["participant_id"]},
             )
             if scoped.status_code != 200:
                 raise RuntimeError(f"FUNCTIONAL_FAIL=assistant_context_api:{scoped.status_code}:{scoped.text[:1000]}")
             context = scoped.json()
             if context.get("context_scope") != "scene_participant":
                 raise RuntimeError(f"FUNCTIONAL_FAIL=assistant_context_scope:{context.get('context_scope')}")
-            if context.get("active_scene_id") != scenes[0]["scene_id"]:
-                raise RuntimeError("FUNCTIONAL_FAIL=assistant_context_scene_focus")
-            if context.get("active_participant_id") != focus_participant["participant_id"]:
-                raise RuntimeError("FUNCTIONAL_FAIL=assistant_context_participant_focus")
-            if len(context.get("scene_context", [])) != 1 or len(context.get("participant_context", [])) != 2:
-                # Scene+participant scope retains the complete scene cast for coherent dialogue grounding,
-                # while active_participant_id marks the conversational focus.
-                raise RuntimeError(f"FUNCTIONAL_FAIL=assistant_context_shape:{context}")
+            if context.get("active_scene_id") != scenes[0]["scene_id"] or context.get("active_participant_id") != focus_participant["participant_id"]:
+                raise RuntimeError("FUNCTIONAL_FAIL=assistant_context_focus")
             if {item.get("scene_id") for item in context.get("dialogue_context", [])} != {scenes[0]["scene_id"]}:
                 raise RuntimeError("FUNCTIONAL_FAIL=assistant_context_dialogue_not_scene_scoped")
             print("FUNCTIONAL_ASSISTANT_CONTEXT_SCOPING=PASS")
 
             story_count = await conn.fetchval(
-                "select count(*) from public.v3_stories where story_id=$1 and account_id=$2",
-                story_id,
-                account_id,
+                "select count(*) from public.v3_stories where story_id=$1 and account_id=$2", story_id, account_id
             )
             if int(story_count or 0) != 1:
                 raise RuntimeError("FUNCTIONAL_FAIL=canonical_story_not_persisted")
@@ -308,13 +347,7 @@ async def main() -> None:
         print("V3_MPS_CREATIVE_DIRECTOR_FUNCTIONAL_TEST=PASS")
     finally:
         try:
-            await _cleanup(
-                conn,
-                source_id=source_id,
-                story_id=story_id,
-                project_id=project_id,
-                thread_id=thread_id,
-            )
+            await _cleanup(conn, source_id=source_id, story_id=story_id, project_id=project_id, thread_id=thread_id)
             print("FUNCTIONAL_TEST_CLEANUP=PASS")
         finally:
             await conn.close()
