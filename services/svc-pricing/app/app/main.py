@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from typing import Optional
 
 from fastapi import FastAPI
@@ -26,6 +27,15 @@ logger = logging.getLogger(__name__)
 def _configure_logging() -> None:
     level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
+def _v3_pricing_adapter_probe_enabled() -> bool:
+    return str(os.getenv("DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED", "false")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _attach_task_logging(task: asyncio.Task, *, task_name: str) -> None:
@@ -140,6 +150,13 @@ def create_app() -> FastAPI:
     app.include_router(payments_router)
     app.include_router(payment_webhooks_router)
     app.include_router(pricing_bootstrap_router)
+
+    # Additive V3-only read-only canonical mapping probe. Import lazily so V2
+    # pricing startup never depends on V3 contract packaging when the flag is off.
+    if _v3_pricing_adapter_probe_enabled():
+        from app.api.v3_adapter_probe import router as v3_adapter_probe_router
+
+        app.include_router(v3_adapter_probe_router)
 
     return app
 
