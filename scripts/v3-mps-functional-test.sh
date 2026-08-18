@@ -33,6 +33,13 @@ if [ "$DB_NAME" != "desifaces_v3" ]; then
 fi
 echo "MPS_FUNCTIONAL_DB_TARGET=PASS"
 
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+BACKUP_DIR="$HOME/backups/desifaces-v3-mps-hitl/$STAMP"
+mkdir -p "$BACKUP_DIR"
+docker exec desifaces-v3-db sh -lc 'pg_dump -Fc -U "$POSTGRES_USER" -d "$POSTGRES_DB"' > "$BACKUP_DIR/desifaces_v3_pre_mps_hitl.dump"
+sha256sum "$BACKUP_DIR/desifaces_v3_pre_mps_hitl.dump" > "$BACKUP_DIR/desifaces_v3_pre_mps_hitl.dump.sha256"
+echo "MPS_FUNCTIONAL_PRE_MIGRATION_BACKUP=PASS"
+
 for migration in \
   migrations/2026_08_18_v3_studio_hitl_workflow.sql \
   migrations/2026_08_18_v3_studio_hitl_hardening.sql
