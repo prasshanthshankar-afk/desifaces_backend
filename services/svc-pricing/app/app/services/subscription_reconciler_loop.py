@@ -55,31 +55,37 @@ async def subscription_reconciler_loop() -> None:
     gateway = StripeGateway()
 
     while True:
+        provider_result = None
+        integrity_result = None
+
+        # Provider-state refresh and credit-cycle integrity are deliberately
+        # independent failure domains. A Stripe outage must not suppress repair
+        # for Apple/Google periods already persisted in our database.
         try:
-            result = await run_subscription_reconciler_once(
+            provider_result = await run_subscription_reconciler_once(
                 pool,
                 gw=gateway,
                 lookahead_minutes=reconciler_lookahead_minutes(),
                 limit=100,
             )
+        except Exception:
+            logger.exception("subscription_provider_reconcile_tick_failed")
 
-            integrity_result = None
-            if credit_integrity_enabled():
+        if credit_integrity_enabled():
+            try:
                 async with pool.acquire() as conn:
                     async with conn.transaction():
                         integrity_result = await repair_active_subscription_credit_cycles(
                             conn,
                             limit=200,
                         )
+            except Exception:
+                logger.exception("subscription_credit_integrity_tick_failed")
 
-            logger.info(
-                "subscription_reconciler_tick_complete count=%s credit_integrity_count=%s",
-                result.get("count") if isinstance(result, dict) else None,
-                integrity_result.get("count") if isinstance(integrity_result, dict) else None,
-            )
-        except Exception:
-            # Best-effort background loop: never crash the API, but do not
-            # swallow failures silently. Silent failure hides payment drift.
-            logger.exception("subscription_reconciler_tick_failed")
+        logger.info(
+            "subscription_reconciler_tick_complete provider_count=%s credit_integrity_count=%s",
+            provider_result.get("count") if isinstance(provider_result, dict) else None,
+            integrity_result.get("count") if isinstance(integrity_result, dict) else None,
+        )
 
         await asyncio.sleep(reconciler_interval_seconds())
