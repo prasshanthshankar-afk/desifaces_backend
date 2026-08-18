@@ -93,6 +93,13 @@ def _stable_fingerprint(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _fingerprint_breakdown(breakdown: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove preview-instance fields before fallback fingerprinting."""
+
+    volatile = {"quote_id", "quote_expires_at", "preview_fingerprint"}
+    return {key: value for key, value in dict(breakdown).items() if key not in volatile}
+
+
 def _money_minor(amount: Any, currency: str) -> PriceMoney | None:
     text = _clean(amount)
     if text is None:
@@ -138,7 +145,7 @@ def adapt_pricing_preview_response(
                 "service_name": data.get("service_name"),
                 "service_action": data.get("service_action"),
                 "sku_code": data.get("sku_code"),
-                "quote_breakdown": breakdown,
+                "quote_breakdown": _fingerprint_breakdown(breakdown),
             }
         )
     )
