@@ -103,13 +103,30 @@ class CreativeStoryPlan(V3ContractModel):
         if len(names) != len(set(names)):
             raise ValueError("planned_participant_display_names_must_be_unique")
         allowed = set(names)
+
+        scene_sequences = [scene.sequence for scene in self.scenes]
+        if len(scene_sequences) != len(set(scene_sequences)):
+            raise ValueError("planned_scene_sequences_must_be_unique")
+
         for scene in self.scenes:
+            if len(scene.participant_refs) != len(set(scene.participant_refs)):
+                raise ValueError(f"scene_participant_refs_must_be_unique:{scene.sequence}")
             unknown = set(scene.participant_refs) - allowed
             if unknown:
                 raise ValueError(f"scene_unknown_participant_refs:{sorted(unknown)}")
+
+            turn_sequences = [turn.sequence for turn in scene.dialogue]
+            if len(turn_sequences) != len(set(turn_sequences)):
+                raise ValueError(f"dialogue_sequences_must_be_unique:{scene.sequence}")
+
+            scene_people = set(scene.participant_refs)
             for turn in scene.dialogue:
                 if turn.speaker_ref and turn.speaker_ref not in allowed:
                     raise ValueError(f"dialogue_unknown_speaker_ref:{turn.speaker_ref}")
+                if turn.speaker_ref and turn.speaker_ref not in scene_people:
+                    raise ValueError(
+                        f"dialogue_speaker_not_in_scene:{scene.sequence}:{turn.speaker_ref}"
+                    )
         return self
 
 
