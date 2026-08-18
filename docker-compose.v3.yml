@@ -80,6 +80,13 @@ services:
 
   svc-pricing:
     container_name: df-v3-svc-pricing
+    image: desifaces-v3-svc-pricing
+    build:
+      context: .
+      dockerfile: services/svc-pricing/app/Dockerfile.v3
+    environment:
+      DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED: "true"
+      DF_SUBSCRIPTION_RECONCILER_ENABLED: "false"
     ports: !override
       - "127.0.0.1:18009:8009"
 
