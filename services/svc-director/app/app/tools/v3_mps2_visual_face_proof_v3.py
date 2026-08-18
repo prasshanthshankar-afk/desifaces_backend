@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
-from typing import Any
 from uuid import UUID
 
-from df_contracts.v3.director import PlannedParticipant
-
+from app.participant_face import compile_participant_face_studio_input
 from app.tools import v3_mps2_visual_face_proof_v2 as proof
 
 
@@ -15,139 +12,6 @@ REQUIRED_CREDITS = 10
 TEST_USER_EMAIL = str(
     os.getenv("DF_V3_E2E_TEST_USER_EMAIL") or "user_apple_iap_test1@desifaces.ai"
 ).strip().lower()
-_ALLOWED_GENDERS = {"male", "female"}
-_SENSITIVE_KEY_TOKENS = {
-    "account", "billing", "credential", "email", "password", "payment",
-    "phone", "secret", "token", "user",
-}
-_VISUAL_PRIORITY = (
-    "identity type",
-    "identity brief",
-    "presentation",
-    "portrait framing",
-    "expression",
-    "face shape",
-    "brows",
-    "eyes",
-    "eye colour",
-    "eye color",
-    "nose",
-    "lips",
-    "jaw and chin",
-    "hair styling",
-    "hair",
-    "lighting",
-    "distinguishing cues",
-    "rendering",
-    "photorealism",
-    "wardrobe",
-    "body reference",
-    "resemblance constraint",
-    "identity independence",
-)
-_CONTINUITY_PRIORITY = ("identity", "identity lock", "wardrobe", "wardrobe lock")
-
-
-def _sensitive(key: str) -> bool:
-    tokens = {
-        token for token in re.split(r"[^a-z0-9]+", str(key or "").strip().lower()) if token
-    }
-    return bool(tokens & _SENSITIVE_KEY_TOKENS) or "id" in tokens
-
-
-def _normalized_key(value: str) -> str:
-    return re.sub(r"[_-]+", " ", str(value or "").strip().lower()).strip()
-
-
-def _safe_map(value: dict[str, Any] | None) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for raw_key, raw_value in (value or {}).items():
-        key = str(raw_key or "").strip()
-        if not key or _sensitive(key) or raw_value is None:
-            continue
-        text = str(raw_value).strip()
-        if text:
-            out[_normalized_key(key)] = text[:420]
-    return out
-
-
-def _explicit_gender(hint: dict[str, Any]) -> str | None:
-    value = str(hint.get("gender") or hint.get("gender_presentation") or "").strip().lower()
-    return value if value in _ALLOWED_GENDERS else None
-
-
-def _explicit_age(hint: dict[str, Any]) -> str | None:
-    for key in ("age", "age_range", "age_range_code", "age_presentation"):
-        value = hint.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()[:80]
-    return None
-
-
-def _append(parts: list[str], sentence: str, *, max_chars: int = 1500) -> None:
-    sentence = " ".join(str(sentence or "").split()).strip()
-    if not sentence:
-        return
-    candidate = " ".join([*parts, sentence])
-    if len(candidate) <= max_chars:
-        parts.append(sentence)
-
-
-def compile_face_input(
-    *,
-    participant: PlannedParticipant,
-    participant_hint: dict[str, Any] | None = None,
-    language: str = "en",
-    num_variants: int = 1,
-) -> dict[str, Any]:
-    """Identity-first Face prompt compiler for the MPS2 visual proof.
-
-    Story mechanics do not consume the provider prompt budget. Director field
-    names are normalized so both snake_case and human-readable keys survive into
-    the Face prompt. Complete identity sentences are prioritized; no blind string
-    truncation is used.
-    """
-    hint = dict(participant_hint or {})
-    gender = _explicit_gender(hint)
-    age = _explicit_age(hint)
-    visual = _safe_map(participant.visual_direction)
-    continuity = _safe_map(participant.continuity)
-
-    parts: list[str] = []
-    _append(parts, f"Create exactly one photorealistic identity-reference portrait for {participant.display_name}.")
-    if age:
-        _append(parts, f"Explicit user age: {age}.")
-    _append(
-        parts,
-        "Do not infer ethnicity, skin tone, religion, attire, occupation, socioeconomic status, facial anatomy, or personality from geography, locale, name, or family relationship.",
-    )
-    _append(parts, "No other story participant may appear in the image.")
-
-    for key in _VISUAL_PRIORITY:
-        value = visual.get(key)
-        if value:
-            _append(parts, f"{key.title()}: {value}.")
-    for key in _CONTINUITY_PRIORITY:
-        value = continuity.get(key)
-        if value:
-            _append(parts, f"{key.title()}: {value}.")
-
-    _append(
-        parts,
-        "Treat the resulting face as a durable recurring-character identity reference; preserve natural pores, believable eyes, fine hair detail, realistic age detail, and non-synthetic texture.",
-    )
-
-    payload: dict[str, Any] = {
-        "mode": "text-to-image",
-        "language": language or "en",
-        "subject_composition_code": "single_person",
-        "num_variants": max(1, min(int(num_variants), 4)),
-        "aspect_ratio": "9:16",
-        "user_prompt": " ".join(parts),
-    }
-    if gender:
-        payload["gender"] = gender
-    return payload
 
 
 async def _active_actor(pool) -> tuple[UUID, UUID]:
@@ -200,7 +64,7 @@ async def _active_actor(pool) -> tuple[UUID, UUID]:
 
 
 proof._active_actor = _active_actor
-proof.compile_participant_face_studio_input = compile_face_input
+proof.compile_participant_face_studio_input = compile_participant_face_studio_input
 
 
 if __name__ == "__main__":
