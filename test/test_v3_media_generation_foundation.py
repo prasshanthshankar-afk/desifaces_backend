@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-from services.shared.df_contracts.v3.domain import (
+from df_contracts.v3.domain import (
     EntityState,
     GenerationJob,
     GenerationKind,
@@ -16,11 +16,11 @@ from services.shared.df_contracts.v3.domain import (
     MediaRole,
     SafetyState,
 )
-from services.shared.python.desifaces_shared.v3.generation_store import (
+from desifaces_shared.v3.generation_store import (
     InvalidJobTransition,
     validate_job_transition,
 )
-from services.shared.python.desifaces_shared.v3.media_store import (
+from desifaces_shared.v3.media_store import (
     normalize_media_kind,
     normalize_media_role,
 )
