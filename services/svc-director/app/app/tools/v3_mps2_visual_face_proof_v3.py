@@ -13,7 +13,7 @@ from app.tools import v3_mps2_visual_face_proof_v2 as proof
 
 REQUIRED_CREDITS = 10
 TEST_USER_EMAIL = str(
-    os.getenv("DF_V3_E2E_TEST_USER_EMAIL") or "test_apple_iap_test1@desifaces.ai"
+    os.getenv("DF_V3_E2E_TEST_USER_EMAIL") or "user_apple_iap_test1@desifaces.ai"
 ).strip().lower()
 _ALLOWED_GENDERS = {"male", "female"}
 _SENSITIVE_KEY_TOKENS = {
