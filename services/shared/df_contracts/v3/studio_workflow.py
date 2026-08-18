@@ -57,6 +57,7 @@ class StudioArtifactRef(V3ContractModel):
     media_id: UUID
     role: str = Field(min_length=1, max_length=100)
     source_stage_run_id: UUID | None = None
+    is_active: bool = True
 
 
 class StudioReviewItem(V3ContractModel):
@@ -89,12 +90,18 @@ class StudioStageView(V3ContractModel):
 
     @model_validator(mode="after")
     def validate_scope(self):
-        if self.scope_type == StudioScopeType.PARTICIPANT and self.participant_id is None:
-            raise ValueError("participant_scope_requires_participant_id")
-        if self.scope_type == StudioScopeType.DIALOGUE_TURN and self.dialogue_turn_id is None:
-            raise ValueError("dialogue_turn_scope_requires_dialogue_turn_id")
-        if self.scope_type == StudioScopeType.SCENE and self.scene_id is None:
-            raise ValueError("scene_scope_requires_scene_id")
+        ids = (self.participant_id, self.scene_id, self.dialogue_turn_id)
+        if self.scope_type == StudioScopeType.PARTICIPANT:
+            if self.participant_id is None or self.scene_id is not None or self.dialogue_turn_id is not None:
+                raise ValueError("invalid_participant_scope")
+        elif self.scope_type == StudioScopeType.DIALOGUE_TURN:
+            if self.dialogue_turn_id is None or self.participant_id is not None or self.scene_id is not None:
+                raise ValueError("invalid_dialogue_turn_scope")
+        elif self.scope_type == StudioScopeType.SCENE:
+            if self.scene_id is None or self.participant_id is not None or self.dialogue_turn_id is not None:
+                raise ValueError("invalid_scene_scope")
+        elif self.scope_type == StudioScopeType.STORY and any(value is not None for value in ids):
+            raise ValueError("invalid_story_scope")
         return self
 
 
