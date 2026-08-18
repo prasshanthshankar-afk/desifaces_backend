@@ -119,17 +119,32 @@ class SceneRef(V3ContractModel):
 
 
 class MediaAsset(V3ContractModel):
+    """Canonical durable media identity.
+
+    ``storage_uri`` is a stable storage reference (for example ``az://...``), not
+    a temporary signed/SAS delivery URL. ``source_media_ids`` describes lineage;
+    the persistence layer stores that lineage relationally.
+    """
+
     media_id: UUID = Field(default_factory=uuid4)
     account_id: UUID
     owner_user_id: UUID | None = None
     project_id: UUID | None = None
     kind: MediaKind
     role: MediaRole
+    lifecycle_state: EntityState = EntityState.ACTIVE
     mime_type: str | None = Field(default=None, max_length=150)
     storage_uri: str = Field(min_length=1, max_length=4000)
+    sha256: str | None = Field(default=None, max_length=128)
+    size_bytes: int | None = Field(default=None, ge=0)
+    width: int | None = Field(default=None, ge=0)
+    height: int | None = Field(default=None, ge=0)
+    duration_ms: int | None = Field(default=None, ge=0)
     thumbnail_media_id: UUID | None = None
     source_media_ids: tuple[UUID, ...] = ()
     parent_job_id: UUID | None = None
+    retention_until: datetime | None = None
+    deleted_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
 
@@ -151,8 +166,12 @@ class GenerationRequest(V3ContractModel):
 class GenerationJob(V3ContractModel):
     job_id: UUID = Field(default_factory=uuid4)
     generation_id: UUID
+    parent_job_id: UUID | None = None
+    job_type: str = Field(default="root", min_length=1, max_length=100)
     state: JobState = JobState.SUBMITTED
     progress_percent: int | None = Field(default=None, ge=0, le=100)
+    attempt_count: int = Field(default=0, ge=0)
+    max_attempts: int = Field(default=3, ge=1)
     provider_execution_ids: tuple[UUID, ...] = ()
     output_media_ids: tuple[UUID, ...] = ()
     error_code: str | None = None
@@ -169,6 +188,7 @@ class ProviderExecution(V3ContractModel):
     model: str | None = Field(default=None, max_length=200)
     state: ProviderExecutionState = ProviderExecutionState.PLANNED
     provider_request_id: str | None = Field(default=None, max_length=500)
+    idempotency_key: str | None = Field(default=None, max_length=200)
     attempt: int = Field(default=1, ge=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
     started_at: datetime | None = None
