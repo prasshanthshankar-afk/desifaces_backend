@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 from langgraph.checkpoint.memory import InMemorySaver
 
 from df_contracts.v3.director import (
+    CreationContextScope,
     CreativeBrief,
     CreativeCritique,
     CreativeStoryPlan,
@@ -16,6 +17,7 @@ from df_contracts.v3.director import (
 )
 from df_contracts.v3.domain import ParticipantKind
 from df_contracts.v3.story import DialogueTurn, Participant, Project, Scene, SceneParticipant, Story, StoryGraph, StoryParticipant
+from desifaces_shared.v3.creation_context import build_creation_context
 from desifaces_shared.v3.director_graph import CreativeDirectorRuntime, build_creative_director_graph
 
 
@@ -132,7 +134,7 @@ class FakeCompiler:
         )
 
 
-def test_director_produces_canonical_ui_and_assistant_views_from_same_story():
+def _run_director():
     async def run():
         runtime = CreativeDirectorRuntime(
             retriever=FakeRetriever(),
@@ -144,7 +146,7 @@ def test_director_produces_canonical_ui_and_assistant_views_from_same_story():
         graph = build_creative_director_graph(runtime, checkpointer=InMemorySaver())
         account_id = uuid4()
         owner_user_id = uuid4()
-        state = await graph.ainvoke(
+        return await graph.ainvoke(
             {
                 "run_id": str(uuid4()),
                 "thread_id": "director-test-thread",
@@ -155,17 +157,38 @@ def test_director_produces_canonical_ui_and_assistant_views_from_same_story():
             {"configurable": {"thread_id": "director-test-thread"}},
         )
 
-        canonical = state["story_graph"]
-        workspace = state["workspace"]
-        assistant = state["assistant_context"]
-        assert state["phase"] == "ready"
-        assert workspace["story_id"] == canonical["story"]["story_id"]
-        assert assistant["story_id"] == canonical["story"]["story_id"]
-        assert workspace["project_id"] == assistant["project_id"] == canonical["project"]["project_id"]
-        assert set(assistant["participant_ids"]) == {p["participant_id"] for p in canonical["participants"]}
-        assert workspace["scenes"][0]["dialogue"][0]["speaker_display_name"] == "Ananya"
-        assert "ask_assistant" in workspace["actions"]
-        assert "edit_dialogue" in assistant["allowed_assistant_actions"]
-        assert "creative_chunk:test" in assistant["retrieved_context_refs"]
+    return asyncio.run(run())
 
-    asyncio.run(run())
+
+def test_director_produces_canonical_ui_and_assistant_views_from_same_story():
+    state = _run_director()
+    canonical = state["story_graph"]
+    workspace = state["workspace"]
+    assistant = state["assistant_context"]
+    assert state["phase"] == "ready"
+    assert workspace["story_id"] == canonical["story"]["story_id"]
+    assert assistant["story_id"] == canonical["story"]["story_id"]
+    assert workspace["project_id"] == assistant["project_id"] == canonical["project"]["project_id"]
+    assert set(assistant["participant_ids"]) == {p["participant_id"] for p in canonical["participants"]}
+    assert workspace["scenes"][0]["dialogue"][0]["speaker_display_name"] == "Ananya"
+    assert "ask_assistant" in workspace["actions"]
+    assert "edit_dialogue" in assistant["allowed_assistant_actions"]
+    assert "creative_chunk:test" in assistant["retrieved_context_refs"]
+
+
+def test_assistant_context_can_focus_on_current_scene_and_participant():
+    state = _run_director()
+    graph = StoryGraph.model_validate(state["story_graph"])
+    scene_id = graph.scenes[0].scene_id
+    participant_id = graph.participants[0].participant_id
+    context = build_creation_context(
+        graph,
+        active_scene_id=scene_id,
+        active_participant_id=participant_id,
+        allowed_assistant_actions=("edit_dialogue",),
+    )
+    assert context.context_scope is CreationContextScope.SCENE_PARTICIPANT
+    assert context.active_scene_id == scene_id
+    assert context.active_participant_id == participant_id
+    assert {item["scene_id"] for item in context.dialogue_context} == {str(scene_id)}
+    assert participant_id in context.participant_ids
