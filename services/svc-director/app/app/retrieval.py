@@ -96,6 +96,8 @@ class HybridCreativeRetriever:
                 )
                 context = build_creation_context(
                     graph,
+                    active_scene_id=brief.focus_scene_id,
+                    active_participant_id=brief.focus_participant_id,
                     allowed_assistant_actions=("explain_creation", "edit_story", "edit_dialogue"),
                 )
                 structured["existing_creation"] = context.model_dump(mode="json")
@@ -159,7 +161,14 @@ class HybridCreativeRetriever:
                 brief.text,
                 refs,
                 len(knowledge),
-                json.dumps({"mode": "hybrid", "embedding_model": self._embedding_model or None}),
+                json.dumps(
+                    {
+                        "mode": "hybrid",
+                        "embedding_model": self._embedding_model or None,
+                        "focus_scene_id": str(brief.focus_scene_id) if brief.focus_scene_id else None,
+                        "focus_participant_id": str(brief.focus_participant_id) if brief.focus_participant_id else None,
+                    }
+                ),
             )
 
             return {
