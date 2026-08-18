@@ -23,8 +23,15 @@ if [ "$DB_NAME" != "desifaces_v3" ]; then
 fi
 echo "C6_DB_TARGET=PASS"
 
-# C4/C5 and all C6 migrations were already applied by the prior closure run.
-# Rebuild only Pricing so this resume uses the corrected certifier/integrity code.
+# C4/C5 are already certified and their migrations stay untouched. Apply only
+# the idempotent C6 follow-up that repairs historically double-encoded credit-lot
+# metadata and installs a DB-boundary normalization trigger.
+docker exec -i desifaces-v3-db sh -lc 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  < migrations/2026_08_18_v3_credit_lot_jsonb_normalization.sql >/dev/null
+echo "C6_CREDIT_LOT_JSONB_NORMALIZATION=PASS"
+
+# Rebuild only Pricing so the resume uses the corrected JSON codec,
+# certifier, and provider-neutral integrity logic.
 COMPOSE_PARALLEL_LIMIT=1 ./scripts/v3-compose.sh up -d --no-deps --build svc-pricing
 until curl -fsS 127.0.0.1:18009/api/health >/dev/null 2>&1; do sleep 2; done
 echo "C6_V3_PRICING_HEALTH=PASS"
