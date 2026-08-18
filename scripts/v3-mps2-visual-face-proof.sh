@@ -21,6 +21,12 @@ if [ -z "${DF_DIRECTOR_LLM_MODEL:-}" ] && [ -f infra/.env ]; then
 fi
 export DF_DIRECTOR_LLM_MODEL="${DF_DIRECTOR_LLM_MODEL:-gpt-5.6}"
 
+# Canonical V3 E2E media actor. Passwords/credentials are deliberately never
+# stored in this repository; the proof resolves the user from V3 DB and uses a
+# short-lived locally signed test JWT.
+DF_V3_E2E_TEST_USER_EMAIL="test_apple_iap_test1@desifaces.ai"
+export DF_V3_E2E_TEST_USER_EMAIL
+
 # Fast source regression gate. No provider call yet.
 docker run --rm -v "$PWD:/repo" -w /repo desifaces-v3-svc-fusion \
   sh -lc 'pip install -q pytest langgraph==1.2.9 httpx && PYTHONPATH=/repo:/repo/services/shared:/repo/services/shared/python:/repo/services/svc-director/app python -m pytest -q test/test_v3_participant_face_bridge.py test/test_v3_participant_ref_normalization.py test/test_v3_studio_hitl_workflow.py'
@@ -100,12 +106,16 @@ echo "MPS2_VISUAL_FACE_MODEL=PASS:$FACE_MODEL"
 # Pricing must remain real. Do not inject fake balance or bypass reservations.
 # Reuse the certified C6 period-aware integrity repair, which can only reconcile
 # already-persisted active subscription periods, then require >=10 spendable
-# credits before the visual runner is allowed to create two 5-credit Face jobs.
-docker exec df-v3-svc-pricing python -m app.tools.v3_mps2_prepare_visual_pricing
+# credits on the canonical E2E actor before two 5-credit Face jobs are allowed.
+docker exec \
+  -e DF_V3_E2E_TEST_USER_EMAIL="$DF_V3_E2E_TEST_USER_EMAIL" \
+  df-v3-svc-pricing \
+  python -m app.tools.v3_mps2_prepare_visual_pricing
 
 # Interactive unless explicit test-only approval flags are supplied.
 set +e
 docker exec -i \
+  -e DF_V3_E2E_TEST_USER_EMAIL="$DF_V3_E2E_TEST_USER_EMAIL" \
   -e MPS2_FACE_MODEL_RESOLVED="$FACE_MODEL" \
   -e MPS2_DIRECTOR_PLAN_APPROVED="${MPS2_DIRECTOR_PLAN_APPROVED:-}" \
   -e MPS2_FACE_GENERATION_APPROVED="${MPS2_FACE_GENERATION_APPROVED:-}" \
