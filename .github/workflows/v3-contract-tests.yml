@@ -13,6 +13,7 @@ on:
       - "services/svc-audio/app/**"
       - "services/svc-fusion/app/**"
       - "services/svc-pricing/app/**"
+      - "services/svc-director/app/**"
       - "migrations/2026_08_18_v3_*.sql"
       - "test/test_v3_*.py"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
@@ -33,6 +34,7 @@ on:
       - "services/svc-audio/app/**"
       - "services/svc-fusion/app/**"
       - "services/svc-pricing/app/**"
+      - "services/svc-director/app/**"
       - "migrations/2026_08_18_v3_*.sql"
       - "test/test_v3_*.py"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
@@ -59,7 +61,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install focused test dependencies
-        run: python -m pip install --disable-pip-version-check pytest "pydantic>=2,<3"
+        run: python -m pip install --disable-pip-version-check pytest "pydantic>=2,<3" langgraph==1.2.9
 
       - name: Compile V3 contract and compatibility code
         run: |
@@ -78,6 +80,7 @@ jobs:
             services/svc-pricing/app/app/services/subscription_credit_integrity_service.py \
             services/svc-pricing/app/app/services/subscription_reconciler_loop.py \
             services/svc-pricing/app/app/tools/v3_c6_certify.py \
+            services/svc-director/app/app \
             scripts/v3-c45-runtime-certify.py \
             scripts/v3-multiperson-story-runtime-certify.py
 
@@ -100,4 +103,5 @@ jobs:
             test/test_v3_account_context.py \
             test/test_v3_media_generation_foundation.py \
             test/test_v3_subscription_cycle.py \
-            test/test_v3_multiperson_story_foundation.py
+            test/test_v3_multiperson_story_foundation.py \
+            test/test_v3_creative_director_foundation.py
