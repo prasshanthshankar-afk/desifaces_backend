@@ -95,7 +95,7 @@ jobs:
 
       - name: Run canonical foundation unit tests
         env:
-          PYTHONPATH: .:services/shared:services/shared/python
+          PYTHONPATH: .:services/shared:services/shared/python:services/svc-director/app
         run: |
           python -m pytest -q \
             test/test_v3_adapter_primitives.py \
@@ -108,4 +108,5 @@ jobs:
             test/test_v3_subscription_cycle.py \
             test/test_v3_multiperson_story_foundation.py \
             test/test_v3_creative_director_foundation.py \
-            test/test_v3_participant_ref_normalization.py
+            test/test_v3_participant_ref_normalization.py \
+            test/test_v3_studio_hitl_workflow.py
