@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -26,6 +27,7 @@ class FaceStageContext:
     planned_participant: PlannedParticipant
     stage_state: str
     metadata: dict[str, Any]
+    participant_metadata: dict[str, Any]
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -79,6 +81,7 @@ async def load_face_stage_context(
     )
     if not row:
         raise ParticipantFaceBridgeError("face_stage_not_found_or_account_mismatch")
+    participant_metadata = _dict(row["participant_metadata"])
     return FaceStageContext(
         workflow_id=UUID(str(row["workflow_id"])),
         stage_run_id=UUID(str(row["stage_run_id"])),
@@ -87,16 +90,14 @@ async def load_face_stage_context(
         planned_participant=_planned_from_row(row),
         stage_state=str(row["state"]),
         metadata=_dict(row["metadata_json"]),
+        participant_metadata=participant_metadata,
     )
 
 
 def compile_context_face_input(context: FaceStageContext) -> dict[str, Any]:
-    # Explicit age/gender are only taken from a durable explicit constraint block
-    # if present. The compiler does not infer them from name, geography or role.
-    participant_metadata = _dict(context.planned_participant.model_dump().get("metadata"))
-    hint = _dict(context.metadata.get("explicit_face_constraints"))
-    if not hint:
-        hint = _dict(participant_metadata.get("explicit_face_constraints"))
+    # Explicit age/gender are carried from the approved CreativeBrief and stored
+    # on the durable Participant. They are never inferred from name/role/locale.
+    hint = _dict(context.participant_metadata.get("explicit_face_constraints"))
     return compile_participant_face_studio_input(
         participant=context.planned_participant,
         participant_hint=hint,
@@ -171,14 +172,14 @@ class ParticipantFaceExecutionService:
                     set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $2::jsonb,updated_at=now()
                     where stage_run_id=$1""",
                     stage_run_id,
-                    {
+                    json.dumps({
                         "face_attempt_count": attempt_count,
                         "face_attempt_kind": attempt_kind,
                         "face_quote_id": quote_id,
                         "face_preview_fingerprint": preview_fingerprint,
                         "compatibility_face_job_id": None,
                         "last_error": None,
-                    },
+                    }),
                 )
 
         studio_input = compile_context_face_input(context)
@@ -202,7 +203,7 @@ class ParticipantFaceExecutionService:
                 set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $2::jsonb,updated_at=now()
                 where stage_run_id=$1""",
                 stage_run_id,
-                {"compatibility_face_job_id": job_id},
+                json.dumps({"compatibility_face_job_id": job_id}),
             )
         return context, job_id, attempt_count, attempt_kind
 
@@ -270,6 +271,9 @@ class ParticipantFaceExecutionService:
             variant = dict(variants[0])
             media_asset_id = UUID(str(variant["media_asset_id"]))
             if not existing or str(existing["media_id"]) != str(media_asset_id):
+                # Never attach a newly observed output to an already approved slot.
+                if context.stage_state == "approved":
+                    raise ParticipantFaceBridgeError("approved_face_stage_cannot_accept_new_output")
                 async with pool.acquire() as conn:
                     async with conn.transaction():
                         review_item_id = await self.binder.bind_generated_face(
@@ -284,8 +288,11 @@ class ParticipantFaceExecutionService:
                         )
                 response["review_item_id"] = str(review_item_id)
                 response["review_decision"] = "pending"
+                stage_state = "awaiting_review"
+            else:
+                stage_state = context.stage_state
             response.update({
-                "stage_state": "awaiting_review",
+                "stage_state": stage_state,
                 "media_asset_id": str(media_asset_id),
                 "image_url": str(variant.get("image_url") or ""),
                 "face_profile_id": str(variant.get("face_profile_id") or ""),
@@ -295,11 +302,13 @@ class ParticipantFaceExecutionService:
             return response
 
         if provider_state in {"failed", "cancelled", "canceled"}:
-            error = status_payload.get("error") or status_payload.get("message") or "face_generation_failed"
-            async with pool.acquire() as conn:
-                await self.store.mark_failed(conn, stage_run_id=stage_run_id, error=str(error))
-            response["stage_state"] = "failed"
-            response["error"] = error
+            # A stale status sync must never downgrade an already approved output.
+            if context.stage_state != "approved":
+                error = status_payload.get("error") or status_payload.get("message") or "face_generation_failed"
+                async with pool.acquire() as conn:
+                    await self.store.mark_failed(conn, stage_run_id=stage_run_id, error=str(error))
+                response["stage_state"] = "failed"
+                response["error"] = error
             response["pricing"] = status_payload.get("pricing")
             return response
 
