@@ -1,5 +1,6 @@
 -- Durable execution-attempt history for independently billable/retryable Studio output slots.
 -- Billing authority remains svc-pricing/credit ledger; this table records execution correlation.
+-- Each attempt is also bound to the certified C5 canonical GenerationRequest/root GenerationJob.
 
 BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -10,6 +11,8 @@ CREATE TABLE IF NOT EXISTS public.v3_studio_stage_attempts (
   attempt_no integer NOT NULL,
   attempt_kind text NOT NULL,
   state text NOT NULL DEFAULT 'dispatching',
+  generation_id uuid,
+  generation_job_id uuid,
   provider_service text NOT NULL,
   provider_job_ref text,
   pricing_quote_id text,
@@ -34,6 +37,45 @@ CREATE TABLE IF NOT EXISTS public.v3_studio_stage_attempts (
   )
 );
 
+-- Upgrade an already-created attempt table idempotently.
+ALTER TABLE public.v3_studio_stage_attempts
+  ADD COLUMN IF NOT EXISTS generation_id uuid,
+  ADD COLUMN IF NOT EXISTS generation_job_id uuid;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname='fk_v3_studio_attempt_generation'
+      AND conrelid='public.v3_studio_stage_attempts'::regclass
+  ) THEN
+    ALTER TABLE public.v3_studio_stage_attempts
+      ADD CONSTRAINT fk_v3_studio_attempt_generation
+      FOREIGN KEY(generation_id)
+      REFERENCES public.v3_generation_requests(generation_id)
+      ON DELETE SET NULL;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname='fk_v3_studio_attempt_generation_job'
+      AND conrelid='public.v3_studio_stage_attempts'::regclass
+  ) THEN
+    ALTER TABLE public.v3_studio_stage_attempts
+      ADD CONSTRAINT fk_v3_studio_attempt_generation_job
+      FOREIGN KEY(generation_job_id)
+      REFERENCES public.v3_generation_jobs(job_id)
+      ON DELETE SET NULL;
+  END IF;
+END;
+$$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_v3_studio_stage_attempt_generation
+  ON public.v3_studio_stage_attempts(generation_id)
+  WHERE generation_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_v3_studio_stage_attempt_generation_job
+  ON public.v3_studio_stage_attempts(generation_job_id)
+  WHERE generation_job_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_v3_studio_stage_attempts_stage
   ON public.v3_studio_stage_attempts(stage_run_id, attempt_no DESC);
 CREATE INDEX IF NOT EXISTS idx_v3_studio_stage_attempts_provider_job
