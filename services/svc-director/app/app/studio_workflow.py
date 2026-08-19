@@ -28,17 +28,25 @@ async def build_direct_studio_workflow(
         account_id=account_id,
         owner_user_id=owner_user_id,
         project_id=project_id,
-        metadata={"workflow_kind": "face_audio_fusion_direct", "hitl_required": True},
+        metadata={
+            "workflow_kind": "face_audio_fusion_direct",
+            "hitl_required": True,
+            "execution_manifest": {
+                "face_gate_scope": "single_participant",
+                "required_face_participant_ids": [str(participant_id)],
+                "audio_requires_complete_face_cohort": True,
+            },
+        },
     )
     face_stage = await store.add_stage(
         conn, workflow_id=workflow_id, stage_type=StudioStageType.FACE,
         scope_type=StudioScopeType.PARTICIPANT, participant_id=participant_id,
-        metadata={"review_required": True, "output_role": "approved_face"},
+        metadata={"review_required": True, "output_role": "approved_face", "cohort": "face_cast"},
     )
     audio_stage = await store.add_stage(
         conn, workflow_id=workflow_id, stage_type=StudioStageType.AUDIO,
         scope_type=StudioScopeType.PARTICIPANT, participant_id=participant_id,
-        metadata={"review_required": True, "output_role": "approved_audio"},
+        metadata={"review_required": True, "output_role": "approved_audio", "requires_cohort": "face_cast"},
     )
     fusion_stage = await store.add_stage(
         conn, workflow_id=workflow_id, stage_type=StudioStageType.FUSION,
@@ -66,14 +74,32 @@ async def build_story_studio_workflow(
 
     Face is participant-scoped. Audio is speech-turn-scoped. Fusion is scene-scoped.
     Multi-scene stories add a final assembly/review stage after approved scene videos.
+
+    Canonical V3 invariant:
+      * successful Face outputs are independent, durable, billable and retry-safe;
+      * no successful/approved Face independently advances the Story;
+      * every Story Audio stage depends on the complete required Face cast cohort;
+      * approved Faces stay locked while only failed/rejected members are retried.
     """
+    required_participant_ids = tuple(participant.participant_id for participant in graph.participants)
     workflow_id = await store.create_workflow(
         conn,
         account_id=graph.project.account_id,
         owner_user_id=owner_user_id,
         project_id=graph.project.project_id,
         story_id=graph.story.story_id,
-        metadata={"workflow_kind": "face_audio_fusion_story", "hitl_required": True},
+        metadata={
+            "workflow_kind": "face_audio_fusion_story",
+            "hitl_required": True,
+            "execution_manifest": {
+                "face_gate_scope": "story_cast",
+                "required_face_participant_ids": [str(value) for value in required_participant_ids],
+                "required_face_count": len(required_participant_ids),
+                "audio_requires_complete_face_cohort": True,
+                "retry_policy": "retry_failed_or_rejected_slot_only",
+                "approved_output_policy": "lock_and_reuse",
+            },
+        },
     )
 
     face_by_participant: dict[UUID, UUID] = {}
@@ -81,8 +107,18 @@ async def build_story_studio_workflow(
         face_by_participant[participant.participant_id] = await store.add_stage(
             conn, workflow_id=workflow_id, stage_type=StudioStageType.FACE,
             scope_type=StudioScopeType.PARTICIPANT, participant_id=participant.participant_id,
-            metadata={"review_required": True, "output_role": "approved_face"},
+            metadata={
+                "review_required": True,
+                "output_role": "approved_face",
+                "cohort": "face_cast",
+                "cohort_scope": "story",
+            },
         )
+
+    # Freeze the complete Face cohort before any Story Audio can advance. This is
+    # intentionally broader than speaker-only dependency: if Ananya is approved
+    # but Ravi is failed/pending/rejected, *all* Story Audio remains blocked.
+    required_face_stages = tuple(face_by_participant.values())
 
     audio_by_scene: dict[UUID, list[UUID]] = defaultdict(list)
     for turn in graph.dialogue_turns:
@@ -95,12 +131,14 @@ async def build_story_studio_workflow(
                 "review_required": True,
                 "speaker_participant_id": str(turn.speaker_participant_id),
                 "output_role": "approved_audio",
+                "requires_cohort": "face_cast",
             },
         )
         audio_by_scene[turn.scene_id].append(stage_id)
-        if turn.speaker_participant_id is not None:
+        for face_stage_id in required_face_stages:
             await store.add_dependency(
-                conn, parent_stage_run_id=face_by_participant[turn.speaker_participant_id],
+                conn,
+                parent_stage_run_id=face_stage_id,
                 child_stage_run_id=stage_id,
             )
 
