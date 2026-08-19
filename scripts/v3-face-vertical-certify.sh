@@ -70,7 +70,8 @@ docker exec -i desifaces-v3-db sh -lc 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USE
 echo "V3_FACE_STAGE_ATTEMPT_MIGRATION=PASS"
 
 SCHEMA_CHECK="$(docker exec desifaces-v3-db sh -lc 'psql -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select concat_ws('"'"':'"'"', to_regclass('"'"'public.v3_studio_stage_attempts'"'"') is not null, exists(select 1 from information_schema.columns where table_schema='"'"'public'"'"' and table_name='"'"'v3_studio_stage_attempts'"'"' and column_name='"'"'generation_id'"'"'), exists(select 1 from information_schema.columns where table_schema='"'"'public'"'"' and table_name='"'"'v3_studio_stage_attempts'"'"' and column_name='"'"'generation_job_id'"'"'));"')"
-if [ "$SCHEMA_CHECK" != "true:true:true" ]; then
+# psql text output renders PostgreSQL booleans as t/f (not true/false).
+if [ "$SCHEMA_CHECK" != "t:t:t" ]; then
   echo "V3_FACE_VERTICAL_FAIL=attempt_schema:$SCHEMA_CHECK"
   exit 1
 fi
