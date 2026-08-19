@@ -24,7 +24,7 @@ from .run_store import DirectorRunNotFound, DirectorRunStore
 from .runtime import create_director_graph
 from .security import DirectorAuthContext, get_director_auth
 from .studio_projection import load_story_studio_projection
-from .studio_routes import router as studio_router
+from .studio_routes_runtime import router as studio_router
 
 
 class ResumeIn(BaseModel):
