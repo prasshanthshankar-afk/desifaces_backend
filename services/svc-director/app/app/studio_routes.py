@@ -199,7 +199,7 @@ async def dispatch_participant_face(
     if not body.user_confirmed:
         raise HTTPException(status_code=422, detail="face_pricing_confirmation_required")
     try:
-        context, job_id, attempt_count, attempt_kind = await face_execution.dispatch(
+        context, job_id, attempt_count, attempt_kind, attempt_id = await face_execution.dispatch(
             request.app.state.business_pool,
             account_id=auth.account_id,
             workflow_id=workflow_id,
@@ -215,6 +215,7 @@ async def dispatch_participant_face(
             "display_name": context.display_name,
             "face_job_id": job_id,
             "stage_state": "generating",
+            "attempt_id": str(attempt_id),
             "attempt_count": attempt_count,
             "attempt_kind": attempt_kind,
         }
