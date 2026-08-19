@@ -379,6 +379,28 @@ class ParticipantFaceExecutionService:
                 raise ParticipantFaceBridgeError(f"face_succeeded_without_variants:{job_id}")
             variant = dict(variants[0])
             media_asset_id = UUID(str(variant["media_asset_id"]))
+
+            # A rejected/revise decision is terminal for that successful candidate.
+            # Refreshing/polling its old provider job may display the historical
+            # image, but must never reactivate it or create a new review item.
+            if (
+                context.stage_state == "rejected"
+                and latest_attempt
+                and str(latest_attempt["state"]) == "succeeded"
+                and latest_attempt["media_id"]
+                and str(latest_attempt["media_id"]) == str(media_asset_id)
+            ):
+                response.update({
+                    "stage_state": "rejected",
+                    "media_asset_id": str(media_asset_id),
+                    "review_decision": "rejected",
+                    "image_url": str(variant.get("image_url") or ""),
+                    "face_profile_id": str(variant.get("face_profile_id") or ""),
+                    "prompt_used": str(variant.get("prompt_used") or ""),
+                    "pricing": status_payload.get("pricing"),
+                })
+                return response
+
             if not existing or str(existing["media_id"]) != str(media_asset_id):
                 if context.stage_state == "approved":
                     raise ParticipantFaceBridgeError("approved_face_stage_cannot_accept_new_output")
