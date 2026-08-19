@@ -39,6 +39,12 @@ if [ "$DB_NAME" != "desifaces_v3" ]; then
 fi
 echo "MPS2_VISUAL_DB_TARGET=PASS"
 
+# The per-output attempt ledger is idempotent schema. Apply it explicitly so a
+# Face slot can be retried/regenerated without depending on manual migration state.
+docker exec -i desifaces-v3-db sh -lc 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  < migrations/2026_08_19_v3_studio_stage_attempts.sql >/dev/null
+echo "MPS2_STAGE_ATTEMPT_MIGRATION=PASS"
+
 FACE_WORKER_WAS_RUNNING=0
 if docker ps --format '{{.Names}}' | grep -Fxq 'df-v3-svc-face-worker'; then
   FACE_WORKER_WAS_RUNNING=1
