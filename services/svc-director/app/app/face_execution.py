@@ -97,13 +97,50 @@ async def load_face_stage_context(
 def compile_context_face_input(context: FaceStageContext) -> dict[str, Any]:
     # Explicit age/gender are carried from the approved CreativeBrief and stored
     # on the durable Participant. They are never inferred from name/role/locale.
+    #
+    # Dedicated explicit_face_constraints are authoritative. Older/compatibility
+    # workflow rows may contain the approved demographic values only in the
+    # durable Participant persona; recover those values only when the dedicated
+    # constraint object is empty.
     hint = _dict(context.participant_metadata.get("explicit_face_constraints"))
-    return compile_participant_face_studio_input(
+
+    if not hint:
+        persona = _dict(context.planned_participant.persona)
+        compatibility_hint: dict[str, Any] = {}
+
+        age = str(persona.get("age") or "").strip()
+        if age:
+            compatibility_hint["age"] = age
+
+        gender_presentation = str(
+            persona.get("gender_presentation") or ""
+        ).strip()
+
+        if gender_presentation:
+            normalized_gender = {
+                "man": "male",
+                "woman": "female",
+            }.get(
+                gender_presentation.casefold(),
+                gender_presentation,
+            )
+            compatibility_hint["gender"] = normalized_gender
+
+        hint = compatibility_hint
+
+    studio_input = compile_participant_face_studio_input(
         participant=context.planned_participant,
         participant_hint=hint,
         language=(context.planned_participant.preferred_locale or "en").split("-")[0],
         num_variants=1,
     )
+
+    # Director must never allow an absent demographic contract to fall through
+    # to a provider/service default.
+    if not str(studio_input.get("gender") or "").strip():
+        raise ParticipantFaceBridgeError("face_explicit_gender_required")
+
+    return studio_input
 
 
 def _face_generate_http_status(exc: Exception) -> int | None:

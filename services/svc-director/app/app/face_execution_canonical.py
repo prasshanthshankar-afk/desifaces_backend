@@ -302,6 +302,255 @@ class ParticipantFaceExecutionService(BaseParticipantFaceExecutionService):
                     attempt_id=attempt_id,
                 )
 
+    async def _adopt_compatibility_face_media(
+        self,
+        pool,
+        *,
+        account_id: UUID,
+        workflow_id: UUID,
+        stage_run_id: UUID,
+        headers: dict[str, str],
+    ) -> None:
+        """
+        Adopt a successfully generated svc-face compatibility asset into
+        V3 canonical ownership.
+
+        This method is intentionally strict:
+
+        - it is invoked only after the normal Face reconciliation path
+          rejected the asset because V3 account ownership was absent;
+        - it never generates or regenerates media;
+        - it proves the media belongs to the exact svc-face job correlated
+          with this V3 stage attempt;
+        - it never overwrites conflicting account/project/generation
+          ownership;
+        - it is safe to replay.
+        """
+
+        async with pool.acquire() as conn:
+            correlation = await conn.fetchrow(
+                """
+                select
+                    a.attempt_id,
+                    a.provider_job_ref,
+                    a.generation_job_id,
+                    s.workflow_id,
+                    w.account_id,
+                    w.project_id
+                from public.v3_studio_stage_attempts a
+                join public.v3_studio_stage_runs s
+                  on s.stage_run_id = a.stage_run_id
+                join public.v3_studio_workflows w
+                  on w.workflow_id = s.workflow_id
+                where a.stage_run_id = $1
+                order by a.attempt_no desc
+                limit 1
+                """,
+                stage_run_id,
+            )
+
+        if not correlation:
+            raise ParticipantFaceBridgeError(
+                "face_media_adoption_missing_attempt"
+            )
+
+        if str(correlation["workflow_id"]) != str(workflow_id):
+            raise ParticipantFaceBridgeError(
+                "face_media_adoption_workflow_mismatch"
+            )
+
+        if str(correlation["account_id"]) != str(account_id):
+            raise ParticipantFaceBridgeError(
+                "face_media_adoption_account_mismatch"
+            )
+
+        generation_job_id = correlation["generation_job_id"]
+        if not generation_job_id:
+            raise ParticipantFaceBridgeError(
+                "face_media_adoption_missing_generation_job"
+            )
+
+        face_job_id = str(
+            correlation["provider_job_ref"] or ""
+        ).strip()
+
+        if not face_job_id:
+            raise ParticipantFaceBridgeError(
+                "face_media_adoption_missing_provider_job"
+            )
+
+        # Re-read the authoritative producer state.
+        #
+        # This is a status GET only. It cannot submit a new provider job.
+        status_payload = await self._status_once(
+            headers=headers,
+            job_id=face_job_id,
+        )
+
+        provider_state = str(
+            status_payload.get("status") or ""
+        ).strip().lower()
+
+        if provider_state != "succeeded":
+            raise ParticipantFaceBridgeError(
+                "face_media_adoption_provider_not_succeeded:"
+                f"{provider_state}"
+            )
+
+        variants = list(status_payload.get("variants") or [])
+        if not variants:
+            raise ParticipantFaceBridgeError(
+                f"face_succeeded_without_variants:{face_job_id}"
+            )
+
+        variant = dict(variants[0])
+
+        raw_media_id = variant.get("media_asset_id")
+        if not raw_media_id:
+            raise ParticipantFaceBridgeError(
+                "face_media_adoption_missing_media_id"
+            )
+
+        media_asset_id = UUID(str(raw_media_id))
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+
+                # Lock the media row so concurrent sync requests cannot
+                # race ownership adoption.
+                media = await conn.fetchrow(
+                    """
+                    select
+                        id,
+                        user_id,
+                        account_id,
+                        project_id,
+                        parent_generation_job_id,
+                        role
+                    from public.media_assets
+                    where id = $1
+                    for update
+                    """,
+                    media_asset_id,
+                )
+
+                if not media:
+                    raise ParticipantFaceBridgeError(
+                        "face_media_adoption_asset_not_found"
+                    )
+
+                # Strong provenance check:
+                # this exact media must be an output of this exact svc-face
+                # provider job.
+                linked_output = await conn.fetchval(
+                    """
+                    select exists(
+                        select 1
+                        from public.face_job_outputs
+                        where job_id = $1::uuid
+                          and output_asset_id = $2
+                    )
+                    """,
+                    face_job_id,
+                    media_asset_id,
+                )
+
+                if not linked_output:
+                    raise ParticipantFaceBridgeError(
+                        "face_media_adoption_provider_job_mismatch"
+                    )
+
+                # The producer job and media asset must belong to the
+                # same originating user.
+                producer_user_id = await conn.fetchval(
+                    """
+                    select user_id
+                    from public.studio_jobs
+                    where id = $1::uuid
+                      and studio_type = 'face'
+                    """,
+                    face_job_id,
+                )
+
+                if not producer_user_id:
+                    raise ParticipantFaceBridgeError(
+                        "face_media_adoption_provider_job_not_found"
+                    )
+
+                if str(producer_user_id) != str(media["user_id"]):
+                    raise ParticipantFaceBridgeError(
+                        "face_media_adoption_user_mismatch"
+                    )
+
+                existing_account_id = media["account_id"]
+
+                if (
+                    existing_account_id is not None
+                    and str(existing_account_id) != str(account_id)
+                ):
+                    # Never take ownership away from another account.
+                    raise ParticipantFaceBridgeError(
+                        "face_media_account_mismatch"
+                    )
+
+                workflow_project_id = correlation["project_id"]
+                existing_project_id = media["project_id"]
+
+                if (
+                    existing_project_id is not None
+                    and workflow_project_id is not None
+                    and str(existing_project_id)
+                    != str(workflow_project_id)
+                ):
+                    raise ParticipantFaceBridgeError(
+                        "face_media_project_mismatch"
+                    )
+
+                existing_generation_job_id = media[
+                    "parent_generation_job_id"
+                ]
+
+                if (
+                    existing_generation_job_id is not None
+                    and str(existing_generation_job_id)
+                    != str(generation_job_id)
+                ):
+                    raise ParticipantFaceBridgeError(
+                        "face_media_generation_job_mismatch"
+                    )
+
+                existing_role = str(media["role"] or "").strip()
+
+                if existing_role and existing_role != "preview":
+                    # An unapproved Face candidate must not silently
+                    # inherit final/source semantics.
+                    raise ParticipantFaceBridgeError(
+                        "face_media_role_mismatch"
+                    )
+
+                # Idempotent adoption:
+                # populate absent V3 context only.
+                await conn.execute(
+                    """
+                    update public.media_assets
+                    set
+                        account_id =
+                            coalesce(account_id, $2),
+                        project_id =
+                            coalesce(project_id, $3),
+                        parent_generation_job_id =
+                            coalesce(parent_generation_job_id, $4),
+                        role =
+                            coalesce(role, 'preview'),
+                        updated_at = now()
+                    where id = $1
+                    """,
+                    media_asset_id,
+                    account_id,
+                    workflow_project_id,
+                    generation_job_id,
+                )
+
     async def sync(
         self,
         pool,
@@ -312,13 +561,45 @@ class ParticipantFaceExecutionService(BaseParticipantFaceExecutionService):
         stage_run_id: UUID,
         headers: dict[str, str],
     ) -> dict:
-        result = await super().sync(
-            pool,
-            account_id=account_id,
-            workflow_id=workflow_id,
-            stage_run_id=stage_run_id,
-            headers=headers,
-        )
+
+        try:
+            result = await super().sync(
+                pool,
+                account_id=account_id,
+                workflow_id=workflow_id,
+                stage_run_id=stage_run_id,
+                headers=headers,
+            )
+
+        except ParticipantFaceBridgeError as exc:
+
+            # Do not mask unrelated Face errors.
+            #
+            # The compatibility repair is allowed ONLY for the exact
+            # legacy-media ownership gap we have identified.
+            if str(exc) != "face_media_account_mismatch":
+                raise
+
+            await self._adopt_compatibility_face_media(
+                pool,
+                account_id=account_id,
+                workflow_id=workflow_id,
+                stage_run_id=stage_run_id,
+                headers=headers,
+            )
+
+            # Replay reconciliation once.
+            #
+            # This calls the existing status API; it does NOT invoke
+            # Face generation and does NOT reserve credits.
+            result = await super().sync(
+                pool,
+                account_id=account_id,
+                workflow_id=workflow_id,
+                stage_run_id=stage_run_id,
+                headers=headers,
+            )
+
         await self._reconcile_c5(
             pool,
             account_id=account_id,
@@ -326,4 +607,5 @@ class ParticipantFaceExecutionService(BaseParticipantFaceExecutionService):
             stage_run_id=stage_run_id,
             result=result,
         )
+
         return result

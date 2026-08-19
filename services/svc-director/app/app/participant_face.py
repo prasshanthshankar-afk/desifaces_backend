@@ -330,8 +330,56 @@ class ParticipantFaceBinder:
         if str(stage["participant_id"]) != str(participant_id):
             raise ParticipantFaceBridgeError("face_stage_participant_mismatch")
 
-        media = await conn.fetchrow("select id,account_id from public.media_assets where id=$1", media_asset_id)
-        if not media or str(media["account_id"]) != str(account_id):
+        media = await conn.fetchrow(
+            "select id,user_id,account_id from public.media_assets where id=$1 for update",
+            media_asset_id,
+        )
+        if not media:
+            raise ParticipantFaceBridgeError("face_media_account_mismatch")
+
+        if media["account_id"] is None:
+            adopted_account_id = await conn.fetchval(
+                """update public.media_assets m
+                set account_id=w.account_id,
+                    project_id=coalesce(m.project_id,w.project_id),
+                    parent_generation_job_id=coalesce(
+                        m.parent_generation_job_id,s.generation_job_id
+                    ),
+                    role=coalesce(m.role,'preview'),
+                    updated_at=now()
+                from public.face_job_outputs o
+                join public.studio_jobs j
+                  on j.id=o.job_id and j.studio_type='face'
+                join public.v3_studio_stage_runs s
+                  on s.stage_run_id=$3
+                join public.v3_studio_workflows w
+                  on w.workflow_id=s.workflow_id
+                join public.v3_studio_stage_attempts a
+                  on a.stage_run_id=s.stage_run_id
+                 and a.provider_job_ref=$2
+                 and a.generation_job_id=s.generation_job_id
+                where m.id=$1
+                  and o.job_id=$2::uuid
+                  and o.output_asset_id=m.id
+                  and j.user_id=m.user_id
+                  and w.account_id=$4
+                  and s.generation_job_id is not null
+                  and m.account_id is null
+                  and m.lifecycle_state='active'
+                  and (m.project_id is null or m.project_id=w.project_id)
+                  and (m.parent_generation_job_id is null
+                       or m.parent_generation_job_id=s.generation_job_id)
+                  and (m.role is null or m.role='preview')
+                returning m.account_id""",
+                media_asset_id,
+                face_job_id,
+                stage_run_id,
+                account_id,
+            )
+            if str(adopted_account_id or "") != str(account_id):
+                raise ParticipantFaceBridgeError("face_media_adoption_conflict")
+
+        elif str(media["account_id"]) != str(account_id):
             raise ParticipantFaceBridgeError("face_media_account_mismatch")
 
         candidate_meta = json.dumps({
