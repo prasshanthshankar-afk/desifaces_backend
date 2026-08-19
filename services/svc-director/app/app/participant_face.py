@@ -194,13 +194,24 @@ class FaceStudioClient:
         headers: dict[str, str],
         studio_input: dict[str, Any],
         pricing_preview: dict[str, Any],
+        request_nonce: str | None = None,
     ) -> str:
+        """Create/replay one Face job.
+
+        When request_nonce is supplied it is part of svc-face's request hash. The
+        Face job repository is idempotent by user/studio/request_hash, so replaying
+        the same Studio attempt returns the same job instead of creating another
+        provider execution or billing reservation.
+        """
         quote_id = str(pricing_preview.get("quote_id") or "").strip()
         if not quote_id:
             raise ParticipantFaceBridgeError("face_pricing_preview_missing_quote_id")
+        resolved_input = dict(studio_input or {})
+        if request_nonce:
+            resolved_input["request_nonce"] = str(request_nonce)
         payload = {
             "studio": "face",
-            "studio_input": studio_input,
+            "studio_input": resolved_input,
             "pricing_confirmation": {
                 "quote_id": quote_id,
                 "preview_fingerprint": pricing_preview.get("preview_fingerprint"),
