@@ -106,6 +106,29 @@ def compile_context_face_input(context: FaceStageContext) -> dict[str, Any]:
     )
 
 
+def _face_generate_http_status(exc: Exception) -> int | None:
+    """Extract svc-face create-job status from the typed bridge error."""
+    text = str(exc or "")
+    if not text.startswith("face_generate_failed:"):
+        return None
+    try:
+        return int(text.split(":", 2)[1])
+    except Exception:
+        return None
+
+
+def _definitive_dispatch_rejection(exc: Exception) -> bool:
+    """4xx means the Face API definitively rejected this dispatch.
+
+    5xx/timeout/transport errors are ambiguous because svc-face may already have
+    persisted the idempotent job before the response path failed. Those must be
+    recovered by replaying the same Studio attempt nonce, never by creating a new
+    billable attempt.
+    """
+    status = _face_generate_http_status(exc)
+    return status is not None and 400 <= status < 500
+
+
 async def _create_attempt(
     conn,
     *,
@@ -160,7 +183,8 @@ async def _update_attempt(
 
 async def _latest_attempt(conn, *, stage_run_id: UUID):
     return await conn.fetchrow(
-        """select attempt_id,attempt_no,attempt_kind,state,provider_job_ref,media_id
+        """select attempt_id,attempt_no,attempt_kind,state,provider_job_ref,media_id,
+                  pricing_quote_id,preview_fingerprint,error_message
         from public.v3_studio_stage_attempts
         where stage_run_id=$1 order by attempt_no desc limit 1""",
         stage_run_id,
@@ -174,6 +198,10 @@ class ParticipantFaceExecutionService:
     independent provider job. A failure is retryable without touching already
     approved sibling Face stages. A successful output is bound for HITL review;
     workflow progression remains governed by the complete Face cohort barrier.
+
+    attempt_id is propagated to svc-face as request_nonce. Because svc-face is
+    idempotent by request hash, replaying an ambiguous dispatch cannot duplicate
+    provider execution or billing for the same logical attempt.
     """
 
     def __init__(self, *, face_base_url: str, store: CanonicalStudioWorkflowStore | None = None) -> None:
@@ -199,6 +227,80 @@ class ParticipantFaceExecutionService:
         studio_input = compile_context_face_input(context)
         pricing = await self.face_client.preview_pricing(headers=headers, studio_input=studio_input)
         return context, studio_input, pricing
+
+    async def _persist_job_correlation(
+        self,
+        pool,
+        *,
+        stage_run_id: UUID,
+        attempt_id: UUID,
+        job_id: str,
+    ) -> None:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await _update_attempt(
+                    conn,
+                    attempt_id=attempt_id,
+                    state="queued",
+                    provider_job_ref=job_id,
+                    error_message=None,
+                )
+                await conn.execute(
+                    """update public.v3_studio_stage_runs
+                    set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $2::jsonb,updated_at=now()
+                    where stage_run_id=$1""",
+                    stage_run_id,
+                    json.dumps({
+                        "compatibility_face_job_id": job_id,
+                        "dispatch_outcome": "accepted",
+                        "last_error": None,
+                    }),
+                )
+
+    async def _record_ambiguous_dispatch(
+        self,
+        pool,
+        *,
+        stage_run_id: UUID,
+        attempt_id: UUID,
+        error: Exception,
+    ) -> None:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await _update_attempt(
+                    conn,
+                    attempt_id=attempt_id,
+                    state="dispatching",
+                    error_message=f"dispatch_outcome_unknown:{error}",
+                )
+                await conn.execute(
+                    """update public.v3_studio_stage_runs
+                    set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $2::jsonb,updated_at=now()
+                    where stage_run_id=$1""",
+                    stage_run_id,
+                    json.dumps({
+                        "dispatch_outcome": "unknown",
+                        "last_error": f"dispatch_outcome_unknown:{error}"[:4000],
+                    }),
+                )
+
+    async def _record_definitive_dispatch_failure(
+        self,
+        pool,
+        *,
+        stage_run_id: UUID,
+        attempt_id: UUID,
+        error: Exception,
+    ) -> None:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await _update_attempt(
+                    conn,
+                    attempt_id=attempt_id,
+                    state="failed",
+                    error_message=str(error),
+                )
+                await self.store.mark_failed(conn, stage_run_id=stage_run_id, error=str(error))
 
     async def dispatch(
         self,
@@ -251,6 +353,7 @@ class ParticipantFaceExecutionService:
                         "face_quote_id": quote_id,
                         "face_preview_fingerprint": preview_fingerprint,
                         "compatibility_face_job_id": None,
+                        "dispatch_outcome": "dispatching",
                         "last_error": None,
                     }),
                 )
@@ -264,35 +367,119 @@ class ParticipantFaceExecutionService:
                     "quote_id": quote_id,
                     "preview_fingerprint": preview_fingerprint,
                 },
+                request_nonce=str(attempt_id),
             )
         except Exception as exc:
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    await _update_attempt(
-                        conn,
-                        attempt_id=attempt_id,
-                        state="failed",
-                        error_message=str(exc),
-                    )
-                    await self.store.mark_failed(conn, stage_run_id=stage_run_id, error=str(exc))
-            raise
-
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                await _update_attempt(
-                    conn,
+            if _definitive_dispatch_rejection(exc):
+                await self._record_definitive_dispatch_failure(
+                    pool,
+                    stage_run_id=stage_run_id,
                     attempt_id=attempt_id,
-                    state="queued",
-                    provider_job_ref=job_id,
+                    error=exc,
                 )
-                await conn.execute(
-                    """update public.v3_studio_stage_runs
-                    set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $2::jsonb,updated_at=now()
-                    where stage_run_id=$1""",
-                    stage_run_id,
-                    json.dumps({"compatibility_face_job_id": job_id}),
-                )
+                raise
+
+            # Do not manufacture a new attempt after a timeout/5xx. The Face API
+            # may already have persisted/queued the job. Sync will replay this same
+            # attempt_id nonce and recover the authoritative job_id idempotently.
+            await self._record_ambiguous_dispatch(
+                pool,
+                stage_run_id=stage_run_id,
+                attempt_id=attempt_id,
+                error=exc,
+            )
+            raise ParticipantFaceBridgeError(
+                f"face_dispatch_outcome_unknown:{attempt_id}:{exc}"
+            ) from exc
+
+        try:
+            await self._persist_job_correlation(
+                pool,
+                stage_run_id=stage_run_id,
+                attempt_id=attempt_id,
+                job_id=job_id,
+            )
+        except Exception as exc:
+            # External acceptance is known, but local correlation persistence is
+            # not. Keep the same attempt recoverable; never create a replacement.
+            await self._record_ambiguous_dispatch(
+                pool,
+                stage_run_id=stage_run_id,
+                attempt_id=attempt_id,
+                error=exc,
+            )
+            raise ParticipantFaceBridgeError(
+                f"face_dispatch_correlation_unknown:{attempt_id}:{exc}"
+            ) from exc
+
         return context, job_id, attempt_count, attempt_kind, attempt_id
+
+    async def _recover_dispatch_if_needed(
+        self,
+        pool,
+        *,
+        context: FaceStageContext,
+        latest_attempt,
+        headers: dict[str, str],
+    ) -> tuple[str | None, str | None]:
+        """Recover job correlation for a dispatch whose response/persist outcome was ambiguous."""
+        if not latest_attempt:
+            return None, None
+        if str(latest_attempt["state"] or "") != "dispatching":
+            return None, None
+        if latest_attempt["provider_job_ref"]:
+            return str(latest_attempt["provider_job_ref"]), None
+
+        attempt_id = UUID(str(latest_attempt["attempt_id"]))
+        quote_id = str(latest_attempt["pricing_quote_id"] or "").strip()
+        if not quote_id:
+            return None, "dispatch_recovery_missing_quote_id"
+        fingerprint = str(latest_attempt["preview_fingerprint"] or "").strip() or None
+        studio_input = compile_context_face_input(context)
+
+        try:
+            job_id = await self.face_client.create_job(
+                headers=headers,
+                studio_input=studio_input,
+                pricing_preview={
+                    "quote_id": quote_id,
+                    "preview_fingerprint": fingerprint,
+                },
+                request_nonce=str(attempt_id),
+            )
+        except Exception as exc:
+            if _definitive_dispatch_rejection(exc):
+                await self._record_definitive_dispatch_failure(
+                    pool,
+                    stage_run_id=context.stage_run_id,
+                    attempt_id=attempt_id,
+                    error=exc,
+                )
+                return None, str(exc)
+            await self._record_ambiguous_dispatch(
+                pool,
+                stage_run_id=context.stage_run_id,
+                attempt_id=attempt_id,
+                error=exc,
+            )
+            return None, f"dispatch_outcome_unknown:{exc}"
+
+        try:
+            await self._persist_job_correlation(
+                pool,
+                stage_run_id=context.stage_run_id,
+                attempt_id=attempt_id,
+                job_id=job_id,
+            )
+        except Exception as exc:
+            await self._record_ambiguous_dispatch(
+                pool,
+                stage_run_id=context.stage_run_id,
+                attempt_id=attempt_id,
+                error=exc,
+            )
+            return None, f"dispatch_correlation_unknown:{exc}"
+        return job_id, None
 
     async def _status_once(self, *, headers: dict[str, str], job_id: str) -> dict[str, Any]:
         async with httpx.AsyncClient(
@@ -335,6 +522,41 @@ class ParticipantFaceExecutionService:
                 order by o.created_at desc limit 1""",
                 stage_run_id,
             )
+
+        if not job_id and context.stage_state == "generating":
+            recovered_job_id, recovery_error = await self._recover_dispatch_if_needed(
+                pool,
+                context=context,
+                latest_attempt=latest_attempt,
+                headers=headers,
+            )
+            if recovered_job_id:
+                job_id = recovered_job_id
+                async with pool.acquire() as conn:
+                    latest_attempt = await _latest_attempt(conn, stage_run_id=stage_run_id)
+            elif recovery_error:
+                # If recovery discovered a definitive 4xx, the stage was marked
+                # failed. Otherwise it stays generating and remains recoverable.
+                async with pool.acquire() as conn:
+                    refreshed = await load_face_stage_context(
+                        conn,
+                        account_id=account_id,
+                        workflow_id=workflow_id,
+                        stage_run_id=stage_run_id,
+                    )
+                return {
+                    "provider_state": "dispatching" if refreshed.stage_state == "generating" else "failed",
+                    "stage_state": refreshed.stage_state,
+                    "face_job_id": None,
+                    "attempt_id": str(latest_attempt["attempt_id"]) if latest_attempt else None,
+                    "attempt_no": int(latest_attempt["attempt_no"]) if latest_attempt else 0,
+                    "attempt_kind": str(latest_attempt["attempt_kind"]) if latest_attempt else None,
+                    "media_asset_id": str(existing["media_id"]) if existing else None,
+                    "review_item_id": str(existing["review_item_id"]) if existing and existing["review_item_id"] else None,
+                    "review_decision": str(existing["decision"]) if existing and existing["decision"] else None,
+                    "error": recovery_error,
+                }
+
         attempt_id = UUID(str(latest_attempt["attempt_id"])) if latest_attempt else None
         if not job_id:
             return {
