@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 from df_contracts.v3.studio_workflow import (
     ReviewDecision,
     StudioArtifactRef,
+    StudioCohortView,
     StudioReviewItem,
     StudioScopeType,
     StudioStageState,
@@ -41,7 +42,8 @@ class CanonicalStudioWorkflowStore:
     """Own durable studio handoffs and mandatory review gates.
 
     This store never calls Face, Audio or Fusion providers. Provider execution is
-    represented by existing C5 GenerationRequest/GenerationJob identifiers.
+    represented by existing service jobs/C5 identifiers. Successful outputs remain
+    individually durable and reviewable; dependency cohorts control progression.
     """
 
     async def create_workflow(self, conn, *, account_id: UUID, owner_user_id: UUID,
@@ -102,11 +104,21 @@ class CanonicalStudioWorkflowStore:
         await self.assert_startable(conn, stage_run_id=stage_run_id)
         result = await conn.execute(
             """update public.v3_studio_stage_runs set state='generating',updated_at=now()
-            where stage_run_id=$1 and state in ('pending','ready','rejected')""",
+            where stage_run_id=$1 and state in ('pending','ready','rejected','failed')""",
             stage_run_id,
         )
         if _updated_rows(result) == 0:
             raise StudioWorkflowError(f"stage_not_startable:{stage_run_id}")
+
+    async def mark_failed(self, conn, *, stage_run_id: UUID, error: str | None = None) -> None:
+        await conn.execute(
+            """update public.v3_studio_stage_runs
+            set state='failed',
+                metadata_json=coalesce(metadata_json,'{}'::jsonb) || jsonb_build_object('last_error',$2::text),
+                updated_at=now()
+            where stage_run_id=$1""",
+            stage_run_id, str(error or "generation_failed")[:4000],
+        )
 
     async def attach_output(self, conn, *, stage_run_id: UUID,
                             media_id: UUID, output_role: str) -> UUID:
@@ -241,9 +253,35 @@ class CanonicalStudioWorkflowStore:
             metadata=dict(row["metadata_json"] or {}), created_at=row["created_at"], updated_at=row["updated_at"],
         )
 
+    @staticmethod
+    def _face_cohort(stages: tuple[StudioStageView, ...]) -> StudioCohortView | None:
+        face_stages = tuple(stage for stage in stages if stage.stage_type == StudioStageType.FACE)
+        if not face_stages:
+            return None
+        state_counts = {state: 0 for state in StudioStageState}
+        for stage in face_stages:
+            state_counts[stage.state] += 1
+        approved = tuple(stage.stage_run_id for stage in face_stages if stage.state == StudioStageState.APPROVED)
+        return StudioCohortView(
+            cohort_key="face_cast",
+            stage_type=StudioStageType.FACE,
+            downstream_stage_type=StudioStageType.AUDIO,
+            required_total=len(face_stages),
+            approved_total=len(approved),
+            awaiting_review_total=state_counts[StudioStageState.AWAITING_REVIEW],
+            generating_total=state_counts[StudioStageState.GENERATING],
+            failed_total=state_counts[StudioStageState.FAILED],
+            rejected_total=state_counts[StudioStageState.REJECTED],
+            pending_total=state_counts[StudioStageState.PENDING] + state_counts[StudioStageState.READY],
+            satisfied=len(approved) == len(face_stages),
+            required_stage_run_ids=tuple(stage.stage_run_id for stage in face_stages),
+            approved_stage_run_ids=approved,
+        )
+
     async def get_workflow(self, conn, *, workflow_id: UUID, account_id: UUID) -> StudioWorkflowView:
         workflow = await conn.fetchrow(
-            """select workflow_id,account_id,owner_user_id,project_id,story_id,state,current_stage,final_media_id,created_at,updated_at
+            """select workflow_id,account_id,owner_user_id,project_id,story_id,state,current_stage,
+                      final_media_id,metadata_json,created_at,updated_at
             from public.v3_studio_workflows where workflow_id=$1 and account_id=$2""",
             workflow_id, account_id,
         )
@@ -254,14 +292,32 @@ class CanonicalStudioWorkflowStore:
             workflow_id,
         )
         stages = tuple([await self._stage_view(conn, row) for row in rows])
-        pending_review = any(stage.state == StudioStageState.AWAITING_REVIEW for stage in stages)
+        face_cohort = self._face_cohort(stages)
+        cohorts = (face_cohort,) if face_cohort is not None else ()
+
+        if face_cohort is not None and not face_cohort.satisfied:
+            if face_cohort.awaiting_review_total:
+                next_action = "review_face_outputs"
+            elif face_cohort.failed_total or face_cohort.rejected_total:
+                next_action = "retry_or_regenerate_face_outputs"
+            elif face_cohort.generating_total:
+                next_action = "wait_for_face_generation"
+            else:
+                next_action = "generate_faces"
+        else:
+            pending_review = any(stage.state == StudioStageState.AWAITING_REVIEW for stage in stages)
+            next_action = "review_stage_output" if pending_review else "generate_audio"
+
         return StudioWorkflowView(
             workflow_id=UUID(str(workflow["workflow_id"])), account_id=UUID(str(workflow["account_id"])),
             owner_user_id=UUID(str(workflow["owner_user_id"])), project_id=UUID(str(workflow["project_id"])),
             story_id=UUID(str(workflow["story_id"])) if workflow["story_id"] else None,
             state=StudioWorkflowState(str(workflow["state"])),
             current_stage=StudioStageType(str(workflow["current_stage"])) if workflow["current_stage"] else None,
-            stages=stages, final_media_id=UUID(str(workflow["final_media_id"])) if workflow["final_media_id"] else None,
-            next_action="review_stage_output" if pending_review else None,
+            stages=stages,
+            cohorts=cohorts,
+            metadata=dict(workflow["metadata_json"] or {}),
+            final_media_id=UUID(str(workflow["final_media_id"])) if workflow["final_media_id"] else None,
+            next_action=next_action,
             created_at=workflow["created_at"], updated_at=workflow["updated_at"],
         )
