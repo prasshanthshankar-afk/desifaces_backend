@@ -105,6 +105,28 @@ class StudioStageView(V3ContractModel):
         return self
 
 
+class StudioCohortView(V3ContractModel):
+    """Deterministic readiness barrier over a required set of stage outputs.
+
+    Output success/billing/retry remains atomic at the individual stage/attempt.
+    Cohort satisfaction alone controls downstream eligibility.
+    """
+
+    cohort_key: str = Field(min_length=1, max_length=100)
+    stage_type: StudioStageType
+    downstream_stage_type: StudioStageType | None = None
+    required_total: int = Field(ge=0)
+    approved_total: int = Field(ge=0)
+    awaiting_review_total: int = Field(ge=0)
+    generating_total: int = Field(ge=0)
+    failed_total: int = Field(ge=0)
+    rejected_total: int = Field(ge=0)
+    pending_total: int = Field(ge=0)
+    satisfied: bool
+    required_stage_run_ids: tuple[UUID, ...] = ()
+    approved_stage_run_ids: tuple[UUID, ...] = ()
+
+
 class StudioWorkflowView(V3ContractModel):
     workflow_id: UUID
     account_id: UUID
@@ -114,6 +136,8 @@ class StudioWorkflowView(V3ContractModel):
     state: StudioWorkflowState
     current_stage: StudioStageType | None = None
     stages: tuple[StudioStageView, ...] = ()
+    cohorts: tuple[StudioCohortView, ...] = ()
+    metadata: dict[str, Any] = Field(default_factory=dict)
     final_media_id: UUID | None = None
     next_action: str | None = None
     created_at: datetime
