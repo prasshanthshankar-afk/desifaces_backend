@@ -16,7 +16,7 @@ from df_contracts.v3.story import (
 from df_contracts.v3.studio_workflow import (
     StudioScopeType, StudioStageState, StudioStageType, StudioStageView,
 )
-from desifaces_shared.v3.studio_workflow_store import _updated_rows
+from desifaces_shared.v3.studio_workflow_store import CanonicalStudioWorkflowStore, _updated_rows
 
 
 def now():
@@ -64,11 +64,13 @@ def graph_2p_2scene() -> StoryGraph:
 class RecordingStore:
     def __init__(self):
         self.workflow_id = uuid4()
+        self.workflow_kwargs = None
         self.stages = []
         self.dependencies = []
         self.state = None
 
     async def create_workflow(self, conn, **kwargs):
+        self.workflow_kwargs = kwargs
         return self.workflow_id
 
     async def add_stage(self, conn, **kwargs):
@@ -83,7 +85,7 @@ class RecordingStore:
         self.state = kwargs
 
 
-def test_story_builds_face_audio_fusion_and_final_hitl_dag():
+def test_story_builds_all_in_face_barrier_audio_fusion_and_final_hitl_dag():
     from app.studio_workflow import build_story_studio_workflow
 
     async def run():
@@ -93,6 +95,13 @@ def test_story_builds_face_audio_fusion_and_final_hitl_dag():
             None, graph=graph, owner_user_id=graph.project.owner_user_id, store=store
         )
         assert workflow_id == store.workflow_id
+        manifest = store.workflow_kwargs["metadata"]["execution_manifest"]
+        assert manifest["face_gate_scope"] == "story_cast"
+        assert manifest["required_face_count"] == 2
+        assert manifest["audio_requires_complete_face_cohort"] is True
+        assert manifest["retry_policy"] == "retry_failed_or_rejected_slot_only"
+        assert manifest["approved_output_policy"] == "lock_and_reuse"
+
         by_type = {}
         for stage_id, kwargs in store.stages:
             by_type.setdefault(kwargs["stage_type"], []).append((stage_id, kwargs))
@@ -111,13 +120,47 @@ def test_story_builds_face_audio_fusion_and_final_hitl_dag():
         face_ids = {x[0] for x in by_type[StudioStageType.FACE]}
         audio_ids = {x[0] for x in by_type[StudioStageType.AUDIO]}
         fusion_ids = {x[0] for x in by_type[StudioStageType.FUSION]}
-        assert all(parents[a] <= face_ids and len(parents[a]) == 1 for a in audio_ids)
+
+        # Hard invariant: every Story Audio stage waits for the complete Face cast,
+        # not just the speaker's Face stage.
+        assert all(parents[a] == face_ids for a in audio_ids)
         assert all((parents[f] & face_ids) and (parents[f] & audio_ids) for f in fusion_ids)
         final_id = by_type[StudioStageType.STORY_FINAL][0][0]
         assert parents[final_id] == fusion_ids
         assert store.state["current_stage"] is StudioStageType.FACE
 
     asyncio.run(run())
+
+
+def test_face_cohort_requires_every_face_approved():
+    workflow_id = uuid4()
+    p1, p2 = uuid4(), uuid4()
+    stages = (
+        StudioStageView(
+            stage_run_id=uuid4(), workflow_id=workflow_id, stage_type=StudioStageType.FACE,
+            scope_type=StudioScopeType.PARTICIPANT, participant_id=p1,
+            state=StudioStageState.APPROVED, created_at=now(), updated_at=now(),
+        ),
+        StudioStageView(
+            stage_run_id=uuid4(), workflow_id=workflow_id, stage_type=StudioStageType.FACE,
+            scope_type=StudioScopeType.PARTICIPANT, participant_id=p2,
+            state=StudioStageState.FAILED, created_at=now(), updated_at=now(),
+        ),
+    )
+    cohort = CanonicalStudioWorkflowStore._face_cohort(stages)
+    assert cohort is not None
+    assert cohort.required_total == 2
+    assert cohort.approved_total == 1
+    assert cohort.failed_total == 1
+    assert cohort.satisfied is False
+
+    approved = tuple(
+        stage.model_copy(update={"state": StudioStageState.APPROVED}) for stage in stages
+    )
+    cohort = CanonicalStudioWorkflowStore._face_cohort(approved)
+    assert cohort.required_total == 2
+    assert cohort.approved_total == 2
+    assert cohort.satisfied is True
 
 
 def test_stage_scope_contract_rejects_extraneous_ids():
