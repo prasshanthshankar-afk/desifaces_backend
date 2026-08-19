@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 from uuid import uuid4
 
@@ -148,7 +149,49 @@ def test_rejected_successful_attempt_is_never_reactivated(monkeypatch):
     asyncio.run(run())
 
 
-def test_stage_attempt_migration_has_atomic_retry_guards():
+def test_same_studio_attempt_is_propagated_as_face_request_nonce():
+    from app.participant_face import FaceStudioClient
+
+    source = inspect.getsource(FaceStudioClient.create_job)
+    assert "request_nonce" in source
+    assert 'resolved_input["request_nonce"] = str(request_nonce)' in source
+    assert "request_hash" in FaceStudioClient.create_job.__doc__
+
+
+def test_dispatch_error_classification_preserves_ambiguous_attempts():
+    from app.face_execution import ParticipantFaceBridgeError, _definitive_dispatch_rejection
+
+    assert _definitive_dispatch_rejection(
+        ParticipantFaceBridgeError("face_generate_failed:400:bad request")
+    ) is True
+    assert _definitive_dispatch_rejection(
+        ParticipantFaceBridgeError("face_generate_failed:402:insufficient credits")
+    ) is True
+    assert _definitive_dispatch_rejection(
+        ParticipantFaceBridgeError("face_generate_failed:500:upstream error")
+    ) is False
+    assert _definitive_dispatch_rejection(TimeoutError("socket timeout")) is False
+
+
+def test_c5_face_binding_precedes_provider_and_attaches_media():
+    from app.face_execution_canonical import ParticipantFaceExecutionService
+    from app.face_generation import CanonicalFaceGeneration
+
+    dispatch_source = inspect.getsource(ParticipantFaceExecutionService.dispatch)
+    attach_source = inspect.getsource(CanonicalFaceGeneration.attach_output)
+    ensure_source = inspect.getsource(CanonicalFaceGeneration.ensure)
+
+    assert "self.canonical.ensure" in dispatch_source
+    assert dispatch_source.index("self.canonical.ensure") < dispatch_source.index("self.face_client.create_job")
+    assert "create_request_and_root_job" in ensure_source
+    assert "v3_studio_stage_attempts" in ensure_source
+    assert "generation_request_id" in ensure_source
+    assert "generation_job_id" in ensure_source
+    assert "self.generations.attach_media" in attach_source
+    assert 'relation="output"' in attach_source
+
+
+def test_stage_attempt_migration_has_atomic_retry_and_c5_guards():
     migration = (
         Path(__file__).resolve().parents[1]
         / "migrations"
@@ -158,3 +201,7 @@ def test_stage_attempt_migration_has_atomic_retry_guards():
     assert "attempt_kind IN ('initial','retry','regenerate')" in migration
     assert "state IN ('dispatching','queued','running','succeeded','failed','canceled')" in migration
     assert "uq_v3_studio_stage_attempt_provider_job" in migration
+    assert "generation_id uuid" in migration
+    assert "generation_job_id uuid" in migration
+    assert "REFERENCES public.v3_generation_requests(generation_id)" in migration
+    assert "REFERENCES public.v3_generation_jobs(job_id)" in migration
