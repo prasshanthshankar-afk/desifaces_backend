@@ -98,9 +98,9 @@ jobs:
           bash -n scripts/v3-mps-functional-test.sh
           bash -n scripts/v3-mps2-visual-face-proof.sh
 
-      - name: Run canonical foundation unit tests
+      - name: Run canonical and Director unit tests
         env:
-          PYTHONPATH: .:services/shared:services/shared/python:services/svc-director/app:services/svc-face/app
+          PYTHONPATH: .:services/shared:services/shared/python:services/svc-director/app
         run: |
           python -m pytest -q \
             test/test_v3_adapter_primitives.py \
@@ -116,5 +116,9 @@ jobs:
             test/test_v3_participant_ref_normalization.py \
             test/test_v3_studio_hitl_workflow.py \
             test/test_v3_participant_face_bridge.py \
-            test/test_v3_face_execution_policy.py \
-            test/test_v3_face_creator_config_hydration.py
+            test/test_v3_face_execution_policy.py
+
+      - name: Run Face model hydration tests in isolated app package
+        env:
+          PYTHONPATH: .:services/shared:services/shared/python:services/svc-face/app
+        run: python -m pytest -q test/test_v3_face_creator_config_hydration.py
