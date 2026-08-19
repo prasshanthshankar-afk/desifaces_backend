@@ -106,6 +106,67 @@ def compile_context_face_input(context: FaceStageContext) -> dict[str, Any]:
     )
 
 
+async def _create_attempt(
+    conn,
+    *,
+    stage_run_id: UUID,
+    attempt_no: int,
+    attempt_kind: str,
+    quote_id: str,
+    preview_fingerprint: str | None,
+) -> UUID:
+    row = await conn.fetchrow(
+        """insert into public.v3_studio_stage_attempts(
+          stage_run_id,attempt_no,attempt_kind,state,provider_service,
+          pricing_quote_id,preview_fingerprint,metadata_json
+        ) values($1,$2,$3,'dispatching','svc-face',$4,$5,'{}'::jsonb)
+        returning attempt_id""",
+        stage_run_id,
+        attempt_no,
+        attempt_kind,
+        quote_id,
+        preview_fingerprint,
+    )
+    return UUID(str(row["attempt_id"]))
+
+
+async def _update_attempt(
+    conn,
+    *,
+    attempt_id: UUID,
+    state: str,
+    provider_job_ref: str | None = None,
+    media_id: UUID | None = None,
+    error_message: str | None = None,
+) -> None:
+    terminal = state in {"succeeded", "failed", "canceled"}
+    await conn.execute(
+        """update public.v3_studio_stage_attempts
+        set state=$2,
+            provider_job_ref=coalesce($3,provider_job_ref),
+            media_id=coalesce($4,media_id),
+            error_message=$5,
+            completed_at=case when $6::boolean then coalesce(completed_at,now()) else completed_at end,
+            updated_at=now()
+        where attempt_id=$1""",
+        attempt_id,
+        state,
+        provider_job_ref,
+        media_id,
+        str(error_message)[:4000] if error_message else None,
+        terminal,
+    )
+
+
+async def _latest_attempt(conn, *, stage_run_id: UUID):
+    return await conn.fetchrow(
+        """select attempt_id,attempt_no,attempt_kind,state,provider_job_ref,media_id
+        from public.v3_studio_stage_attempts
+        where stage_run_id=$1 order by attempt_no desc limit 1""",
+        stage_run_id,
+    )
+
+
 class ParticipantFaceExecutionService:
     """Nonblocking control-plane bridge for one Participant Face output slot.
 
@@ -149,7 +210,7 @@ class ParticipantFaceExecutionService:
         headers: dict[str, str],
         quote_id: str,
         preview_fingerprint: str | None,
-    ) -> tuple[FaceStageContext, str, int, str]:
+    ) -> tuple[FaceStageContext, str, int, str, UUID]:
         async with pool.acquire() as conn:
             async with conn.transaction():
                 context = await load_face_stage_context(
@@ -162,9 +223,20 @@ class ParticipantFaceExecutionService:
                 prior_state = context.stage_state
                 if prior_state not in {"pending", "ready", "failed", "rejected"}:
                     raise ParticipantFaceBridgeError(f"face_stage_not_dispatchable:{prior_state}")
-                attempt_count = int(context.metadata.get("face_attempt_count") or 0) + 1
+                attempt_count = int(await conn.fetchval(
+                    "select coalesce(max(attempt_no),0)+1 from public.v3_studio_stage_attempts where stage_run_id=$1",
+                    stage_run_id,
+                ))
                 attempt_kind = "initial" if attempt_count == 1 else (
                     "regenerate" if prior_state == "rejected" else "retry"
+                )
+                attempt_id = await _create_attempt(
+                    conn,
+                    stage_run_id=stage_run_id,
+                    attempt_no=attempt_count,
+                    attempt_kind=attempt_kind,
+                    quote_id=quote_id,
+                    preview_fingerprint=preview_fingerprint,
                 )
                 await self.store.mark_generating(conn, stage_run_id=stage_run_id)
                 await conn.execute(
@@ -175,6 +247,7 @@ class ParticipantFaceExecutionService:
                     json.dumps({
                         "face_attempt_count": attempt_count,
                         "face_attempt_kind": attempt_kind,
+                        "face_attempt_id": str(attempt_id),
                         "face_quote_id": quote_id,
                         "face_preview_fingerprint": preview_fingerprint,
                         "compatibility_face_job_id": None,
@@ -194,18 +267,32 @@ class ParticipantFaceExecutionService:
             )
         except Exception as exc:
             async with pool.acquire() as conn:
-                await self.store.mark_failed(conn, stage_run_id=stage_run_id, error=str(exc))
+                async with conn.transaction():
+                    await _update_attempt(
+                        conn,
+                        attempt_id=attempt_id,
+                        state="failed",
+                        error_message=str(exc),
+                    )
+                    await self.store.mark_failed(conn, stage_run_id=stage_run_id, error=str(exc))
             raise
 
         async with pool.acquire() as conn:
-            await conn.execute(
-                """update public.v3_studio_stage_runs
-                set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $2::jsonb,updated_at=now()
-                where stage_run_id=$1""",
-                stage_run_id,
-                json.dumps({"compatibility_face_job_id": job_id}),
-            )
-        return context, job_id, attempt_count, attempt_kind
+            async with conn.transaction():
+                await _update_attempt(
+                    conn,
+                    attempt_id=attempt_id,
+                    state="queued",
+                    provider_job_ref=job_id,
+                )
+                await conn.execute(
+                    """update public.v3_studio_stage_runs
+                    set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $2::jsonb,updated_at=now()
+                    where stage_run_id=$1""",
+                    stage_run_id,
+                    json.dumps({"compatibility_face_job_id": job_id}),
+                )
+        return context, job_id, attempt_count, attempt_kind, attempt_id
 
     async def _status_once(self, *, headers: dict[str, str], job_id: str) -> dict[str, Any]:
         async with httpx.AsyncClient(
@@ -233,7 +320,12 @@ class ParticipantFaceExecutionService:
             context = await load_face_stage_context(
                 conn, account_id=account_id, workflow_id=workflow_id, stage_run_id=stage_run_id,
             )
-            job_id = str(context.metadata.get("compatibility_face_job_id") or "").strip()
+            latest_attempt = await _latest_attempt(conn, stage_run_id=stage_run_id)
+            job_id = str(
+                (latest_attempt["provider_job_ref"] if latest_attempt else None)
+                or context.metadata.get("compatibility_face_job_id")
+                or ""
+            ).strip()
             existing = await conn.fetchrow(
                 """select o.media_id,r.review_item_id,r.decision
                 from public.v3_studio_stage_outputs o
@@ -243,11 +335,15 @@ class ParticipantFaceExecutionService:
                 order by o.created_at desc limit 1""",
                 stage_run_id,
             )
+        attempt_id = UUID(str(latest_attempt["attempt_id"])) if latest_attempt else None
         if not job_id:
             return {
                 "provider_state": None,
                 "stage_state": context.stage_state,
                 "face_job_id": None,
+                "attempt_id": str(attempt_id) if attempt_id else None,
+                "attempt_no": int(latest_attempt["attempt_no"]) if latest_attempt else 0,
+                "attempt_kind": str(latest_attempt["attempt_kind"]) if latest_attempt else None,
                 "media_asset_id": str(existing["media_id"]) if existing else None,
                 "review_item_id": str(existing["review_item_id"]) if existing and existing["review_item_id"] else None,
                 "review_decision": str(existing["decision"]) if existing and existing["decision"] else None,
@@ -255,10 +351,23 @@ class ParticipantFaceExecutionService:
 
         status_payload = await self._status_once(headers=headers, job_id=job_id)
         provider_state = str(status_payload.get("status") or "").strip().lower()
+        attempt_state = {
+            "pending": "queued",
+            "queued": "queued",
+            "running": "running",
+            "processing": "running",
+            "succeeded": "succeeded",
+            "failed": "failed",
+            "cancelled": "canceled",
+            "canceled": "canceled",
+        }.get(provider_state)
         response: dict[str, Any] = {
             "provider_state": provider_state,
             "stage_state": context.stage_state,
             "face_job_id": job_id,
+            "attempt_id": str(attempt_id) if attempt_id else None,
+            "attempt_no": int(latest_attempt["attempt_no"]) if latest_attempt else 0,
+            "attempt_kind": str(latest_attempt["attempt_kind"]) if latest_attempt else None,
             "media_asset_id": str(existing["media_id"]) if existing else None,
             "review_item_id": str(existing["review_item_id"]) if existing and existing["review_item_id"] else None,
             "review_decision": str(existing["decision"]) if existing and existing["decision"] else None,
@@ -271,7 +380,6 @@ class ParticipantFaceExecutionService:
             variant = dict(variants[0])
             media_asset_id = UUID(str(variant["media_asset_id"]))
             if not existing or str(existing["media_id"]) != str(media_asset_id):
-                # Never attach a newly observed output to an already approved slot.
                 if context.stage_state == "approved":
                     raise ParticipantFaceBridgeError("approved_face_stage_cannot_accept_new_output")
                 async with pool.acquire() as conn:
@@ -286,11 +394,28 @@ class ParticipantFaceExecutionService:
                             face_profile_id=str(variant.get("face_profile_id") or ""),
                             prompt_used=str(variant.get("prompt_used") or ""),
                         )
+                        if attempt_id:
+                            await _update_attempt(
+                                conn,
+                                attempt_id=attempt_id,
+                                state="succeeded",
+                                provider_job_ref=job_id,
+                                media_id=media_asset_id,
+                            )
                 response["review_item_id"] = str(review_item_id)
                 response["review_decision"] = "pending"
                 stage_state = "awaiting_review"
             else:
                 stage_state = context.stage_state
+                if attempt_id and str(latest_attempt["state"]) != "succeeded":
+                    async with pool.acquire() as conn:
+                        await _update_attempt(
+                            conn,
+                            attempt_id=attempt_id,
+                            state="succeeded",
+                            provider_job_ref=job_id,
+                            media_id=media_asset_id,
+                        )
             response.update({
                 "stage_state": stage_state,
                 "media_asset_id": str(media_asset_id),
@@ -302,15 +427,31 @@ class ParticipantFaceExecutionService:
             return response
 
         if provider_state in {"failed", "cancelled", "canceled"}:
-            # A stale status sync must never downgrade an already approved output.
             if context.stage_state != "approved":
                 error = status_payload.get("error") or status_payload.get("message") or "face_generation_failed"
                 async with pool.acquire() as conn:
-                    await self.store.mark_failed(conn, stage_run_id=stage_run_id, error=str(error))
+                    async with conn.transaction():
+                        if attempt_id and str(latest_attempt["state"]) not in {"failed", "canceled"}:
+                            await _update_attempt(
+                                conn,
+                                attempt_id=attempt_id,
+                                state="canceled" if provider_state in {"cancelled", "canceled"} else "failed",
+                                provider_job_ref=job_id,
+                                error_message=str(error),
+                            )
+                        await self.store.mark_failed(conn, stage_run_id=stage_run_id, error=str(error))
                 response["stage_state"] = "failed"
                 response["error"] = error
             response["pricing"] = status_payload.get("pricing")
             return response
 
+        if attempt_id and attempt_state and str(latest_attempt["state"]) not in {"succeeded", "failed", "canceled"}:
+            async with pool.acquire() as conn:
+                await _update_attempt(
+                    conn,
+                    attempt_id=attempt_id,
+                    state=attempt_state,
+                    provider_job_ref=job_id,
+                )
         response["pricing"] = status_payload.get("pricing")
         return response
