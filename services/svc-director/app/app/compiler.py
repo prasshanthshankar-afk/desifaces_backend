@@ -27,6 +27,26 @@ def _id(thread_id: str, kind: str, key: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"desifaces:v3:director:{thread_id}:{kind}:{key}")
 
 
+def _explicit_face_constraints(brief: CreativeBrief, display_name: str) -> dict[str, Any]:
+    """Carry only explicit, Face-relevant user hints into durable Participant state.
+
+    These values are never inferred from name, role, locale or geography. Sensitive
+    identifiers and arbitrary prompt fields are deliberately excluded.
+    """
+    allowed = ("age", "age_range", "age_range_code", "age_presentation", "gender", "gender_presentation")
+    for raw in brief.participant_hints:
+        hint = dict(raw or {})
+        if str(hint.get("display_name") or "").strip() != str(display_name or "").strip():
+            continue
+        out: dict[str, Any] = {}
+        for key in allowed:
+            value = hint.get(key)
+            if value is not None and str(value).strip():
+                out[key] = value
+        return out
+    return {}
+
+
 class CanonicalStoryCompiler:
     """Compile a validated AI plan into canonical relational Story state.
 
@@ -156,6 +176,7 @@ class CanonicalStoryCompiler:
                             project_id,
                         )
 
+                    explicit_constraints = _explicit_face_constraints(brief, item.display_name)
                     if row:
                         participant = Participant(
                             participant_id=row["participant_id"],
@@ -190,6 +211,7 @@ class CanonicalStoryCompiler:
                                 "created_by": "creative_director",
                                 "visual_direction": item.visual_direction,
                                 "voice_direction": item.voice_direction,
+                                "explicit_face_constraints": explicit_constraints,
                             },
                             created_at=now,
                             updated_at=now,
