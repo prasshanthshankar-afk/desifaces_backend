@@ -18,5 +18,6 @@ def create_director_graph(business_pool, checkpointer):
         compiler=CanonicalStoryCompiler(business_pool),
         require_human_review=settings.DF_DIRECTOR_REVIEW_REQUIRED,
         max_revisions=max(0, settings.DF_DIRECTOR_MAX_REVISIONS),
+        blocking_critic=settings.DF_DIRECTOR_BLOCKING_CRITIC,
     )
     return build_creative_director_graph(runtime, checkpointer=checkpointer)
