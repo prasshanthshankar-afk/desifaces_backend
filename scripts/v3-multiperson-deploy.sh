@@ -61,7 +61,7 @@ jq -e '.paths["/api/longform/v3/scene-stitch"]' /tmp/fusion-extension-openapi.js
 echo "ROUTES=PASS"
 
 echo "===== FUSION CONFIRMED-QUOTE BRIDGE ====="
-docker exec df-v3-svc-fusion python - <<'PY'
+docker exec -i df-v3-svc-fusion python - <<'PY'
 from app.services.v3_pricing_bridge import ConfirmedFusionJobCreate
 fields = getattr(ConfirmedFusionJobCreate, "model_fields", {})
 assert "pricing_confirmation" in fields
