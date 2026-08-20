@@ -231,32 +231,16 @@ async def set_participant_voice_profile(
                     {
                         "audio_voice_selection_source": "user",
                         "audio_voice_gender": catalog_gender,
+                        "audio_voice_locale": voice_locale,
                     }
                 ),
             )
 
-            # Language/locale is a participant-level Audio Studio choice. Keep all
-            # of this participant's pending story turns on the same selected locale
-            # so the existing per-turn synthesis bridge receives one durable voice
-            # identity and locale across the conversation.
-            await conn.execute(
-                """
-                update public.v3_dialogue_turns dt
-                set locale=$3
-                where dt.speaker_participant_id=$2
-                  and dt.turn_id in (
-                    select s.dialogue_turn_id
-                    from public.v3_studio_stage_runs s
-                    where s.workflow_id=$1
-                      and s.stage_type='audio'
-                      and s.scope_type='dialogue_turn'
-                      and s.dialogue_turn_id is not null
-                  )
-                """,
-                workflow_id,
-                participant_id,
-                voice_locale,
-            )
+            # Important: do not rewrite v3_dialogue_turns.locale here. That field
+            # is the canonical language of the authored dialogue. The participant
+            # voice_locale is the target speech locale and the runtime bridge
+            # requests translation explicitly when source and target languages
+            # differ.
 
     return {
         "workflow_id": str(workflow_id),
