@@ -124,9 +124,13 @@ async def build_story_studio_workflow(
     for turn in graph.dialogue_turns:
         if turn.kind != DialogueTurnKind.SPEECH:
             continue
+        if turn.speaker_participant_id is None:
+            raise ValueError(f"speech_turn_requires_speaker:{turn.turn_id}")
         stage_id = await store.add_stage(
             conn, workflow_id=workflow_id, stage_type=StudioStageType.AUDIO,
-            scope_type=StudioScopeType.DIALOGUE_TURN, dialogue_turn_id=turn.turn_id,
+            scope_type=StudioScopeType.DIALOGUE_TURN,
+            participant_id=turn.speaker_participant_id,
+            dialogue_turn_id=turn.turn_id,
             metadata={
                 "review_required": True,
                 "speaker_participant_id": str(turn.speaker_participant_id),
