@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     DF_DIRECTOR_EMBEDDING_MODEL: str = ""
     DF_DIRECTOR_REVIEW_REQUIRED: bool = True
     DF_DIRECTOR_MAX_REVISIONS: int = 3
+    # Interactive Studio UX is human-review gated already. Keep the LLM critic
+    # available for deeper validation, but do not block the first draft on it by
+    # default. This reduces a simple Ask Creative Director request to one LLM call.
+    DF_DIRECTOR_BLOCKING_CRITIC: bool = False
     DF_DIRECTOR_CHECKPOINTER_AUTO_SETUP: bool = True
 
     # Director is control-plane only. Each Studio remains execution/pricing owner.
