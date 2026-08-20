@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from uuid import UUID
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -44,6 +45,14 @@ async def run_forever() -> None:
             run_id = UUID(str(run["run_id"]))
             thread_id = str(run["thread_id"])
             config = {"configurable": {"thread_id": thread_id}}
+            started = time.perf_counter()
+            is_resume = bool(run["resume_json"])
+            logger.info(
+                "director_run_started run_id=%s thread_id=%s mode=%s",
+                run_id,
+                thread_id,
+                "resume" if is_resume else "initial",
+            )
             try:
                 resume_json = dict(run["resume_json"] or {}) if run["resume_json"] else None
                 if resume_json is not None:
@@ -66,6 +75,7 @@ async def run_forever() -> None:
                 async with business_pool.acquire() as conn:
                     if _has_interrupt(result):
                         await store.mark_awaiting_review(conn, run_id=run_id)
+                        outcome = "awaiting_review"
                     elif str(result.get("phase") or "") == DirectorRunState.READY.value:
                         workspace = dict(result.get("workspace") or {})
                         await store.mark_ready(
@@ -74,16 +84,33 @@ async def run_forever() -> None:
                             project_id=UUID(str(workspace["project_id"])) if workspace.get("project_id") else None,
                             story_id=UUID(str(workspace["story_id"])) if workspace.get("story_id") else None,
                         )
+                        outcome = "ready"
                     else:
                         await store.mark_failed(
                             conn,
                             run_id=run_id,
                             error=f"director_run_ended_without_interrupt_or_ready:{result.get('phase')}",
                         )
+                        outcome = "failed"
+                logger.info(
+                    "director_run_completed run_id=%s thread_id=%s mode=%s outcome=%s duration_ms=%d",
+                    run_id,
+                    thread_id,
+                    "resume" if is_resume else "initial",
+                    outcome,
+                    int((time.perf_counter() - started) * 1000),
+                )
             except Exception as exc:
                 logger.exception("director_run_failed run_id=%s thread_id=%s", run_id, thread_id)
                 async with business_pool.acquire() as conn:
                     await store.mark_failed(conn, run_id=run_id, error=f"{type(exc).__name__}:{exc}")
+                logger.info(
+                    "director_run_completed run_id=%s thread_id=%s mode=%s outcome=failed duration_ms=%d",
+                    run_id,
+                    thread_id,
+                    "resume" if is_resume else "initial",
+                    int((time.perf_counter() - started) * 1000),
+                )
     finally:
         await close_pools()
 
