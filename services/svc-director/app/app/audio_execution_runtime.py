@@ -1,10 +1,9 @@
-"""Runtime patch for participant-level Audio Studio language/voice selection.
+"""Runtime patch for participant-level Story Audio language/voice selection.
 
-The canonical dialogue-turn locale remains the source language of the written
-story. ``v3_participants.voice_locale`` is the user-selected target speech
-locale. When the base languages differ, svc-audio receives an explicit
-translation request before synthesis. This preserves canonical story text while
-letting one durable character voice profile drive every dialogue turn.
+For Story workflows, the canonical dialogue-turn locale remains the source
+language and ``v3_participants.voice_locale`` is the user-selected target speech
+locale. Direct/single-person Studio behavior remains unchanged unless an explicit
+participant voice profile is already present.
 """
 
 from __future__ import annotations
@@ -39,27 +38,32 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def compile_context_audio_input(context: _audio_execution.AudioStageContext) -> dict:
-    # Multi-person Story Audio must never silently synthesize with a provider
+    is_story_audio = context.story_id is not None
+
+    # Multi-person/Story Audio must never silently synthesize with a provider
     # default voice. The user explicitly chooses one durable language + voice
     # profile for each speaking participant before pricing/generation.
-    if not str(context.voice_profile_ref or "").strip() or not str(context.voice_locale or "").strip():
+    if is_story_audio and (
+        not str(context.voice_profile_ref or "").strip()
+        or not str(context.voice_locale or "").strip()
+    ):
         raise _audio_execution.ParticipantAudioBridgeError(
             f"audio_participant_voice_profile_required:{context.participant_id}"
         )
 
     studio_input = dict(_original_compile_context_audio_input(context))
-
-    # load_audio_stage_context resolves dialogue-turn locale first, so before any
-    # voice-locale override it is the durable language of the authored dialogue.
     source_locale = str(context.target_locale or "").strip()
-    target_locale = str(context.voice_locale or "").strip()
-
     if not source_locale:
         raise _audio_execution.ParticipantAudioBridgeError("audio_source_locale_required")
+
+    # Keep the direct/single-person path backward compatible. Story workflows use
+    # the explicit character voice locale as target speech language.
+    target_locale = str(context.voice_locale or source_locale).strip()
     if not target_locale:
         raise _audio_execution.ParticipantAudioBridgeError("audio_target_locale_required")
 
-    studio_input["voice_id"] = str(context.voice_profile_ref).strip()
+    if context.voice_profile_ref:
+        studio_input["voice_id"] = str(context.voice_profile_ref).strip()
     studio_input["source_language"] = source_locale
     studio_input["target_locale"] = target_locale
     studio_input["voice_locale"] = target_locale
