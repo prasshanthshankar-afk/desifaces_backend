@@ -116,6 +116,8 @@ async def health():
         "llm_configured": bool(settings.DF_DIRECTOR_LLM_MODEL),
         "embedding_configured": bool(settings.DF_DIRECTOR_EMBEDDING_MODEL),
         "review_required": settings.DF_DIRECTOR_REVIEW_REQUIRED,
+        "blocking_critic": settings.DF_DIRECTOR_BLOCKING_CRITIC,
+        "max_revisions": max(0, settings.DF_DIRECTOR_MAX_REVISIONS),
         "runtime_ready": app.state.director_graph is not None,
         "configuration_error": app.state.director_config_error,
     }
