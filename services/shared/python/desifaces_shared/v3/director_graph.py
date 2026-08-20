@@ -74,6 +74,10 @@ class CreativeDirectorRuntime:
     compiler: CreativeCompiler
     require_human_review: bool = True
     max_revisions: int = 3
+    # When false, the first structured plan goes directly to the mandatory
+    # human-review gate. This keeps interactive Studio creation to one LLM call
+    # per user action while preserving the optional critic path for deeper review.
+    blocking_critic: bool = True
 
 
 def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpointer=None):
@@ -123,8 +127,17 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
     async def revise_story(state: DirectorState) -> DirectorState:
         brief = CreativeBrief.model_validate(state["brief"])
         plan = CreativeStoryPlan.model_validate(state["plan"])
-        critique = CreativeCritique.model_validate(state.get("critique") or {"score": 0, "ready": False})
-        feedback = state.get("review_feedback") or "\n".join(critique.revision_instructions or critique.issues)
+        critique_raw = state.get("critique")
+        critique = (
+            CreativeCritique.model_validate(critique_raw)
+            if critique_raw
+            else None
+        )
+        feedback = state.get("review_feedback") or (
+            "\n".join(critique.revision_instructions or critique.issues)
+            if critique is not None
+            else ""
+        )
         revised = await runtime.planner.plan(
             brief=brief,
             retrieved_context=dict(state.get("retrieved_context") or {}),
@@ -136,6 +149,9 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
             "plan": revised.model_dump(mode="json"),
             "revision_count": int(state.get("revision_count") or 0) + 1,
             "review_feedback": "",
+            # A prior critique belongs to the prior plan. Do not surface stale
+            # critique content beside a newly revised fast-path plan.
+            "critique": {},
         }
 
     async def human_review(state: DirectorState) -> DirectorState:
@@ -144,7 +160,7 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
             "run_id": state.get("run_id"),
             "thread_id": state.get("thread_id"),
             "plan": state.get("plan"),
-            "critique": state.get("critique"),
+            "critique": state.get("critique") or None,
             "revision_count": int(state.get("revision_count") or 0),
         }
         response = interrupt(payload)
@@ -191,6 +207,11 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
             "assistant_context": assistant_context.model_dump(mode="json"),
         }
 
+    def after_plan(state: DirectorState) -> str:
+        if runtime.blocking_critic:
+            return "critique"
+        return "review" if runtime.require_human_review else "compile"
+
     def after_critique(state: DirectorState) -> str:
         critique = CreativeCritique.model_validate(state["critique"])
         revisions = int(state.get("revision_count") or 0)
@@ -213,9 +234,21 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
 
     builder.add_edge(START, "retrieve")
     builder.add_edge("retrieve", "plan")
-    builder.add_edge("plan", "critique")
-    builder.add_conditional_edges("critique", after_critique, {"revise": "revise", "review": "review", "compile": "compile"})
-    builder.add_edge("revise", "critique")
+    builder.add_conditional_edges(
+        "plan",
+        after_plan,
+        {"critique": "critique", "review": "review", "compile": "compile"},
+    )
+    builder.add_conditional_edges(
+        "critique",
+        after_critique,
+        {"revise": "revise", "review": "review", "compile": "compile"},
+    )
+    builder.add_conditional_edges(
+        "revise",
+        after_plan,
+        {"critique": "critique", "review": "review", "compile": "compile"},
+    )
     builder.add_conditional_edges("review", after_review, {"compile": "compile", "revise": "revise"})
     builder.add_edge("compile", END)
 
