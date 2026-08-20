@@ -17,6 +17,7 @@ router = APIRouter()
 class ParticipantVoiceProfileIn(BaseModel):
     voice_id: str = Field(min_length=1, max_length=300)
     voice_locale: str = Field(min_length=2, max_length=64)
+    style: str | None = Field(default=None, max_length=120)
 
 
 def _clean(value: Any) -> str:
@@ -55,15 +56,33 @@ def _gender(value: Any) -> str:
     }.get(raw, "unspecified")
 
 
-def _participant_gender(persona: dict[str, Any], metadata: dict[str, Any]) -> str:
-    constraints = _as_dict(metadata.get("explicit_face_constraints"))
-    value = (
-        constraints.get("gender")
-        or constraints.get("gender_presentation")
-        or persona.get("gender")
-        or persona.get("gender_presentation")
+def _voice_styles(voice: dict[str, Any]) -> list[str]:
+    meta = _as_dict(voice.get("meta_json"))
+    raw = (
+        voice.get("styles")
+        or voice.get("style_list")
+        or meta.get("StyleList")
+        or meta.get("style_list")
+        or meta.get("styles")
+        or []
     )
-    return _gender(value)
+    if isinstance(raw, str):
+        values = [item.strip() for item in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        values = [_clean(item) for item in raw]
+    else:
+        values = []
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
 
 
 def _forward_auth(request: Request) -> dict[str, str]:
@@ -124,6 +143,7 @@ async def set_participant_voice_profile(
 ):
     voice_id = _clean(body.voice_id)
     voice_locale = _clean(body.voice_locale)
+    requested_style = _clean(body.style) or None
     pool = request.app.state.business_pool
 
     async with pool.acquire() as conn:
@@ -159,22 +179,27 @@ async def set_participant_voice_profile(
     if _clean(context["current_stage"]) != "audio":
         raise HTTPException(status_code=409, detail="participant_voice_configuration_not_current")
 
-    persona = _as_dict(context["persona_json"])
-    metadata = _as_dict(context["metadata_json"])
-    expected_gender = _participant_gender(persona, metadata)
-
     catalog_voice = await _load_catalog_voice(
         request=request,
         locale=voice_locale,
         voice_id=voice_id,
     )
     catalog_gender = _gender(catalog_voice.get("gender"))
-    if (
-        expected_gender in {"male", "female"}
-        and catalog_gender in {"male", "female"}
-        and expected_gender != catalog_gender
-    ):
-        raise HTTPException(status_code=422, detail="audio_voice_gender_mismatch")
+    available_styles = _voice_styles(catalog_voice)
+
+    # Voice gender is descriptive catalog metadata, not a restriction. A Story
+    # character's Face gender never forces the user's TTS voice choice.
+    resolved_style: str | None = None
+    if requested_style:
+        match = next(
+            (value for value in available_styles if value.casefold() == requested_style.casefold()),
+            None,
+        )
+        if available_styles and match is None:
+            raise HTTPException(status_code=422, detail="audio_voice_style_not_available")
+        if not available_styles and not bool(catalog_voice.get("supports_styles")):
+            raise HTTPException(status_code=422, detail="audio_voice_style_not_supported")
+        resolved_style = match or requested_style
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -194,7 +219,7 @@ async def set_participant_voice_profile(
             )
             current = await conn.fetchrow(
                 """
-                select voice_profile_ref,voice_locale
+                select voice_profile_ref,voice_locale,metadata_json
                 from public.v3_participants
                 where participant_id=$1 and account_id=$2
                 for update
@@ -207,13 +232,32 @@ async def set_participant_voice_profile(
 
             current_voice = _clean(current["voice_profile_ref"])
             current_locale = _clean(current["voice_locale"])
-            changing = current_voice != voice_id or current_locale != voice_locale
+            current_meta = _as_dict(current["metadata_json"])
+            current_delivery = _as_dict(current_meta.get("audio_delivery"))
+            current_style = _clean(current_delivery.get("style")) or None
+            changing = (
+                current_voice != voice_id
+                or current_locale != voice_locale
+                or current_style != resolved_style
+            )
             if changing and int(locked or 0) > 0:
                 raise HTTPException(
                     status_code=409,
                     detail="participant_voice_locked_after_audio_generation",
                 )
 
+            delivery = dict(current_delivery)
+            if resolved_style:
+                delivery["style"] = resolved_style
+            else:
+                delivery.pop("style", None)
+
+            metadata_patch = {
+                "audio_voice_selection_source": "user",
+                "audio_voice_gender": catalog_gender,
+                "audio_voice_locale": voice_locale,
+                "audio_delivery": delivery,
+            }
             await conn.execute(
                 """
                 update public.v3_participants
@@ -227,20 +271,12 @@ async def set_participant_voice_profile(
                 auth.account_id,
                 voice_id,
                 voice_locale,
-                json.dumps(
-                    {
-                        "audio_voice_selection_source": "user",
-                        "audio_voice_gender": catalog_gender,
-                        "audio_voice_locale": voice_locale,
-                    }
-                ),
+                json.dumps(metadata_patch),
             )
 
-            # Important: do not rewrite v3_dialogue_turns.locale here. That field
-            # is the canonical language of the authored dialogue. The participant
-            # voice_locale is the target speech locale and the runtime bridge
-            # requests translation explicitly when source and target languages
-            # differ.
+            # Do not rewrite v3_dialogue_turns.locale. That field is the canonical
+            # authored language. voice_locale is the selected target speech locale;
+            # the runtime bridge requests translation when required.
 
     return {
         "workflow_id": str(workflow_id),
@@ -250,6 +286,8 @@ async def set_participant_voice_profile(
         "voice_locale": voice_locale,
         "voice_gender": catalog_gender,
         "voice_display_name": _clean(catalog_voice.get("display_name")) or voice_id,
+        "style": resolved_style,
+        "available_styles": available_styles,
         "applies_to": "all_dialogue_turns_for_participant",
     }
 
