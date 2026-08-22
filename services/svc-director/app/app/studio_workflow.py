@@ -129,7 +129,6 @@ async def build_story_studio_workflow(
         stage_id = await store.add_stage(
             conn, workflow_id=workflow_id, stage_type=StudioStageType.AUDIO,
             scope_type=StudioScopeType.DIALOGUE_TURN,
-            participant_id=turn.speaker_participant_id,
             dialogue_turn_id=turn.turn_id,
             metadata={
                 "review_required": True,
