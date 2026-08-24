@@ -153,8 +153,8 @@ done
 info "6. NO-DUPLICATE + ECONOMIC RECONCILIATION"
 JOBS_AFTER="$(stage_job_count)"
 RES_AFTER_COUNT="$(psql_at "select count(*) from public.pricing_credit_reservations where user_id='$USER_ID'::uuid and job_ref='$STAGE_ID'")"
-NEG_COUNT="$(psql_at "select count(*) from public.pricing_credit_ledger_events where user_id='$USER_ID'::uuid and idempotency_key like 'svc-fusion-extension:v3-scene:$STAGE_ID:%' and credits_delta<0")"
-LEDGER="$(psql_at "select credits_delta,coalesce(sku_code,''),coalesce(quantity::text,'') from public.pricing_credit_ledger_events where user_id='$USER_ID'::uuid and idempotency_key like 'svc-fusion-extension:v3-scene:$STAGE_ID:%' and credits_delta<0 order by created_at desc limit 1")"
+NEG_COUNT="$(psql_at "select count(*) from public.pricing_credit_ledger_events where user_id='$USER_ID'::uuid and idempotency_key like 'consume:svc-fusion-extension:v3-scene:$STAGE_ID:commit:%' and credits_delta<0")"
+LEDGER="$(psql_at "select credits_delta,coalesce(sku_code,''),coalesce(quantity::text,'') from public.pricing_credit_ledger_events where user_id='$USER_ID'::uuid and idempotency_key like 'consume:svc-fusion-extension:v3-scene:$STAGE_ID:commit:%' and credits_delta<0 order by created_at desc limit 1")"
 
 echo "stage_jobs_before=$JOBS_BEFORE"
 echo "stage_jobs_after=$JOBS_AFTER"
