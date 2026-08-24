@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 from .fusion_execution import FusionSceneContext, _clean, _scene_prompt
+
+
+def _input_concurrency() -> int:
+    raw = str(os.getenv("DF_DIRECTOR_FUSION_INPUT_CONCURRENCY", "32") or "32").strip()
+    try:
+        return max(1, min(64, int(raw)))
+    except Exception:
+        return 32
 
 
 async def compile_children_performant(
@@ -17,14 +26,14 @@ async def compile_children_performant(
 ) -> list[dict[str, Any]]:
     """Compile canonical child requests with bounded parallel media resolution.
 
-    The original contract is preserved byte-for-byte at the semantic level: one
-    approved Face + one approved Audio asset per speech turn, canonical scene prompt,
-    VEED/Fabric child execution and the same Director lineage tags. The optimization
-    only removes N-by-2 serial internal read-URL calls. Repeated Face media is resolved
-    once per compilation and Audio URLs are fetched concurrently with a conservative
-    bound.
+    The canonical payload is unchanged: one approved Face + one approved Audio asset
+    per speech turn, canonical scene prompt, VEED/Fabric child execution and the same
+    Director lineage tags. Repeated Face media is resolved once per compilation and
+    all unique Face/Audio read URLs are resolved concurrently up to the deployment
+    limit. V3 defaults to 32 so a 28-turn scene does not acquire an artificial
+    preparation queue before provider dispatch.
     """
-    semaphore = asyncio.Semaphore(8)
+    semaphore = asyncio.Semaphore(_input_concurrency())
     face_urls: dict[str, str] = {}
     audio_urls: dict[str, str] = {}
 
@@ -93,4 +102,4 @@ async def compile_children_performant(
     return children
 
 
-__all__ = ["compile_children_performant"]
+__all__ = ["compile_children_performant", "_input_concurrency"]
