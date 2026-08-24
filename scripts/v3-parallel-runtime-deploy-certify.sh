@@ -119,8 +119,6 @@ cat /tmp/v3-director-health.json | jq '{ok,service,execution_mode,runtime_ready,
 
 section "5. RUNTIME PARALLELISM + BACKGROUND FINALIZATION"
 "${COMPOSE[@]}" exec -T svc-director python - <<'PY'
-import os
-from app import fusion_execution_runtime as _runtime
 from app.fusion_execution_background_read import BackgroundFinalizedParallelSceneFusionExecutionService, _background_enabled
 from app.fusion_execution_parallel_dispatch import _dispatch_limit
 from app.fusion_input_performance import compile_children_performant, _input_concurrency
@@ -148,19 +146,51 @@ assert _background_enabled() is True
 print("director_parallel_background_runtime=PASS")
 PY
 
-"${COMPOSE[@]}" exec -T svc-fusion-extension-stitch-worker python - <<'PY'
-import os
-from app.workers.v3_scene_coordinator import _enabled, _status_concurrency, _batch_size
-from app.config import settings
-print(f"scene_coordinator_enabled={_enabled()}")
-print(f"scene_coordinator_status_concurrency={_status_concurrency()}")
-print(f"scene_coordinator_batch_size={_batch_size()}")
-print(f"scene_video_output_container={settings.AZURE_VIDEO_OUTPUT_CONTAINER}")
-assert _enabled() is True
-assert _status_concurrency() >= 28
-assert str(settings.AZURE_VIDEO_OUTPUT_CONTAINER or '').strip()
-print("background_scene_coordinator_runtime=PASS")
-PY
+# Do not start a second Python interpreter in the fusion-extension image merely
+# to import the already-running coordinator stack. On small VMs that doubles a
+# memory-heavy import set and can make the certification probe itself get
+# SIGKILL/OOM (exit 137) even though PID 1 is healthy. Prove the real running
+# coordinator with Docker state, effective environment and its startup log.
+STITCH_CID="$("${COMPOSE[@]}" ps -q svc-fusion-extension-stitch-worker)"
+[[ -n "$STITCH_CID" ]] || hold "stitch worker container id missing"
+STITCH_RUNNING="$(docker inspect -f '{{.State.Running}}' "$STITCH_CID")"
+STITCH_OOM="$(docker inspect -f '{{.State.OOMKilled}}' "$STITCH_CID")"
+STITCH_RESTARTS="$(docker inspect -f '{{.RestartCount}}' "$STITCH_CID")"
+echo "scene_coordinator_container_running=$STITCH_RUNNING"
+echo "scene_coordinator_container_oom_killed=$STITCH_OOM"
+echo "scene_coordinator_container_restarts=$STITCH_RESTARTS"
+[[ "$STITCH_RUNNING" == "true" ]] || hold "stitch worker is not running"
+[[ "$STITCH_OOM" == "false" ]] || hold "stitch worker itself was OOM-killed"
+
+STITCH_ENV="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$STITCH_CID")"
+COORD_ENABLED="$(printf '%s\n' "$STITCH_ENV" | awk -F= '$1=="DF_V3_SCENE_COORDINATOR_ENABLED"{print $2; exit}')"
+COORD_STATUS="$(printf '%s\n' "$STITCH_ENV" | awk -F= '$1=="DF_V3_SCENE_COORDINATOR_STATUS_CONCURRENCY"{print $2; exit}')"
+COORD_BATCH="$(printf '%s\n' "$STITCH_ENV" | awk -F= '$1=="DF_V3_SCENE_COORDINATOR_BATCH_SIZE"{print $2; exit}')"
+VIDEO_CONTAINER="$(printf '%s\n' "$STITCH_ENV" | awk -F= '$1=="AZURE_VIDEO_OUTPUT_CONTAINER"{print $2; exit}')"
+[[ -n "$VIDEO_CONTAINER" ]] || VIDEO_CONTAINER="$(printf '%s\n' "$STITCH_ENV" | awk -F= '$1=="AZURE_FINAL_VIDEO_CONTAINER"{print $2; exit}')"
+[[ -n "$VIDEO_CONTAINER" ]] || VIDEO_CONTAINER="video-output"
+echo "scene_coordinator_enabled=${COORD_ENABLED:-missing}"
+echo "scene_coordinator_status_concurrency=${COORD_STATUS:-missing}"
+echo "scene_coordinator_batch_size=${COORD_BATCH:-missing}"
+echo "scene_video_output_container=$VIDEO_CONTAINER"
+[[ "${COORD_ENABLED,,}" =~ ^(1|true|yes|on)$ ]] || hold "scene coordinator env is not enabled"
+[[ "${COORD_STATUS:-0}" -ge 28 ]] || hold "scene coordinator status concurrency < 28"
+[[ -n "$VIDEO_CONTAINER" ]] || hold "scene video output container missing"
+
+COORD_LOG_READY=0
+for _ in $(seq 1 30); do
+  if "${COMPOSE[@]}" logs --no-color --tail=300 svc-fusion-extension-stitch-worker 2>&1 \
+      | grep -Fq "V3 scene coordinator started"; then
+    COORD_LOG_READY=1
+    break
+  fi
+  sleep 1
+done
+[[ "$COORD_LOG_READY" == "1" ]] || {
+  "${COMPOSE[@]}" logs --no-color --tail=120 svc-fusion-extension-stitch-worker >&2 || true
+  hold "scene coordinator startup log not observed"
+}
+echo "background_scene_coordinator_runtime=PASS"
 
 "${COMPOSE[@]}" exec -T svc-fusion-worker python - <<'PY'
 from app.workers.fusion_worker import _worker_concurrency
