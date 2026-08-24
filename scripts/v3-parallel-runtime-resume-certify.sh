@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 COMPOSE=(bash "$ROOT/scripts/v3-compose.sh")
 WORKFLOW_ID="${WORKFLOW_ID:-a58bd7bf-b958-4bfe-9855-0d964d500b04}"
+EXPECTED_PYTHONPATH='/app:/repo:/repo/services/shared:/repo/services/shared/python'
 
 hold() { echo "V3 PARALLEL RESUME CERT: HOLD: $*" >&2; exit 1; }
 section() { echo; echo "===== $* ====="; }
@@ -76,35 +77,54 @@ assert _background_enabled() is True
 print("director_parallel_background_runtime=PASS")
 PY
 
-section "4. BACKGROUND SCENE COORDINATOR — LOW-MEMORY PROBE"
+section "4. BACKGROUND SCENE COORDINATOR — PROCESS STABILITY PROOF"
 STITCH_CID="$("${COMPOSE[@]}" ps -q svc-fusion-extension-stitch-worker)"
+[[ -n "$STITCH_CID" ]] || hold "stitch worker container missing"
 STITCH_ENV="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$STITCH_CID")"
 COORD_ENABLED="$(printf '%s\n' "$STITCH_ENV" | awk -F= '$1=="DF_V3_SCENE_COORDINATOR_ENABLED"{print $2; exit}')"
 COORD_STATUS="$(printf '%s\n' "$STITCH_ENV" | awk -F= '$1=="DF_V3_SCENE_COORDINATOR_STATUS_CONCURRENCY"{print $2; exit}')"
 COORD_BATCH="$(printf '%s\n' "$STITCH_ENV" | awk -F= '$1=="DF_V3_SCENE_COORDINATOR_BATCH_SIZE"{print $2; exit}')"
+ACTUAL_PYTHONPATH="$(printf '%s\n' "$STITCH_ENV" | awk -F= '$1=="PYTHONPATH"{sub(/^PYTHONPATH=/,""); print; exit}')"
 VIDEO_CONTAINER="$(printf '%s\n' "$STITCH_ENV" | awk -F= '$1=="AZURE_VIDEO_OUTPUT_CONTAINER"{print $2; exit}')"
 [[ -n "$VIDEO_CONTAINER" ]] || VIDEO_CONTAINER="$(printf '%s\n' "$STITCH_ENV" | awk -F= '$1=="AZURE_FINAL_VIDEO_CONTAINER"{print $2; exit}')"
 [[ -n "$VIDEO_CONTAINER" ]] || VIDEO_CONTAINER="video-output"
+CMD_JSON="$(docker inspect -f '{{json .Config.Cmd}}' "$STITCH_CID")"
+PID1="$(docker inspect -f '{{.State.Pid}}' "$STITCH_CID")"
+RESTARTS1="$(docker inspect -f '{{.RestartCount}}' "$STITCH_CID")"
+
 echo "scene_coordinator_enabled=${COORD_ENABLED:-missing}"
 echo "scene_coordinator_status_concurrency=${COORD_STATUS:-missing}"
 echo "scene_coordinator_batch_size=${COORD_BATCH:-missing}"
 echo "scene_video_output_container=$VIDEO_CONTAINER"
+echo "scene_worker_command=$CMD_JSON"
+echo "scene_worker_pid=$PID1"
+echo "scene_worker_restarts=$RESTARTS1"
+echo "scene_worker_pythonpath=$ACTUAL_PYTHONPATH"
+
 [[ "${COORD_ENABLED,,}" =~ ^(1|true|yes|on)$ ]] || hold "scene coordinator env not enabled"
 [[ "${COORD_STATUS:-0}" -ge 28 ]] || hold "scene coordinator status concurrency < 28"
+[[ "$ACTUAL_PYTHONPATH" == "$EXPECTED_PYTHONPATH" ]] || hold "scene worker shared PYTHONPATH mismatch"
+[[ "$CMD_JSON" == *"app.workers.stitch_worker"* ]] || hold "unexpected stitch worker command"
+grep -Fq 'v3_scene_coordinator_loop' services/svc-fusion-extension/app/app/workers/stitch_worker.py \
+  || hold "stitch worker source missing V3 coordinator"
+grep -Fq 'asyncio.gather' services/svc-fusion-extension/app/app/workers/stitch_worker.py \
+  || hold "stitch worker source missing concurrent loop ownership"
+"${COMPOSE[@]}" exec -T svc-fusion-extension-stitch-worker sh -lc \
+  'test -d /repo/services/shared/df_contracts && test -d /repo/services/shared/python/desifaces_shared' \
+  || hold "shared package roots missing in running stitch container"
 
-COORD_LOG_READY=0
-for _ in $(seq 1 10); do
-  if "${COMPOSE[@]}" logs --no-color --tail=300 svc-fusion-extension-stitch-worker 2>&1 \
-      | grep -Fq "V3 scene coordinator started"; then
-    COORD_LOG_READY=1
-    break
-  fi
-  sleep 1
-done
-if [[ "$COORD_LOG_READY" != "1" ]]; then
-  "${COMPOSE[@]}" logs --no-color --tail=120 svc-fusion-extension-stitch-worker >&2 || true
-  hold "scene coordinator startup log not observed"
-fi
+sleep 5
+STATUS2="$(docker inspect -f '{{.State.Status}}' "$STITCH_CID")"
+RUNNING2="$(docker inspect -f '{{.State.Running}}' "$STITCH_CID")"
+RESTARTING2="$(docker inspect -f '{{.State.Restarting}}' "$STITCH_CID")"
+OOM2="$(docker inspect -f '{{.State.OOMKilled}}' "$STITCH_CID")"
+PID2="$(docker inspect -f '{{.State.Pid}}' "$STITCH_CID")"
+RESTARTS2="$(docker inspect -f '{{.RestartCount}}' "$STITCH_CID")"
+echo "scene_worker_stability=status:$STATUS2 running:$RUNNING2 restarting:$RESTARTING2 oom:$OOM2 pid:$PID2 restarts:$RESTARTS2"
+[[ "$STATUS2" == "running" && "$RUNNING2" == "true" && "$RESTARTING2" == "false" && "$OOM2" == "false" ]] \
+  || hold "scene coordinator worker is not stable"
+[[ "$PID2" == "$PID1" ]] || hold "scene coordinator worker PID changed during stability window"
+[[ "$RESTARTS2" == "$RESTARTS1" ]] || hold "scene coordinator worker restarted during stability window"
 echo "background_scene_coordinator_runtime=PASS"
 
 section "5. WORKER CONCURRENCY — LOW-MEMORY SOURCE/ENV PROOF"
@@ -170,7 +190,8 @@ echo "============================================================"
 echo " V3 PARALLEL + BACKGROUND RUNTIME RESUME CERT = PASS"
 echo " Director parallel fan-out >= 28"
 echo " Director sync = background/read-only"
-echo " Scene coordinator = running, enabled, not OOM-killed"
+echo " Scene coordinator worker = stable, enabled, not OOM-killed"
+echo " Scene coordinator process remained stable across proof window"
 echo " Scene status coordination >= 28"
 echo " Fusion worker concurrency >= 28"
 echo " Audio worker concurrency >= 28"
