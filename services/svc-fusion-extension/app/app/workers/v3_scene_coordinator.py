@@ -121,7 +121,10 @@ async def _candidate_rows(pool) -> list[dict[str, Any]]:
             where s.stage_type='fusion'
               and s.scope_type='scene'
               and s.state='generating'
-              and a.state in ('dispatching','running','succeeded')
+              -- Never reconcile while Director is still creating the required child
+              -- set. A running attempt is the durable fan-out barrier: its metadata
+              -- contains the complete accepted/reused child lineage.
+              and a.state in ('running','succeeded')
               and coalesce(s.metadata_json #>> '{fusion_parent_pricing,state}','')
                     in ('reserved','commit_pending')
             order by s.updated_at,s.stage_run_id
