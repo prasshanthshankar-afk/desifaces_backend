@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 from uuid import UUID
 
@@ -264,8 +265,8 @@ async def set_face_profile(
                 where participant_id=$1
                 """,
                 participant_id,
-                metadata,
-                persona,
+                json.dumps(metadata, ensure_ascii=False),
+                json.dumps(persona, ensure_ascii=False),
             )
 
         return await _load_preflight(conn, workflow_id=workflow_id, account_id=auth.account_id)
