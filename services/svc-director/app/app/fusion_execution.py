@@ -597,6 +597,7 @@ class SceneFusionExecutionService:
                     """
                     update public.v3_studio_stage_attempts
                     set state='failed',error_code='fusion_child_dispatch_failed',error_message=$2,
+                        completed_at=coalesce(completed_at,now()),
                         metadata_json=coalesce(metadata_json,'{}'::jsonb) || $3::jsonb,updated_at=now()
                     where attempt_id=$1
                     """,
@@ -721,7 +722,8 @@ class SceneFusionExecutionService:
                 await conn.execute(
                     """
                     update public.v3_studio_stage_attempts
-                    set state='failed',error_code='fusion_child_failed',error_message='one_or_more_child_fusion_jobs_failed',updated_at=now()
+                    set state='failed',error_code='fusion_child_failed',error_message='one_or_more_child_fusion_jobs_failed',
+                        completed_at=coalesce(completed_at,now()),updated_at=now()
                     where attempt_id=$1
                     """,
                     attempt_id,
@@ -821,6 +823,7 @@ class SceneFusionExecutionService:
                     """
                     update public.v3_studio_stage_attempts
                     set state='succeeded',media_id=$2,
+                        completed_at=coalesce(completed_at,now()),
                         metadata_json=coalesce(metadata_json,'{}'::jsonb) || $3::jsonb,updated_at=now()
                     where attempt_id=$1
                     """,
