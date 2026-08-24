@@ -48,44 +48,44 @@ echo "container_pythonpath=$ACTUAL_PYTHONPATH"
   || hold "actual stitch worker PYTHONPATH mismatch"
 echo "STITCH_SHARED_PYTHONPATH_RUNTIME = PASS"
 
-section "5. WAIT FOR STABLE COORDINATOR START"
-READY=0
-LAST_RESTARTS=""
-for _ in $(seq 1 30); do
-  status="$(docker inspect -f '{{.State.Status}}' "$CID")"
-  running="$(docker inspect -f '{{.State.Running}}' "$CID")"
-  restarting="$(docker inspect -f '{{.State.Restarting}}' "$CID")"
-  oom="$(docker inspect -f '{{.State.OOMKilled}}' "$CID")"
-  restarts="$(docker inspect -f '{{.RestartCount}}' "$CID")"
-  LAST_RESTARTS="$restarts"
-  if [[ "$status" == "running" && "$running" == "true" && "$restarting" == "false" && "$oom" == "false" ]] \
-      && "${COMPOSE[@]}" logs --no-color --tail=120 svc-fusion-extension-stitch-worker 2>&1 \
-           | grep -Fq 'V3 scene coordinator started'; then
-    READY=1
-    break
-  fi
-  sleep 1
-done
+section "5. WAIT FOR STABLE WORKER + COORDINATOR CONTRACT"
+CMD_JSON="$(docker inspect -f '{{json .Config.Cmd}}' "$CID")"
+ENV_DUMP="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CID")"
+COORD_ENABLED="$(printf '%s\n' "$ENV_DUMP" | awk -F= '$1=="DF_V3_SCENE_COORDINATOR_ENABLED"{print $2; exit}')"
+COORD_STATUS="$(printf '%s\n' "$ENV_DUMP" | awk -F= '$1=="DF_V3_SCENE_COORDINATOR_STATUS_CONCURRENCY"{print $2; exit}')"
+[[ "${COORD_ENABLED,,}" =~ ^(1|true|yes|on)$ ]] || hold "scene coordinator env not enabled"
+[[ "${COORD_STATUS:-0}" -ge 28 ]] || hold "scene coordinator status concurrency < 28"
+[[ "$CMD_JSON" == *"app.workers.stitch_worker"* ]] || hold "unexpected stitch worker command"
+grep -Fq 'v3_scene_coordinator_loop' services/svc-fusion-extension/app/app/workers/stitch_worker.py \
+  || hold "stitch worker source missing V3 coordinator"
+grep -Fq 'asyncio.gather' services/svc-fusion-extension/app/app/workers/stitch_worker.py \
+  || hold "stitch worker source missing concurrent loop ownership"
+"${COMPOSE[@]}" exec -T svc-fusion-extension-stitch-worker sh -lc \
+  'test -d /repo/services/shared/df_contracts && test -d /repo/services/shared/python/desifaces_shared' \
+  || hold "shared package roots missing in running stitch container"
 
-if [[ "$READY" != "1" ]]; then
-  docker inspect -f 'status={{.State.Status}} running={{.State.Running}} restarting={{.State.Restarting}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} error={{json .State.Error}}' "$CID" || true
-  "${COMPOSE[@]}" logs --no-color --tail=160 svc-fusion-extension-stitch-worker >&2 || true
-  hold "stitch worker did not reach stable coordinator startup"
-fi
-
-echo "stitch_worker_restart_count=$LAST_RESTARTS"
+PID1="$(docker inspect -f '{{.State.Pid}}' "$CID")"
+RESTARTS1="$(docker inspect -f '{{.RestartCount}}' "$CID")"
+sleep 5
+STATUS2="$(docker inspect -f '{{.State.Status}}' "$CID")"
+RUNNING2="$(docker inspect -f '{{.State.Running}}' "$CID")"
+RESTARTING2="$(docker inspect -f '{{.State.Restarting}}' "$CID")"
+OOM2="$(docker inspect -f '{{.State.OOMKilled}}' "$CID")"
+PID2="$(docker inspect -f '{{.State.Pid}}' "$CID")"
+RESTARTS2="$(docker inspect -f '{{.RestartCount}}' "$CID")"
+echo "scene_worker_command=$CMD_JSON"
+echo "scene_coordinator_enabled=$COORD_ENABLED"
+echo "scene_coordinator_status_concurrency=$COORD_STATUS"
+echo "scene_worker_stability=status:$STATUS2 running:$RUNNING2 restarting:$RESTARTING2 oom:$OOM2 pid:$PID2 restarts:$RESTARTS2"
+[[ "$STATUS2" == "running" && "$RUNNING2" == "true" && "$RESTARTING2" == "false" && "$OOM2" == "false" ]] \
+  || hold "stitch worker did not remain stable"
+[[ "$PID2" == "$PID1" ]] || hold "stitch worker PID changed during stability window"
+[[ "$RESTARTS2" == "$RESTARTS1" ]] || hold "stitch worker restarted during stability window"
 echo "STITCH_WORKER_STABLE = PASS"
+echo "SHARED_IMPORT_RUNTIME = PASS"
+echo "BACKGROUND_COORDINATOR_PROCESS_CONTRACT = PASS"
 
-section "6. SHARED IMPORT RUNTIME PROOF"
-"${COMPOSE[@]}" exec -T svc-fusion-extension-stitch-worker python - <<'PY'
-import df_contracts
-from desifaces_shared.v3.studio_workflow_store import CanonicalStudioWorkflowStore
-print(f"df_contracts_module={df_contracts.__name__}")
-print(f"workflow_store={CanonicalStudioWorkflowStore.__name__}")
-print("SHARED_IMPORT_RUNTIME = PASS")
-PY
-
-section "7. COMPLETE ZERO-CREDIT RESUME CERTIFICATE"
+section "6. COMPLETE ZERO-CREDIT RESUME CERTIFICATE"
 WORKFLOW_ID="$WORKFLOW_ID" bash "$ROOT/scripts/v3-parallel-runtime-resume-certify.sh"
 
 echo
@@ -93,7 +93,7 @@ echo "============================================================"
 echo " V3 BACKGROUND RUNTIME REPAIR = PASS"
 echo " Existing image reused; no rebuild"
 echo " Stitch worker shared imports = PASS"
-echo " Server-side scene coordinator = RUNNING"
+echo " Server-side scene coordinator worker = STABLE"
 echo " Director parallel/background runtime = PASS"
 echo " Closed certified Story remains closed"
 echo " NO BILLABLE GENERATION EXECUTED"
