@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from df_contracts.v3.director import CreativeBrief, CreativeStoryPlan, PlannedParticipant
@@ -139,8 +140,8 @@ class UserOwnedStoryCompiler(CanonicalStoryCompiler):
                             where participant_id=$1
                             """,
                             participant.participant_id,
-                            metadata,
-                            persona,
+                            json.dumps(metadata, ensure_ascii=False),
+                            json.dumps(persona, ensure_ascii=False),
                         )
                         changed = True
 
