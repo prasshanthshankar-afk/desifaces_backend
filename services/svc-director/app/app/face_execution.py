@@ -113,7 +113,9 @@ def compile_context_face_input(context: FaceStageContext) -> dict[str, Any]:
             compatibility_hint["age"] = age
 
         gender_presentation = str(
-            persona.get("gender_presentation") or ""
+            persona.get("gender")
+            or persona.get("gender_presentation")
+            or ""
         ).strip()
 
         if gender_presentation:
