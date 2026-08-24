@@ -4,21 +4,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from .config import settings
 from .fusion_execution import SceneFusionBridgeError
-from .fusion_execution_resilient import ResilientSceneFusionExecutionService
 from .security import DirectorAuthContext, get_director_auth
-from .studio_routes import store
+from .studio_e2e_routes import fusion_execution
 
 router = APIRouter()
-
-fusion_execution = ResilientSceneFusionExecutionService(
-    face_base_url=settings.DF_FACE_BASE_URL,
-    audio_base_url=settings.DF_AUDIO_BASE_URL,
-    fusion_base_url=settings.DF_FUSION_BASE_URL,
-    fusion_extension_base_url=settings.DF_FUSION_EXTENSION_BASE_URL,
-    store=store,
-)
 
 
 def _forward_auth(request: Request) -> dict[str, str]:
@@ -37,35 +27,59 @@ async def retry_scene_stitch(
     request: Request,
     auth: DirectorAuthContext = Depends(get_director_auth),
 ):
-    """Retry only deterministic scene stitching when all child renders are reusable.
+    """Retry deterministic scene stitching only when every child is reusable.
 
-    No svc-fusion pricing preview or child provider dispatch occurs on this path. The
-    resilient execution service verifies that the prior failed attempt contains a
-    successful video URL for every dialogue child before allowing an empty
-    confirmation bundle.
+    The canonical performant/resilient Fusion execution instance is reused here.
+    First run its non-billable preview: an empty quote list is the proof that every
+    dialogue child already has a reusable successful video. If any child still needs
+    work, the user must return to normal Check Price so only those failed/missing
+    children receive new quotes. The stitch-only attempt performs no svc-fusion child
+    dispatch and therefore creates no new child charge.
     """
+    headers = _forward_auth(request)
     try:
+        async with request.app.state.business_pool.acquire() as conn:
+            context, quotes = await fusion_execution.preview(
+                conn,
+                account_id=auth.account_id,
+                workflow_id=workflow_id,
+                stage_run_id=stage_run_id,
+                headers=headers,
+                external_provider_ok=True,
+            )
+
+        if context.stage_state != "failed":
+            raise HTTPException(status_code=409, detail={
+                "code": "fusion_stitch_retry_requires_failed_scene",
+                "message": "Scene assembly retry is only available after a failed scene attempt.",
+                "recoverable": True,
+                "action": "reload_scene",
+            })
+        if quotes:
+            raise HTTPException(status_code=409, detail={
+                "code": "fusion_child_retry_requires_pricing",
+                "message": "One or more dialogue videos still need to be created. Check the scene price to retry only those segments.",
+                "recoverable": True,
+                "action": "check_scene_price",
+            })
+
         context, attempt_id, attempt_no, attempt_kind, children = await fusion_execution.dispatch(
             request.app.state.business_pool,
             account_id=auth.account_id,
             workflow_id=workflow_id,
             stage_run_id=stage_run_id,
-            headers=_forward_auth(request),
+            headers=headers,
             confirmations=[],
             external_provider_ok=True,
         )
+    except HTTPException:
+        raise
     except SceneFusionBridgeError as exc:
-        code = str(exc)
-        message = (
-            "The completed dialogue videos cannot be stitched yet. Retry scene pricing for the failed segment."
-            if code == "fusion_pricing_confirmation_bundle_mismatch"
-            else "The scene could not be prepared for a stitch retry."
-        )
         raise HTTPException(status_code=409, detail={
-            "code": code,
-            "message": message,
+            "code": str(exc),
+            "message": "The scene could not be prepared for a stitch-only retry. Reload the scene and try again.",
             "recoverable": True,
-            "action": "retry_scene",
+            "action": "reload_scene",
         }) from exc
 
     return {
@@ -78,6 +92,7 @@ async def retry_scene_stitch(
         "attempt_kind": attempt_kind,
         "retry_scope": "stitch_only",
         "new_child_charges": 0,
+        "preserved_child_count": len(children),
         "children": children,
     }
 
