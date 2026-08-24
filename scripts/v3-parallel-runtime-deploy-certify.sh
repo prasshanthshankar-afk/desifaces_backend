@@ -18,6 +18,7 @@ git --no-pager log -1 --oneline
 python3 -m py_compile \
   services/svc-director/app/app/fusion_execution_parallel_dispatch.py \
   services/svc-director/app/app/fusion_execution_runtime.py \
+  services/svc-director/app/app/fusion_input_performance.py \
   services/svc-fusion/app/app/workers/fusion_worker.py \
   services/svc-audio/app/app/workers/audio_worker.py \
   services/svc-face/app/app/workers/face_worker.py
@@ -28,6 +29,10 @@ checks = {
     "director_parallel": (
         "services/svc-director/app/app/fusion_execution_parallel_dispatch.py",
         ["asyncio.gather", "DF_DIRECTOR_FUSION_DISPATCH_CONCURRENCY", "dispatch_spread_ms", '"execution_mode": "parallel"'],
+    ),
+    "fusion_input_parallel": (
+        "services/svc-director/app/app/fusion_input_performance.py",
+        ["asyncio.gather", "unique_faces", "unique_audio"],
     ),
     "fusion_worker_parallel": (
         "services/svc-fusion/app/app/workers/fusion_worker.py",
@@ -82,14 +87,20 @@ cat /tmp/v3-director-health.json | jq '{ok,service,execution_mode,runtime_ready,
 
 section "5. RUNTIME PARALLELISM"
 "${COMPOSE[@]}" exec -T svc-director python - <<'PY'
-from app import fusion_execution_runtime as _runtime  # installs the runtime override
+from app import fusion_execution_runtime as _runtime  # installs runtime overrides
 from app.fusion_execution_parallel_dispatch import _dispatch_limit, ParallelOrphanReconciledParentPricedSceneFusionExecutionService
+from app.fusion_input_performance import compile_children_performant
 from app import fusion_execution
+from app import fusion_execution_parent_pricing
+from app import fusion_execution_parallel_dispatch
 print(f"director_dispatch_concurrency={_dispatch_limit()}")
 print(f"parallel_service={ParallelOrphanReconciledParentPricedSceneFusionExecutionService.__name__}")
 print(f"installed_service={fusion_execution.SceneFusionExecutionService.__name__}")
+print(f"input_compiler={fusion_execution_parallel_dispatch._compile_children.__name__}")
 assert _dispatch_limit() >= 28
 assert fusion_execution.SceneFusionExecutionService is ParallelOrphanReconciledParentPricedSceneFusionExecutionService
+assert fusion_execution_parallel_dispatch._compile_children is compile_children_performant
+assert fusion_execution_parent_pricing._compile_children is compile_children_performant
 print("director_parallel_runtime=PASS")
 PY
 
@@ -130,6 +141,7 @@ echo "This gate called no pricing preview/reserve/commit endpoint and created no
 echo
 echo "============================================================"
 echo " V3 PARALLEL RUNTIME DEPLOYMENT = PASS"
+echo " Fusion input resolution = PARALLEL"
 echo " Director Fusion fan-out >= 28"
 echo " Fusion worker concurrency >= 28"
 echo " Audio worker concurrency >= 28"
