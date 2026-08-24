@@ -2,8 +2,9 @@
 --
 -- This migration deliberately does NOT change the existing Fusion price,
 -- credit rate, variant composition, entitlement, wallet, or ledger behavior.
--- It removes a stale legacy provider hint from the provider-neutral pricing SKU.
--- Provider selection remains an execution/routing concern, not a pricing concern.
+-- It removes a stale legacy provider hint from the provider-neutral pricing SKU
+-- and enforces that a Fusion scene cannot cross HITL approval before its single
+-- parent pricing lifecycle is committed.
 
 BEGIN;
 
@@ -46,5 +47,44 @@ BEGIN
     RAISE EXCEPTION 'FUSION_TALK_MIN pricing SKU must be provider-neutral; found %', v_provider_hint;
   END IF;
 END $$;
+
+-- A Fusion candidate is not approvable until the logical-scene parent charge is
+-- durably committed. Enforce this in PostgreSQL so UI/API/worker callers cannot
+-- bypass the pricing lifecycle by writing the review decision directly.
+CREATE OR REPLACE FUNCTION public.v3_guard_fusion_review_pricing_commit()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_stage_type text;
+  v_pricing_state text;
+BEGIN
+  IF NEW.decision IS DISTINCT FROM 'approved' THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT s.stage_type,
+         COALESCE(s.metadata_json #>> '{fusion_parent_pricing,state}', '')
+  INTO v_stage_type, v_pricing_state
+  FROM public.v3_studio_stage_runs s
+  WHERE s.stage_run_id = NEW.stage_run_id;
+
+  IF v_stage_type = 'fusion' AND v_pricing_state <> 'committed' THEN
+    RAISE EXCEPTION USING
+      ERRCODE = '23514',
+      MESSAGE = 'fusion_parent_pricing_not_committed';
+  END IF;
+
+  RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS trg_v3_guard_fusion_review_pricing_commit
+ON public.v3_studio_review_items;
+
+CREATE TRIGGER trg_v3_guard_fusion_review_pricing_commit
+BEFORE INSERT OR UPDATE OF decision
+ON public.v3_studio_review_items
+FOR EACH ROW
+EXECUTE FUNCTION public.v3_guard_fusion_review_pricing_commit();
 
 COMMIT;
