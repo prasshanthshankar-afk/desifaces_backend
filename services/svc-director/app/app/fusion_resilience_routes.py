@@ -27,19 +27,17 @@ async def retry_scene_stitch(
     request: Request,
     auth: DirectorAuthContext = Depends(get_director_auth),
 ):
-    """Retry deterministic scene stitching only when every child is reusable.
+    """Retry deterministic scene stitching without re-rendering completed children.
 
-    The canonical performant/resilient Fusion execution instance is reused here.
-    First run its non-billable preview: an empty quote list is the proof that every
-    dialogue child already has a reusable successful video. If any child still needs
-    work, the user must return to normal Check Price so only those failed/missing
-    children receive new quotes. The stitch-only attempt performs no svc-fusion child
-    dispatch and therefore creates no new child charge.
+    The logical scene still owns one parent pricing lifecycle. A prior failed attempt
+    releases its reservation, so stitch-only recovery obtains one fresh parent quote
+    and reservation while preserving every successful child. No child quote, child
+    reservation, or child provider dispatch is created by this route.
     """
     headers = _forward_auth(request)
     try:
         async with request.app.state.business_pool.acquire() as conn:
-            context, quotes = await fusion_execution.preview(
+            context, bundle = await fusion_execution.preview(
                 conn,
                 account_id=auth.account_id,
                 workflow_id=workflow_id,
@@ -55,21 +53,34 @@ async def retry_scene_stitch(
                 "recoverable": True,
                 "action": "reload_scene",
             })
-        if quotes:
+
+        required_children = int(bundle.get("required_child_count") or 0)
+        if required_children != 0:
             raise HTTPException(status_code=409, detail={
                 "code": "fusion_child_retry_requires_pricing",
-                "message": "One or more dialogue videos still need to be created. Check the scene price to retry only those segments.",
+                "message": "One or more dialogue videos still need to be created. Check the scene price to retry only those missing segments under the one parent price.",
                 "recoverable": True,
                 "action": "check_scene_price",
             })
 
-        context, attempt_id, attempt_no, attempt_kind, children = await fusion_execution.dispatch(
+        parent = dict(bundle.get("parent") or {})
+        pricing = dict(parent.get("pricing") or {})
+        quote_id = str(pricing.get("quote_id") or "").strip()
+        preview_fingerprint = str(pricing.get("preview_fingerprint") or "").strip()
+        if not quote_id or not preview_fingerprint:
+            raise SceneFusionBridgeError("fusion_parent_pricing_confirmation_required")
+
+        context, attempt_id, attempt_no, attempt_kind, children, parent_pricing = await fusion_execution.dispatch(
             request.app.state.business_pool,
             account_id=auth.account_id,
             workflow_id=workflow_id,
             stage_run_id=stage_run_id,
             headers=headers,
-            confirmations=[],
+            parent_confirmation={
+                "quote_id": quote_id,
+                "preview_fingerprint": preview_fingerprint,
+            },
+            child_confirmations=[],
             external_provider_ok=True,
         )
     except HTTPException:
@@ -92,7 +103,9 @@ async def retry_scene_stitch(
         "attempt_kind": attempt_kind,
         "retry_scope": "stitch_only",
         "new_child_charges": 0,
+        "new_child_dispatches": 0,
         "preserved_child_count": len(children),
+        "parent_pricing": parent_pricing,
         "children": children,
     }
 
