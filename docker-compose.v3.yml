@@ -113,6 +113,7 @@ services:
       DF_DIRECTOR_MAX_REVISIONS: ${DF_DIRECTOR_MAX_REVISIONS:-3}
       DF_DIRECTOR_CHECKPOINTER_AUTO_SETUP: "true"
       LANGGRAPH_STRICT_MSGPACK: "true"
+      DF_V3_FUSION_BACKGROUND_COORDINATOR_ENABLED: "true"
     depends_on:
       - desifaces-db
     networks:
@@ -185,6 +186,13 @@ services:
   svc-fusion-extension-stitch-worker:
     container_name: df-v3-svc-fusion-extension-stitch-worker
     profiles: !override ["v3-execution"]
+    environment:
+      DF_V3_SCENE_COORDINATOR_ENABLED: "true"
+      DF_V3_SCENE_COORDINATOR_POLL_SECONDS: "2"
+      DF_V3_SCENE_COORDINATOR_BATCH_SIZE: "4"
+      DF_V3_SCENE_COORDINATOR_STATUS_CONCURRENCY: "32"
+      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://svc-fusion:8002}
+      AZURE_VIDEO_OUTPUT_CONTAINER: ${AZURE_VIDEO_OUTPUT_CONTAINER:-${AZURE_FINAL_VIDEO_CONTAINER:-video-output}}
 
   svc-music-worker:
     container_name: df-v3-svc-music-worker
