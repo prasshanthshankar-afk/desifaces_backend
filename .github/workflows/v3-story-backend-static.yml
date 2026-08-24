@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feature/v3-multiperson-core-20260818
+      - release/v3-studio-completion-20260824
     paths:
       - 'services/svc-director/app/app/**'
       - 'migrations/001_pricing.sql'
