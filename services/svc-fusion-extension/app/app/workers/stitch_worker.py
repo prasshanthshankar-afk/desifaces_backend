@@ -13,7 +13,8 @@ from azure.storage.blob import BlobServiceClient, ContentSettings
 from app.config import settings
 from app.db import get_db_pool
 from app.services.sas_service import parse_blob_path_from_sas_url
-from app.services.sas_service import AzureBlobService  # you already use this in routes
+from app.services.sas_service import AzureBlobService
+from app.workers.v3_scene_coordinator import v3_scene_coordinator_loop
 
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,6 @@ async def _download(url: str, path: str) -> None:
 
 
 def _ffmpeg_concat(file_list_path: str, out_path: str) -> None:
-    # -safe 0 allows absolute paths in concat list file
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0",
@@ -102,7 +102,6 @@ def _upload_poster_jpeg(
 
 
 async def _claim_one_stitch_job(conn) -> Optional[dict]:
-    # Claim one job in stitching state (avoid double stitch)
     row = await conn.fetchrow(
         """
         with cte as (
@@ -160,7 +159,6 @@ async def stitch_loop() -> None:
             if not segs:
                 raise RuntimeError("No segments found for stitching")
 
-            # Ensure all succeeded and have urls
             for s in segs:
                 if (s.get("status") or "").lower() != "succeeded":
                     raise RuntimeError(f"Segment not succeeded: index={s['segment_index']} status={s.get('status')}")
@@ -168,14 +166,12 @@ async def stitch_loop() -> None:
                     raise RuntimeError(f"Missing segment_video_url for segment {s['segment_index']}")
 
             with tempfile.TemporaryDirectory(prefix="df_longform_") as td:
-                # Download segment files
                 local_files: List[str] = []
                 for s in segs:
                     lp = os.path.join(td, f"seg_{int(s['segment_index']):04d}.mp4")
                     await _download(s["segment_video_url"], lp)
                     local_files.append(lp)
 
-                # Build concat list
                 list_path = os.path.join(td, "concat.txt")
                 with open(list_path, "w", encoding="utf-8") as f:
                     for lp in local_files:
@@ -184,7 +180,6 @@ async def stitch_loop() -> None:
                 out_path = os.path.join(td, "final.mp4")
                 _ffmpeg_concat(list_path, out_path)
 
-                # Upload final
                 final_blob_path = f"{user_id}/{job_id}/final.mp4"
                 _upload_final_mp4(
                     settings.AZURE_STORAGE_CONNECTION_STRING,
@@ -193,14 +188,12 @@ async def stitch_loop() -> None:
                     out_path,
                 )
 
-                # Mint final SAS for response caching
                 final_sas_url = az.sign_read_url(
                     settings.AZURE_FINAL_VIDEO_CONTAINER,
                     final_blob_path,
                     settings.FINAL_SAS_TTL_SECONDS,
                 )
 
-                # Poster generation is best-effort and must not fail the completed video.
                 poster_url: Optional[str] = None
                 poster_blob_path: Optional[str] = None
                 try:
@@ -263,5 +256,13 @@ async def stitch_loop() -> None:
         await asyncio.sleep(0.1)
 
 
+async def main() -> None:
+    """Run legacy longform stitching and V3 Story scene reconciliation side by side."""
+    await asyncio.gather(
+        stitch_loop(),
+        v3_scene_coordinator_loop(),
+    )
+
+
 if __name__ == "__main__":
-    asyncio.run(stitch_loop())
+    asyncio.run(main())
