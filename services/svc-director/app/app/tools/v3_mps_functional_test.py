@@ -309,9 +309,18 @@ async def main() -> None:
             parents_by_child = {}
             for row in dep_rows:
                 parents_by_child.setdefault(str(row["child_id"]), []).append(str(row["parent_type"]))
+            required_face_count = len(by_type.get("face", []))
             for audio_stage in by_type.get("audio", []):
-                if parents_by_child.get(audio_stage["stage_run_id"]) != ["face"]:
-                    raise RuntimeError(f"FUNCTIONAL_FAIL=audio_face_dependency:{audio_stage}:{parents_by_child.get(audio_stage['stage_run_id'])}")
+                audio_parents = parents_by_child.get(audio_stage["stage_run_id"], [])
+                if (
+                    len(audio_parents) != required_face_count
+                    or any(parent_type != "face" for parent_type in audio_parents)
+                ):
+                    raise RuntimeError(
+                        f"FUNCTIONAL_FAIL=audio_face_cohort_dependency:"
+                        f"{audio_stage}:{audio_parents}:"
+                        f"required_face_count={required_face_count}"
+                    )
             for fusion_stage in by_type.get("fusion", []):
                 parent_types = set(parents_by_child.get(fusion_stage["stage_run_id"], []))
                 if not {"face", "audio"}.issubset(parent_types):
