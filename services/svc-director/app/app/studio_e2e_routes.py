@@ -51,15 +51,19 @@ class FusionPreviewIn(BaseModel):
     external_provider_ok: bool = False
 
 
-class FusionTurnConfirmation(BaseModel):
+class FusionChildConfirmation(BaseModel):
     dialogue_turn_id: UUID
     request_nonce: str = Field(min_length=1, max_length=300)
+
+
+class FusionParentConfirmation(BaseModel):
     quote_id: str = Field(min_length=1, max_length=300)
-    preview_fingerprint: str | None = Field(default=None, max_length=500)
+    preview_fingerprint: str = Field(min_length=1, max_length=500)
 
 
 class FusionDispatchIn(BaseModel):
-    confirmations: list[FusionTurnConfirmation] = Field(min_length=1, max_length=200)
+    parent_confirmation: FusionParentConfirmation
+    child_confirmations: list[FusionChildConfirmation] = Field(default_factory=list, max_length=200)
     external_provider_ok: bool = False
     user_confirmed: bool = True
 
@@ -182,7 +186,7 @@ async def preview_fusion_stage(
 ):
     try:
         async with request.app.state.business_pool.acquire() as conn:
-            context, quotes = await fusion_execution.preview(
+            context, bundle = await fusion_execution.preview(
                 conn,
                 account_id=auth.account_id,
                 workflow_id=workflow_id,
@@ -197,7 +201,13 @@ async def preview_fusion_stage(
             "stage_state": context.stage_state,
             "render_strategy": "dialogue_turn_segments_then_stitch",
             "turn_count": len(context.turns),
-            "children": quotes,
+            "parent_quote": bundle["parent"],
+            "children": bundle["children"],
+            "preserved_child_count": bundle["preserved_child_count"],
+            "required_child_count": bundle["required_child_count"],
+            "billable_parent_quote_count": bundle["billable_parent_quote_count"],
+            "billable_child_quote_count": bundle["billable_child_quote_count"],
+            "child_pricing_suppressed": bundle["child_pricing_suppressed"],
         }
     except (SceneFusionBridgeError, StudioWorkflowError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -218,13 +228,14 @@ async def dispatch_fusion_stage(
     if body.external_provider_ok is not True:
         raise HTTPException(status_code=422, detail="fusion_external_provider_consent_required")
     try:
-        context, attempt_id, attempt_no, attempt_kind, children = await fusion_execution.dispatch(
+        context, attempt_id, attempt_no, attempt_kind, children, parent_pricing = await fusion_execution.dispatch(
             request.app.state.business_pool,
             account_id=auth.account_id,
             workflow_id=workflow_id,
             stage_run_id=stage_run_id,
             headers=_forward_auth(request),
-            confirmations=[item.model_dump(mode="json") for item in body.confirmations],
+            parent_confirmation=body.parent_confirmation.model_dump(mode="json"),
+            child_confirmations=[item.model_dump(mode="json") for item in body.child_confirmations],
             external_provider_ok=body.external_provider_ok,
         )
         return {
@@ -236,6 +247,7 @@ async def dispatch_fusion_stage(
             "attempt_count": attempt_no,
             "attempt_kind": attempt_kind,
             "children": children,
+            "parent_pricing": parent_pricing,
         }
     except (SceneFusionBridgeError, StudioWorkflowError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
