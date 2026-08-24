@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 COMPOSE=(bash "$ROOT/scripts/v3-compose.sh")
 WORKFLOW_ID="${WORKFLOW_ID:-a58bd7bf-b958-4bfe-9855-0d964d500b04}"
+EXPECTED_PYTHONPATH='/app:/repo:/repo/services/shared:/repo/services/shared/python'
 
 hold() { echo "V3 BACKGROUND REPAIR: HOLD: $*" >&2; exit 1; }
 section() { echo; echo "===== $* ====="; }
@@ -26,11 +27,10 @@ echo "active_generation_jobs=$ACTIVE"
 [[ "${ACTIVE:-0}" == "0" ]] || hold "active generation exists; refusing stitch-worker recreate"
 echo "ACTIVE_GENERATION_GATE = PASS"
 
-section "2. VERIFY COMPOSE SHARED PACKAGE PATH"
-CONFIG="$("${COMPOSE[@]}" config)"
-printf '%s\n' "$CONFIG" | grep -F 'PYTHONPATH: /app:/repo:/repo/services/shared:/repo/services/shared/python' >/dev/null \
-  || hold "V3 stitch worker shared PYTHONPATH not present in resolved compose"
-echo "STITCH_SHARED_PYTHONPATH_CONFIG = PASS"
+section "2. VERIFY V3 OVERRIDE SOURCE"
+grep -Fq 'PYTHONPATH: "/app:/repo:/repo/services/shared:/repo/services/shared/python"' docker-compose.v3.yml \
+  || hold "V3 stitch worker PYTHONPATH override missing from docker-compose.v3.yml"
+echo "STITCH_SHARED_PYTHONPATH_SOURCE = PASS"
 
 section "3. RECREATE ONLY STITCH WORKER — NO IMAGE BUILD"
 "${COMPOSE[@]}" up -d --no-deps --force-recreate svc-fusion-extension-stitch-worker
@@ -38,7 +38,17 @@ section "3. RECREATE ONLY STITCH WORKER — NO IMAGE BUILD"
 CID="$("${COMPOSE[@]}" ps -q svc-fusion-extension-stitch-worker)"
 [[ -n "$CID" ]] || hold "stitch worker container missing after recreate"
 
-section "4. WAIT FOR STABLE COORDINATOR START"
+section "4. VERIFY ACTUAL CONTAINER ENVIRONMENT"
+ACTUAL_PYTHONPATH="$(
+  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CID" \
+    | awk -F= '$1=="PYTHONPATH"{sub(/^PYTHONPATH=/,""); print; exit}'
+)"
+echo "container_pythonpath=$ACTUAL_PYTHONPATH"
+[[ "$ACTUAL_PYTHONPATH" == "$EXPECTED_PYTHONPATH" ]] \
+  || hold "actual stitch worker PYTHONPATH mismatch"
+echo "STITCH_SHARED_PYTHONPATH_RUNTIME = PASS"
+
+section "5. WAIT FOR STABLE COORDINATOR START"
 READY=0
 LAST_RESTARTS=""
 for _ in $(seq 1 30); do
@@ -66,7 +76,7 @@ fi
 echo "stitch_worker_restart_count=$LAST_RESTARTS"
 echo "STITCH_WORKER_STABLE = PASS"
 
-section "5. SHARED IMPORT RUNTIME PROOF"
+section "6. SHARED IMPORT RUNTIME PROOF"
 "${COMPOSE[@]}" exec -T svc-fusion-extension-stitch-worker python - <<'PY'
 import df_contracts
 from desifaces_shared.v3.studio_workflow_store import CanonicalStudioWorkflowStore
@@ -75,7 +85,7 @@ print(f"workflow_store={CanonicalStudioWorkflowStore.__name__}")
 print("SHARED_IMPORT_RUNTIME = PASS")
 PY
 
-section "6. COMPLETE ZERO-CREDIT RESUME CERTIFICATE"
+section "7. COMPLETE ZERO-CREDIT RESUME CERTIFICATE"
 WORKFLOW_ID="$WORKFLOW_ID" bash "$ROOT/scripts/v3-parallel-runtime-resume-certify.sh"
 
 echo
