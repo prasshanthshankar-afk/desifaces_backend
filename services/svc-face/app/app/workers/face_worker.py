@@ -18,11 +18,11 @@ IDLE_SLEEP_SECONDS = 3
 
 
 def _worker_concurrency() -> int:
-    raw = str(os.getenv("DF_FACE_WORKER_CONCURRENCY", "4") or "4").strip()
+    raw = str(os.getenv("DF_FACE_WORKER_CONCURRENCY", "16") or "16").strip()
     try:
-        return max(1, min(16, int(raw)))
+        return max(1, min(32, int(raw)))
     except Exception:
-        return 4
+        return 16
 
 
 class WorkerProcess:
@@ -60,8 +60,6 @@ class WorkerProcess:
         return (s or "").strip().lower()
 
     async def _process_one(self, job_id: str) -> None:
-        # One orchestrator per concurrent Face job keeps request/job-local state
-        # isolated while all workers share the async DB pool.
         orchestrator = CreatorOrchestrator(self.pool)
 
         try:
