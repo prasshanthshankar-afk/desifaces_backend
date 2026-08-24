@@ -6,6 +6,7 @@ from app.db import init_db
 from app.api.health import router as health_router
 from app.api.routes.longform import router as longform_router
 from app.api.routes.v3_scene_stitch import router as v3_scene_stitch_router
+from app.api.routes.v3_story_stitch import router as v3_story_stitch_router
 from app.config import settings
 
 from app.workers.longform_worker import worker_loop
@@ -16,6 +17,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(longform_router)
     app.include_router(v3_scene_stitch_router)
+    app.include_router(v3_story_stitch_router)
     return app
 
 

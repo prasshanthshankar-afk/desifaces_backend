@@ -12,6 +12,10 @@ from desifaces_shared.v3.studio_workflow_store import StudioWorkflowError
 from .audio_execution import ParticipantAudioBridgeError, ParticipantAudioExecutionService
 from .config import settings
 from .fusion_execution import SceneFusionBridgeError, SceneFusionExecutionService
+from .story_final_execution import (
+    StoryFinalBridgeError,
+    StoryFinalExecutionService,
+)
 from .security import DirectorAuthContext, get_director_auth
 from .studio_progression import advance_studio_workflow
 from .studio_routes import store
@@ -27,6 +31,12 @@ fusion_execution = SceneFusionExecutionService(
     audio_base_url=settings.DF_AUDIO_BASE_URL,
     fusion_base_url=settings.DF_FUSION_BASE_URL,
     fusion_extension_base_url=settings.DF_FUSION_EXTENSION_BASE_URL,
+    store=store,
+)
+
+story_final_execution = StoryFinalExecutionService(
+    fusion_extension_base_url=
+        settings.DF_FUSION_EXTENSION_BASE_URL,
     store=store,
 )
 
@@ -258,6 +268,48 @@ async def sync_fusion_stage(
         return {**result, "workflow": workflow.model_dump(mode="json")}
     except (SceneFusionBridgeError, StudioWorkflowError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post(
+    "/api/director/studio-workflows/{workflow_id}/story-final-stages/{stage_run_id}/stitch"
+)
+async def stitch_story_final_stage(
+    workflow_id: UUID,
+    stage_run_id: UUID,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    try:
+        result = await story_final_execution.stitch(
+            request.app.state.business_pool,
+            account_id=auth.account_id,
+            workflow_id=workflow_id,
+            stage_run_id=stage_run_id,
+            headers=_forward_auth(request),
+        )
+
+        async with request.app.state.business_pool.acquire() as conn:
+            workflow = await advance_studio_workflow(
+                conn,
+                store=store,
+                workflow_id=workflow_id,
+                account_id=auth.account_id,
+            )
+
+        return {
+            **result,
+            "workflow":
+                workflow.model_dump(mode="json"),
+        }
+
+    except (
+        StoryFinalBridgeError,
+        StudioWorkflowError,
+    ) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
 
 
 @router.post(
