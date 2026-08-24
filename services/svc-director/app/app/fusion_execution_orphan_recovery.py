@@ -17,7 +17,6 @@ from .fusion_execution_parent_pricing import ParentPricedSceneFusionExecutionSer
 
 _TERMINAL_SUCCESS = {"succeeded", "completed", "complete", "ready"}
 _TERMINAL_FAILURE = {"failed", "canceled", "cancelled", "blocked"}
-_ACTIVE = {"queued", "running", "processing", "submitted", "pending", "finalizing", "unknown", ""}
 
 
 def _payload_turn_id(payload: dict[str, Any]) -> str:
@@ -85,36 +84,39 @@ class OrphanReconciledParentPricedSceneFusionExecutionService(
             if _clean(item.get("dialogue_turn_id"))
         }
 
-        owner_user_id = await conn.fetchval(
-            """
-            select owner_user_id
-            from public.v3_studio_workflows
-            where workflow_id=$1 and account_id=$2
-            """,
-            context.workflow_id,
-            context.account_id,
-        )
-        if not owner_user_id:
-            return 0
+        owner_user_id = context.owner_user_id
+        parent_stage = str(context.stage_run_id)
 
-        # Read only candidate V3 internal child jobs for this workflow owner. Exact
-        # parent-stage/segment lineage is revalidated in Python before adoption.
+        # Use the exact persisted parent-stage lineage. Director duplicates these
+        # markers into provider_options/tags, which FusionJobCreate preserves.
         rows = await conn.fetch(
             """
             select id,status,payload_json,meta_json,created_at,updated_at
             from public.studio_jobs
             where studio_type='fusion'
               and user_id=$1
-              and created_at >= ($2::timestamptz - interval '5 minutes')
+              and (
+                payload_json #>> '{provider_options,billing_context,billing_parent_job_id}' = $2
+                or payload_json #>> '{provider_options,billing_context,parent_longform_job_id}' = $2
+                or payload_json #>> '{provider_options,billing_context,parent_job_id}' = $2
+                or payload_json #>> '{provider_options,pricing_context,billing_parent_job_id}' = $2
+                or payload_json #>> '{provider_options,pricing_context,parent_longform_job_id}' = $2
+                or payload_json #>> '{provider_options,pricing_context,parent_job_id}' = $2
+                or payload_json #>> '{tags,billing_context,billing_parent_job_id}' = $2
+                or payload_json #>> '{tags,billing_context,parent_longform_job_id}' = $2
+                or payload_json #>> '{tags,billing_context,parent_job_id}' = $2
+                or payload_json #>> '{tags,pricing_context,billing_parent_job_id}' = $2
+                or payload_json #>> '{tags,pricing_context,parent_longform_job_id}' = $2
+                or payload_json #>> '{tags,pricing_context,parent_job_id}' = $2
+              )
             order by created_at desc
             limit 250
             """,
             owner_user_id,
-            latest["started_at"],
+            parent_stage,
         )
 
         by_turn: dict[str, Any] = {}
-        parent_stage = str(context.stage_run_id)
         valid_turns = {str(turn.dialogue_turn_id): turn for turn in context.turns}
 
         for row in rows:
@@ -171,9 +173,9 @@ class OrphanReconciledParentPricedSceneFusionExecutionService(
             children.append(
                 {
                     "dialogue_turn_id": turn_id,
-                    "participant_id": str(getattr(turn, "participant_id", "") or ""),
-                    "display_name": str(getattr(turn, "display_name", "") or ""),
-                    "sequence_no": int(getattr(turn, "sequence_no", 0) or 0),
+                    "participant_id": str(turn.participant_id),
+                    "display_name": turn.display_name,
+                    "sequence_no": int(turn.sequence_no),
                     "fusion_job_id": job_id,
                     "status": "succeeded",
                     "video_url": video_url,
