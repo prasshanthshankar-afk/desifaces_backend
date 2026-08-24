@@ -82,6 +82,8 @@ class TTSJobsRepo:
                     """
                     UPDATE studio_jobs
                        SET status='running',
+                           meta_json=COALESCE(meta_json, '{}'::jsonb)
+                                     || jsonb_build_object('worker_claimed_at', now()::text),
                            updated_at=now()
                      WHERE id = ANY($1::uuid[])
                     """,
