@@ -110,12 +110,13 @@ class UserOwnedStoryCompiler(CanonicalStoryCompiler):
                     metadata = dict(row["metadata_json"] or {})
                     explicit = dict(metadata.get("explicit_face_constraints") or {})
                     persona = dict(row["persona_json"] or {})
+                    participant_changed = False
 
                     if recovered.get("gender") and not _clean(explicit.get("gender")):
                         explicit["gender"] = recovered["gender"]
                         if not _clean(persona.get("gender_presentation")):
                             persona["gender_presentation"] = recovered["gender"]
-                        changed = True
+                        participant_changed = True
                     if recovered.get("age") and not (
                         _clean(explicit.get("age"))
                         or _clean(explicit.get("age_range"))
@@ -124,9 +125,9 @@ class UserOwnedStoryCompiler(CanonicalStoryCompiler):
                         explicit["age"] = recovered["age"]
                         if not _clean(persona.get("age")):
                             persona["age"] = recovered["age"]
-                        changed = True
+                        participant_changed = True
 
-                    if changed:
+                    if participant_changed:
                         metadata["explicit_face_constraints"] = explicit
                         provenance = dict(metadata.get("production_provenance") or {})
                         provenance["explicit_face_constraints"] = "creative_plan_user_context"
@@ -141,6 +142,7 @@ class UserOwnedStoryCompiler(CanonicalStoryCompiler):
                             metadata,
                             persona,
                         )
+                        changed = True
 
         if not changed:
             return graph
