@@ -4,6 +4,15 @@ on:
   push:
     branches:
       - feature/v3-multiperson-core-20260818
+      - release/v3-studio-completion-20260824
+    paths:
+      - 'services/svc-director/app/app/**'
+      - 'migrations/001_pricing.sql'
+      - 'migrations/2026_08_24_v3_multiperson_pricing_packages.sql'
+      - '.github/workflows/v3-story-backend-static.yml'
+  pull_request:
+    branches:
+      - feature/v3-multiperson-core-20260818
     paths:
       - 'services/svc-director/app/app/**'
       - 'migrations/001_pricing.sql'
