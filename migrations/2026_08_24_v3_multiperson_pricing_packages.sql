@@ -38,7 +38,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_pricing_experience_packages_active_default
 -- Dormant surcharge SKU. It carries zero default credits and is inactive so it can
 -- never accidentally participate in today's pricing. Pricing Operations can later
 -- activate it and use the existing pricebook/sku override model for country/channel/
--- tier-specific values.
+-- tier-specific values. ON CONFLICT deliberately preserves status/default credits so
+-- a future Pricing Operations activation is never silently undone by a replay.
 INSERT INTO pricing_skus(
   code,name,unit,category,provider_hint,default_unit_credits,status,metadata_json
 )
@@ -98,7 +99,6 @@ VALUES (
   )
 )
 ON CONFLICT (variant_code,sku_code,qty_mode,qty_param) DO UPDATE SET
-  qty_value = EXCLUDED.qty_value,
   metadata_json = pricing_variant_lines.metadata_json || EXCLUDED.metadata_json;
 
 INSERT INTO pricing_experience_packages(
@@ -144,8 +144,8 @@ ON CONFLICT (package_code) DO UPDATE SET
   display_name = EXCLUDED.display_name,
   pricing_strategy = EXCLUDED.pricing_strategy,
   package_variant_code = EXCLUDED.package_variant_code,
-  is_default = EXCLUDED.is_default,
-  is_active = EXCLUDED.is_active,
+  -- is_default/is_active are operational state. Preserve them on replay so future
+  -- package activation/deactivation remains an explicit pricing decision.
   metadata_json = pricing_experience_packages.metadata_json || EXCLUDED.metadata_json,
   updated_at = now();
 
