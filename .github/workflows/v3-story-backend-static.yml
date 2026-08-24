@@ -10,6 +10,14 @@ on:
       - 'migrations/001_pricing.sql'
       - 'migrations/2026_08_24_v3_multiperson_pricing_packages.sql'
       - '.github/workflows/v3-story-backend-static.yml'
+  pull_request:
+    branches:
+      - feature/v3-multiperson-core-20260818
+    paths:
+      - 'services/svc-director/app/app/**'
+      - 'migrations/001_pricing.sql'
+      - 'migrations/2026_08_24_v3_multiperson_pricing_packages.sql'
+      - '.github/workflows/v3-story-backend-static.yml'
   workflow_dispatch:
 
 permissions:
