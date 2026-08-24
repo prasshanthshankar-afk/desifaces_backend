@@ -114,7 +114,6 @@ def _parse_expiry(value: Any) -> datetime | None:
 
 
 def _pricing_cycle_token(stored: dict[str, Any]) -> str:
-    """One preview lifecycle token; stable for retries, fresh after a new preview."""
     source = "|".join(
         (
             _clean(stored.get("quote_id")),
@@ -129,26 +128,22 @@ def _pricing_cycle_token(stored: dict[str, Any]) -> str:
 
 
 def _line_unit(pricing: dict[str, Any]) -> str:
-    meta = _as_dict(pricing.get("meta"))
-    lines = list(meta.get("lines") or [])
+    lines = list(_as_dict(pricing.get("meta")).get("lines") or [])
     units = {
-        _clean(_as_dict(item).get("unit")).lower()
-        for item in lines
-        if _clean(_as_dict(item).get("unit"))
+        _clean(_as_dict(line).get("unit")).lower()
+        for line in lines
+        if _clean(_as_dict(line).get("unit"))
     }
     if len(units) == 1:
         return next(iter(units))
-    if len(units) > 1:
-        return "composite"
-    return ""
+    return "composite" if len(units) > 1 else ""
 
 
 def _provider_hints(pricing: dict[str, Any]) -> set[str]:
-    meta = _as_dict(pricing.get("meta"))
     return {
-        _clean(_as_dict(item).get("provider_hint")).lower()
-        for item in list(meta.get("lines") or [])
-        if _clean(_as_dict(item).get("provider_hint"))
+        _clean(_as_dict(line).get("provider_hint")).lower()
+        for line in list(_as_dict(pricing.get("meta")).get("lines") or [])
+        if _clean(_as_dict(line).get("provider_hint"))
     }
 
 
@@ -158,19 +153,21 @@ def _storage_location(row: asyncpg.Record) -> tuple[str, str]:
     blob_name = _clean(meta.get("storage_path") or meta.get("blob_name"))
     if container and blob_name:
         return container, blob_name.lstrip("/")
-
     storage_ref = _clean(row["storage_ref"])
     if storage_ref.startswith("azure://"):
-        value = storage_ref[len("azure://") :]
-        container, sep, blob_name = value.partition("/")
+        remainder = storage_ref[len("azure://") :]
+        container, sep, blob_name = remainder.partition("/")
         if sep and container and blob_name:
             return container, blob_name.lstrip("/")
     raise HTTPException(status_code=409, detail="scene_pricing_audio_storage_lineage_missing")
 
 
 def _sign_audio(container: str, blob_name: str) -> str:
-    sas = AzureBlobService(settings.AZURE_STORAGE_CONNECTION_STRING)
-    return sas.sign_read_url(container, blob_name, 900)
+    return AzureBlobService(settings.AZURE_STORAGE_CONNECTION_STRING).sign_read_url(
+        container,
+        blob_name,
+        900,
+    )
 
 
 async def _resolve_account_or_401(conn, user_id: UUID):
@@ -183,9 +180,8 @@ async def _resolve_account_or_401(conn, user_id: UUID):
 async def _load_scene(conn, *, body: ScenePricingKey, account_id: UUID):
     row = await conn.fetchrow(
         """
-        select
-          w.workflow_id,w.account_id,w.owner_user_id,w.project_id,w.current_stage,
-          s.stage_run_id,s.stage_type,s.scope_type,s.scene_id,s.state,s.metadata_json
+        select w.workflow_id,w.account_id,w.owner_user_id,w.project_id,w.current_stage,
+               s.stage_run_id,s.stage_type,s.scope_type,s.scene_id,s.state,s.metadata_json
         from public.v3_studio_workflows w
         join public.v3_studio_stage_runs s on s.workflow_id=w.workflow_id
         where w.workflow_id=$1 and w.project_id=$2 and w.account_id=$3
@@ -203,7 +199,14 @@ async def _load_scene(conn, *, body: ScenePricingKey, account_id: UUID):
     return row
 
 
-async def _approved_audio_rows(conn, *, scene_id: UUID, workflow_id: UUID, account_id: UUID, project_id: UUID):
+async def _approved_audio_rows(
+    conn,
+    *,
+    scene_id: UUID,
+    workflow_id: UUID,
+    account_id: UUID,
+    project_id: UUID,
+):
     speech_count = int(
         await conn.fetchval(
             "select count(*) from public.v3_dialogue_turns where scene_id=$1 and turn_kind='speech'",
@@ -243,14 +246,16 @@ async def _approved_audio_rows(conn, *, scene_id: UUID, workflow_id: UUID, accou
     return rows
 
 
-async def _measure_audio_rows(rows: list[asyncpg.Record] | tuple[asyncpg.Record, ...]) -> tuple[list[dict[str, Any]], float, str]:
+async def _measure_audio_rows(rows) -> tuple[list[dict[str, Any]], float, str]:
     semaphore = asyncio.Semaphore(_MAX_PROBE_CONCURRENCY)
 
-    async def measure(row: asyncpg.Record) -> dict[str, Any]:
+    async def measure(row) -> dict[str, Any]:
         container, blob_name = _storage_location(row)
-        url = _sign_audio(container, blob_name)
         async with semaphore:
-            duration = await asyncio.to_thread(probe_duration_seconds, url)
+            duration = await asyncio.to_thread(
+                probe_duration_seconds,
+                _sign_audio(container, blob_name),
+            )
         if duration is None or float(duration) <= 0:
             raise HTTPException(
                 status_code=409,
@@ -264,9 +269,9 @@ async def _measure_audio_rows(rows: list[asyncpg.Record] | tuple[asyncpg.Record,
         }
 
     measured = await asyncio.gather(*(measure(row) for row in rows))
-    measured = sorted(measured, key=lambda item: (int(item["sequence_no"]), item["dialogue_turn_id"]))
+    measured.sort(key=lambda item: (int(item["sequence_no"]), item["dialogue_turn_id"]))
     total = round(sum(float(item["duration_sec"]) for item in measured), 3)
-    lineage_src = [
+    lineage = [
         {
             "dialogue_turn_id": item["dialogue_turn_id"],
             "media_id": item["media_id"],
@@ -274,10 +279,10 @@ async def _measure_audio_rows(rows: list[asyncpg.Record] | tuple[asyncpg.Record,
         }
         for item in measured
     ]
-    lineage_hash = hashlib.sha256(
-        json.dumps(lineage_src, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(
+        json.dumps(lineage, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    return measured, total, lineage_hash
+    return measured, total, digest
 
 
 async def _scene_measurement(conn, *, body: ScenePricingKey, account_id: UUID):
@@ -293,7 +298,15 @@ async def _scene_measurement(conn, *, body: ScenePricingKey, account_id: UUID):
     return scene, measured, total, _billable_minutes(total), lineage_hash
 
 
-def _pricing_meta(*, body: ScenePricingKey, scene_id: UUID, measured: list[dict[str, Any]], total: float, minutes: int, lineage_hash: str) -> dict[str, Any]:
+def _pricing_meta(
+    *,
+    body: ScenePricingKey,
+    scene_id: UUID,
+    measured: list[dict[str, Any]],
+    total: float,
+    minutes: int,
+    lineage_hash: str,
+) -> dict[str, Any]:
     return {
         "mode": "fusion_scene_parent",
         "provider": _PROVIDER,
@@ -315,28 +328,42 @@ def _pricing_meta(*, body: ScenePricingKey, scene_id: UUID, measured: list[dict[
     }
 
 
-def _normalize_parent_pricing(pricing: dict[str, Any], *, minutes: int, meta: dict[str, Any]) -> dict[str, Any]:
+def _normalize_parent_pricing(
+    pricing: dict[str, Any],
+    *,
+    minutes: int,
+    meta: dict[str, Any],
+) -> dict[str, Any]:
     out = dict(pricing or {})
-    out["enabled"] = True
-    out["service_name"] = _SERVICE_NAME
-    out["service_action"] = _SERVICE_ACTION
-    out["sku_code"] = _VARIANT_CODE
-    out["variant_code"] = _VARIANT_CODE
-    out["leaf_sku_code"] = _LEAF_SKU_CODE
-    out["unit_type"] = "minute"
-    out["estimated_units"] = str(minutes)
-    out["provider"] = _PROVIDER
-    merged_meta = {**_as_dict(out.get("meta")), **meta}
-    out["meta"] = merged_meta
+    out.update(
+        {
+            "enabled": True,
+            "service_name": _SERVICE_NAME,
+            "service_action": _SERVICE_ACTION,
+            "sku_code": _VARIANT_CODE,
+            "variant_code": _VARIANT_CODE,
+            "leaf_sku_code": _LEAF_SKU_CODE,
+            "unit_type": "minute",
+            "estimated_units": str(minutes),
+            "provider": _PROVIDER,
+            "meta": {**_as_dict(out.get("meta")), **meta},
+        }
+    )
     return out
 
 
 def _validate_pricebook_contract(pricing: dict[str, Any]) -> None:
     unit = _line_unit(pricing)
     if unit != "minute":
-        raise HTTPException(status_code=409, detail=f"scene_pricing_unit_contract_invalid:{unit or 'missing'}")
-    hints = _provider_hints(pricing)
-    stale = {value for value in hints if value not in {_PROVIDER, "provider-neutral", "neutral"}}
+        raise HTTPException(
+            status_code=409,
+            detail=f"scene_pricing_unit_contract_invalid:{unit or 'missing'}",
+        )
+    stale = {
+        hint
+        for hint in _provider_hints(pricing)
+        if hint not in {_PROVIDER, "provider-neutral", "neutral"}
+    }
     if stale:
         raise HTTPException(
             status_code=409,
@@ -344,7 +371,15 @@ def _validate_pricebook_contract(pricing: dict[str, Any]) -> None:
         )
 
 
-def _preview_record(*, pricing: dict[str, Any], pricing_summary: dict[str, Any], measured: list[dict[str, Any]], total: float, minutes: int, lineage_hash: str) -> dict[str, Any]:
+def _preview_record(
+    *,
+    pricing: dict[str, Any],
+    pricing_summary: dict[str, Any],
+    measured: list[dict[str, Any]],
+    total: float,
+    minutes: int,
+    lineage_hash: str,
+) -> dict[str, Any]:
     return {
         "state": "quoted",
         "quote_id": _clean(pricing.get("quote_id")),
@@ -378,7 +413,14 @@ def _stored_parent_pricing(scene) -> dict[str, Any]:
     return _as_dict(_as_dict(scene["metadata_json"]).get(_PRICING_KEY))
 
 
-def _assert_preview_confirmation(stored: dict[str, Any], *, body: ScenePricingReserveIn, minutes: int, lineage_hash: str, turn_count: int) -> None:
+def _assert_preview_confirmation(
+    stored: dict[str, Any],
+    *,
+    body: ScenePricingReserveIn,
+    minutes: int,
+    lineage_hash: str,
+    turn_count: int,
+) -> None:
     if _clean(stored.get("quote_id")) != _clean(body.quote_id):
         raise HTTPException(status_code=409, detail="scene_pricing_quote_id_mismatch")
     if _clean(stored.get("preview_fingerprint")) != _clean(body.preview_fingerprint):
@@ -401,7 +443,17 @@ def _pricing_client() -> SvcPricingClient:
     return client
 
 
-def _out(*, scene_id: UUID, body: ScenePricingKey, measured: list[dict[str, Any]], total: float, minutes: int, lineage_hash: str, pricing: dict[str, Any], pricing_summary: dict[str, Any]) -> ScenePricingOut:
+def _out(
+    *,
+    scene_id: UUID,
+    body: ScenePricingKey,
+    measured: list[dict[str, Any]],
+    total: float,
+    minutes: int,
+    lineage_hash: str,
+    pricing: dict[str, Any],
+    pricing_summary: dict[str, Any],
+) -> ScenePricingOut:
     return ScenePricingOut(
         workflow_id=body.workflow_id,
         stage_run_id=body.stage_run_id,
@@ -453,25 +505,38 @@ async def preview_scene_pricing(
             units=str(minutes),
             external_ref_type="v3_scene_stage_preview",
             external_ref_id=str(body.stage_run_id),
-            idempotency_key=f"svc-fusion-extension:v3-scene:{body.stage_run_id}:preview:{request_fingerprint}",
+            idempotency_key=(
+                f"svc-fusion-extension:v3-scene:{body.stage_run_id}:"
+                f"preview:{request_fingerprint}"
+            ),
             meta=meta,
         )
         try:
-            resp = await _pricing_client().preview(build_preview_request(spec))
+            response = await _pricing_client().preview(build_preview_request(spec))
         except PricingClientError as exc:
-            raise HTTPException(status_code=409, detail=f"scene_pricing_preview_failed:{str(exc)[:1200]}") from exc
+            raise HTTPException(
+                status_code=409,
+                detail=f"scene_pricing_preview_failed:{str(exc)[:1200]}",
+            ) from exc
         artifact = make_preview_artifact(
-            resp,
+            response,
             service_name=_SERVICE_NAME,
             service_action=_SERVICE_ACTION,
             sku_code=_VARIANT_CODE,
             meta=meta,
         )
-        pricing = _normalize_parent_pricing(dict(artifact.get("pricing") or {}), minutes=minutes, meta=meta)
-        pricing_summary = dict(artifact.get("pricing_summary") or build_pricing_summary(pricing))
+        pricing = _normalize_parent_pricing(
+            dict(artifact.get("pricing") or {}),
+            minutes=minutes,
+            meta=meta,
+        )
         _validate_pricebook_contract(pricing)
         if not _clean(pricing.get("quote_id")) or not _clean(pricing.get("preview_fingerprint")):
-            raise HTTPException(status_code=409, detail="scene_pricing_preview_missing_confirmation_contract")
+            raise HTTPException(
+                status_code=409,
+                detail="scene_pricing_preview_missing_confirmation_contract",
+            )
+        pricing_summary = build_pricing_summary(pricing)
         record = _preview_record(
             pricing=pricing,
             pricing_summary=pricing_summary,
@@ -508,13 +573,21 @@ async def reserve_scene_pricing(
             account_id=account.account_id,
         )
         stored = _stored_parent_pricing(scene)
-        if _clean(stored.get("state")) in {"reserved", "committed"} and _clean(stored.get("quote_id")) == _clean(body.quote_id):
-            pricing = _as_dict(stored.get("pricing"))
+        if (
+            _clean(stored.get("state")) in {"reserved", "committed"}
+            and _clean(stored.get("quote_id")) == _clean(body.quote_id)
+        ):
             return _out(
-                scene_id=UUID(str(scene["scene_id"])), body=body, measured=measured, total=total,
-                minutes=minutes, lineage_hash=lineage_hash, pricing=pricing,
+                scene_id=UUID(str(scene["scene_id"])),
+                body=body,
+                measured=measured,
+                total=total,
+                minutes=minutes,
+                lineage_hash=lineage_hash,
+                pricing=_as_dict(stored.get("pricing")),
                 pricing_summary=_as_dict(stored.get("pricing_summary")),
             )
+
         _assert_preview_confirmation(
             stored,
             body=body,
@@ -523,7 +596,10 @@ async def reserve_scene_pricing(
             turn_count=len(measured),
         )
         base_pricing = _as_dict(stored.get("pricing"))
-        meta = {**_as_dict(base_pricing.get("meta")), "reservation_owner": "v3_scene_parent"}
+        meta = {
+            **_as_dict(base_pricing.get("meta")),
+            "reservation_owner": "v3_scene_parent",
+        }
         cycle_token = _pricing_cycle_token(stored)
         spec = PricingReserveSpec(
             user_id=str(canonical_user_id),
@@ -533,32 +609,65 @@ async def reserve_scene_pricing(
             units=str(minutes),
             external_ref_type="v3_scene_stage",
             external_ref_id=str(body.stage_run_id),
-            idempotency_key=f"svc-fusion-extension:v3-scene:{body.stage_run_id}:reserve:{cycle_token}",
+            idempotency_key=(
+                f"svc-fusion-extension:v3-scene:{body.stage_run_id}:"
+                f"reserve:{cycle_token}"
+            ),
             meta=meta,
             quote_id=body.quote_id,
             preview_fingerprint=body.preview_fingerprint,
         )
         try:
-            resp = await _pricing_client().reserve(build_reserve_request(spec))
+            response = await _pricing_client().reserve(build_reserve_request(spec))
         except PricingClientError as exc:
-            raise HTTPException(status_code=409, detail=f"scene_pricing_reserve_failed:{str(exc)[:1200]}") from exc
-        artifact = make_reserved_artifact(resp, base_pricing=base_pricing, meta=meta)
-        pricing = _normalize_parent_pricing(dict(artifact.get("pricing") or {}), minutes=minutes, meta=meta)
+            raise HTTPException(
+                status_code=409,
+                detail=f"scene_pricing_reserve_failed:{str(exc)[:1200]}",
+            ) from exc
+        artifact = make_reserved_artifact(
+            response,
+            service_name=_SERVICE_NAME,
+            service_action=_SERVICE_ACTION,
+            sku_code=_VARIANT_CODE,
+            estimated_units=str(minutes),
+            estimated_amount=_clean(base_pricing.get("estimated_amount")) or None,
+            currency=_clean(base_pricing.get("currency")) or None,
+            unit_type="minute",
+            meta=meta,
+        )
+        pricing = _normalize_parent_pricing(
+            dict(artifact.get("pricing") or {}),
+            minutes=minutes,
+            meta=meta,
+        )
         pricing["state"] = "reserved"
-        pricing_summary = dict(artifact.get("pricing_summary") or build_pricing_summary(pricing))
+        pricing["quote_id"] = body.quote_id
+        pricing["preview_fingerprint"] = body.preview_fingerprint
+        pricing["quote_expires_at"] = _clean(stored.get("quote_expires_at")) or None
+        reservation_id = _clean(pricing.get("reservation_id"))
+        if not reservation_id:
+            raise HTTPException(
+                status_code=409,
+                detail="scene_pricing_reserve_missing_reservation_id",
+            )
+        pricing_summary = build_pricing_summary(pricing)
         record = {
             **stored,
             "state": "reserved",
-            "reservation_id": _clean(pricing.get("reservation_id")),
+            "reservation_id": reservation_id,
             "pricing": pricing,
             "pricing_summary": pricing_summary,
         }
-        if not record["reservation_id"]:
-            raise HTTPException(status_code=409, detail="scene_pricing_reserve_missing_reservation_id")
         await _persist_parent_pricing(conn, stage_run_id=body.stage_run_id, record=record)
         return _out(
-            scene_id=UUID(str(scene["scene_id"])), body=body, measured=measured, total=total,
-            minutes=minutes, lineage_hash=lineage_hash, pricing=pricing, pricing_summary=pricing_summary,
+            scene_id=UUID(str(scene["scene_id"])),
+            body=body,
+            measured=measured,
+            total=total,
+            minutes=minutes,
+            lineage_hash=lineage_hash,
+            pricing=pricing,
+            pricing_summary=pricing_summary,
         )
 
 
@@ -579,15 +688,30 @@ async def commit_scene_pricing(
         stored = _stored_parent_pricing(scene)
         if _clean(stored.get("state")) == "committed":
             return _out(
-                scene_id=UUID(str(scene["scene_id"])), body=body, measured=measured, total=total,
-                minutes=minutes, lineage_hash=lineage_hash, pricing=_as_dict(stored.get("pricing")),
+                scene_id=UUID(str(scene["scene_id"])),
+                body=body,
+                measured=measured,
+                total=total,
+                minutes=minutes,
+                lineage_hash=lineage_hash,
+                pricing=_as_dict(stored.get("pricing")),
                 pricing_summary=_as_dict(stored.get("pricing_summary")),
             )
-        reservation_id = _clean(stored.get("reservation_id") or _as_dict(stored.get("pricing")).get("reservation_id"))
+        reservation_id = _clean(
+            stored.get("reservation_id")
+            or _as_dict(stored.get("pricing")).get("reservation_id")
+        )
         if not reservation_id:
-            raise HTTPException(status_code=409, detail="scene_pricing_commit_requires_reservation")
-        if int(stored.get("estimated_units") or 0) != minutes or _clean(stored.get("audio_lineage_hash")) != lineage_hash:
+            raise HTTPException(
+                status_code=409,
+                detail="scene_pricing_commit_requires_reservation",
+            )
+        if (
+            int(stored.get("estimated_units") or 0) != minutes
+            or _clean(stored.get("audio_lineage_hash")) != lineage_hash
+        ):
             raise HTTPException(status_code=409, detail="scene_pricing_commit_input_changed")
+
         base_pricing = _as_dict(stored.get("pricing"))
         meta = {**_as_dict(base_pricing.get("meta")), "commit_owner": "v3_scene_parent"}
         spec = PricingCommitSpec(
@@ -596,24 +720,60 @@ async def commit_scene_pricing(
             actual_units=str(minutes),
             external_ref_type="v3_scene_stage",
             external_ref_id=str(body.stage_run_id),
-            idempotency_key=f"svc-fusion-extension:v3-scene:{body.stage_run_id}:commit:{reservation_id}",
+            idempotency_key=(
+                f"svc-fusion-extension:v3-scene:{body.stage_run_id}:"
+                f"commit:{reservation_id}"
+            ),
             meta=meta,
         )
         try:
-            resp = await _pricing_client().commit(build_commit_request(spec))
+            response = await _pricing_client().commit(build_commit_request(spec))
         except PricingClientError as exc:
-            pending = {**stored, "state": "commit_pending", "last_error": str(exc)[:1200]}
-            await _persist_parent_pricing(conn, stage_run_id=body.stage_run_id, record=pending)
-            raise HTTPException(status_code=409, detail=f"scene_pricing_commit_failed:{str(exc)[:1200]}") from exc
-        artifact = make_committed_artifact(resp, base_pricing=base_pricing, actual_units=str(minutes), meta=meta)
-        pricing = _normalize_parent_pricing(dict(artifact.get("pricing") or {}), minutes=minutes, meta=meta)
+            pending = {
+                **stored,
+                "state": "commit_pending",
+                "last_error": str(exc)[:1200],
+            }
+            await _persist_parent_pricing(
+                conn,
+                stage_run_id=body.stage_run_id,
+                record=pending,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=f"scene_pricing_commit_failed:{str(exc)[:1200]}",
+            ) from exc
+
+        artifact = make_committed_artifact(
+            response,
+            base_pricing=base_pricing,
+            actual_units=str(minutes),
+            meta=meta,
+        )
+        pricing = _normalize_parent_pricing(
+            dict(artifact.get("pricing") or {}),
+            minutes=minutes,
+            meta=meta,
+        )
         pricing["state"] = "committed"
-        pricing_summary = dict(artifact.get("pricing_summary") or build_pricing_summary(pricing))
-        record = {**stored, "state": "committed", "pricing": pricing, "pricing_summary": pricing_summary, "last_error": None}
+        pricing_summary = build_pricing_summary(pricing)
+        record = {
+            **stored,
+            "state": "committed",
+            "pricing": pricing,
+            "pricing_summary": pricing_summary,
+            "last_error": None,
+        }
         await _persist_parent_pricing(conn, stage_run_id=body.stage_run_id, record=record)
         return _out(
-            scene_id=UUID(str(scene["scene_id"])), body=body, measured=measured, total=total,
-            minutes=minutes, lineage_hash=lineage_hash, pricing=pricing, pricing_summary=pricing_summary,
+            scene_id=UUID(str(scene["scene_id"])),
+            body=body,
+            measured=measured,
+            total=total,
+            minutes=minutes,
+            lineage_hash=lineage_hash,
+            pricing=pricing,
+            pricing_summary=pricing_summary,
         )
 
 
@@ -633,24 +793,52 @@ async def release_scene_pricing(
         )
         stored = _stored_parent_pricing(scene)
         if _clean(stored.get("state")) == "committed":
-            raise HTTPException(status_code=409, detail="scene_pricing_committed_cannot_release")
+            raise HTTPException(
+                status_code=409,
+                detail="scene_pricing_committed_cannot_release",
+            )
         if _clean(stored.get("state")) == "released":
             return _out(
-                scene_id=UUID(str(scene["scene_id"])), body=body, measured=measured, total=total,
-                minutes=minutes, lineage_hash=lineage_hash, pricing=_as_dict(stored.get("pricing")),
+                scene_id=UUID(str(scene["scene_id"])),
+                body=body,
+                measured=measured,
+                total=total,
+                minutes=minutes,
+                lineage_hash=lineage_hash,
+                pricing=_as_dict(stored.get("pricing")),
                 pricing_summary=_as_dict(stored.get("pricing_summary")),
             )
-        reservation_id = _clean(stored.get("reservation_id") or _as_dict(stored.get("pricing")).get("reservation_id"))
+
+        reservation_id = _clean(
+            stored.get("reservation_id")
+            or _as_dict(stored.get("pricing")).get("reservation_id")
+        )
         if not reservation_id:
             pricing = _as_dict(stored.get("pricing"))
             pricing["state"] = "released"
-            record = {**stored, "state": "released", "pricing": pricing, "release_reason": body.reason}
-            await _persist_parent_pricing(conn, stage_run_id=body.stage_run_id, record=record)
-            return _out(
-                scene_id=UUID(str(scene["scene_id"])), body=body, measured=measured, total=total,
-                minutes=minutes, lineage_hash=lineage_hash, pricing=pricing,
-                pricing_summary=_as_dict(stored.get("pricing_summary")),
+            summary = build_pricing_summary(pricing)
+            await _persist_parent_pricing(
+                conn,
+                stage_run_id=body.stage_run_id,
+                record={
+                    **stored,
+                    "state": "released",
+                    "pricing": pricing,
+                    "pricing_summary": summary,
+                    "release_reason": body.reason,
+                },
             )
+            return _out(
+                scene_id=UUID(str(scene["scene_id"])),
+                body=body,
+                measured=measured,
+                total=total,
+                minutes=minutes,
+                lineage_hash=lineage_hash,
+                pricing=pricing,
+                pricing_summary=summary,
+            )
+
         base_pricing = _as_dict(stored.get("pricing"))
         meta = {**_as_dict(base_pricing.get("meta")), "release_owner": "v3_scene_parent"}
         spec = PricingReleaseSpec(
@@ -659,22 +847,48 @@ async def release_scene_pricing(
             reason=body.reason,
             external_ref_type="v3_scene_stage",
             external_ref_id=str(body.stage_run_id),
-            idempotency_key=f"svc-fusion-extension:v3-scene:{body.stage_run_id}:release:{reservation_id}",
+            idempotency_key=(
+                f"svc-fusion-extension:v3-scene:{body.stage_run_id}:"
+                f"release:{reservation_id}"
+            ),
             meta=meta,
         )
         try:
-            resp = await _pricing_client().release(build_release_request(spec))
+            response = await _pricing_client().release(build_release_request(spec))
         except PricingClientError as exc:
-            raise HTTPException(status_code=409, detail=f"scene_pricing_release_failed:{str(exc)[:1200]}") from exc
-        artifact = make_released_artifact(resp, base_pricing=base_pricing, meta=meta)
-        pricing = _normalize_parent_pricing(dict(artifact.get("pricing") or {}), minutes=minutes, meta=meta)
+            raise HTTPException(
+                status_code=409,
+                detail=f"scene_pricing_release_failed:{str(exc)[:1200]}",
+            ) from exc
+        artifact = make_released_artifact(
+            response,
+            base_pricing=base_pricing,
+            meta=meta,
+        )
+        pricing = _normalize_parent_pricing(
+            dict(artifact.get("pricing") or {}),
+            minutes=minutes,
+            meta=meta,
+        )
         pricing["state"] = "released"
-        pricing_summary = dict(artifact.get("pricing_summary") or build_pricing_summary(pricing))
-        record = {**stored, "state": "released", "pricing": pricing, "pricing_summary": pricing_summary, "release_reason": body.reason}
+        pricing_summary = build_pricing_summary(pricing)
+        record = {
+            **stored,
+            "state": "released",
+            "pricing": pricing,
+            "pricing_summary": pricing_summary,
+            "release_reason": body.reason,
+        }
         await _persist_parent_pricing(conn, stage_run_id=body.stage_run_id, record=record)
         return _out(
-            scene_id=UUID(str(scene["scene_id"])), body=body, measured=measured, total=total,
-            minutes=minutes, lineage_hash=lineage_hash, pricing=pricing, pricing_summary=pricing_summary,
+            scene_id=UUID(str(scene["scene_id"])),
+            body=body,
+            measured=measured,
+            total=total,
+            minutes=minutes,
+            lineage_hash=lineage_hash,
+            pricing=pricing,
+            pricing_summary=pricing_summary,
         )
 
 
