@@ -2,7 +2,8 @@
 --
 -- This migration deliberately does NOT change the existing Fusion price,
 -- credit rate, variant composition, entitlement, wallet, or ledger behavior.
--- It removes a stale legacy provider hint from the provider-neutral pricing SKU
+-- It removes stale provider-specific metadata from customer pricing, retires the
+-- obsolete HeyGen-only internal COGS assumption without inventing a replacement,
 -- and enforces that a Fusion scene cannot cross HITL approval before its single
 -- parent pricing lifecycle is committed.
 
@@ -23,7 +24,27 @@ WHERE code = 'FUSION_TALK_MIN'
     OR COALESCE(metadata_json->>'provider_neutral', 'false') <> 'true'
   );
 
--- Guard the canonical pricing contract without changing economics.
+-- The old HeyGen subscription row is internal COGS only. It must not remain active
+-- once execution is provider-orchestrated. Do not invent VEED/Kling cost data here;
+-- accurate provider cost masterdata must be loaded separately from real contracts.
+DO $$
+BEGIN
+  IF to_regclass('public.pricing_sku_costs') IS NOT NULL THEN
+    UPDATE public.pricing_sku_costs
+    SET is_active = false,
+        effective_to = COALESCE(effective_to, now()),
+        metadata_json = COALESCE(metadata_json, '{}'::jsonb)
+                        || jsonb_build_object(
+                             'retired_reason', 'provider_no_longer_canonical_for_fusion_talk_min',
+                             'retired_by', '2026_08_24_v3_fusion_parent_pricing_integrity'
+                           )
+    WHERE sku_code = 'FUSION_TALK_MIN'
+      AND component_code = 'heygen_subscription'
+      AND is_active = true;
+  END IF;
+END $$;
+
+-- Guard the canonical customer pricing contract without changing economics.
 DO $$
 DECLARE
   v_unit text;
