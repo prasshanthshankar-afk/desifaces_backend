@@ -11,10 +11,10 @@ _routes.face_execution = ParticipantFaceExecutionService(
 
 router = _routes.router
 
-# Install the participant-level Audio language/voice boundary before the E2E
-# routes instantiate ParticipantAudioExecutionService. Canonical dialogue locale
-# remains the source language; participant voice_locale becomes target speech.
+# Install participant-level Audio and resilient Fusion execution boundaries before
+# studio_e2e_routes instantiates the owner-service bridge classes.
 from . import audio_execution_runtime as _audio_execution_runtime  # noqa: E402,F401
+from . import fusion_execution_runtime as _fusion_execution_runtime  # noqa: E402,F401
 
 # Additive multi-person control-plane routes. Studio services remain
 # pricing/execution owners; Director only coordinates dependency, HITL, reuse,
