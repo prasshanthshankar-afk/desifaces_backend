@@ -76,9 +76,10 @@ class ResilientSceneFusionExecutionService(SceneFusionExecutionService):
             if str(turn.dialogue_turn_id) not in preserved
         }
         if not required_turn_ids:
-            # A prior attempt may have rendered every child and then failed during
-            # stitching. No child pricing is required; sync can reuse every child.
-            # Return an empty quote bundle and let dispatch create a stitch-only retry.
+            # Every child is already available. A prior attempt therefore failed
+            # after child rendering (normally scene stitching). Re-pricing child
+            # renders would double-charge the user, so an empty quote bundle is the
+            # explicit signal for the no-charge stitch-only retry route.
             return context, []
 
         request_nonce_by_turn = {turn_id: uuid4().hex for turn_id in required_turn_ids}
@@ -232,7 +233,6 @@ class ResilientSceneFusionExecutionService(SceneFusionExecutionService):
                     }),
                 )
 
-        # A stitch-only retry requires no child provider call and no new child charge.
         if not expected_turns:
             async with pool.acquire() as conn:
                 await conn.execute(
@@ -320,6 +320,57 @@ class ResilientSceneFusionExecutionService(SceneFusionExecutionService):
                 json.dumps({"children": dispatched, "dispatch_outcome": "accepted"}),
             )
         return context, attempt_id, attempt_no, attempt_kind, dispatched
+
+    async def sync(
+        self,
+        pool,
+        *,
+        account_id: UUID,
+        workflow_id: UUID,
+        stage_run_id: UUID,
+        headers: dict[str, str],
+    ) -> dict[str, Any]:
+        try:
+            return await super().sync(
+                pool,
+                account_id=account_id,
+                workflow_id=workflow_id,
+                stage_run_id=stage_run_id,
+                headers=headers,
+            )
+        except SceneFusionBridgeError as exc:
+            code = str(exc)
+            post_child_failure = (
+                code.startswith("fusion_scene_stitch_failed:")
+                or code.startswith("fusion_final_media_")
+            )
+            if not post_child_failure:
+                raise
+
+            # Base sync has already persisted refreshed child status/video URLs before
+            # it calls deterministic stitching. Convert that late failure into a real
+            # failed attempt/stage so the next preview can preserve every completed
+            # child and offer a no-charge stitch-only recovery.
+            async with pool.acquire() as conn:
+                latest = await _latest_attempt(conn, stage_run_id=stage_run_id)
+                if latest:
+                    attempt_id = UUID(str(latest["attempt_id"]))
+                    await conn.execute(
+                        """
+                        update public.v3_studio_stage_attempts
+                        set state='failed',completed_at=coalesce(completed_at,now()),
+                            error_code='fusion_scene_finalize_failed',error_message=$2,updated_at=now()
+                        where attempt_id=$1 and state not in ('succeeded','canceled','cancelled')
+                        """,
+                        attempt_id,
+                        code[:4000],
+                    )
+                await self.store.mark_failed(
+                    conn,
+                    stage_run_id=stage_run_id,
+                    error="Scene assembly could not finish. Completed dialogue videos were preserved.",
+                )
+            raise SceneFusionBridgeError("fusion_scene_finalize_failed") from exc
 
 
 __all__ = ["ResilientSceneFusionExecutionService"]
