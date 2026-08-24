@@ -42,17 +42,20 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Compile V3 Director production boundaries
+      - name: Compile V3 Story production boundaries
         run: |
           python -m py_compile \
             services/svc-director/app/app/experience_compiler.py \
             services/svc-director/app/app/studio_preflight_routes.py \
             services/svc-director/app/app/audio_autoconfigure_routes.py \
+            services/svc-director/app/app/audio_voice_routes.py \
             services/svc-director/app/app/audio_execution_runtime.py \
+            services/svc-director/app/app/studio_e2e_routes.py \
             services/svc-director/app/app/fusion_execution.py \
             services/svc-director/app/app/fusion_execution_resilient.py \
             services/svc-director/app/app/fusion_execution_performance.py \
             services/svc-director/app/app/fusion_execution_runtime.py \
+            services/svc-director/app/app/fusion_resilience_routes.py \
             services/svc-director/app/app/studio_routes_runtime.py
 
       - name: Install PostgreSQL client
@@ -69,3 +72,12 @@ jobs:
           psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select package_code,pricing_strategy,is_default,is_active from pricing_experience_packages order by package_code;"
           psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select code,is_active from pricing_variants where code='V3_MULTIPERSON_STORY_PREMIUM';"
           psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select code,status,default_unit_credits from pricing_skus where code='V3_MULTIPERSON_PREMIUM_SURCHARGE';"
+
+      - name: Assert launch pricing stays component passthrough
+        env:
+          PGPASSWORD: desifaces_ci
+        run: |
+          test "$(psql -At -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select pricing_strategy from pricing_experience_packages where package_code='V3_MULTIPERSON_STANDARD' and is_active=true and is_default=true")" = "component_passthrough"
+          test "$(psql -At -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select is_active::text from pricing_experience_packages where package_code='V3_MULTIPERSON_PREMIUM'")" = "false"
+          test "$(psql -At -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select is_active::text from pricing_variants where code='V3_MULTIPERSON_STORY_PREMIUM'")" = "false"
+          test "$(psql -At -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select status from pricing_skus where code='V3_MULTIPERSON_PREMIUM_SURCHARGE'")" = "inactive"
