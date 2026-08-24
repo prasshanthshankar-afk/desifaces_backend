@@ -187,6 +187,7 @@ services:
     container_name: df-v3-svc-fusion-extension-stitch-worker
     profiles: !override ["v3-execution"]
     environment:
+      PYTHONPATH: "/app:/repo:/repo/services/shared:/repo/services/shared/python"
       DF_V3_SCENE_COORDINATOR_ENABLED: "true"
       DF_V3_SCENE_COORDINATOR_POLL_SECONDS: "2"
       DF_V3_SCENE_COORDINATOR_BATCH_SIZE: "4"
