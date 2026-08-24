@@ -13,17 +13,11 @@ logger = logging.getLogger("audio_worker")
 
 
 def _worker_concurrency(default_batch_size: int) -> int:
-    raw = str(
-        os.getenv(
-            "DF_AUDIO_WORKER_CONCURRENCY",
-            str(max(1, default_batch_size)),
-        )
-        or max(1, default_batch_size)
-    ).strip()
+    raw = str(os.getenv("DF_AUDIO_WORKER_CONCURRENCY", "32") or "32").strip()
     try:
         return max(1, min(64, int(raw)))
     except Exception:
-        return max(1, default_batch_size)
+        return 32
 
 
 class AudioWorker:
@@ -42,8 +36,6 @@ class AudioWorker:
         self.jobs = TTSJobsRepo(self.pool, studio_type="audio")
 
     async def _process_one(self, job_id: str) -> None:
-        # Use one orchestrator instance per concurrent job so no request/job-local
-        # state can leak across sibling TTS executions while sharing the DB pool.
         orch = TTSOrchestrator(self.pool)
         try:
             logger.info("Processing audio job %s", job_id)
@@ -51,10 +43,6 @@ class AudioWorker:
             logger.info("Audio job finished %s", job_id)
         except Exception as e:
             logger.exception("Audio job failed %s", job_id)
-
-            # The orchestrator owns the business lifecycle. If it already
-            # terminalized the job (for example after releasing pricing), never
-            # resurrect that job by changing it back to queued.
             try:
                 current = await self.jobs.get_job(job_id)
                 current_status = str(
