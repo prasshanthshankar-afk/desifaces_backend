@@ -56,8 +56,9 @@ class ProviderRunsRepo:
         SET provider_status=$2,
             meta_json=COALESCE(meta_json, '{}'::jsonb)
                       || COALESCE($3::jsonb, '{}'::jsonb)
+                      || jsonb_build_object('provider_last_status_at', now()::text)
                       || CASE
-                           WHEN $4::text = ANY(ARRAY['submitted','queued','pending','running','processing','in_progress','finalizing'])
+                           WHEN $4::text = ANY(ARRAY['running','processing','in_progress','started','finalizing'])
                             AND NOT (COALESCE(meta_json, '{}'::jsonb) ? 'provider_first_processing_at')
                              THEN jsonb_build_object('provider_first_processing_at', now()::text)
                            ELSE '{}'::jsonb
