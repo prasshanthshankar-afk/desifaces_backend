@@ -82,6 +82,7 @@ cat /tmp/v3-director-health.json | jq '{ok,service,execution_mode,runtime_ready,
 
 section "5. RUNTIME PARALLELISM"
 "${COMPOSE[@]}" exec -T svc-director python - <<'PY'
+from app import fusion_execution_runtime as _runtime  # installs the runtime override
 from app.fusion_execution_parallel_dispatch import _dispatch_limit, ParallelOrphanReconciledParentPricedSceneFusionExecutionService
 from app import fusion_execution
 print(f"director_dispatch_concurrency={_dispatch_limit()}")
