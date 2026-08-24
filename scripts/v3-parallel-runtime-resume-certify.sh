@@ -48,6 +48,7 @@ docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\
 section "3. DIRECTOR READINESS + INSTALLED PARALLEL RUNTIME"
 curl -fsS http://127.0.0.1:18011/api/health | jq '{ok,service,execution_mode,runtime_ready,configuration_error}'
 "${COMPOSE[@]}" exec -T svc-director python - <<'PY'
+from app import fusion_execution_runtime as _runtime
 from app.fusion_execution_background_read import BackgroundFinalizedParallelSceneFusionExecutionService, _background_enabled
 from app.fusion_execution_parallel_dispatch import _dispatch_limit
 from app.fusion_input_performance import compile_children_performant, _input_concurrency
