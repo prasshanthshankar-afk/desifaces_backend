@@ -113,6 +113,21 @@ def _parse_expiry(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _pricing_cycle_token(stored: dict[str, Any]) -> str:
+    """One preview lifecycle token; stable for retries, fresh after a new preview."""
+    source = "|".join(
+        (
+            _clean(stored.get("quote_id")),
+            _clean(stored.get("preview_fingerprint")),
+            _clean(stored.get("quote_expires_at")),
+            _clean(stored.get("audio_lineage_hash")),
+        )
+    )
+    if not source.strip("|"):
+        raise HTTPException(status_code=409, detail="scene_pricing_preview_cycle_missing")
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:20]
+
+
 def _line_unit(pricing: dict[str, Any]) -> str:
     meta = _as_dict(pricing.get("meta"))
     lines = list(meta.get("lines") or [])
@@ -509,6 +524,7 @@ async def reserve_scene_pricing(
         )
         base_pricing = _as_dict(stored.get("pricing"))
         meta = {**_as_dict(base_pricing.get("meta")), "reservation_owner": "v3_scene_parent"}
+        cycle_token = _pricing_cycle_token(stored)
         spec = PricingReserveSpec(
             user_id=str(canonical_user_id),
             service_name=_SERVICE_NAME,
@@ -517,7 +533,7 @@ async def reserve_scene_pricing(
             units=str(minutes),
             external_ref_type="v3_scene_stage",
             external_ref_id=str(body.stage_run_id),
-            idempotency_key=f"svc-fusion-extension:v3-scene:{body.stage_run_id}:reserve:{body.quote_id}",
+            idempotency_key=f"svc-fusion-extension:v3-scene:{body.stage_run_id}:reserve:{cycle_token}",
             meta=meta,
             quote_id=body.quote_id,
             preview_fingerprint=body.preview_fingerprint,
@@ -580,7 +596,7 @@ async def commit_scene_pricing(
             actual_units=str(minutes),
             external_ref_type="v3_scene_stage",
             external_ref_id=str(body.stage_run_id),
-            idempotency_key=f"svc-fusion-extension:v3-scene:{body.stage_run_id}:commit",
+            idempotency_key=f"svc-fusion-extension:v3-scene:{body.stage_run_id}:commit:{reservation_id}",
             meta=meta,
         )
         try:
@@ -643,7 +659,7 @@ async def release_scene_pricing(
             reason=body.reason,
             external_ref_type="v3_scene_stage",
             external_ref_id=str(body.stage_run_id),
-            idempotency_key=f"svc-fusion-extension:v3-scene:{body.stage_run_id}:release",
+            idempotency_key=f"svc-fusion-extension:v3-scene:{body.stage_run_id}:release:{reservation_id}",
             meta=meta,
         )
         try:
@@ -668,6 +684,7 @@ __all__ = [
     "_billable_minutes",
     "_line_unit",
     "_provider_hints",
+    "_pricing_cycle_token",
     "_assert_preview_confirmation",
     "router",
 ]
