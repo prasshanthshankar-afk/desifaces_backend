@@ -16,17 +16,17 @@ logger = logging.getLogger("fusion_worker")
 def _worker_concurrency() -> int:
     """Bounded parallelism for independent Fusion jobs.
 
-    Multi-person V3 scenes fan out independent dialogue-turn renders. A worker must
-    therefore claim and execute a batch concurrently instead of waiting for each
-    provider render to finish before starting the next one. The bound remains
-    configurable so provider/account rate limits can be respected without reverting
-    to serial execution.
+    V3 multi-person scenes fan out independent dialogue-turn renders. The default of
+    32 intentionally allows the current 28-turn scene to enter provider execution in
+    one batch rather than becoming an artificial eight-at-a-time queue. Deployments
+    can lower or raise this through DF_FUSION_WORKER_CONCURRENCY when a provider or
+    account has an explicit concurrency contract.
     """
-    raw = str(os.getenv("DF_FUSION_WORKER_CONCURRENCY", "8") or "8").strip()
+    raw = str(os.getenv("DF_FUSION_WORKER_CONCURRENCY", "32") or "32").strip()
     try:
-        return max(1, min(32, int(raw)))
+        return max(1, min(64, int(raw)))
     except Exception:
-        return 8
+        return 32
 
 
 async def run_forever() -> None:
@@ -43,7 +43,6 @@ async def run_forever() -> None:
         except Exception as e:
             msg = str(e)
             logger.exception("job_unhandled_exception", extra={"job_id": job_id, "error": msg})
-            # HARD safety: ensure job isn't stuck in running.
             try:
                 await orch.jobs.set_status(
                     job_id,
@@ -71,9 +70,6 @@ async def run_forever() -> None:
                 concurrency,
             )
 
-            # All claimed independent jobs begin together. asyncio.gather keeps one
-            # child failure from serializing or delaying submission/execution of the
-            # remaining children; run_one owns each child's terminal safety handling.
             await asyncio.gather(*(run_one(job_id) for job_id in job_ids))
 
         except Exception as e:
