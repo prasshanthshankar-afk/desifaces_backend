@@ -47,6 +47,24 @@ def _region_code(locale: Any) -> str:
     return ""
 
 
+def _explicit_gender(metadata: dict[str, Any]) -> str:
+    """Use only durable explicit Face gender; never infer from names or locale."""
+    constraints = _as_dict(
+        metadata.get("explicit_face_constraints")
+    )
+    raw = _clean(
+        constraints.get("gender")
+        or constraints.get("gender_presentation")
+    ).casefold()
+
+    return {
+        "man": "male",
+        "male": "male",
+        "woman": "female",
+        "female": "female",
+    }.get(raw, "")
+
+
 def _forward_auth(request: Request) -> dict[str, str]:
     value = _clean(request.headers.get("authorization"))
     if not value:
@@ -161,17 +179,33 @@ def _choose_voice(
     voices: list[dict[str, Any]],
     *,
     preferred_voice: str,
+    requested_gender: str,
 ) -> dict[str, Any] | None:
+    gender = _clean(requested_gender).casefold()
+
+    compatible = [
+        item
+        for item in voices
+        if not gender
+        or _clean(item.get("gender")).casefold() == gender
+    ]
+
     if preferred_voice:
         existing = next(
-            (item for item in voices if _clean(item.get("voice_name")) == preferred_voice),
+            (
+                item
+                for item in compatible
+                if _clean(item.get("voice_name")) == preferred_voice
+            ),
             None,
         )
         if existing:
             return existing
-    return next((item for item in voices if bool(item.get("is_default"))), None) or (
-        voices[0] if voices else None
-    )
+
+    return next(
+        (item for item in compatible if bool(item.get("is_default"))),
+        None,
+    ) or (compatible[0] if compatible else None)
 
 
 @router.post("/api/director/studio-workflows/{workflow_id}/audio-autoconfigure")
@@ -231,6 +265,7 @@ async def autoconfigure_story_audio(
             "voice_locale": _clean(row["voice_locale"]),
             "style": _clean(delivery.get("style")),
             "metadata": metadata,
+            "explicit_gender": _explicit_gender(metadata),
             "authored_locales": [],
         })
         if _clean(row["authored_locale"]):
@@ -272,6 +307,7 @@ async def autoconfigure_story_audio(
         voice = _choose_voice(
             voices_by_locale.get(locale, []),
             preferred_voice=item["voice_profile_ref"],
+            requested_gender=item["explicit_gender"],
         )
         if voice is None:
             results.append({
@@ -286,14 +322,21 @@ async def autoconfigure_story_audio(
             continue
 
         voice_id = _clean(voice.get("voice_name"))
+        preserved = (
+            source == "existing_profile"
+            and voice_id == item["voice_profile_ref"]
+        )
         existing_metadata = _as_dict(item.get("metadata"))
         provenance = _as_dict(existing_metadata.get("production_provenance"))
         provenance["voice_profile"] = (
-            "service_resolved_default" if source != "existing_profile" else "user_or_prior_selection"
+            "user_or_prior_selection"
+            if preserved
+            else "service_resolved_default"
         )
         metadata_patch = {
             "audio_voice_selection_source": (
-                "preserved" if source == "existing_profile" and voice_id == item["voice_profile_ref"]
+                "preserved"
+                if preserved
                 else "desifaces_suggested_default"
             ),
             "audio_voice_locale": locale,
@@ -336,7 +379,7 @@ async def autoconfigure_story_audio(
             "participant_id": participant_id,
             "display_name": item["display_name"],
             "ready": True,
-            "status": "preserved" if source == "existing_profile" else "suggested",
+            "status": "preserved" if preserved else "suggested",
             "locale": locale,
             "language": _clean(locale_item.get("display_name")) or locale,
             "native_name": _clean(locale_item.get("native_name")) or None,
@@ -345,7 +388,8 @@ async def autoconfigure_story_audio(
             "voice_gender": _clean(voice.get("gender")) or None,
             "style": item["style"] or None,
             "message": (
-                "Existing voice preserved." if source == "existing_profile"
+                "Existing voice preserved."
+                if preserved
                 else "desifaces selected a compatible default voice. You can change it before generation."
             ),
         })
