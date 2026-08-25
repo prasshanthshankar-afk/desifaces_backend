@@ -17,6 +17,7 @@ from .fusion_execution_parallel_dispatch import (
     ParallelOrphanReconciledParentPricedSceneFusionExecutionService,
 )
 from .fusion_execution_performance import PooledFusionStudioClient
+from .fusion_execution_preserved_url_refresh import install_preserved_child_url_refresh
 from .fusion_input_performance import compile_children_performant
 
 
@@ -140,6 +141,14 @@ ParallelOrphanReconciledParentPricedSceneFusionExecutionService.child_pricing_co
 BackgroundFinalizedParallelSceneFusionExecutionService.pricing_concurrency = 32
 BackgroundFinalizedParallelSceneFusionExecutionService.status_concurrency = 32
 BackgroundFinalizedParallelSceneFusionExecutionService.child_pricing_concurrency = 32
+
+# Retry recovery keeps provider job ids as durable lineage, but signed child video
+# URLs are ephemeral. Refresh all preserved succeeded child URLs from svc-fusion's
+# freshly signed canonical artifacts before the original dispatch can reserve the
+# parent price. The concrete parallel class owns dispatch, so install the guard here.
+install_preserved_child_url_refresh(
+    ParallelOrphanReconciledParentPricedSceneFusionExecutionService
+)
 
 # V3 Story Fusion invariants:
 # - one logical parent pricing lifecycle in svc-fusion-extension
