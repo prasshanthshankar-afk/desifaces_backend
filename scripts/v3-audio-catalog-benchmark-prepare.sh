@@ -125,7 +125,6 @@ where s.workflow_id='${WORKFLOW_ID}'::uuid and s.stage_type='audio';")"
 
 echo "FIXTURE_GATE=PASS"
 
-# Build/recreate only affected HTTP APIs. Provider/background workers remain up.
 echo
 echo "===== BUILD AFFECTED APIS ====="
 compose build svc-audio svc-director
@@ -152,7 +151,6 @@ wait_health() {
 wait_health "$AUDIO_URL" "svc-audio"
 wait_health "$DIRECTOR_URL" "svc-director"
 
-# Authenticate only if caller did not already supply a token.
 if [[ -z "${DF_BEARER_TOKEN:-}" ]]; then
   export DF_EMAIL CORE_URL
   read -rsp "Enter test-account password: " DF_PASSWORD
@@ -176,9 +174,6 @@ export DF_BEARER_TOKEN
 
 echo "AUTH=PASS"
 
-# -----------------------------------------------------------------------------
-# Live catalog certification
-# -----------------------------------------------------------------------------
 echo
 echo "===== CATALOG CERTIFICATION ====="
 curl -fsS -H "Authorization: Bearer $DF_BEARER_TOKEN" \
@@ -205,8 +200,6 @@ echo "PK_TARGET_${BENCHMARK_TARGET_LOCALE}=PASS"
 echo "EN_PK_UNSUPPORTED_FAIL_CLOSED=PASS"
 echo "TARGET_LOCALE_MALE_FEMALE_VOICES=PASS"
 
-# Every exposed benchmark-target voice must have a fully executable
-# provider/model/voice/locale path.
 mapfile -t exposed_voices < <(jq -r '.items[].voice_name' "$RUN_DIR/target-voices.json")
 [[ "${#exposed_voices[@]}" -gt 0 ]] || {
   echo "ERROR: no voices returned for $BENCHMARK_TARGET_LOCALE" >&2
@@ -268,9 +261,6 @@ done
 
 echo "EXECUTABLE_CAPABILITY_GRAPH=PASS"
 
-# -----------------------------------------------------------------------------
-# Director fail-closed certification and benchmark-only explicit voice selection
-# -----------------------------------------------------------------------------
 participant_state="$(psql_scalar "
 select
   count(distinct p.participant_id) filter (
@@ -423,9 +413,6 @@ active_after_voice="$(psql_scalar "select count(*) from public.studio_jobs where
 }
 echo "VOICE_CONFIGURATION_NON_BILLABLE=PASS"
 
-# -----------------------------------------------------------------------------
-# Concurrent pricing preview of all 28 Audio stages. PREVIEW ONLY.
-# -----------------------------------------------------------------------------
 mapfile -t audio_stage_ids < <(psql_scalar "
 select stage_run_id::text
 from public.v3_studio_stage_runs
@@ -481,19 +468,34 @@ for path in sorted(glob.glob(os.path.join(run_dir, "price-*.json"))):
     stage_id = os.path.basename(path)[len("price-"):-len(".json")]
     with open(path, "r", encoding="utf-8") as fh:
         payload = json.load(fh)
-    pricing = payload.get("pricing") or {}
-    amount_raw = pricing.get("estimated_amount")
+
+    # Director response contract:
+    #   payload.pricing = AudioPricingPreviewResponse
+    #   payload.pricing.pricing = canonical pricing payload
+    envelope = payload.get("pricing") or {}
+    canonical = envelope.get("pricing") or {}
+
+    amount_raw = canonical.get("estimated_amount")
     if amount_raw is None:
-        raise SystemExit(f"missing pricing.estimated_amount for {stage_id}: {payload}")
+        raise SystemExit(
+            f"missing pricing.pricing.estimated_amount for {stage_id}: {payload}"
+        )
     try:
         amount = Decimal(str(amount_raw))
     except InvalidOperation as exc:
         raise SystemExit(f"invalid estimated_amount for {stage_id}: {amount_raw}") from exc
-    quote_id = str(payload.get("quote_id") or pricing.get("quote_id") or "")
-    fingerprint = str(payload.get("preview_fingerprint") or pricing.get("preview_fingerprint") or "")
-    currency = str(pricing.get("currency") or "")
+
+    quote_id = str(envelope.get("quote_id") or canonical.get("quote_id") or "")
+    fingerprint = str(
+        envelope.get("preview_fingerprint")
+        or canonical.get("preview_fingerprint")
+        or ""
+    )
+    currency = str(canonical.get("currency") or "")
+
     if not quote_id:
-        raise SystemExit(f"missing quote_id for {stage_id}")
+        raise SystemExit(f"missing quote_id for {stage_id}: {payload}")
+
     total += amount
     if currency:
         currencies.add(currency)
