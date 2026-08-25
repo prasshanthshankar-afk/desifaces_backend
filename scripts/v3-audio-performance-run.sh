@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Paid V3 Story Audio performance certification run.
-#
-# Safety:
-# - fixed benchmark workflow only by default
-# - fresh authentication only
-# - requires 28 clean pending Audio stages and zero prior attempts
-# - re-previews every quote immediately before dispatch
-# - requires exact total/currency to match the previously reviewed exposure
-# - requires exact interactive payment confirmation
-# - dispatches all 28 Audio stages concurrently
-# - waits for owner-service terminal status, then syncs Director outputs concurrently
-# - STOPS with all successful Audio outputs awaiting HITL review
-# - does NOT approve review items and does NOT start Fusion
+# Paid V3 Story Audio performance certification.
+# Safe to run only while the fixed benchmark is still clean.
+# It re-previews the exact 28 Audio stages, requires the reviewed $0.84 USD
+# exposure, dispatches all 28 concurrently using Python (no nested shell quoting),
+# waits for owner-service completion, syncs all outputs concurrently into Director,
+# validates one committed charge per Audio job, measures actual worker overlap,
+# and STOPS with 28 Audio outputs awaiting HITL review. Fusion is never dispatched.
 
 WORKFLOW_ID="${WORKFLOW_ID:-06c5d43e-7bbc-4cb4-aef3-9df36886da3b}"
 EXPECTED_TOTAL="${EXPECTED_TOTAL:-0.84}"
@@ -29,7 +23,7 @@ POSTGRES_USER="${POSTGRES_USER:-desifaces_v3_admin}"
 RUN_DIR="/tmp/v3-audio-performance-${WORKFLOW_ID}"
 
 mkdir -p "$RUN_DIR"
-rm -f "$RUN_DIR"/*.json "$RUN_DIR"/*.http "$RUN_DIR"/*.tsv "$RUN_DIR"/*.txt 2>/dev/null || true
+rm -f "$RUN_DIR"/*.json "$RUN_DIR"/*.tsv "$RUN_DIR"/*.txt 2>/dev/null || true
 
 compose() { bash scripts/v3-compose.sh "$@"; }
 psql_scalar() {
@@ -40,18 +34,12 @@ psql_tsv() {
   compose exec -T desifaces-db \
     psql -X -At -F $'\t' -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"
 }
-
-fail() {
-  echo "ERROR: $*" >&2
-  exit 1
-}
-
-now_ms() { date +%s%3N; }
+fail() { echo "ERROR: $*" >&2; exit 1; }
 
 echo "============================================================"
 echo " V3 AUDIO PARALLEL PERFORMANCE RUN"
 echo " workflow: $WORKFLOW_ID"
-echo " reviewed maximum exposure: $EXPECTED_TOTAL $EXPECTED_CURRENCY"
+echo " reviewed/live maximum exposure: $EXPECTED_TOTAL $EXPECTED_CURRENCY"
 echo " source locale: $EXPECTED_SOURCE_LOCALE"
 echo " target speech locale: $EXPECTED_TARGET_LOCALE"
 echo " Fusion: DISABLED"
@@ -61,7 +49,6 @@ echo "============================================================"
 [[ -f scripts/v3-compose.sh ]] || fail "run from ~/workspace/desifaces-v3"
 [[ "$(git branch --show-current)" == "feature/v3-multiperson-core-20260818" ]] || fail "wrong branch"
 
-# Runtime/service gate. No restart is performed here.
 curl -fsS "$AUDIO_URL/api/health" >/dev/null || fail "svc-audio unhealthy"
 curl -fsS "$DIRECTOR_URL/api/health" >/dev/null || fail "svc-director unhealthy"
 
@@ -104,14 +91,14 @@ echo "AUTHORED_AUDIO_LOCALES=$authored"
 echo "VOICE_CONFIGURED=$configured_participants/$participant_count"
 
 [[ "$active_jobs" == "0" ]] || fail "active generation/pricing jobs exist"
-[[ "$audio_attempts" == "0" ]] || fail "benchmark already has Audio attempts"
+[[ "$audio_attempts" == "0" ]] || fail "benchmark already has Audio attempts; do not retry blindly"
 [[ "$pending_audio" == "28" ]] || fail "expected 28 pending Audio stages"
-[[ "$fusion_pending" == "1" ]] || fail "expected exactly one untouched pending Fusion stage"
+[[ "$fusion_pending" == "1" ]] || fail "expected one untouched pending Fusion stage"
 [[ "$authored" == "$EXPECTED_SOURCE_LOCALE" ]] || fail "authored locale changed: $authored"
 [[ "$participant_count" == "2" && "$configured_participants" == "2" ]] || fail "benchmark voices are not fully configured"
 echo "PREPAID_SAFETY_GATE=PASS"
 
-# Fresh auth only; discard any inherited/stale token.
+# Fresh auth only.
 unset DF_BEARER_TOKEN DF_X_USER_ID || true
 export DF_EMAIL CORE_URL
 read -rsp "Enter test-account password: " DF_PASSWORD
@@ -124,57 +111,74 @@ unset DF_PASSWORD
 eval "$LOGIN_EXPORTS"
 unset LOGIN_EXPORTS
 [[ -n "${DF_BEARER_TOKEN:-}" ]] || fail "fresh bearer token missing"
-export DF_BEARER_TOKEN
-
+export DF_BEARER_TOKEN WORKFLOW_ID AUDIO_URL DIRECTOR_URL RUN_DIR
+export EXPECTED_TOTAL EXPECTED_CURRENCY EXPECTED_SOURCE_LOCALE EXPECTED_TARGET_LOCALE
 echo "AUTH_FRESH=PASS"
 
-# Re-preview all 28 stages in parallel. This is non-billable.
-mapfile -t stage_ids < <(psql_scalar "
+psql_scalar "
 select stage_run_id::text
 from public.v3_studio_stage_runs
 where workflow_id='${WORKFLOW_ID}'::uuid and stage_type='audio' and state='pending'
-order by created_at,stage_run_id;")
-[[ "${#stage_ids[@]}" -eq 28 ]] || fail "stage discovery returned ${#stage_ids[@]} instead of 28"
+order by created_at,stage_run_id;" > "$RUN_DIR/stages.txt"
+[[ "$(wc -l < "$RUN_DIR/stages.txt" | tr -d ' ')" == "28" ]] || fail "stage discovery did not return 28 stages"
 
-export WORKFLOW_ID DIRECTOR_URL RUN_DIR DF_BEARER_TOKEN
-printf '%s\n' "${stage_ids[@]}" | xargs -P 28 -I{} bash -c '
-  stage="$1"
-  start="$(date +%s%3N)"
-  code="$(curl -sS -o "$RUN_DIR/preview-${stage}.json" -w "%{http_code}" \
-    -X POST -H "Authorization: Bearer $DF_BEARER_TOKEN" \
-    "$DIRECTOR_URL/api/director/studio-workflows/$WORKFLOW_ID/audio-stages/$stage/pricing-preview")"
-  end="$(date +%s%3N)"
-  printf "%s\t%s\t%s\t%s\n" "$stage" "$code" "$start" "$end" > "$RUN_DIR/preview-${stage}.http"
-' _ {}
-
-cat "$RUN_DIR"/preview-*.http | sort > "$RUN_DIR/preview-http.tsv"
-preview_failures="$(awk -F'\t' '$2 != 200 {n++} END {print n+0}' "$RUN_DIR/preview-http.tsv")"
-if [[ "$preview_failures" != "0" ]]; then
-  echo "PREVIEW_FAILURES=$preview_failures" >&2
-  cat "$RUN_DIR/preview-http.tsv" >&2
-  for f in "$RUN_DIR"/preview-*.http; do
-    [[ "$(cut -f2 "$f")" == "200" ]] && continue
-    stage="$(cut -f1 "$f")"
-    echo "--- $stage ---" >&2
-    cat "$RUN_DIR/preview-${stage}.json" >&2
-  done
-  exit 20
-fi
-
-python3 - "$RUN_DIR" "$EXPECTED_TOTAL" "$EXPECTED_CURRENCY" "$EXPECTED_SOURCE_LOCALE" "$EXPECTED_TARGET_LOCALE" <<'PY'
+# Fresh concurrent preview. Non-billable. Produces exact confirmations only after
+# validating the Story Audio source/target/translation contract for every stage.
+python3 - "$RUN_DIR" <<'PY'
 from __future__ import annotations
-import glob, json, os, sys
+import concurrent.futures
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
 from decimal import Decimal
 
-run_dir, expected_total, expected_currency, source_locale, target_locale = sys.argv[1:]
+run_dir=sys.argv[1]
+token=os.environ['DF_BEARER_TOKEN']
+workflow=os.environ['WORKFLOW_ID']
+base=os.environ['DIRECTOR_URL'].rstrip('/')
+expected_total=Decimal(os.environ['EXPECTED_TOTAL'])
+expected_currency=os.environ['EXPECTED_CURRENCY']
+source_locale=os.environ['EXPECTED_SOURCE_LOCALE']
+target_locale=os.environ['EXPECTED_TARGET_LOCALE']
+stages=[x.strip() for x in open(os.path.join(run_dir,'stages.txt'),encoding='utf-8') if x.strip()]
+
+
+def post(stage: str):
+    url=f'{base}/api/director/studio-workflows/{workflow}/audio-stages/{stage}/pricing-preview'
+    req=urllib.request.Request(url,data=b'',method='POST',headers={'Authorization':f'Bearer {token}','Accept':'application/json'})
+    start=int(time.time()*1000)
+    try:
+        with urllib.request.urlopen(req,timeout=60) as resp:
+            body=resp.read().decode('utf-8')
+            code=resp.status
+    except urllib.error.HTTPError as exc:
+        body=exc.read().decode('utf-8','replace')
+        code=exc.code
+    end=int(time.time()*1000)
+    return stage,code,start,end,body
+
+results=[]
+with concurrent.futures.ThreadPoolExecutor(max_workers=28) as ex:
+    futures=[ex.submit(post,s) for s in stages]
+    for fut in concurrent.futures.as_completed(futures):
+        results.append(fut.result())
+
+bad=[r for r in results if r[1] != 200]
+if bad:
+    for stage,code,_,_,body in sorted(bad):
+        print(f'PREVIEW_FAILURE stage={stage} HTTP={code} body={body[:1200]}',file=sys.stderr)
+    raise SystemExit(20)
+
 rows=[]
 total=Decimal('0')
 currencies=set()
-
-for path in sorted(glob.glob(os.path.join(run_dir,'preview-*.json'))):
-    stage=os.path.basename(path)[len('preview-'):-len('.json')]
-    with open(path,encoding='utf-8') as fh:
-        payload=json.load(fh)
+starts=[]
+for stage,code,start,end,body in sorted(results):
+    starts.append(start)
+    payload=json.loads(body)
     inp=payload.get('studio_input') or {}
     if inp.get('source_language') != source_locale:
         raise SystemExit(f'{stage}: source_language={inp.get("source_language")!r}, expected {source_locale!r}')
@@ -183,124 +187,147 @@ for path in sorted(glob.glob(os.path.join(run_dir,'preview-*.json'))):
     if inp.get('voice_locale') != target_locale:
         raise SystemExit(f'{stage}: voice_locale={inp.get("voice_locale")!r}, expected {target_locale!r}')
     if inp.get('translate') is not True:
-        raise SystemExit(f'{stage}: translate must be true for {source_locale}->{target_locale}: {inp}')
-
+        raise SystemExit(f'{stage}: translate must be true: {inp}')
     envelope=payload.get('pricing') or {}
     canonical=envelope.get('pricing') or {}
     quote=str(envelope.get('quote_id') or canonical.get('quote_id') or '')
-    fingerprint=str(envelope.get('preview_fingerprint') or canonical.get('preview_fingerprint') or '')
+    fp=str(envelope.get('preview_fingerprint') or canonical.get('preview_fingerprint') or '')
     amount=Decimal(str(canonical.get('estimated_amount')))
     currency=str(canonical.get('currency') or '')
     if not quote:
         raise SystemExit(f'{stage}: missing quote_id')
     total += amount
-    if currency:
-        currencies.add(currency)
-    rows.append((stage,quote,fingerprint,str(amount),currency))
+    if currency: currencies.add(currency)
+    rows.append((stage,quote,fp,str(amount),currency))
 
-if len(rows)!=28:
-    raise SystemExit(f'expected 28 previews, got {len(rows)}')
-if total != Decimal(expected_total):
-    raise SystemExit(f'price changed: expected {expected_total}, live total {total}')
-if currencies != {expected_currency}:
-    raise SystemExit(f'currency mismatch: expected {expected_currency}, got {sorted(currencies)}')
-
-out=os.path.join(run_dir,'dispatch-confirmations.tsv')
-with open(out,'w',encoding='utf-8') as fh:
-    for r in rows:
-        fh.write('\t'.join(r)+'\n')
-print(f'LIVE_AUDIO_QUOTES={len(rows)}')
+if len(rows) != 28: raise SystemExit(f'expected 28 previews, got {len(rows)}')
+if total != expected_total: raise SystemExit(f'price changed: expected {expected_total}, got {total}')
+if currencies != {expected_currency}: raise SystemExit(f'currency mismatch: {sorted(currencies)}')
+with open(os.path.join(run_dir,'dispatch-confirmations.tsv'),'w',encoding='utf-8') as fh:
+    for row in rows: fh.write('\t'.join(row)+'\n')
+print('LIVE_AUDIO_QUOTES=28')
 print(f'LIVE_AUDIO_TOTAL={total}')
 print(f'LIVE_AUDIO_CURRENCY={expected_currency}')
 print('AUDIO_STUDIO_INPUT_CONTRACT=PASS')
+print(f'PREVIEW_REQUEST_START_SPREAD_MS={max(starts)-min(starts)}')
 PY
 
-echo
+# The caller can set PAYMENT_CONFIRMATION in the command line to avoid a second
+# prompt. Otherwise prompt interactively. Exact match is required.
+if [[ -z "${PAYMENT_CONFIRMATION:-}" ]]; then
+  echo
 echo "============================================================"
-echo " PAYMENT CONFIRMATION REQUIRED"
-echo " 28 Audio generations"
-echo " Maximum reviewed/live total: $EXPECTED_TOTAL $EXPECTED_CURRENCY"
-echo " This WILL reserve/consume credits if generation succeeds."
-echo "============================================================"
-read -r -p "Type exactly 'PAY $EXPECTED_TOTAL $EXPECTED_CURRENCY' to dispatch: " PAYMENT_CONFIRMATION
+  echo " PAYMENT CONFIRMATION REQUIRED"
+  echo " 28 Audio generations; exact live total $EXPECTED_TOTAL $EXPECTED_CURRENCY"
+  echo "============================================================"
+  read -r -p "Type exactly 'PAY $EXPECTED_TOTAL $EXPECTED_CURRENCY' to dispatch: " PAYMENT_CONFIRMATION
+fi
 [[ "$PAYMENT_CONFIRMATION" == "PAY $EXPECTED_TOTAL $EXPECTED_CURRENCY" ]] || {
   echo "PAYMENT_NOT_CONFIRMED=STOP"
   exit 0
 }
 echo "PAYMENT_CONFIRMATION=ACCEPTED"
 
-# Dispatch all 28 at once using the fresh quote/fingerprint pairs.
-DISPATCH_WALL_START_MS="$(now_ms)"
-export EXPECTED_TOTAL EXPECTED_CURRENCY
-cat "$RUN_DIR/dispatch-confirmations.tsv" | xargs -P 28 -n 5 bash -c '
-  stage="$1"; quote="$2"; fp="$3"; amount="$4"; currency="$5"
-  body="$(jq -nc --arg q "$quote" --arg f "$fp" '{quote_id:$q,preview_fingerprint:$f,user_confirmed:true}')"
-  start="$(date +%s%3N)"
-  code="$(curl -sS -o "$RUN_DIR/dispatch-${stage}.json" -w "%{http_code}" \
-    -X POST -H "Authorization: Bearer $DF_BEARER_TOKEN" -H "Content-Type: application/json" \
-    -d "$body" \
-    "$DIRECTOR_URL/api/director/studio-workflows/$WORKFLOW_ID/audio-stages/$stage/dispatch")"
-  end="$(date +%s%3N)"
-  printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$stage" "$code" "$start" "$end" "$amount" "$currency" > "$RUN_DIR/dispatch-${stage}.http"
-' _
-DISPATCH_WALL_END_MS="$(now_ms)"
-export DISPATCH_WALL_START_MS DISPATCH_WALL_END_MS
-
-cat "$RUN_DIR"/dispatch-*.http | sort > "$RUN_DIR/dispatch-http.tsv"
-dispatch_failures="$(awk -F'\t' '$2 != 200 {n++} END {print n+0}' "$RUN_DIR/dispatch-http.tsv")"
-if [[ "$dispatch_failures" != "0" ]]; then
-  echo "DISPATCH_FAILURES=$dispatch_failures" >&2
-  cat "$RUN_DIR/dispatch-http.tsv" >&2
-  for f in "$RUN_DIR"/dispatch-*.http; do
-    [[ "$(cut -f2 "$f")" == "200" ]] && continue
-    stage="$(cut -f1 "$f")"
-    echo "--- $stage ---" >&2
-    cat "$RUN_DIR/dispatch-${stage}.json" >&2
-  done
-  echo "HOLD: partial paid dispatch occurred; do not retry blindly." >&2
-  exit 30
-fi
-
-python3 - "$RUN_DIR" <<'PY'
+# Robust concurrent dispatch implemented in Python. No nested bash/jq quoting.
+if ! python3 - "$RUN_DIR" <<'PY'
 from __future__ import annotations
-import glob,json,os,sys
+import concurrent.futures
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
 run_dir=sys.argv[1]
+token=os.environ['DF_BEARER_TOKEN']
+workflow=os.environ['WORKFLOW_ID']
+base=os.environ['DIRECTOR_URL'].rstrip('/')
 rows=[]
-starts=[]
-ends=[]
-for http_path in glob.glob(os.path.join(run_dir,'dispatch-*.http')):
-    stage,code,start,end,amount,currency=open(http_path,encoding='utf-8').read().strip().split('\t')
-    starts.append(int(start)); ends.append(int(end))
-    payload=json.load(open(os.path.join(run_dir,f'dispatch-{stage}.json'),encoding='utf-8'))
+for line in open(os.path.join(run_dir,'dispatch-confirmations.tsv'),encoding='utf-8'):
+    stage,quote,fp,amount,currency=line.rstrip('\n').split('\t')
+    rows.append((stage,quote,fp,amount,currency))
+
+
+def dispatch(row):
+    stage,quote,fp,amount,currency=row
+    payload=json.dumps({'quote_id':quote,'preview_fingerprint':fp or None,'user_confirmed':True}).encode('utf-8')
+    url=f'{base}/api/director/studio-workflows/{workflow}/audio-stages/{stage}/dispatch'
+    req=urllib.request.Request(url,data=payload,method='POST',headers={'Authorization':f'Bearer {token}','Content-Type':'application/json','Accept':'application/json'})
+    start=int(time.time()*1000)
+    try:
+        with urllib.request.urlopen(req,timeout=120) as resp:
+            body=resp.read().decode('utf-8')
+            code=resp.status
+    except urllib.error.HTTPError as exc:
+        body=exc.read().decode('utf-8','replace')
+        code=exc.code
+    except Exception as exc:
+        body=json.dumps({'transport_error':str(exc)})
+        code=0
+    end=int(time.time()*1000)
+    return stage,code,start,end,amount,currency,body
+
+results=[]
+with concurrent.futures.ThreadPoolExecutor(max_workers=28) as ex:
+    futures=[ex.submit(dispatch,row) for row in rows]
+    for fut in concurrent.futures.as_completed(futures):
+        results.append(fut.result())
+
+with open(os.path.join(run_dir,'dispatch-results.json'),'w',encoding='utf-8') as fh:
+    json.dump([{'stage':s,'code':c,'start_ms':st,'end_ms':en,'amount':a,'currency':cur,'body':b} for s,c,st,en,a,cur,b in results],fh,indent=2)
+
+bad=[r for r in results if r[1] != 200]
+if bad:
+    for stage,code,_,_,_,_,body in sorted(bad):
+        print(f'DISPATCH_FAILURE stage={stage} HTTP={code} body={body[:1200]}',file=sys.stderr)
+    raise SystemExit(30)
+
+jobs=[]; starts=[]; ends=[]
+for stage,code,start,end,amount,currency,body in sorted(results):
+    payload=json.loads(body)
     job=str(payload.get('audio_job_id') or '')
     attempt=str(payload.get('attempt_id') or '')
     if not job or not attempt:
         raise SystemExit(f'{stage}: dispatch response missing job/attempt: {payload}')
-    rows.append((stage,job,attempt,start,end,amount,currency))
-if len(rows)!=28:
-    raise SystemExit(f'expected 28 dispatches, got {len(rows)}')
+    starts.append(start); ends.append(end)
+    jobs.append((stage,job,attempt,str(start),str(end),amount,currency))
 with open(os.path.join(run_dir,'audio-jobs.tsv'),'w',encoding='utf-8') as fh:
-    for r in sorted(rows): fh.write('\t'.join(r)+'\n')
+    for row in jobs: fh.write('\t'.join(row)+'\n')
 print('AUDIO_DISPATCHES=28')
 print(f'CLIENT_DISPATCH_START_SPREAD_MS={max(starts)-min(starts)}')
 print(f'CLIENT_DISPATCH_RESPONSE_SPREAD_MS={max(ends)-min(ends)}')
 print(f'CLIENT_DISPATCH_WALL_MS={max(ends)-min(starts)}')
 PY
+then
+  attempts_after_error="$(psql_scalar "
+select count(*) from public.v3_studio_stage_attempts a
+join public.v3_studio_stage_runs s on s.stage_run_id=a.stage_run_id
+where s.workflow_id='${WORKFLOW_ID}'::uuid and s.stage_type='audio';")"
+  active_after_error="$(psql_scalar "select count(*) from public.studio_jobs where status in ('queued','running','processing','submitted','pending','finalizing','pricing_pending');")"
+  echo "HOLD_PARTIAL_DISPATCH_AUDIO_ATTEMPTS=$attempts_after_error" >&2
+  echo "HOLD_PARTIAL_DISPATCH_ACTIVE_JOBS=$active_after_error" >&2
+  echo "DO_NOT_RETRY_BLINDLY=YES" >&2
+  exit 30
+fi
 
 attempts_now="$(psql_scalar "
-select count(*)
-from public.v3_studio_stage_attempts a
+select count(*) from public.v3_studio_stage_attempts a
 join public.v3_studio_stage_runs s on s.stage_run_id=a.stage_run_id
 where s.workflow_id='${WORKFLOW_ID}'::uuid and s.stage_type='audio';")"
 [[ "$attempts_now" == "28" ]] || fail "expected 28 Director Audio attempts after dispatch, got $attempts_now"
 echo "DIRECTOR_ATTEMPTS=28"
 
-# Poll all owner-service jobs concurrently without calling Director sync.
-# This captures actual owner-service completion independently of page/client state.
-export AUDIO_URL
+# Poll the owner-service jobs concurrently. This is read-only.
 python3 - "$RUN_DIR" <<'PY'
 from __future__ import annotations
-import concurrent.futures, json, os, sys, time, urllib.request, urllib.error
+import concurrent.futures
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
 
 run_dir=sys.argv[1]
 token=os.environ['DF_BEARER_TOKEN']
@@ -310,27 +337,22 @@ for line in open(os.path.join(run_dir,'audio-jobs.tsv'),encoding='utf-8'):
     stage,job,attempt,start,end,amount,currency=line.rstrip('\n').split('\t')
     jobs[job]={'stage':stage,'attempt':attempt,'dispatch_start_ms':int(start),'dispatch_end_ms':int(end),'observed':[]}
 
-terminal_success={'succeeded'}
-terminal_failure={'failed','blocked','canceled','cancelled'}
-start=time.time()
-last_print=0.0
 
 def get_status(job_id):
-    req=urllib.request.Request(
-        f'{base}/api/audio/jobs/{job_id}/status',
-        headers={'Authorization':f'Bearer {token}','Accept':'application/json'},
-    )
-    with urllib.request.urlopen(req,timeout=20) as resp:
+    req=urllib.request.Request(f'{base}/api/audio/jobs/{job_id}/status',headers={'Authorization':f'Bearer {token}','Accept':'application/json'})
+    with urllib.request.urlopen(req,timeout=30) as resp:
         return json.loads(resp.read().decode('utf-8'))
 
 pending=set(jobs)
+terminal_failure={'failed','blocked','canceled','cancelled'}
+start=time.time(); last_print=0.0
 with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
     while pending:
         if time.time()-start > 900:
             raise SystemExit(f'timeout waiting for {len(pending)} Audio jobs')
         futures={ex.submit(get_status,j):j for j in list(pending)}
         now_ms=int(time.time()*1000)
-        failures=[]
+        saw_failure=False
         for fut,j in futures.items():
             try:
                 payload=fut.result()
@@ -341,7 +363,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
             obs=jobs[j]['observed']
             if not obs or obs[-1].get('status') != status:
                 obs.append({'at_ms':now_ms,'status':status})
-            if status in terminal_success:
+            if status == 'succeeded':
                 jobs[j]['terminal_status']=status
                 jobs[j]['terminal_observed_ms']=now_ms
                 jobs[j]['pricing']=payload.get('pricing') or {}
@@ -353,17 +375,15 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
                 jobs[j]['error_message']=payload.get('error_message')
                 jobs[j]['pricing']=payload.get('pricing') or {}
                 pending.discard(j)
-                failures.append(j)
+                saw_failure=True
         elapsed=time.time()-start
         if elapsed-last_print >= 5 or not pending:
             succeeded=sum(1 for v in jobs.values() if v.get('terminal_status')=='succeeded')
             failed=sum(1 for v in jobs.values() if v.get('terminal_status') in terminal_failure)
             print(f'OWNER_PROGRESS succeeded={succeeded}/28 failed={failed} pending={len(pending)} elapsed_s={elapsed:.1f}',flush=True)
             last_print=elapsed
-        if failures:
-            break
-        if pending:
-            time.sleep(0.5)
+        if saw_failure: break
+        if pending: time.sleep(0.5)
 
 with open(os.path.join(run_dir,'owner-observations.json'),'w',encoding='utf-8') as fh:
     json.dump(jobs,fh,indent=2,sort_keys=True)
@@ -377,63 +397,72 @@ if any(v.get('terminal_status')!='succeeded' for v in jobs.values()):
 print('OWNER_AUDIO_SUCCEEDED=28/28')
 PY
 
-# Sync all successful owner jobs back to Director concurrently. Sync is non-billable.
-cut -f1 "$RUN_DIR/audio-jobs.tsv" | xargs -P 28 -I{} bash -c '
-  stage="$1"
-  start="$(date +%s%3N)"
-  code="$(curl -sS -o "$RUN_DIR/sync-${stage}.json" -w "%{http_code}" \
-    -X POST -H "Authorization: Bearer $DF_BEARER_TOKEN" \
-    "$DIRECTOR_URL/api/director/studio-workflows/$WORKFLOW_ID/audio-stages/$stage/sync")"
-  end="$(date +%s%3N)"
-  printf "%s\t%s\t%s\t%s\n" "$stage" "$code" "$start" "$end" > "$RUN_DIR/sync-${stage}.http"
-' _ {}
-
-cat "$RUN_DIR"/sync-*.http | sort > "$RUN_DIR/sync-http.tsv"
-sync_failures="$(awk -F'\t' '$2 != 200 {n++} END {print n+0}' "$RUN_DIR/sync-http.tsv")"
-if [[ "$sync_failures" != "0" ]]; then
-  echo "SYNC_FAILURES=$sync_failures" >&2
-  cat "$RUN_DIR/sync-http.tsv" >&2
-  exit 40
-fi
-
+# Sync successful owner outputs into Director concurrently; non-billable.
 python3 - "$RUN_DIR" <<'PY'
-import glob,json,os,sys
+from __future__ import annotations
+import concurrent.futures
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
 run_dir=sys.argv[1]
+token=os.environ['DF_BEARER_TOKEN']
+workflow=os.environ['WORKFLOW_ID']
+base=os.environ['DIRECTOR_URL'].rstrip('/')
+stages=[]
+for line in open(os.path.join(run_dir,'audio-jobs.tsv'),encoding='utf-8'):
+    stages.append(line.split('\t',1)[0])
+
+
+def sync(stage):
+    url=f'{base}/api/director/studio-workflows/{workflow}/audio-stages/{stage}/sync'
+    req=urllib.request.Request(url,data=b'',method='POST',headers={'Authorization':f'Bearer {token}','Accept':'application/json'})
+    start=int(time.time()*1000)
+    try:
+        with urllib.request.urlopen(req,timeout=90) as resp:
+            return stage,resp.status,start,int(time.time()*1000),resp.read().decode('utf-8')
+    except urllib.error.HTTPError as exc:
+        return stage,exc.code,start,int(time.time()*1000),exc.read().decode('utf-8','replace')
+
+results=[]
+with concurrent.futures.ThreadPoolExecutor(max_workers=28) as ex:
+    for fut in concurrent.futures.as_completed([ex.submit(sync,s) for s in stages]):
+        results.append(fut.result())
+bad=[r for r in results if r[1] != 200]
+if bad:
+    for stage,code,_,_,body in sorted(bad): print(f'SYNC_FAILURE stage={stage} HTTP={code} body={body[:1200]}',file=sys.stderr)
+    raise SystemExit(40)
 count=0
-for path in glob.glob(os.path.join(run_dir,'sync-*.json')):
-    p=json.load(open(path,encoding='utf-8'))
+for stage,code,start,end,body in results:
+    p=json.loads(body)
     if p.get('provider_state')!='succeeded' or p.get('stage_state')!='awaiting_review' or not p.get('review_item_id'):
-        raise SystemExit(f'unexpected sync payload {path}: {p}')
+        raise SystemExit(f'unexpected sync payload stage={stage}: {p}')
     count += 1
-if count!=28: raise SystemExit(f'expected 28 sync payloads, got {count}')
-print('DIRECTOR_SYNC_AWAITING_REVIEW=28/28')
+print(f'DIRECTOR_SYNC_AWAITING_REVIEW={count}/28')
 PY
 
-# Canonical stage/review gate.
 awaiting_review="$(psql_scalar "select count(*) from public.v3_studio_stage_runs where workflow_id='${WORKFLOW_ID}'::uuid and stage_type='audio' and state='awaiting_review';")"
 attempt_succeeded="$(psql_scalar "
-select count(*)
-from public.v3_studio_stage_attempts a
+select count(*) from public.v3_studio_stage_attempts a
 join public.v3_studio_stage_runs s on s.stage_run_id=a.stage_run_id
 where s.workflow_id='${WORKFLOW_ID}'::uuid and s.stage_type='audio' and a.state='succeeded';")"
 active_outputs="$(psql_scalar "
-select count(*)
-from public.v3_studio_stage_outputs o
+select count(*) from public.v3_studio_stage_outputs o
 join public.v3_studio_stage_runs s on s.stage_run_id=o.stage_run_id
 where s.workflow_id='${WORKFLOW_ID}'::uuid and s.stage_type='audio' and o.is_active=true;")"
 pending_reviews="$(psql_scalar "
-select count(*)
-from public.v3_studio_review_items r
+select count(*) from public.v3_studio_review_items r
 join public.v3_studio_stage_runs s on s.stage_run_id=r.stage_run_id
 where s.workflow_id='${WORKFLOW_ID}'::uuid and s.stage_type='audio' and r.decision='pending';")"
 [[ "$awaiting_review" == "28" ]] || fail "awaiting_review=$awaiting_review, expected 28"
 [[ "$attempt_succeeded" == "28" ]] || fail "succeeded attempts=$attempt_succeeded, expected 28"
 [[ "$active_outputs" == "28" ]] || fail "active outputs=$active_outputs, expected 28"
 [[ "$pending_reviews" == "28" ]] || fail "pending reviews=$pending_reviews, expected 28"
-
 echo "CANONICAL_AUDIO_OUTPUT_GATE=PASS"
 
-# Extract server-side timing and pricing evidence for this exact run.
+# Server-side timing + exact pricing evidence.
 psql_tsv "
 select
   s.stage_run_id::text,
@@ -451,73 +480,55 @@ select
 from public.v3_studio_stage_runs s
 join public.v3_studio_stage_attempts a on a.stage_run_id=s.stage_run_id
 join public.studio_jobs j on j.id::text=a.provider_job_ref
-where s.workflow_id='${WORKFLOW_ID}'::uuid
-  and s.stage_type='audio'
-  and a.attempt_no=1
+where s.workflow_id='${WORKFLOW_ID}'::uuid and s.stage_type='audio' and a.attempt_no=1
 order by a.created_at,s.stage_run_id;" > "$RUN_DIR/server-timing.tsv"
 
-python3 - "$RUN_DIR" "$EXPECTED_TOTAL" "$EXPECTED_CURRENCY" <<'PY'
+python3 - "$RUN_DIR" <<'PY'
 from __future__ import annotations
-import json,math,os,statistics,sys
+import math
+import os
+import sys
 from decimal import Decimal
-
-run_dir, expected_total, expected_currency=sys.argv[1:]
+run_dir=sys.argv[1]
+expected_total=Decimal(os.environ['EXPECTED_TOTAL'])
+expected_currency=os.environ['EXPECTED_CURRENCY']
 rows=[]
 for line in open(os.path.join(run_dir,'server-timing.tsv'),encoding='utf-8'):
     p=line.rstrip('\n').split('\t')
-    if len(p)!=12:
-        raise SystemExit(f'unexpected timing row: {p}')
+    if len(p)!=12: raise SystemExit(f'unexpected timing row: {p}')
     stage,attempt,job,a_created,a_done,j_created,claimed,j_updated,status,pricing_state,amount,currency=p
     def f(x): return float(x) if x else None
     rows.append(dict(stage=stage,attempt=attempt,job=job,a_created=f(a_created),a_done=f(a_done),j_created=f(j_created),claimed=f(claimed),j_updated=f(j_updated),status=status,pricing_state=pricing_state,amount=amount,currency=currency))
-if len(rows)!=28:
-    raise SystemExit(f'expected 28 timing rows, got {len(rows)}')
-if any(r['status']!='succeeded' for r in rows):
-    raise SystemExit('not all studio_jobs succeeded')
-if any(r['claimed'] is None for r in rows):
-    raise SystemExit('worker_claimed_at missing on one or more jobs')
-
-# Pricing must be committed exactly once per Audio owner job.
+if len(rows)!=28: raise SystemExit(f'expected 28 timing rows, got {len(rows)}')
+if any(r['status']!='succeeded' for r in rows): raise SystemExit('not all studio_jobs succeeded')
+if any(r['claimed'] is None for r in rows): raise SystemExit('worker_claimed_at missing')
 not_committed=[r for r in rows if r['pricing_state']!='committed']
-if not_committed:
-    raise SystemExit(f'pricing not committed for {len(not_committed)} jobs: {[r["job"] for r in not_committed]}')
+if not_committed: raise SystemExit(f'pricing not committed for {len(not_committed)} jobs')
 charges=sum((Decimal(r['amount']) for r in rows),Decimal('0'))
-if charges != Decimal(expected_total):
-    raise SystemExit(f'committed Audio total mismatch: expected {expected_total}, got {charges}')
-if {r['currency'] for r in rows} != {expected_currency}:
-    raise SystemExit(f'committed currency mismatch: {sorted({r["currency"] for r in rows})}')
+if charges != expected_total: raise SystemExit(f'committed total mismatch: expected {expected_total}, got {charges}')
+if {r['currency'] for r in rows} != {expected_currency}: raise SystemExit('committed currency mismatch')
 
 attempt_times=[r['a_created'] for r in rows]
 job_times=[r['j_created'] for r in rows]
 claim_times=[r['claimed'] for r in rows]
 queue_wait=[r['claimed']-r['j_created'] for r in rows]
-owner_total=[r['j_updated']-r['j_created'] for r in rows]
 worker_proc=[r['j_updated']-r['claimed'] for r in rows]
-
-# Exact max overlap of claimed->terminal intervals proves actual worker concurrency.
+owner_total=[r['j_updated']-r['j_created'] for r in rows]
 events=[]
 for r in rows:
-    events.append((r['claimed'],1))
-    events.append((r['j_updated'],-1))
+    events.append((r['claimed'],1)); events.append((r['j_updated'],-1))
 events.sort(key=lambda x:(x[0],-x[1]))
 cur=max_overlap=0
 for _,delta in events:
-    cur += delta
-    max_overlap=max(max_overlap,cur)
+    cur += delta; max_overlap=max(max_overlap,cur)
 
-def percentile(values,p):
-    xs=sorted(values)
-    if not xs: return 0.0
-    k=(len(xs)-1)*p
-    lo=math.floor(k); hi=math.ceil(k)
-    if lo==hi: return xs[lo]
-    return xs[lo]*(hi-k)+xs[hi]*(k-lo)
-
+def pct(values,p):
+    xs=sorted(values); k=(len(xs)-1)*p; lo=math.floor(k); hi=math.ceil(k)
+    return xs[lo] if lo==hi else xs[lo]*(hi-k)+xs[hi]*(k-lo)
 def metric(name,values):
-    print(f'{name}_P50_MS={percentile(values,0.50):.1f}')
-    print(f'{name}_P95_MS={percentile(values,0.95):.1f}')
+    print(f'{name}_P50_MS={pct(values,.50):.1f}')
+    print(f'{name}_P95_MS={pct(values,.95):.1f}')
     print(f'{name}_MAX_MS={max(values):.1f}')
-
 print(f'SERVER_ATTEMPT_CREATE_SPREAD_MS={max(attempt_times)-min(attempt_times):.1f}')
 print(f'OWNER_JOB_CREATE_SPREAD_MS={max(job_times)-min(job_times):.1f}')
 print(f'WORKER_CLAIM_SPREAD_MS={max(claim_times)-min(claim_times):.1f}')
@@ -529,8 +540,7 @@ print(f'OWNER_BATCH_ELAPSED_MS={max(r["j_updated"] for r in rows)-min(r["j_creat
 print('PRICING_COMMITTED_JOBS=28')
 print(f'PRICING_COMMITTED_TOTAL={charges}')
 print(f'PRICING_CURRENCY={expected_currency}')
-if max_overlap <= 1:
-    raise SystemExit('PERFORMANCE_FAIL: actual Audio worker execution was serial')
+if max_overlap <= 1: raise SystemExit('PERFORMANCE_FAIL: actual Audio execution was serial')
 print('ACTUAL_PARALLEL_EXECUTION=PASS')
 PY
 
