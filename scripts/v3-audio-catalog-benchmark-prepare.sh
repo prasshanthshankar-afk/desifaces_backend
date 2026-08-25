@@ -3,14 +3,14 @@ set -euo pipefail
 
 # V3 Audio catalog hardening + benchmark preparation.
 #
-# This script intentionally stops after pricing preview.
+# This script intentionally STOPS after pricing preview.
 # It does NOT reserve credits, dispatch Audio jobs, call a TTS provider for
 # generation, or commit/release pricing.
 #
-# Benchmark fixture defaults to the clean 28-turn Story selected for V3
-# performance certification. The benchmark-only target locale defaults to ur-PK,
-# using executable gender-compatible voices discovered from the live svc-audio
-# catalog. The authored dialogue locale remains unchanged (en-PK in this fixture).
+# Benchmark fixture: clean 28-turn Pakistan Story selected for V3 performance
+# certification. The benchmark-only speech target is ur-PK because that is the
+# proven executable Pakistan locale in the live capability graph. The authored
+# dialogue locale remains en-PK and is never rewritten by this script.
 
 WORKFLOW_ID="${WORKFLOW_ID:-06c5d43e-7bbc-4cb4-aef3-9df36886da3b}"
 BENCHMARK_TARGET_LOCALE="${BENCHMARK_TARGET_LOCALE:-ur-PK}"
@@ -20,11 +20,19 @@ AUDIO_URL="${AUDIO_URL:-http://127.0.0.1:18004}"
 DIRECTOR_URL="${DIRECTOR_URL:-http://127.0.0.1:18011}"
 POSTGRES_DB="${POSTGRES_DB:-desifaces_v3}"
 POSTGRES_USER="${POSTGRES_USER:-desifaces_v3_admin}"
-COMPOSE="bash scripts/v3-compose.sh"
 RUN_DIR="/tmp/v3-audio-benchmark-${WORKFLOW_ID}"
 
 mkdir -p "$RUN_DIR"
 rm -f "$RUN_DIR"/*.json "$RUN_DIR"/*.http "$RUN_DIR"/*.tsv 2>/dev/null || true
+
+compose() {
+  bash scripts/v3-compose.sh "$@"
+}
+
+psql_scalar() {
+  compose exec -T desifaces-db \
+    psql -X -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"
+}
 
 echo "============================================================"
 echo " V3 AUDIO CATALOG HARDENING + BENCHMARK PREPARE"
@@ -33,7 +41,7 @@ echo " benchmark target locale: $BENCHMARK_TARGET_LOCALE"
 echo " PAID GENERATION: DISABLED"
 echo "============================================================"
 
-if [[ ! -x scripts/v3-compose.sh && ! -f scripts/v3-compose.sh ]]; then
+if [[ ! -f scripts/v3-compose.sh ]]; then
   echo "ERROR: run from ~/workspace/desifaces-v3" >&2
   exit 2
 fi
@@ -55,13 +63,12 @@ required_commits=(
 )
 for sha in "${required_commits[@]}"; do
   git merge-base --is-ancestor "$sha" HEAD || {
-    echo "ERROR: required commit missing: $sha" >&2
+    echo "ERROR: required source commit missing: $sha" >&2
     exit 4
   }
 done
 echo "SOURCE_GATE=PASS"
 
-# Syntax gate before any deployment.
 python3 -m py_compile \
   services/svc-audio/app/app/api/routes/catalog.py \
   services/svc-director/app/app/audio_autoconfigure_routes.py \
@@ -70,16 +77,6 @@ python3 -m py_compile \
 
 echo "PY_COMPILE=PASS"
 
-psql_scalar() {
-  $COMPOSE exec -T desifaces-db \
-    psql -X -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"
-}
-
-psql_table() {
-  $COMPOSE exec -T desifaces-db \
-    psql -X -P pager=off -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"
-}
-
 active_jobs="$(psql_scalar "select count(*) from public.studio_jobs where status in ('queued','running','processing','submitted','pending','finalizing');")"
 echo "ACTIVE_GENERATION_JOBS=$active_jobs"
 [[ "$active_jobs" == "0" ]] || {
@@ -87,7 +84,6 @@ echo "ACTIVE_GENERATION_JOBS=$active_jobs"
   exit 10
 }
 
-# Fixture integrity before deploy.
 fixture_row="$(psql_scalar "
 select
   w.current_stage || '|' ||
@@ -99,11 +95,22 @@ join public.v3_studio_stage_runs s on s.workflow_id=w.workflow_id
 where w.workflow_id='${WORKFLOW_ID}'::uuid
 group by w.current_stage;")"
 
+authored_locales="$(psql_scalar "
+select coalesce(string_agg(distinct dt.locale, ',' order by dt.locale),'')
+from public.v3_studio_stage_runs s
+join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
+where s.workflow_id='${WORKFLOW_ID}'::uuid and s.stage_type='audio';")"
+
 echo "FIXTURE=$fixture_row"
+echo "AUTHORED_AUDIO_LOCALES=$authored_locales"
 IFS='|' read -r current_stage audio_total audio_pending fusion_pending <<<"$fixture_row"
 [[ "$current_stage" == "audio" && "$audio_total" == "28" && "$audio_pending" == "28" && "$fusion_pending" == "1" ]] || {
   echo "ERROR: benchmark fixture is no longer clean/current Audio." >&2
   exit 11
+}
+[[ "$authored_locales" == "en-PK" ]] || {
+  echo "ERROR: expected authored Audio locale en-PK, got '$authored_locales'" >&2
+  exit 12
 }
 
 attempts_before="$(psql_scalar "
@@ -113,19 +120,19 @@ join public.v3_studio_stage_runs s on s.stage_run_id=a.stage_run_id
 where s.workflow_id='${WORKFLOW_ID}'::uuid and s.stage_type='audio';")"
 [[ "$attempts_before" == "0" ]] || {
   echo "ERROR: benchmark Audio fixture already has attempts=$attempts_before" >&2
-  exit 12
+  exit 13
 }
 
 echo "FIXTURE_GATE=PASS"
 
-# Build/recreate only affected HTTP APIs. No provider workers are restarted.
+# Build/recreate only affected HTTP APIs. Provider/background workers remain up.
 echo
 echo "===== BUILD AFFECTED APIS ====="
-$COMPOSE build svc-audio svc-director
+compose build svc-audio svc-director
 
 echo
 echo "===== RECREATE AFFECTED APIS ====="
-$COMPOSE up -d --no-deps --force-recreate svc-audio svc-director
+compose up -d --no-deps --force-recreate svc-audio svc-director
 
 wait_health() {
   local url="$1"
@@ -169,7 +176,9 @@ export DF_BEARER_TOKEN
 
 echo "AUTH=PASS"
 
-# Live catalog certification.
+# -----------------------------------------------------------------------------
+# Live catalog certification
+# -----------------------------------------------------------------------------
 echo
 echo "===== CATALOG CERTIFICATION ====="
 curl -fsS -H "Authorization: Bearer $DF_BEARER_TOKEN" \
@@ -184,20 +193,31 @@ curl -fsS -H "Authorization: Bearer $DF_BEARER_TOKEN" \
   "$AUDIO_URL/api/audio/catalog/voices?locale=en-PK" \
   > "$RUN_DIR/en-pk-voices.json"
 
-jq -e '.items | any(.locale == "ur-PK")' "$RUN_DIR/pk-targets.json" >/dev/null
+jq -e --arg locale "$BENCHMARK_TARGET_LOCALE" '.items | any(.locale == $locale)' \
+  "$RUN_DIR/pk-targets.json" >/dev/null
 jq -e '.items | length == 0' "$RUN_DIR/en-pk-voices.json" >/dev/null
-jq -e '.items | any((.gender|ascii_downcase) == "male")' "$RUN_DIR/target-voices.json" >/dev/null
-jq -e '.items | any((.gender|ascii_downcase) == "female")' "$RUN_DIR/target-voices.json" >/dev/null
+jq -e '.items | any(((.gender // "")|ascii_downcase) == "male")' \
+  "$RUN_DIR/target-voices.json" >/dev/null
+jq -e '.items | any(((.gender // "")|ascii_downcase) == "female")' \
+  "$RUN_DIR/target-voices.json" >/dev/null
 
-echo "PK_TARGET_UR_PK=PASS"
+echo "PK_TARGET_${BENCHMARK_TARGET_LOCALE}=PASS"
 echo "EN_PK_UNSUPPORTED_FAIL_CLOSED=PASS"
 echo "TARGET_LOCALE_MALE_FEMALE_VOICES=PASS"
 
-# Verify every exposed benchmark-target voice has at least one fully executable
-# provider/model path with exact model-locale or model-language support.
+# Every exposed benchmark-target voice must have a fully executable
+# provider/model/voice/locale path.
 mapfile -t exposed_voices < <(jq -r '.items[].voice_name' "$RUN_DIR/target-voices.json")
+[[ "${#exposed_voices[@]}" -gt 0 ]] || {
+  echo "ERROR: no voices returned for $BENCHMARK_TARGET_LOCALE" >&2
+  exit 29
+}
+
 for voice in "${exposed_voices[@]}"; do
-  safe_voice="${voice//\'/\'\'}"
+  [[ "$voice" =~ ^[A-Za-z0-9._:-]+$ ]] || {
+    echo "ERROR: unexpected voice identifier syntax: $voice" >&2
+    exit 30
+  }
   graph_count="$(psql_scalar "
 select count(*)
 from public.tts_voices v
@@ -221,7 +241,7 @@ join public.tts_providers p
  and p.is_enabled=true
  and p.routing_enabled=true
 join public.tts_locales l on l.locale='${BENCHMARK_TARGET_LOCALE}'
-where v.voice_name='${safe_voice}'
+where v.voice_name='${voice}'
   and (
     exists (
       select 1 from public.tts_model_locale_capabilities mlc
@@ -242,17 +262,24 @@ where v.voice_name='${safe_voice}'
   );")"
   [[ "$graph_count" -gt 0 ]] || {
     echo "ERROR: catalog exposed non-executable voice: $voice" >&2
-    exit 30
+    exit 31
   }
 done
 
 echo "EXECUTABLE_CAPABILITY_GRAPH=PASS"
 
-# Determine whether this is first preparation or an idempotent rerun.
+# -----------------------------------------------------------------------------
+# Director fail-closed certification and benchmark-only explicit voice selection
+# -----------------------------------------------------------------------------
 participant_state="$(psql_scalar "
-select count(*) filter (where coalesce(nullif(btrim(p.voice_profile_ref),''),'')='') || '|' ||
-       count(*) filter (where coalesce(nullif(btrim(p.voice_locale),''),'')='') || '|' ||
-       count(distinct p.participant_id)
+select
+  count(distinct p.participant_id) filter (
+    where coalesce(nullif(btrim(p.voice_profile_ref),''),'')=''
+  ) || '|' ||
+  count(distinct p.participant_id) filter (
+    where coalesce(nullif(btrim(p.voice_locale),''),'')=''
+  ) || '|' ||
+  count(distinct p.participant_id)
 from public.v3_studio_stage_runs s
 join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
 join public.v3_participants p on p.participant_id=dt.speaker_participant_id
@@ -260,11 +287,10 @@ where s.workflow_id='${WORKFLOW_ID}'::uuid and s.stage_type='audio';")"
 IFS='|' read -r missing_voice missing_locale participant_count <<<"$participant_state"
 [[ "$participant_count" == "2" ]] || {
   echo "ERROR: expected two speaking participants, got $participant_count" >&2
-  exit 31
+  exit 32
 }
 
 if [[ "$missing_voice" == "2" && "$missing_locale" == "2" ]]; then
-  # First prove that unsupported authored en-PK fails closed without mutation.
   autoconfig_http="$(curl -sS -o "$RUN_DIR/autoconfig-before-explicit.json" -w '%{http_code}' \
     -X POST \
     -H "Authorization: Bearer $DF_BEARER_TOKEN" \
@@ -272,14 +298,14 @@ if [[ "$missing_voice" == "2" && "$missing_locale" == "2" ]]; then
   [[ "$autoconfig_http" == "200" ]] || {
     echo "ERROR: audio-autoconfigure returned HTTP $autoconfig_http" >&2
     cat "$RUN_DIR/autoconfig-before-explicit.json" >&2
-    exit 32
+    exit 33
   }
   jq -e '.ready == false' "$RUN_DIR/autoconfig-before-explicit.json" >/dev/null
   jq -e '(.characters | length) == 2 and all(.characters[]; .status == "needs_user_choice")' \
     "$RUN_DIR/autoconfig-before-explicit.json" >/dev/null
 
   after_auto="$(psql_scalar "
-select count(*)
+select count(distinct p.participant_id)
 from public.v3_studio_stage_runs s
 join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
 join public.v3_participants p on p.participant_id=dt.speaker_participant_id
@@ -289,7 +315,7 @@ where s.workflow_id='${WORKFLOW_ID}'::uuid
        or coalesce(nullif(btrim(p.voice_locale),''),'') <> '');")"
   [[ "$after_auto" == "0" ]] || {
     echo "ERROR: fail-closed autoconfigure mutated participant voice profile" >&2
-    exit 33
+    exit 34
   }
   echo "DIRECTOR_UNSUPPORTED_LOCALE_FAIL_CLOSED=PASS"
 elif [[ "$missing_voice" == "0" && "$missing_locale" == "0" ]]; then
@@ -303,20 +329,18 @@ where s.workflow_id='${WORKFLOW_ID}'::uuid
   and p.voice_locale <> '${BENCHMARK_TARGET_LOCALE}';")"
   [[ "$existing_non_target" == "0" ]] || {
     echo "ERROR: fixture already has explicit non-${BENCHMARK_TARGET_LOCALE} voice selection; refusing overwrite" >&2
-    exit 34
+    exit 35
   }
   echo "DIRECTOR_UNSUPPORTED_LOCALE_FAIL_CLOSED=SKIP_ALREADY_PREPARED"
 else
   echo "ERROR: partial participant voice configuration; refusing automatic repair" >&2
-  exit 35
+  exit 36
 fi
 
-# Explicit BENCHMARK-ONLY voice assignment. This is configuration, not generation.
-# The authored dialogue locale is not changed.
 echo
 echo "===== BENCHMARK-ONLY EXPLICIT VOICE CONFIGURATION ====="
 psql_scalar "
-select distinct
+select distinct on (p.participant_id)
   p.participant_id::text || E'\\t' ||
   replace(p.display_name, E'\\t', ' ') || E'\\t' ||
   lower(coalesce(
@@ -330,23 +354,29 @@ from public.v3_studio_stage_runs s
 join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
 join public.v3_participants p on p.participant_id=dt.speaker_participant_id
 where s.workflow_id='${WORKFLOW_ID}'::uuid and s.stage_type='audio'
-order by 2;" > "$RUN_DIR/participants.tsv"
+order by p.participant_id, p.display_name;" > "$RUN_DIR/participants.tsv"
+
+[[ "$(wc -l < "$RUN_DIR/participants.tsv" | tr -d ' ')" == "2" ]] || {
+  echo "ERROR: participant discovery did not produce exactly two rows" >&2
+  cat "$RUN_DIR/participants.tsv" >&2
+  exit 40
+}
 
 while IFS=$'\t' read -r participant_id display_name gender_raw; do
   case "$gender_raw" in
     male|man|m) gender="male" ;;
     female|woman|f) gender="female" ;;
-    *) echo "ERROR: explicit benchmark participant gender missing/unsupported for $display_name: $gender_raw" >&2; exit 40 ;;
+    *) echo "ERROR: explicit participant gender missing/unsupported for $display_name: $gender_raw" >&2; exit 41 ;;
   esac
 
   voice_id="$(jq -r --arg g "$gender" '
-    [ .items[] | select((.gender|ascii_downcase) == $g) ]
+    [ .items[] | select((((.gender // "")|ascii_downcase) == $g)) ]
     | (map(select(.is_default == true)) + .)
     | .[0].voice_name // empty
   ' "$RUN_DIR/target-voices.json")"
   [[ -n "$voice_id" ]] || {
     echo "ERROR: no executable $gender voice for $BENCHMARK_TARGET_LOCALE" >&2
-    exit 41
+    exit 42
   }
 
   payload="$(jq -nc --arg voice "$voice_id" --arg locale "$BENCHMARK_TARGET_LOCALE" \
@@ -362,7 +392,7 @@ while IFS=$'\t' read -r participant_id display_name gender_raw; do
   [[ "$http" == "200" ]] || {
     echo "ERROR: voice-profile HTTP $http for $display_name" >&2
     cat "$RUN_DIR/voice-${participant_id}.json" >&2
-    exit 42
+    exit 43
   }
   echo "$display_name -> $voice_id ($BENCHMARK_TARGET_LOCALE)"
 done < "$RUN_DIR/participants.tsv"
@@ -378,7 +408,7 @@ where s.workflow_id='${WORKFLOW_ID}'::uuid
   and coalesce(nullif(btrim(p.voice_profile_ref),''),'') <> '';")"
 [[ "$configured_count" == "2" ]] || {
   echo "ERROR: benchmark voice configuration incomplete" >&2
-  exit 43
+  exit 44
 }
 
 attempts_after_voice="$(psql_scalar "
@@ -389,11 +419,13 @@ where s.workflow_id='${WORKFLOW_ID}'::uuid and s.stage_type='audio';")"
 active_after_voice="$(psql_scalar "select count(*) from public.studio_jobs where status in ('queued','running','processing','submitted','pending','finalizing');")"
 [[ "$attempts_after_voice" == "0" && "$active_after_voice" == "0" ]] || {
   echo "ERROR: voice configuration unexpectedly created execution work" >&2
-  exit 44
+  exit 45
 }
 echo "VOICE_CONFIGURATION_NON_BILLABLE=PASS"
 
-# Preview all 28 Audio quotes concurrently. Preview only: no reserve/dispatch.
+# -----------------------------------------------------------------------------
+# Concurrent pricing preview of all 28 Audio stages. PREVIEW ONLY.
+# -----------------------------------------------------------------------------
 mapfile -t audio_stage_ids < <(psql_scalar "
 select stage_run_id::text
 from public.v3_studio_stage_runs
@@ -500,13 +532,14 @@ echo "============================================================"
 echo " V3 AUDIO BENCHMARK PREPARE = PASS"
 echo " catalog hardening deployed         = YES"
 echo " en-PK silent substitution          = BLOCKED"
-echo " benchmark target voice locale      = $BENCHMARK_TARGET_LOCALE"
+echo " authored dialogue locale           = en-PK (unchanged)"
+echo " benchmark target speech locale     = $BENCHMARK_TARGET_LOCALE"
 echo " Audio pricing previews             = 28/28"
 echo " Audio stage attempts               = 0"
 echo " active generation jobs             = 0"
-echo " pricing reserve                     = NOT CALLED"
-echo " Audio dispatch                      = NOT CALLED"
-echo " provider generation                 = NOT CALLED"
-echo " credit commit                       = NOT CALLED"
+echo " pricing reserve                    = NOT CALLED"
+echo " Audio dispatch                     = NOT CALLED"
+echo " provider generation                = NOT CALLED"
+echo " credit commit                      = NOT CALLED"
 echo "============================================================"
 echo "STOP: review AUDIO_TOTAL_ESTIMATED_AMOUNT above before paid dispatch."
