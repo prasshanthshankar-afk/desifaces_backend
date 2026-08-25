@@ -15,7 +15,8 @@ from pydantic import BaseModel, Field
 from app.api.deps import get_current_user_id, get_db_pool_dep as get_db_pool
 from app.config import settings
 from app.services.sas_service import AzureBlobService
-from app.services.stitch_service import stitch_video_urls, upload_final_mp4
+from app.services.stitch_service import upload_final_mp4
+from app.services.v3_stitch_resilience import resilient_stitch_video_urls
 from desifaces_shared.identity import AccountContextNotFound, resolve_account_context
 
 router = APIRouter(prefix="/api/longform/v3", tags=["longform-v3-scene-stitch"])
@@ -169,7 +170,7 @@ async def stitch_scene(
     with tempfile.TemporaryDirectory(prefix="df_v3_scene_stitch_") as td:
         out_mp4 = os.path.join(td, "scene.mp4")
         try:
-            await asyncio.to_thread(stitch_video_urls, segment_urls, out_mp4)
+            await asyncio.to_thread(resilient_stitch_video_urls, segment_urls, out_mp4)
             sha256, byte_count = await asyncio.to_thread(_file_sha256_and_size, out_mp4)
             uploaded_storage_path, signed_url = await asyncio.to_thread(
                 upload_final_mp4,
