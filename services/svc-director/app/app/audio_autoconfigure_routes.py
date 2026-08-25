@@ -47,14 +47,18 @@ def _region_code(locale: Any) -> str:
     return ""
 
 
-def _explicit_gender(metadata: dict[str, Any]) -> str:
-    """Use only durable explicit Face gender; never infer from names or locale."""
-    constraints = _as_dict(
-        metadata.get("explicit_face_constraints")
-    )
+def _explicit_gender(
+    metadata: dict[str, Any],
+    persona: dict[str, Any] | None = None,
+) -> str:
+    """Use durable explicit Face/persona gender only; never infer identity cues."""
+    constraints = _as_dict(metadata.get("explicit_face_constraints"))
+    persona = _as_dict(persona)
     raw = _clean(
         constraints.get("gender")
         or constraints.get("gender_presentation")
+        or persona.get("gender")
+        or persona.get("gender_presentation")
     ).casefold()
 
     return {
@@ -91,7 +95,9 @@ async def _catalog(request: Request) -> list[dict[str, Any]]:
     return [
         dict(item)
         for item in list(payload.get("items") or [])
-        if isinstance(item, dict) and _clean(item.get("locale")) and _clean(item.get("default_voice"))
+        if isinstance(item, dict)
+        and _clean(item.get("locale"))
+        and _clean(item.get("default_voice"))
     ]
 
 
@@ -102,6 +108,13 @@ def _choose_locale(
     authored_locales: list[str],
     catalog: list[dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, str]:
+    """Choose only an exact executable locale; never silently change accent/region.
+
+    Cross-region same-language substitution (for example en-PK -> en-AU) is a
+    user choice, not an automatic default. If the authored/profile locale has no
+    executable voice, fail closed and let the user choose another supported target
+    language/locale explicitly.
+    """
     by_code = {_clean(item.get("locale")): item for item in catalog}
 
     if existing_locale and existing_locale in by_code:
@@ -115,27 +128,6 @@ def _choose_locale(
         if value in by_code:
             return by_code[value], "authored_dialogue_locale"
 
-    # Preserve the authored language. Region is only a deterministic tiebreaker
-    # between executable locales of that same language; it never changes language.
-    for value in authored + ([participant_locale] if participant_locale else []):
-        language = _language_code(value)
-        if not language:
-            continue
-        region = _region_code(value)
-        candidates = [
-            item for item in catalog
-            if _language_code(item.get("locale")) == language
-        ]
-        if not candidates:
-            continue
-        candidates.sort(
-            key=lambda item: (
-                0 if region and _region_code(item.get("locale")) == region else 1,
-                _clean(item.get("locale")),
-            )
-        )
-        return candidates[0], "authored_language_default_locale"
-
     return None, "needs_user_choice"
 
 
@@ -144,12 +136,7 @@ async def _load_voice_catalogs(
     *,
     locales: set[str],
 ) -> dict[str, list[dict[str, Any]]]:
-    """Fetch each required locale once with bounded parallelism.
-
-    Multi-person stories can have many characters but usually share languages. This
-    avoids one serial client setup/request per participant while leaving svc-audio as
-    the authoritative catalog owner.
-    """
+    """Fetch each required exact locale once with bounded parallelism."""
     headers = _forward_auth(request)
     base_url = settings.DF_AUDIO_BASE_URL.rstrip("/")
     semaphore = asyncio.Semaphore(6)
@@ -163,12 +150,17 @@ async def _load_voice_catalogs(
     ) as client:
         async def fetch(locale: str) -> None:
             async with semaphore:
-                response = await client.get("/api/audio/catalog/voices", params={"locale": locale})
+                response = await client.get(
+                    "/api/audio/catalog/voices",
+                    params={"locale": locale},
+                )
             if response.status_code != 200:
                 results[locale] = []
                 return
             results[locale] = [
-                item for item in list(response.json().get("items") or []) if isinstance(item, dict)
+                item
+                for item in list(response.json().get("items") or [])
+                if isinstance(item, dict)
             ]
 
         await asyncio.gather(*(fetch(locale) for locale in sorted(locales)))
@@ -242,7 +234,7 @@ async def autoconfigure_story_audio(
         rows = await conn.fetch(
             """
             select p.participant_id,p.display_name,p.default_locale,p.voice_profile_ref,p.voice_locale,
-                   p.metadata_json,dt.locale as authored_locale
+                   p.persona_json,p.metadata_json,dt.locale as authored_locale
             from public.v3_studio_stage_runs s
             join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
             join public.v3_participants p on p.participant_id=dt.speaker_participant_id
@@ -256,6 +248,7 @@ async def autoconfigure_story_audio(
     for row in rows:
         participant_id = str(row["participant_id"])
         metadata = _as_dict(row["metadata_json"])
+        persona = _as_dict(row["persona_json"])
         delivery = _as_dict(metadata.get("audio_delivery"))
         item = grouped.setdefault(participant_id, {
             "participant_id": participant_id,
@@ -265,7 +258,8 @@ async def autoconfigure_story_audio(
             "voice_locale": _clean(row["voice_locale"]),
             "style": _clean(delivery.get("style")),
             "metadata": metadata,
-            "explicit_gender": _explicit_gender(metadata),
+            "persona": persona,
+            "explicit_gender": _explicit_gender(metadata, persona),
             "authored_locales": [],
         })
         if _clean(row["authored_locale"]):
@@ -299,7 +293,11 @@ async def autoconfigure_story_audio(
                 "ready": False,
                 "status": "needs_user_choice",
                 "style": item["style"] or None,
-                "message": f"Choose a language for {item['display_name']}.",
+                "message": (
+                    f"No executable voice is available for {item['display_name']}'s "
+                    "current language/locale. Choose another supported target language "
+                    "or voice explicitly."
+                ),
             })
             continue
 
