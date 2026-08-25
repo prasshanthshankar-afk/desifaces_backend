@@ -1,5 +1,8 @@
 """Runtime installation of the parallel parent-priced V3 Story Fusion service."""
 
+from typing import Any
+from uuid import UUID
+
 import httpx
 
 from . import fusion_execution as _fusion_execution
@@ -32,12 +35,79 @@ class V3ParallelFusionStudioClient(PooledFusionStudioClient):
         )
 
 
+async def _verify_suppressed_child_pricing_without_generation_consent(
+    self,
+    *,
+    headers: dict[str, str],
+    child: dict[str, Any],
+    stage_run_id: UUID,
+) -> dict[str, Any]:
+    """Verify internal child pricing without granting generation consent.
+
+    svc-fusion's generic request validator requires external_provider_ok for both
+    pricing preview and generation. For an internal bill-to-parent child, the
+    pricing preview is a local no-charge/suppression contract check and does not
+    submit media to the external provider. Set consent=True only on this ephemeral
+    preview payload so payload/provider validation can run. Actual child creation
+    remains unchanged and still requires the user's explicit external-provider
+    consent at Director dispatch time and again at svc-fusion /jobs validation.
+    """
+
+    turn_id = child["dialogue_turn_id"]
+    payload = _parent_pricing._stamp_internal_child(
+        child["payload"],
+        stage_run_id=stage_run_id,
+        dialogue_turn_id=turn_id,
+    )
+
+    preview_payload = dict(payload)
+    consent = _parent_pricing._as_dict(preview_payload.get("consent"))
+    consent["external_provider_ok"] = True
+    preview_payload["consent"] = consent
+
+    preview = await self._fusion_post(
+        "/jobs/pricing/preview",
+        headers=headers,
+        payload=preview_payload,
+    )
+    if not _parent_pricing._pricing_is_suppressed(preview):
+        raise _parent_pricing.SceneFusionBridgeError(
+            f"fusion_child_pricing_not_suppressed:{turn_id}"
+        )
+
+    return {
+        "dialogue_turn_id": turn_id,
+        "participant_id": child["participant_id"],
+        "display_name": child["display_name"],
+        "sequence_no": child["sequence_no"],
+        "request_nonce": _parent_pricing._clean(
+            _parent_pricing._as_dict(payload.get("provider_options")).get(
+                "v3_request_nonce"
+            )
+        ),
+        "pricing_suppressed": True,
+        "pricing": _parent_pricing._as_dict(preview.get("pricing")),
+        "pricing_summary": _parent_pricing._as_dict(
+            preview.get("pricing_summary")
+        ),
+        "retry_scope": child.get("retry_scope"),
+    }
+
+
 _fusion_execution.FusionStudioClient = V3ParallelFusionStudioClient
 
 _fusion_execution._compile_children = compile_children_performant
 _parent_pricing._compile_children = compile_children_performant
 _performance._compile_children = compile_children_performant
 _parallel_dispatch._compile_children = compile_children_performant
+
+# Pricing preview of an internal child must be possible before the user grants
+# external-provider generation consent. This patches only the non-generating
+# suppression verification. _create_internal_child and /jobs keep the original
+# consent requirement intact.
+_parent_pricing.ParentPricedSceneFusionExecutionService._verify_child_pricing_suppressed = (
+    _verify_suppressed_child_pricing_without_generation_consent
+)
 
 ParallelOrphanReconciledParentPricedSceneFusionExecutionService.pricing_concurrency = 32
 ParallelOrphanReconciledParentPricedSceneFusionExecutionService.status_concurrency = 32
