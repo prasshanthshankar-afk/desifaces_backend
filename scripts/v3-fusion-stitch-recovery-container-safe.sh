@@ -182,6 +182,10 @@ echo "AZURE_FINAL_CONTAINER_PREPAYMENT_GATE=PASS"
 # retry can legitimately leave the latest parent quote in state=quoted after the
 # reservation has been released. Because the gates above prove zero consume events
 # and zero credit delta, quoted is equally safe for a fresh retry preview.
+#
+# Detached mode uses a 0600 credential handoff file. The base launcher is patched
+# in-memory so Docker/Compose never shares stdin with credentials: authentication
+# reads the file only when it reaches the auth gate, then deletes it immediately.
 tmp_script="$(mktemp /tmp/v3-fusion-stitch-recovery-resume-safe.XXXXXX.sh)"
 trap 'rm -f "$tmp_script"' EXIT
 
@@ -190,19 +194,39 @@ from pathlib import Path
 import sys
 
 src = Path(sys.argv[1]).read_text(encoding="utf-8")
-old = '[[ "$parent_state" == "released" ]] || fail "latest failed parent pricing is not released: $parent_state"'
-new = '[[ "$parent_state" == "released" || "$parent_state" == "quoted" ]] || fail "latest failed parent pricing is not safely retryable: $parent_state"'
 
-count = src.count(old)
-if count != 1:
-    raise SystemExit(f"resume-safe parent-state guard changed unexpectedly: matches={count}")
+old_parent = '[[ "$parent_state" == "released" ]] || fail "latest failed parent pricing is not released: $parent_state"'
+new_parent = '[[ "$parent_state" == "released" || "$parent_state" == "quoted" ]] || fail "latest failed parent pricing is not safely retryable: $parent_state"'
+if src.count(old_parent) != 1:
+    raise SystemExit(f"resume-safe parent-state guard changed unexpectedly: matches={src.count(old_parent)}")
+src = src.replace(old_parent, new_parent, 1)
 
-Path(sys.argv[2]).write_text(src.replace(old, new, 1), encoding="utf-8")
+old_auth = '''read -rsp "Enter test-account password: " DF_PASSWORD
+echo
+export DF_PASSWORD'''
+new_auth = '''if [[ -n "${DF_RECOVERY_INPUT_FILE:-}" ]]; then
+  [[ -f "$DF_RECOVERY_INPUT_FILE" ]] || fail "detached recovery credential file missing"
+  IFS= read -r DF_PASSWORD < "$DF_RECOVERY_INPUT_FILE"
+  PAYMENT_CONFIRMATION="$(sed -n '2p' "$DF_RECOVERY_INPUT_FILE")"
+  rm -f "$DF_RECOVERY_INPUT_FILE"
+  unset DF_RECOVERY_INPUT_FILE
+  echo "DETACHED_CREDENTIAL_HANDOFF=PASS"
+else
+  read -rsp "Enter test-account password: " DF_PASSWORD
+  echo
+fi
+export DF_PASSWORD'''
+if src.count(old_auth) != 1:
+    raise SystemExit(f"resume-safe auth block changed unexpectedly: matches={src.count(old_auth)}")
+src = src.replace(old_auth, new_auth, 1)
+
+Path(sys.argv[2]).write_text(src, encoding="utf-8")
 PY
 
 chmod +x "$tmp_script"
 bash -n "$tmp_script"
 echo "RESUME_SAFE_COMPATIBILITY_PATCH=PASS"
+echo "DETACHED_AUTH_TRANSPORT=FILE_NOT_STDIN"
 echo "DELEGATING_TO_REVIEWED_STITCH_ONLY_RECOVERY=YES"
 
 exec bash "$tmp_script"
