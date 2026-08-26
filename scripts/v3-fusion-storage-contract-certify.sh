@@ -78,11 +78,12 @@ echo "PARENT_CONSUME_EVENTS=$consume_events"
 echo "PARENT_CREDIT_DELTA=$credit_delta"
 
 # Prove the resolved Compose contract before changing running containers.
-compose --profile v3-execution config > /tmp/v3-fusion-storage-contract.compose.yml
-python3 - /tmp/v3-fusion-storage-contract.compose.yml "$artifact_container" <<'PY'
-import sys, yaml
+# Docker Compose emits JSON directly; no host PyYAML dependency is required.
+compose --profile v3-execution config --format json > /tmp/v3-fusion-storage-contract.compose.json
+python3 - /tmp/v3-fusion-storage-contract.compose.json "$artifact_container" <<'PY'
+import json, sys
 path, expected = sys.argv[1:]
-config = yaml.safe_load(open(path, encoding='utf-8'))
+config = json.load(open(path, encoding='utf-8'))
 for service in (
     'svc-fusion',
     'svc-fusion-worker',
