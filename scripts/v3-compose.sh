@@ -105,10 +105,21 @@ PY
 
 DF_V3_FUSION_OUTPUT_CONTAINER="${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}"
 
-if [[ ! "$DF_V3_FUSION_OUTPUT_CONTAINER" =~ ^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$ ]]; then
+# Azure Blob container naming contract:
+# - 3..63 characters
+# - lowercase letters, numbers, and hyphens only
+# - starts and ends with an alphanumeric character
+# - no consecutive hyphens
+#
+# Bash [[ =~ ]] uses POSIX ERE; do not use PCRE constructs such as (?:...).
+container_len=${#DF_V3_FUSION_OUTPUT_CONTAINER}
+if (( container_len < 3 || container_len > 63 )) \
+  || [[ ! "$DF_V3_FUSION_OUTPUT_CONTAINER" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]] \
+  || [[ "$DF_V3_FUSION_OUTPUT_CONTAINER" == *--* ]]; then
   die "invalid DF_V3_FUSION_OUTPUT_CONTAINER: $DF_V3_FUSION_OUTPUT_CONTAINER"
 fi
 
+export DF_V3_FUSION_OUTPUT_CONTAINER
 export AZURE_FINAL_VIDEO_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER"
 export AZURE_VIDEO_OUTPUT_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER"
 
