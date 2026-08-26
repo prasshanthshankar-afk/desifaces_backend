@@ -5,8 +5,9 @@ set -euo pipefail
 #
 # Purpose:
 # - protect the already-completed 28 provider renders,
-# - isolate V3 from stale/global Azure final-container configuration,
-# - verify the canonical output container exists BEFORE another priced retry,
+# - derive the canonical Azure output container from those preserved artifacts,
+# - reject stale/divergent runtime container configuration,
+# - verify the real Azure container exists BEFORE another priced retry,
 # - accept either released or quoted parent state when no consume event exists,
 # - delegate the actual retry/certification to the reviewed resume-safe launcher.
 
@@ -17,11 +18,7 @@ readonly BASE_RECOVERY_SCRIPT="scripts/v3-fusion-stitch-recovery-resume-safe.sh"
 
 POSTGRES_DB="${POSTGRES_DB:-desifaces_v3}"
 POSTGRES_USER="${POSTGRES_USER:-desifaces_v3_admin}"
-DF_V3_FUSION_OUTPUT_CONTAINER="${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}"
-
-export DF_V3_FUSION_OUTPUT_CONTAINER
-export AZURE_FINAL_VIDEO_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER"
-export AZURE_VIDEO_OUTPUT_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER"
+REQUESTED_V3_CONTAINER="${DF_V3_FUSION_OUTPUT_CONTAINER:-}"
 
 compose() { bash scripts/v3-compose.sh "$@"; }
 psql_scalar() {
@@ -60,6 +57,8 @@ where j.studio_type='fusion'
 SQL
 }
 
+artifact_container_expr="split_part(split_part(c->>'video_url', '.blob.core.windows.net/', 2), '/', 1)"
+
 [[ -f scripts/v3-compose.sh ]] || fail "run from ~/workspace/desifaces-v3"
 [[ -f "$BASE_RECOVERY_SCRIPT" ]] || fail "missing $BASE_RECOVERY_SCRIPT"
 [[ "$(git branch --show-current)" == "feature/v3-multiperson-core-20260818" ]] || fail "wrong branch"
@@ -87,13 +86,44 @@ join public.v3_studio_workflows w on w.owner_user_id=l.user_id
 where w.workflow_id='${WORKFLOW_ID}'::uuid
   and l.idempotency_key like 'consume:svc-fusion-extension:v3-scene:${FUSION_STAGE_ID}:commit:%';")"
 
+artifact_container_count="$(psql_scalar "
+select count(distinct ${artifact_container_expr})
+from public.v3_studio_stage_attempts a
+cross join lateral jsonb_array_elements(coalesce(a.metadata_json->'children','[]'::jsonb)) c
+where a.stage_run_id='${FUSION_STAGE_ID}'::uuid
+  and coalesce(c->>'video_url','') like 'https://%.blob.core.windows.net/%';")"
+
+artifact_container="$(psql_scalar "
+select min(${artifact_container_expr})
+from public.v3_studio_stage_attempts a
+cross join lateral jsonb_array_elements(coalesce(a.metadata_json->'children','[]'::jsonb)) c
+where a.stage_run_id='${FUSION_STAGE_ID}'::uuid
+  and coalesce(c->>'video_url','') like 'https://%.blob.core.windows.net/%';")"
+
+[[ "$artifact_container_count" == "1" ]] || fail "expected exactly one Azure container across preserved Fusion artifacts; found $artifact_container_count"
+[[ -n "$artifact_container" ]] || fail "unable to derive Azure container from preserved Fusion artifacts"
+
+if [[ -n "$REQUESTED_V3_CONTAINER" && "$REQUESTED_V3_CONTAINER" != "$artifact_container" ]]; then
+  fail "explicit DF_V3_FUSION_OUTPUT_CONTAINER=$REQUESTED_V3_CONTAINER disagrees with preserved artifact container=$artifact_container"
+fi
+
+export DF_V3_FUSION_OUTPUT_CONTAINER="$artifact_container"
+export AZURE_FINAL_VIDEO_CONTAINER="$artifact_container"
+export AZURE_VIDEO_OUTPUT_CONTAINER="$artifact_container"
+
+live_stitch_container="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' df-v3-svc-fusion-extension-stitch-worker 2>/dev/null | sed -n 's/^AZURE_VIDEO_OUTPUT_CONTAINER=//p' | tail -1 || true)"
+live_stitch_final_container="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' df-v3-svc-fusion-extension-stitch-worker 2>/dev/null | sed -n 's/^AZURE_FINAL_VIDEO_CONTAINER=//p' | tail -1 || true)"
+
 echo "============================================================"
 echo " V3 FUSION FINAL STITCH RECOVERY — STORAGE SAFE"
 echo " latest attempt: ${latest_attempt_no} / ${latest_attempt_id}"
 echo " Fusion stage: $fusion_state"
 echo " parent pricing: $parent_state"
 echo " provider children: $children ($succeeded_children succeeded)"
-echo " V3 final container: $DF_V3_FUSION_OUTPUT_CONTAINER"
+echo " preserved artifact container: $artifact_container"
+echo " live stitch AZURE_VIDEO_OUTPUT_CONTAINER: ${live_stitch_container:-unset}"
+echo " live stitch AZURE_FINAL_VIDEO_CONTAINER: ${live_stitch_final_container:-unset}"
+echo " canonical retry container: $DF_V3_FUSION_OUTPUT_CONTAINER"
 echo " provider rerender: FORBIDDEN"
 echo "============================================================"
 
@@ -114,13 +144,21 @@ PY
 
 echo "STORAGE_RECOVERY_FINANCIAL_GATE=PASS"
 echo "PROVIDER_CHILDREN_FROZEN=28/28"
+echo "PRESERVED_ARTIFACT_CONTAINER=$artifact_container"
+if [[ "$live_stitch_container" != "$artifact_container" || "$live_stitch_final_container" != "$artifact_container" ]]; then
+  echo "STALE_STITCH_CONTAINER_CONFIG_DETECTED=YES"
+  echo "STITCH_RUNTIME_CONTAINER_CORRECTION=$artifact_container"
+else
+  echo "STALE_STITCH_CONTAINER_CONFIG_DETECTED=NO"
+fi
 
-# Validate the actual Azure container before any retry preview/payment mutation.
-# Use the stitch-worker service because it is the process that uploads the final MP4.
+# Validate the exact Azure container proven by the preserved artifacts before any
+# retry preview/payment mutation. The one-shot worker is explicitly overridden to
+# that same container; the delegated recovery inherits the same exported values.
 compose --profile v3-execution run --rm --no-deps \
-  -e DF_EXPECTED_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER" \
-  -e AZURE_FINAL_VIDEO_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER" \
-  -e AZURE_VIDEO_OUTPUT_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER" \
+  -e DF_EXPECTED_CONTAINER="$artifact_container" \
+  -e AZURE_FINAL_VIDEO_CONTAINER="$artifact_container" \
+  -e AZURE_VIDEO_OUTPUT_CONTAINER="$artifact_container" \
   svc-fusion-extension-stitch-worker python - <<'PY'
 import os
 from azure.storage.blob import BlobServiceClient
@@ -137,6 +175,7 @@ print(f"V3_FUSION_OUTPUT_CONTAINER_ETAG={props.etag}")
 print("V3_FUSION_OUTPUT_CONTAINER_EXISTS=PASS")
 PY
 
+echo "ARTIFACT_CONTAINER_MATCH_GATE=PASS"
 echo "AZURE_FINAL_CONTAINER_PREPAYMENT_GATE=PASS"
 
 # The reviewed resume-safe launcher originally required state=released. A failed
