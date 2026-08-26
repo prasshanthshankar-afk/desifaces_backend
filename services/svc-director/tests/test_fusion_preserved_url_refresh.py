@@ -14,14 +14,24 @@ from app.fusion_execution_preserved_url_refresh import (
 class _FakeFusionClient:
     def __init__(self) -> None:
         self.status_calls: list[str] = []
+        self.status_full_calls: list[str] = []
 
     async def status(self, *, headers, job_id: str):
         self.status_calls.append(job_id)
         return {
             "job_id": job_id,
             "status": "succeeded",
-            # Intentionally stale top-level URL: recovery must use the freshly
-            # signed canonical artifact instead.
+            # Production /status-light deliberately has no artifact rows and can
+            # carry an old signed top-level URL. Recovery must not use this path.
+            "primary_video_url": "https://desifacesstore.blob.core.windows.net/video-output/stale.mp4?sig=expired",
+            "artifacts": [],
+        }
+
+    async def status_full(self, *, headers, job_id: str):
+        self.status_full_calls.append(job_id)
+        return {
+            "job_id": job_id,
+            "status": "succeeded",
             "primary_video_url": "https://desifacesstore.blob.core.windows.net/video-output/stale.mp4?sig=expired",
             "artifacts": [
                 {
@@ -80,7 +90,7 @@ def test_fresh_video_artifact_url_ignores_stale_top_level_url():
     assert _fresh_video_artifact_url(payload).endswith("fresh.mp4?sig=fresh")
 
 
-def test_refresh_child_preserves_provider_job_lineage_and_replaces_only_signed_url():
+def test_refresh_child_uses_full_status_and_preserves_provider_job_lineage():
     async def run():
         service = _FakeService()
         child = {
@@ -100,8 +110,10 @@ def test_refresh_child_preserves_provider_job_lineage_and_replaces_only_signed_u
         assert refreshed["status"] == "succeeded"
         assert refreshed["reused_from_prior_attempt"] is True
         assert refreshed["video_url_refreshed_for_stitch"] is True
+        assert refreshed["video_url_refresh_source"] == "svc-fusion-full-status-artifact"
         assert refreshed["video_url"].endswith("job-existing-001.mp4?sig=fresh")
-        assert service.fusion_client.status_calls == ["job-existing-001"]
+        assert service.fusion_client.status_calls == []
+        assert service.fusion_client.status_full_calls == ["job-existing-001"]
 
     asyncio.run(run())
 
@@ -139,7 +151,8 @@ def test_failed_attempt_refreshes_preserved_urls_without_creating_provider_jobs(
         )
 
         assert count == 3
-        assert service.fusion_client.status_calls == [
+        assert service.fusion_client.status_calls == []
+        assert service.fusion_client.status_full_calls == [
             "job-existing-001",
             "job-existing-002",
             "job-existing-003",
@@ -153,5 +166,6 @@ def test_failed_attempt_refreshes_preserved_urls_without_creating_provider_jobs(
             "job-existing-003",
         ]
         assert all("sig=fresh" in item["video_url"] for item in refreshed)
+        assert all(item["video_url_refreshed_for_stitch"] is True for item in refreshed)
 
     asyncio.run(run())
