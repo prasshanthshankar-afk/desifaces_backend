@@ -102,16 +102,21 @@ worker() {
     exit 73
   fi
 
-  exec 9<"$input_file"
-  rm -f "$input_file"
+  [[ -f "$input_file" ]] || fail "detached recovery credential file missing before worker start"
+  chmod 600 "$input_file"
+  export DF_RECOVERY_INPUT_FILE="$input_file"
 
   echo "$(date -Is) DETACHED_RECOVERY_STARTED=YES"
   echo "$(date -Is) RECOVERY_SCRIPT=$RECOVERY_SCRIPT"
+  echo "$(date -Is) DETACHED_AUTH_TRANSPORT=FILE_NOT_STDIN"
 
   set +e
-  bash "$RECOVERY_SCRIPT" <&9
+  bash "$RECOVERY_SCRIPT" </dev/null
   rc=$?
   set -e
+
+  rm -f "$input_file"
+  unset DF_RECOVERY_INPUT_FILE || true
 
   echo "$(date -Is) DETACHED_RECOVERY_EXIT_CODE=$rc"
   rm -f "$PID_FILE"
