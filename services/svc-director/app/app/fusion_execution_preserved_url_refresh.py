@@ -57,11 +57,23 @@ async def _refresh_child(
             f"fusion_preserved_child_lineage_missing:{turn_id or 'unknown'}"
         )
 
+    # Recovery needs a newly signed canonical artifact URL. The production pooled
+    # client's status() method intentionally uses /status-light for routine polling;
+    # that endpoint does not load artifact rows or mint fresh SAS URLs. Use
+    # status_full() when available so svc-fusion rebuilds the artifact view and
+    # re-signs Azure Blob artifacts. Fall back only for non-pooled/test clients.
+    status_full = getattr(service.fusion_client, "status_full", None)
     async with semaphore:
-        status_payload = await service.fusion_client.status(
-            headers=headers,
-            job_id=job_id,
-        )
+        if callable(status_full):
+            status_payload = await status_full(
+                headers=headers,
+                job_id=job_id,
+            )
+        else:
+            status_payload = await service.fusion_client.status(
+                headers=headers,
+                job_id=job_id,
+            )
 
     live_state = _clean(status_payload.get("status")).lower()
     if live_state not in _TERMINAL_SUCCESS:
