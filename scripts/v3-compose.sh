@@ -95,6 +95,25 @@ PY
 
 
 ###############################################################################
+# Pin V3 Fusion final media to one explicit storage-container contract.
+#
+# The legacy env file can carry AZURE_FINAL_VIDEO_CONTAINER or
+# AZURE_VIDEO_OUTPUT_CONTAINER values from other environments. V3 must not inherit
+# those implicitly: provider artifacts and stitched scene output share the V3
+# canonical video container unless an explicit V3-only override is supplied.
+###############################################################################
+
+DF_V3_FUSION_OUTPUT_CONTAINER="${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}"
+
+if [[ ! "$DF_V3_FUSION_OUTPUT_CONTAINER" =~ ^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$ ]]; then
+  die "invalid DF_V3_FUSION_OUTPUT_CONTAINER: $DF_V3_FUSION_OUTPUT_CONTAINER"
+fi
+
+export AZURE_FINAL_VIDEO_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER"
+export AZURE_VIDEO_OUTPUT_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER"
+
+
+###############################################################################
 # Disallow the two most dangerous destructive forms.
 ###############################################################################
 
