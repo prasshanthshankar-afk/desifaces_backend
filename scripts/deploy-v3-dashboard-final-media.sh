@@ -61,7 +61,7 @@ echo
 
 
 echo "=== 5. RUNTIME CODE CERTIFICATION ==="
-docker exec df-v3-svc-dashboard python - <<'PY'
+docker exec -i df-v3-svc-dashboard python - <<'PY'
 from pathlib import Path
 
 helper = Path('/app/app/services/final_video_visibility.py').read_text()
