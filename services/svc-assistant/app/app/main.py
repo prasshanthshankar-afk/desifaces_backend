@@ -20,7 +20,7 @@ from .session_store import SessionStore
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await open_business_pool()
+    pool = await open_business_pool()
     redis = Redis.from_url(settings.REDIS_URL, decode_responses=True)
     await redis.ping()
     http = httpx.AsyncClient(timeout=settings.DF_ASSISTANT_HTTP_TIMEOUT_SECONDS)
@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI):
     app.state.llm = llm
     app.state.service = AssistantService(
         sessions=SessionStore(redis),
-        context_resolver=ContextResolver(http),
+        context_resolver=ContextResolver(http, pool),
         retriever=retriever,
         llm=llm,
     )
@@ -58,10 +58,12 @@ async def health():
     return {
         "ok": redis_ok,
         "service": "svc-assistant",
+        "display_name": settings.DF_ASSISTANT_DISPLAY_NAME,
         "mode": "context_safe_read_only",
         "llm_configured": app.state.llm.configured,
         "embedding_configured": bool(settings.DF_ASSISTANT_EMBEDDING_MODEL),
         "knowledge_chunks": app.state.retriever.chunk_count,
+        "live_context": "dashboard+user_scoped_generation+director_story",
         "privacy_guard": "deterministic_pre_and_post_llm",
         "support_route": "support@desifaces.ai",
         "runtime_ready": redis_ok and app.state.llm.configured,
