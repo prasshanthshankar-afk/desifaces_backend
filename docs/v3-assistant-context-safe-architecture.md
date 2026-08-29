@@ -20,7 +20,7 @@ svc-assistant
    |-- context resolver
    |      `-- authorized svc-director assistant-context
    |-- deterministic safe-context projection
-   |      `-- removes IDs, URLs, real participant names, secrets/payment fields
+   |      `-- removes IDs, URLs, names, customer-authored prose, secrets/payment fields
    |-- approved customer-safe knowledge retrieval
    |-- LLM response generation
    |-- outbound PII/PCI/secret guard (fail closed)
@@ -36,6 +36,7 @@ svc-assistant
 - Story context is fetched from the existing Director `assistant-context` API using the same user JWT and projected into a safe model before LLM use.
 - Account/project/story/scene/participant/turn/media identifiers and signed URLs are removed from model context.
 - Participant display names are replaced with deterministic aliases such as `Participant 1`.
+- V1 does not automatically send Story titles, summaries, scene prose, dialogue text, persona or continuity free-form content to the LLM. It sends structural workflow facts such as stage/state, aliases, locale, generation status and allowlisted pricing fields.
 - Payment instruments, identity PII, authentication secrets and cross-account disclosure requests are denied before retrieval or LLM execution.
 - Outbound generated text is scanned again. If restricted data is detected, the response fails closed to the support route.
 

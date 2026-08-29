@@ -8,14 +8,22 @@ from .config import settings
 from .privacy import redact_sensitive_text
 from .schemas import AssistantContextLocator
 
+# V1 deliberately minimizes what downstream LLM processing can see. IDs,
+# customer-authored prose, media references and identity/payment fields stay out
+# of model context. The Assistant receives workflow facts, not raw customer data.
 _SENSITIVE_KEY_FRAGMENTS = (
     "account_id", "project_id", "story_id", "scene_id", "participant_id", "turn_id",
     "media_id", "url", "uri", "token", "secret", "password", "email", "phone",
     "address", "card", "payment_method", "customer_id", "receipt", "provider_request",
+    "dob", "birth", "passport", "license", "ssn", "government_id",
 )
 _ALLOWED_GENERATION_KEY_FRAGMENTS = (
     "state", "status", "stage", "retry", "error_code", "failure_code", "locale",
     "gender", "voice", "credits", "cost", "amount", "currency", "duration", "progress",
+)
+_ALLOWED_PRICING_KEY_FRAGMENTS = (
+    "plan", "tier", "credits", "cost", "amount", "currency", "price", "unit", "quantity",
+    "premium", "discount", "balance", "available", "required", "afford",
 )
 
 
@@ -23,12 +31,12 @@ def _safe_scalar(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
-        return redact_sensitive_text(value).text[:4000]
-    return str(value)[:1000]
+        return redact_sensitive_text(value).text[:1000]
+    return str(value)[:500]
 
 
-def _safe_freeform(value: Any, *, depth: int = 0) -> Any:
-    if depth > 4:
+def _safe_allowlisted_dict(value: Any, *, allowed_fragments: tuple[str, ...], depth: int = 0) -> Any:
+    if depth > 3:
         return "[TRUNCATED]"
     if isinstance(value, dict):
         result: dict[str, Any] = {}
@@ -37,10 +45,19 @@ def _safe_freeform(value: Any, *, depth: int = 0) -> Any:
             low = key_text.lower()
             if any(fragment in low for fragment in _SENSITIVE_KEY_FRAGMENTS):
                 continue
-            result[key_text[:100]] = _safe_freeform(item, depth=depth + 1)
+            if not any(fragment in low for fragment in allowed_fragments):
+                continue
+            result[key_text[:100]] = _safe_allowlisted_dict(
+                item,
+                allowed_fragments=allowed_fragments,
+                depth=depth + 1,
+            )
         return result
     if isinstance(value, (list, tuple)):
-        return [_safe_freeform(item, depth=depth + 1) for item in value[:30]]
+        return [
+            _safe_allowlisted_dict(item, allowed_fragments=allowed_fragments, depth=depth + 1)
+            for item in value[:30]
+        ]
     return _safe_scalar(value)
 
 
@@ -49,16 +66,18 @@ def _safe_generation(items: list[dict] | tuple[dict, ...] | None) -> list[dict]:
     for item in list(items or ())[:50]:
         if not isinstance(item, dict):
             continue
-        projected = {}
-        for key, value in item.items():
-            low = str(key).lower()
-            if any(fragment in low for fragment in _SENSITIVE_KEY_FRAGMENTS):
-                continue
-            if any(fragment in low for fragment in _ALLOWED_GENERATION_KEY_FRAGMENTS):
-                projected[str(key)[:100]] = _safe_freeform(value)
+        projected = _safe_allowlisted_dict(
+            item,
+            allowed_fragments=_ALLOWED_GENERATION_KEY_FRAGMENTS,
+        )
         if projected:
             safe.append(projected)
     return safe
+
+
+def _safe_pricing(value: Any) -> dict[str, Any]:
+    projected = _safe_allowlisted_dict(value or {}, allowed_fragments=_ALLOWED_PRICING_KEY_FRAGMENTS)
+    return projected if isinstance(projected, dict) else {}
 
 
 def project_safe_story_context(raw: dict[str, Any], locator: AssistantContextLocator) -> dict[str, Any]:
@@ -75,8 +94,6 @@ def project_safe_story_context(raw: dict[str, Any], locator: AssistantContextLoc
             "alias": alias,
             "kind": _safe_scalar(item.get("kind")),
             "locale": _safe_scalar(item.get("locale")),
-            "persona": _safe_freeform(item.get("persona") or {}),
-            "continuity": _safe_freeform(item.get("continuity") or {}),
         })
 
     scenes = []
@@ -85,10 +102,6 @@ def project_safe_story_context(raw: dict[str, Any], locator: AssistantContextLoc
             continue
         scenes.append({
             "sequence": item.get("sequence"),
-            "title": _safe_scalar(item.get("title")),
-            "summary": _safe_scalar(item.get("summary")),
-            "setting": _safe_freeform(item.get("setting") or {}),
-            "direction": _safe_freeform(item.get("direction") or {}),
             "state": _safe_scalar(item.get("state")),
         })
 
@@ -97,13 +110,18 @@ def project_safe_story_context(raw: dict[str, Any], locator: AssistantContextLoc
         if not isinstance(item, dict):
             continue
         speaker_id = str(item.get("speaker_participant_id") or "")
+        raw_text = item.get("text")
         dialogue.append({
             "sequence": item.get("sequence"),
             "kind": _safe_scalar(item.get("kind")),
-            "speaker": participant_aliases.get(speaker_id, "Narrator" if not speaker_id else "Participant"),
-            "text": _safe_scalar(item.get("text")),
+            "speaker": participant_aliases.get(
+                speaker_id,
+                "Narrator" if not speaker_id else "Participant",
+            ),
             "locale": _safe_scalar(item.get("locale")),
             "emotion": _safe_scalar(item.get("emotion")),
+            "has_text": bool(str(raw_text or "").strip()),
+            "text_length": len(str(raw_text or "")) if raw_text is not None else 0,
         })
 
     return {
@@ -111,13 +129,11 @@ def project_safe_story_context(raw: dict[str, Any], locator: AssistantContextLoc
         "screen": locator.screen,
         "creation_type": _safe_scalar(raw.get("creation_type")),
         "context_scope": _safe_scalar(raw.get("context_scope")),
-        "title": _safe_scalar(raw.get("title")),
-        "summary": _safe_scalar(raw.get("concise_summary")),
         "participants": participants,
         "scenes": scenes,
         "dialogue": dialogue,
         "generation": _safe_generation(raw.get("generation_context")),
-        "pricing": _safe_freeform(raw.get("pricing_context") or {}),
+        "pricing": _safe_pricing(raw.get("pricing_context")),
         "allowed_actions": [
             str(action)[:100]
             for action in list(raw.get("allowed_assistant_actions") or ())[:30]
