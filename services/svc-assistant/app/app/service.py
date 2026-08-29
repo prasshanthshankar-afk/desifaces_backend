@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from uuid import uuid4
 
 from .context import ContextResolver
@@ -49,6 +50,21 @@ _GENERATION_CUES = (
     "voice",
     "tts",
 )
+_CREDIT_CUES = (
+    "credit",
+    "credits",
+    "balance",
+    "available",
+    "afford",
+    "enough",
+    "how many",
+    "can i create",
+    "can i generate",
+    "will i be able",
+    "runway",
+    "cost",
+    "pricing",
+)
 _SUCCESS_STATES = {"ready", "succeeded", "success", "complete", "completed", "done"}
 _FAILURE_STATES = {"failed", "failure", "error", "cancelled", "canceled"}
 
@@ -57,9 +73,32 @@ def _normalized(value: object) -> str:
     return str(value or "").strip()
 
 
+def _as_number(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_number(value: object) -> str:
+    number = _as_number(value)
+    if number is None:
+        return _normalized(value)
+    if abs(number - round(number)) < 1e-9:
+        return str(int(round(number)))
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
 def _is_generation_operational_query(message: str) -> bool:
     text = message.lower().strip()
     return any(cue in text for cue in _OPERATIONAL_CUES) and any(cue in text for cue in _GENERATION_CUES)
+
+
+def _is_credit_query(message: str) -> bool:
+    text = message.lower().strip()
+    return any(cue in text for cue in _CREDIT_CUES)
 
 
 def _requested_generation_kind(message: str) -> str | None:
@@ -73,6 +112,29 @@ def _requested_generation_kind(message: str) -> str | None:
     if any(cue in text for cue in ("multi-person", "multi person", "multiperson")):
         return "video"
     return None
+
+
+def _requested_capacity_kinds(message: str) -> list[str]:
+    text = message.lower()
+    kinds: list[str] = []
+    if any(cue in text for cue in ("face", "faces", "image", "images")):
+        kinds.append("face")
+    if any(cue in text for cue in ("audio", "audios", "voice", "voices", "tts")):
+        kinds.append("audio")
+    if any(cue in text for cue in ("video", "videos", "fusion")):
+        kinds.append("video")
+    return kinds
+
+
+def _requested_count(message: str) -> int | None:
+    match = re.search(r"\b(\d{1,5})\b", message)
+    if not match:
+        return None
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def _generation_descriptor(item: dict) -> str:
@@ -154,11 +216,7 @@ def _format_generation_status(item: dict) -> str:
 
 
 def operational_generation_answer(message: str, context: dict) -> str | None:
-    """Return a database-backed operational answer when the question asks for live generation state.
-
-    The context is already authorization-scoped and privacy-projected by ContextResolver. Operational
-    facts therefore bypass RAG/LLM interpretation so the answer cannot drift into generic guidance.
-    """
+    """Return a database-backed operational answer when the question asks for live generation state."""
     if not _is_generation_operational_query(message):
         return None
 
@@ -173,6 +231,186 @@ def operational_generation_answer(message: str, context: dict) -> str | None:
     if requested_label and requested_label != "generation":
         return f"I checked your current authenticated generation history and do not see a recent **{requested_label}** generation for this account."
     return "I checked your current authenticated generation history and do not see any recent generation records for this account."
+
+
+def _pricing_available_credits(pricing: dict) -> float | None:
+    credits = pricing.get("credits") if isinstance(pricing.get("credits"), dict) else {}
+    summary = pricing.get("summary") if isinstance(pricing.get("summary"), dict) else {}
+    runway = pricing.get("runway") if isinstance(pricing.get("runway"), dict) else {}
+    for value in (
+        credits.get("total_available"),
+        credits.get("available_credits"),
+        credits.get("total_spendable"),
+        summary.get("total_available"),
+        summary.get("available_credits"),
+        runway.get("available_credits"),
+    ):
+        number = _as_number(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _pricing_reserved_credits(pricing: dict) -> float | None:
+    credits = pricing.get("credits") if isinstance(pricing.get("credits"), dict) else {}
+    summary = pricing.get("summary") if isinstance(pricing.get("summary"), dict) else {}
+    runway = pricing.get("runway") if isinstance(pricing.get("runway"), dict) else {}
+    for value in (
+        credits.get("total_reserved"),
+        credits.get("reserved_credits"),
+        summary.get("total_reserved"),
+        summary.get("reserved_credits"),
+        runway.get("reserved_credits"),
+    ):
+        number = _as_number(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _runway_kind(item: dict) -> str | None:
+    studio = _normalized(item.get("studio")).lower()
+    if "face" in studio or "image" in studio:
+        return "face"
+    if "audio" in studio or "tts" in studio or "voice" in studio:
+        return "audio"
+    if "video" in studio or "fusion" in studio or "longform" in studio:
+        return "video"
+    return None
+
+
+def _runway_estimates(context: dict) -> list[dict]:
+    pricing = context.get("pricing") if isinstance(context.get("pricing"), dict) else {}
+    runway = pricing.get("runway") if isinstance(pricing.get("runway"), dict) else {}
+    raw = runway.get("estimates")
+    return [item for item in list(raw or ()) if isinstance(item, dict)]
+
+
+def _select_runway_estimates(message: str, context: dict) -> list[dict]:
+    requested = _requested_capacity_kinds(message)
+    estimates = _runway_estimates(context)
+    selected: list[dict] = []
+    seen: set[str] = set()
+    for item in estimates:
+        kind = _runway_kind(item)
+        if kind is None:
+            continue
+        if requested and kind not in requested:
+            continue
+        if kind in seen:
+            continue
+        selected.append(item)
+        seen.add(kind)
+    return selected
+
+
+def _runway_line(item: dict, requested_count: int | None) -> tuple[str, bool | None]:
+    kind = _runway_kind(item) or "generation"
+    label = _normalized(item.get("label")) or _normalized(item.get("mode")) or kind.title()
+    unit = _normalized(item.get("unit")) or "units"
+    remaining = _as_number(item.get("remaining_units"))
+    per_unit = _as_number(item.get("estimated_credits_per_display_unit"))
+    baseline_qty = _as_number(item.get("baseline_display_qty"))
+    baseline_cost = _as_number(item.get("estimated_credits_for_baseline_qty"))
+
+    unit_label = unit
+    if unit == "kchars":
+        unit_label = "1K-character audio blocks"
+    elif unit == "chars":
+        unit_label = "audio characters"
+    elif unit == "seconds":
+        unit_label = "video seconds" if kind == "video" else "seconds"
+    elif unit == "minutes":
+        unit_label = "video minutes" if kind == "video" else "minutes"
+    elif unit == "runs":
+        unit_label = f"{kind} runs"
+
+    details: list[str] = [f"**{kind.title()} — {label}:**"]
+    if remaining is not None:
+        details.append(f"about **{_format_number(remaining)} {unit_label}** available from the current balance")
+    if per_unit is not None:
+        details.append(f"at about **{_format_number(per_unit)} credits per {unit.rstrip('s') or 'unit'}**")
+    elif baseline_cost is not None and baseline_qty is not None:
+        details.append(
+            f"with a baseline of **{_format_number(baseline_cost)} credits for {_format_number(baseline_qty)} {unit}**"
+        )
+
+    count_result: bool | None = None
+    if requested_count is not None and unit == "runs" and remaining is not None:
+        count_result = remaining >= requested_count
+        details.append(
+            f"so **{requested_count} {kind} generations {'fit' if count_result else 'do not fit'}** within that runway"
+        )
+    elif requested_count is not None and unit != "runs":
+        details.append(
+            f"{requested_count} complete {kind} items depend on each item's length, because this mode is priced by **{unit}**, not by item count"
+        )
+
+    return "; ".join(details) + ".", count_result
+
+
+def operational_credit_answer(message: str, context: dict) -> str | None:
+    """Answer balance/runway questions from authenticated pricing data, independent of current screen."""
+    if not _is_credit_query(message):
+        return None
+
+    pricing = context.get("pricing") if isinstance(context.get("pricing"), dict) else {}
+    available = _pricing_available_credits(pricing)
+    reserved = _pricing_reserved_credits(pricing)
+    plan = pricing.get("plan") if isinstance(pricing.get("plan"), dict) else {}
+    plan_name = _normalized(plan.get("plan_name")) or _normalized(plan.get("plan_code"))
+
+    if available is None:
+        return (
+            "I checked your authenticated desifaces pricing context, but the current credit balance is unavailable right now. "
+            "I won't estimate a balance that the pricing system did not return."
+        )
+
+    parts = []
+    if plan_name:
+        parts.append(f"Your current plan is **{plan_name}**.")
+    balance = f"You currently have **{_format_number(available)} credits available**"
+    if reserved is not None:
+        balance += f" and **{_format_number(reserved)} reserved**"
+    parts.append(balance + ".")
+
+    selected = _select_runway_estimates(message, context)
+    wants_capacity = bool(_requested_capacity_kinds(message)) or any(
+        cue in message.lower() for cue in ("how many", "can i create", "can i generate", "will i be able", "afford", "enough", "runway")
+    )
+    if not wants_capacity:
+        return " ".join(parts)
+
+    if not selected:
+        parts.append(
+            "I also checked the account-wide pricing runway, but no safe Face/Audio/Video runway estimate is currently available, so I won't invent a generation count."
+        )
+        return " ".join(parts)
+
+    requested_count = _requested_count(message)
+    run_based_results: list[bool] = []
+    variable_metered = False
+    for item in selected:
+        line, count_result = _runway_line(item, requested_count)
+        parts.append(line)
+        if count_result is not None:
+            run_based_results.append(count_result)
+        if _normalized(item.get("unit")) != "runs":
+            variable_metered = True
+
+    if requested_count is not None:
+        if run_based_results:
+            if all(run_based_results):
+                parts.append(f"For the run-based items above, **{requested_count} generations are within the current credit runway**.")
+            elif not any(run_based_results):
+                parts.append(f"For the run-based items above, **{requested_count} generations exceed the current credit runway**.")
+        if variable_metered:
+            parts.append(
+                "For Audio and Video modes priced by characters, seconds or minutes, the exact number of complete items depends on script length and video duration. "
+                "The figures above are the authoritative current runway units; once those lengths are known, the exact affordability calculation is deterministic."
+            )
+
+    return " ".join(parts)
 
 
 class AssistantService:
@@ -269,9 +507,12 @@ class AssistantService:
             user_id=auth.user_id,
         )
 
-        operational_answer = operational_generation_answer(safe_message, context)
-        if operational_answer is not None:
-            guarded_answer, output_blocked = guard_output(operational_answer)
+        deterministic_answer = (
+            operational_credit_answer(safe_message, context)
+            or operational_generation_answer(safe_message, context)
+        )
+        if deterministic_answer is not None:
+            guarded_answer, output_blocked = guard_output(deterministic_answer)
             await self._store_exchange(
                 auth=auth,
                 session_id=session_id,
