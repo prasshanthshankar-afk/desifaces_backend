@@ -20,11 +20,11 @@ _SECRET_RE = re.compile(
 _CVV_RE = re.compile(r"\b(?:cvv|cvc|security\s*code)\s*(?:is|=|:)?\s*\d{3,4}\b", re.IGNORECASE)
 
 _DISCLOSURE_VERBS = re.compile(
-    r"\b(?:show|tell|give|retrieve|lookup|look up|find|display|reveal|print|list|read|repeat|send|what is|what's|whats|which|provide|share|confirm|identify)\b",
+    r"\b(?:show|tell|give|retrieve|lookup|look up|find|display|reveal|print|list|read|repeat|send|what is|what are|what's|whats|which|provide|share|confirm|identify)\b",
     re.IGNORECASE,
 )
-_POSSESSIVE_DISCLOSURE = re.compile(
-    r"\b(?:my|mine|on my account|on file|associated with (?:my|this) account|for (?:my|this) account)\b",
+_BARE_RESTRICTED_QUERY = re.compile(
+    r"^\s*(?:my|mine)\s+(?:email(?:\s*address)?|phone(?:\s*number)?|mobile(?:\s*number)?|address|ssn|passport(?:\s*number)?|date\s*of\s*birth|dob|card(?:\s*(?:number|details|digits))?|cvv|cvc|password|token)\s*[?.!]*\s*$",
     re.IGNORECASE,
 )
 
@@ -113,7 +113,7 @@ def redact_sensitive_text(value: str) -> RedactionResult:
 
 
 def _disclosure_intent(message: str) -> bool:
-    return bool(_DISCLOSURE_VERBS.search(message) or _POSSESSIVE_DISCLOSURE.search(message))
+    return bool(_DISCLOSURE_VERBS.search(message) or _BARE_RESTRICTED_QUERY.search(message))
 
 
 def classify_restricted_request(message: str) -> PolicyDecision:
