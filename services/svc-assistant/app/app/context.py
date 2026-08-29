@@ -316,7 +316,6 @@ class ContextResolver:
             (
                 coalesce(j->>'final_video_url', '') <> ''
                 or coalesce(j->>'final_storage_path', '') <> ''
-                or lower(j::text) ~ '(final_video|final_output|stitched_video|composed_video|timeline_output|share_url)'
             ) as final_output_available
         from (
             select to_jsonb(lj) as j
