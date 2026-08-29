@@ -1,0 +1,93 @@
+name: V3 Dashboard Final Media Gate
+
+on:
+  push:
+    branches:
+      - "fix/dashboard-final-fusion-library-*"
+    paths:
+      - "services/svc-dashboard/app/**"
+      - "services/svc-dashboard/df_dashboard_video_final_proof.sh"
+      - "services/svc-dashboard/df_video_thumbnail_content_verify.sh"
+      - ".github/workflows/v3-dashboard-final-media-gate.yml"
+  pull_request:
+    paths:
+      - "services/svc-dashboard/app/**"
+      - "services/svc-dashboard/df_dashboard_video_final_proof.sh"
+      - "services/svc-dashboard/df_video_thumbnail_content_verify.sh"
+      - ".github/workflows/v3-dashboard-final-media-gate.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  dashboard-final-media:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dashboard dependencies
+        run: python -m pip install --disable-pip-version-check -r services/svc-dashboard/app/app/requirements.txt
+
+      - name: Compile Dashboard customer-media code
+        run: |
+          python -m compileall -q \
+            services/svc-dashboard/app/app/services/dashboard_service.py \
+            services/svc-dashboard/app/app/services/dashboard_public_media_service.py \
+            services/svc-dashboard/app/app/api/routes/dashboard.py
+
+      - name: Run final-media regression tests
+        env:
+          PYTHONPATH: services/svc-dashboard/app
+        run: |
+          python -m unittest discover \
+            -s services/svc-dashboard/app/tests \
+            -p 'test_dashboard_public_media_policy.py' \
+            -v
+
+      - name: Validate runtime proof scripts
+        run: |
+          bash -n services/svc-dashboard/df_dashboard_video_final_proof.sh
+          bash -n services/svc-dashboard/df_video_thumbnail_content_verify.sh
+
+      - name: Verify API routes use customer-media policy
+        run: |
+          grep -F 'from app.services.dashboard_public_media_service import get_dashboard_home, get_dashboard_library' \
+            services/svc-dashboard/app/app/api/routes/dashboard.py
+
+      - name: Build svc-dashboard Docker image
+        run: |
+          docker build \
+            -t desifaces-v3-svc-dashboard:${GITHUB_SHA} \
+            services/svc-dashboard/app
+
+      - name: Smoke import built image
+        run: |
+          docker run --rm \
+            --entrypoint python \
+            -e DATABASE_URL='postgresql://user:pass@localhost:5432/desifaces_v3' \
+            -e JWT_SECRET='ci-test-secret' \
+            -e AZURE_STORAGE_CONNECTION_STRING='DefaultEndpointsProtocol=https;AccountName=testaccount;AccountKey=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=;EndpointSuffix=core.windows.net' \
+            desifaces-v3-svc-dashboard:${GITHUB_SHA} \
+            -c "from app.api.routes.dashboard import router; from app.services.dashboard_public_media_service import is_internal_customer_hidden_item; assert router; assert is_internal_customer_hidden_item({'studio':'audio','title':'story_dialogue_workflow_id=w dialogue_turn_id=t scene_id=s'}); print('dashboard-image-smoke=PASS')"
+
+      - name: Export certified Dashboard image
+        run: |
+          docker save desifaces-v3-svc-dashboard:${GITHUB_SHA} | gzip -1 > desifaces-v3-svc-dashboard-image.tar.gz
+          sha256sum desifaces-v3-svc-dashboard-image.tar.gz > desifaces-v3-svc-dashboard-image.tar.gz.sha256
+          ls -lh desifaces-v3-svc-dashboard-image.tar.gz*
+
+      - name: Upload certified Dashboard image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: desifaces-v3-svc-dashboard-image-${{ github.sha }}
+          path: |
+            desifaces-v3-svc-dashboard-image.tar.gz
+            desifaces-v3-svc-dashboard-image.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 3
