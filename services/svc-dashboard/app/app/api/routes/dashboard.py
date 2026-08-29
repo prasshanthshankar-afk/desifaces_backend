@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, Query
 import asyncpg
 
 from app.api.deps import get_db_pool, get_current_user_id
-from app.services.dashboard_service import get_dashboard_header, get_dashboard_home, get_dashboard_library, request_refresh
+from app.services.dashboard_service import get_dashboard_header, request_refresh
+from app.services.dashboard_public_media_service import get_dashboard_home, get_dashboard_library
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
