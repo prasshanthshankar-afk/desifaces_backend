@@ -1,0 +1,54 @@
+name: V3 Assistant Static Certification
+
+on:
+  push:
+    branches:
+      - "feature/v3-assistant-*"
+    paths:
+      - "services/svc-assistant/**"
+      - "docker-compose.assistant.v3.yml"
+      - ".github/workflows/v3-assistant-static.yml"
+  pull_request:
+    paths:
+      - "services/svc-assistant/**"
+      - "docker-compose.assistant.v3.yml"
+      - ".github/workflows/v3-assistant-static.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  assistant-static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: postgresql://assistant:assistant@127.0.0.1:5432/assistant
+      REDIS_URL: redis://127.0.0.1:6379/0
+      JWT_SECRET: assistant-static-test-secret
+      JWT_ALG: HS256
+      JWT_ISSUER: desifaces
+      JWT_AUDIENCE: desifaces_clients
+      DF_ASSISTANT_LLM_MODEL: ""
+      PYTHONPATH: services/svc-assistant/app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -r services/svc-assistant/app/requirements.txt pytest
+
+      - name: Compile Assistant
+        run: python -m compileall -q services/svc-assistant/app/app
+
+      - name: Run privacy and context tests
+        run: python -m pytest -q services/svc-assistant/app/tests
+
+      - name: Validate compose syntax
+        run: docker compose -f docker-compose.assistant.v3.yml config --no-interpolate >/dev/null
