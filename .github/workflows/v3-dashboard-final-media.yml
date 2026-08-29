@@ -7,6 +7,7 @@ on:
     paths:
       - 'services/svc-dashboard/app/app/api/routes/dashboard.py'
       - 'services/svc-dashboard/app/app/services/final_video_visibility.py'
+      - 'scripts/deploy-v3-dashboard-final-media.sh'
       - '.github/workflows/v3-dashboard-final-media.yml'
   pull_request:
     branches:
@@ -14,6 +15,7 @@ on:
     paths:
       - 'services/svc-dashboard/app/app/api/routes/dashboard.py'
       - 'services/svc-dashboard/app/app/services/final_video_visibility.py'
+      - 'scripts/deploy-v3-dashboard-final-media.sh'
       - '.github/workflows/v3-dashboard-final-media.yml'
   workflow_dispatch:
 
@@ -38,6 +40,9 @@ jobs:
           python -m py_compile \
             services/svc-dashboard/app/app/api/routes/dashboard.py \
             services/svc-dashboard/app/app/services/final_video_visibility.py
+
+      - name: Validate one-shot deployment bundle
+        run: bash -n scripts/deploy-v3-dashboard-final-media.sh
 
       - name: Prove canonical final relationship and fail-safe guards
         run: |
