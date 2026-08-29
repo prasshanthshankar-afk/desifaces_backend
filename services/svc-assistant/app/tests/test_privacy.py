@@ -55,7 +55,37 @@ def test_redacts_valid_payment_card():
     assert "pci" in result.categories
 
 
+def test_redacts_international_phone():
+    result = redact_sensitive_text("please call me at +91 98765 43210")
+    assert "+91 98765 43210" not in result.text
+    assert "pii" in result.categories
+
+
+def test_redacts_explicit_dob():
+    result = redact_sensitive_text("my date of birth is 1985-02-17")
+    assert "1985-02-17" not in result.text
+    assert "pii" in result.categories
+
+
+def test_redacts_explicit_passport_number():
+    result = redact_sensitive_text("passport number: N12345678")
+    assert "N12345678" not in result.text
+    assert "pii" in result.categories
+
+
+def test_redacts_explicit_physical_address():
+    result = redact_sensitive_text("home address: 123 Private Street, Boston MA 02110")
+    assert "123 Private Street" not in result.text
+    assert "pii" in result.categories
+
+
 def test_output_guard_fails_closed():
     answer, blocked = guard_output("The account email is person@example.com")
+    assert blocked is True
+    assert answer == RESTRICTED_RESPONSE
+
+
+def test_output_guard_fails_closed_on_address():
+    answer, blocked = guard_output("Your home address: 123 Private Street, Boston MA 02110")
     assert blocked is True
     assert answer == RESTRICTED_RESPONSE
