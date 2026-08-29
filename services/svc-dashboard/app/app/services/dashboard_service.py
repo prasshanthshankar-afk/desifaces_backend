@@ -1219,8 +1219,8 @@ async def _fetch_library_view_rows(
         'video'::text as studio,
         'video'::text as asset_type,
         coalesce(
-          nullif(j #>> '{tags,story_title}', ''),
-          nullif(j #>> '{tags,title}', ''),
+          nullif(j #>> '{{tags,story_title}}', ''),
+          nullif(j #>> '{{tags,title}}', ''),
           case
             when j::text ~* 'cinematic_video_direction' then 'Cinematic Video'
             when j::text ~* 'talking_video' then 'Talking Video'
