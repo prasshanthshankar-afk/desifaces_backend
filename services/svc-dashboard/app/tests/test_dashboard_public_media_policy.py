@@ -24,6 +24,14 @@ class PublicMediaClassifierTests(unittest.TestCase):
         }
         self.assertTrue(policy.is_internal_customer_hidden_item(item))
 
+    def test_legacy_story_audio_with_scene_and_participant_is_hidden(self):
+        item = {
+            "studio": "audio",
+            "title": "participant_id=p1 scene_id=s1",
+            "metadata_json": {"workflow_id": "wf1"},
+        }
+        self.assertTrue(policy.is_internal_customer_hidden_item(item))
+
     def test_standalone_audio_is_visible(self):
         item = {
             "studio": "audio",
@@ -40,6 +48,18 @@ class PublicMediaClassifierTests(unittest.TestCase):
                 "scene_id": "scene-3",
                 "render_kind": "child_render",
                 "parent_longform_job_id": "parent-1",
+            },
+        }
+        self.assertTrue(policy.is_internal_customer_hidden_item(item))
+
+    def test_shareable_child_is_still_hidden(self):
+        item = {
+            "studio": "fusion",
+            "title": "Scene 3",
+            "metadata_json": {
+                "scene_id": "scene-3",
+                "render_kind": "child_render",
+                "share_url": "https://example.test/scene3.mp4",
             },
         }
         self.assertTrue(policy.is_internal_customer_hidden_item(item))
@@ -79,35 +99,75 @@ class PublicMediaContractTests(unittest.IsolatedAsyncioTestCase):
         policy._normalize_library_item = self.orig_normalize
         policy.AzureBlobSasSigner.from_connection_string = self.orig_signer
 
-    async def test_all_hides_internal_story_audio_but_keeps_standalone_audio(self):
-        internal = {
+    async def test_all_is_built_from_public_sets_not_legacy_all_page(self):
+        face = {
+            "library_id": "face:1",
+            "source_job_id": "face-job",
+            "studio": "face",
+            "title": "Saved face",
+            "created_at": "2026-08-28T10:00:00+00:00",
+        }
+        internal_audio = {
             "library_id": "audio:internal",
             "source_job_id": "job-internal",
             "studio": "audio",
             "title": "story_dialogue_workflow_id=w1 dialogue_turn_id=t1 scene_id=s1",
             "preview_url": "https://example.test/internal.mp3",
+            "created_at": "2026-08-29T10:00:00+00:00",
         }
-        standalone = {
+        standalone_audio_raw = {
             "library_id": "audio:standalone",
             "source_job_id": "job-standalone",
             "studio": "audio",
             "title": "Saved narration",
             "preview_url": "https://example.test/standalone.mp3",
+            "created_at": "2026-08-29T11:00:00+00:00",
+        }
+        final_video = {
+            "library_id": "video:final",
+            "source_job_id": "video-final",
+            "studio": "video",
+            "asset_type": "video",
+            "title": "Final video",
+            "preview_url": "https://example.test/final.mp4",
+            "thumbnail_url": "https://example.test/final.jpg",
+            "created_at": "2026-08-29T12:00:00+00:00",
+            "reuse_payload": {"video_url": "https://example.test/final.mp4"},
         }
 
-        async def fake_base(*args, **kwargs):
-            return {"items": [internal, standalone], "total": 2, "source": "base"}
+        async def fake_base(_pool, _user, *, asset_type, limit, offset):
+            if asset_type == "face":
+                return {"items": [face], "total": 1, "source": "face-base"}
+            if asset_type == "video":
+                return {"items": [final_video], "total": 1, "source": "video-base"}
+            if asset_type == "audio":
+                raise AssertionError("raw audio rows should be used when policy rows are available")
+            if asset_type == "all":
+                raise AssertionError("legacy type=all query must not drive customer Saved Work")
+            raise AssertionError(asset_type)
 
         async def fake_rows(*args, **kwargs):
-            return [internal]
+            return [internal_audio, standalone_audio_raw]
+
+        def fake_normalize(row, signer):
+            if row["library_id"] == "audio:standalone":
+                return {
+                    **row,
+                    "asset_type": "audio",
+                    "reuse_payload": {"audio_url": row["preview_url"]},
+                }
+            raise AssertionError("internal Story audio must never be normalized for publication")
 
         policy._base_get_dashboard_library = fake_base
         policy._policy_rows = fake_rows
+        policy._normalize_library_item = fake_normalize
+        policy.AzureBlobSasSigner.from_connection_string = lambda _: object()
 
         out = await policy.get_dashboard_library(object(), "u1", "all", 100, 0)
         ids = [x["library_id"] for x in out["items"]]
 
-        self.assertEqual(ids, ["audio:standalone"])
+        self.assertEqual(ids, ["video:final", "audio:standalone", "face:1"])
+        self.assertNotIn("audio:internal", ids)
         self.assertEqual(out["display_scope"], "customer_final_outputs")
 
     async def test_video_adds_public_fusion_final_and_rejects_fusion_child(self):
@@ -115,9 +175,11 @@ class PublicMediaContractTests(unittest.IsolatedAsyncioTestCase):
             "library_id": "video:normal",
             "source_job_id": "job-normal",
             "studio": "video",
+            "asset_type": "video",
             "title": "Talking Video",
             "preview_url": "https://example.test/normal.mp4",
             "thumbnail_url": "https://example.test/normal.jpg",
+            "created_at": "2026-08-29T10:00:00+00:00",
         }
         fusion_final_raw = {
             "library_id": "fusion:final",
@@ -126,6 +188,7 @@ class PublicMediaContractTests(unittest.IsolatedAsyncioTestCase):
             "title": "Final Multi-Person Story",
             "preview_url": "https://example.test/final.mp4",
             "thumbnail_url": "https://example.test/final.jpg",
+            "created_at": "2026-08-29T11:00:00+00:00",
             "metadata_json": {"render_kind": "final", "output_role": "final"},
         }
         fusion_child_raw = {
@@ -134,10 +197,12 @@ class PublicMediaContractTests(unittest.IsolatedAsyncioTestCase):
             "studio": "fusion",
             "title": "Scene 2",
             "preview_url": "https://example.test/scene2.mp4",
+            "created_at": "2026-08-29T12:00:00+00:00",
             "metadata_json": {"scene_id": "scene-2", "render_kind": "child_render"},
         }
 
-        async def fake_base(*args, **kwargs):
+        async def fake_base(_pool, _user, *, asset_type, limit, offset):
+            self.assertEqual(asset_type, "video")
             return {"items": [normal_video], "total": 1, "source": "base"}
 
         async def fake_rows(*args, **kwargs):
@@ -153,6 +218,7 @@ class PublicMediaContractTests(unittest.IsolatedAsyncioTestCase):
                     "title": "Final Multi-Person Story",
                     "preview_url": "https://example.test/final.mp4",
                     "thumbnail_url": "https://example.test/final.jpg",
+                    "created_at": "2026-08-29T11:00:00+00:00",
                     "reuse_payload": {"video_url": "https://example.test/final.mp4"},
                 }
             raise AssertionError("child fusion row must never be normalized for publication")
@@ -171,6 +237,46 @@ class PublicMediaContractTests(unittest.IsolatedAsyncioTestCase):
 
         final = next(x for x in out["items"] if x["library_id"] == "fusion:final")
         self.assertTrue(final.get("thumbnail_url"))
+
+    async def test_pagination_occurs_after_internal_filtering(self):
+        public_audio_rows = [
+            {
+                "library_id": f"audio:{i}",
+                "source_job_id": f"audio-job-{i}",
+                "studio": "audio",
+                "title": f"Saved clip {i}",
+                "preview_url": f"https://example.test/{i}.mp3",
+                "created_at": f"2026-08-29T10:{i:02d}:00+00:00",
+            }
+            for i in range(5)
+        ]
+        internal_rows = [
+            {
+                "library_id": f"internal:{i}",
+                "source_job_id": f"internal-job-{i}",
+                "studio": "audio",
+                "title": f"story_dialogue_workflow_id=w dialogue_turn_id=t{i} scene_id=s{i}",
+                "created_at": f"2026-08-29T12:{i:02d}:00+00:00",
+            }
+            for i in range(20)
+        ]
+
+        async def fake_rows(*args, **kwargs):
+            return [*internal_rows, *public_audio_rows]
+
+        def fake_normalize(row, signer):
+            if row["library_id"].startswith("internal:"):
+                raise AssertionError("internal row must not be normalized")
+            return {**row, "asset_type": "audio", "reuse_payload": {"audio_url": row["preview_url"]}}
+
+        policy._policy_rows = fake_rows
+        policy._normalize_library_item = fake_normalize
+        policy.AzureBlobSasSigner.from_connection_string = lambda _: object()
+
+        out = await policy.get_dashboard_library(object(), "u1", "audio", 3, 0)
+        self.assertEqual(len(out["items"]), 3)
+        self.assertEqual(out["total"], 5)
+        self.assertTrue(all(x["library_id"].startswith("audio:") for x in out["items"]))
 
 
 if __name__ == "__main__":
