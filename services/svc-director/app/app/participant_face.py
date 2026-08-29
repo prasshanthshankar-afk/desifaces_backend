@@ -88,6 +88,16 @@ def _explicit_age(participant_hint: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _explicit_region(participant_hint: dict[str, Any] | None) -> str | None:
+    # desifaces multiperson final v4.0: explicit region
+    hint = participant_hint or {}
+    for key in ("region_code", "region"):
+        value = hint.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()[:120]
+    return None
+
+
 def _append_prompt(parts: list[str], sentence: str, *, max_chars: int = 1500) -> None:
     sentence = " ".join(str(sentence or "").split()).strip()
     if not sentence:
@@ -115,6 +125,7 @@ def compile_participant_face_studio_input(
     hint = dict(participant_hint or {})
     gender = _explicit_gender(hint)
     age = _explicit_age(hint)
+    region_code = _explicit_region(hint)
     visual = _safe_creative_map(participant.visual_direction)
     continuity = _safe_creative_map(participant.continuity)
 
@@ -155,6 +166,23 @@ def compile_participant_face_studio_input(
     }
     if gender:
         studio_input["gender"] = gender
+    if region_code:
+        studio_input["region_code"] = region_code
+
+    # desifaces multiperson hotfix v4.2: single participant face
+    # Participant Face stages create identity assets, never scene/group compositions.
+    # The native CreatorPlatformRequest supports subject_composition_code=single_person;
+    # enforce it here and add a provider-level prompt guard so cast/scene context cannot
+    # accidentally introduce another person into this participant's identity frame.
+    studio_input["subject_composition_code"] = "single_person"
+    studio_input.pop("subjects", None)
+    single_subject_guard = (
+        "SINGLE-PERSON IDENTITY PORTRAIT ONLY. Exactly one human subject in the frame. "
+        "Do not include a second person, companion, crowd, split frame, collage, reflection containing another person, "
+        "or any other human figure. This is participant identity creation, not scene composition."
+    )
+    existing_prompt = str(studio_input.get("user_prompt") or "").strip()
+    studio_input["user_prompt"] = f"{single_subject_guard} {existing_prompt}".strip()
     return studio_input
 
 

@@ -292,4 +292,184 @@ async def set_participant_voice_profile(
     }
 
 
+# desifaces multiperson final v4.0: story-wide conversation language/translation
+class ConversationSettingsIn(BaseModel):
+    target_locale: str = Field(min_length=2, max_length=64)
+    translate: bool = False
+    source_language: str = Field(default="auto", min_length=2, max_length=64)
+
+
+async def _load_supported_locale(request: Request, target_locale: str) -> dict[str, Any]:
+    headers = _forward_auth(request)
+    async with httpx.AsyncClient(
+        base_url=settings.DF_AUDIO_BASE_URL.rstrip("/"),
+        headers=headers,
+        timeout=30.0,
+    ) as client:
+        response = await client.get(
+            "/api/audio/catalog/locales",
+            params={"end_to_end_only": "true", "enabled_only": "true"},
+        )
+    if response.status_code != 200:
+        raise HTTPException(status_code=424, detail="audio_locale_catalog_unavailable")
+    payload = response.json() if response.content else {}
+    items = payload.get("items") if isinstance(payload, dict) else []
+    selected = next(
+        (
+            item for item in (items or [])
+            if isinstance(item, dict) and _clean(item.get("locale")) == target_locale
+        ),
+        None,
+    )
+    if selected is None:
+        raise HTTPException(status_code=422, detail="audio_target_locale_not_supported")
+    return selected
+
+
+async def _conversation_settings(conn, *, workflow_id: UUID, account_id: UUID) -> dict[str, Any]:
+    row = await conn.fetchrow(
+        """
+        select s.metadata_json,dt.locale as authored_locale,p.voice_locale,st.default_locale
+        from public.v3_studio_stage_runs s
+        join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+        join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
+        join public.v3_participants p on p.participant_id=dt.speaker_participant_id
+        left join public.v3_stories st on st.story_id=w.story_id
+        where s.workflow_id=$1 and w.account_id=$2
+          and s.stage_type='audio' and s.scope_type='dialogue_turn'
+        order by dt.sequence_no,dt.turn_id
+        limit 1
+        """,
+        workflow_id,
+        account_id,
+    )
+    if not row:
+        return {"target_locale": None, "translate": False, "source_language": "auto", "persisted": False}
+    metadata = _as_dict(row["metadata_json"])
+    settings_value = _as_dict(metadata.get("conversation_settings"))
+    if settings_value:
+        return {
+            "target_locale": _clean(settings_value.get("target_locale")) or None,
+            "translate": bool(settings_value.get("translate")),
+            "source_language": _clean(settings_value.get("source_language")) or "auto",
+            "persisted": True,
+        }
+    inferred = _clean(row["voice_locale"] or row["authored_locale"] or row["default_locale"])
+    return {"target_locale": inferred or None, "translate": False, "source_language": "auto", "persisted": False}
+
+
+@router.get("/api/director/studio-workflows/{workflow_id}/conversation-settings")
+async def get_conversation_settings(
+    workflow_id: UUID,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    async with request.app.state.business_pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "select 1 from public.v3_studio_workflows where workflow_id=$1 and account_id=$2",
+            workflow_id,
+            auth.account_id,
+        )
+        if not exists:
+            raise HTTPException(status_code=404, detail="studio_workflow_not_found")
+        settings_value = await _conversation_settings(conn, workflow_id=workflow_id, account_id=auth.account_id)
+    return {"workflow_id": str(workflow_id), "settings": settings_value}
+
+
+@router.put("/api/director/studio-workflows/{workflow_id}/conversation-settings")
+async def set_conversation_settings(
+    workflow_id: UUID,
+    body: ConversationSettingsIn,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    target_locale = _clean(body.target_locale)
+    source_language = _clean(body.source_language) or "auto"
+    await _load_supported_locale(request, target_locale)
+    pool = request.app.state.business_pool
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            workflow = await conn.fetchrow(
+                """
+                select workflow_id,current_stage
+                from public.v3_studio_workflows
+                where workflow_id=$1 and account_id=$2
+                for update
+                """,
+                workflow_id,
+                auth.account_id,
+            )
+            if not workflow:
+                raise HTTPException(status_code=404, detail="studio_workflow_not_found")
+            if _clean(workflow["current_stage"]) != "audio":
+                raise HTTPException(status_code=409, detail="conversation_language_configuration_not_current")
+
+            current = await _conversation_settings(conn, workflow_id=workflow_id, account_id=auth.account_id)
+            changed = (
+                _clean(current.get("target_locale")) != target_locale
+                or bool(current.get("translate")) != bool(body.translate)
+                or _clean(current.get("source_language") or "auto") != source_language
+            )
+            locked = await conn.fetchval(
+                """
+                select count(*) from public.v3_studio_stage_runs
+                where workflow_id=$1 and stage_type='audio' and scope_type='dialogue_turn'
+                  and state in ('generating','awaiting_review','approved')
+                """,
+                workflow_id,
+            )
+            if changed and int(locked or 0) > 0:
+                raise HTTPException(status_code=409, detail="conversation_language_locked_after_audio_generation")
+
+            settings_value = {
+                "target_locale": target_locale,
+                "translate": bool(body.translate),
+                "source_language": source_language,
+            }
+            patch = json.dumps({"conversation_settings": settings_value}, ensure_ascii=False)
+            await conn.execute(
+                """
+                update public.v3_studio_stage_runs
+                set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $2::jsonb,updated_at=now()
+                where workflow_id=$1 and stage_type='audio' and scope_type='dialogue_turn'
+                """,
+                workflow_id,
+                patch,
+            )
+            participant_patch = json.dumps({
+                "conversation_target_locale": target_locale,
+                "conversation_translation_enabled": bool(body.translate),
+            }, ensure_ascii=False)
+            await conn.execute(
+                """
+                update public.v3_participants p
+                set voice_profile_ref=case when p.voice_locale=$3 then p.voice_profile_ref else null end,
+                    voice_locale=$3,
+                    metadata_json=coalesce(p.metadata_json,'{}'::jsonb) || $4::jsonb,
+                    updated_at=now()
+                where p.account_id=$2
+                  and p.participant_id in (
+                    select distinct dt.speaker_participant_id
+                    from public.v3_studio_stage_runs s
+                    join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
+                    where s.workflow_id=$1 and s.stage_type='audio' and s.scope_type='dialogue_turn'
+                  )
+                """,
+                workflow_id,
+                auth.account_id,
+                target_locale,
+                participant_patch,
+            )
+            turns = await conn.fetchval(
+                "select count(*) from public.v3_studio_stage_runs where workflow_id=$1 and stage_type='audio' and scope_type='dialogue_turn'",
+                workflow_id,
+            )
+    return {
+        "workflow_id": str(workflow_id),
+        "settings": {**settings_value, "persisted": True},
+        "applies_to_dialogue_turns": int(turns or 0),
+    }
+
+
 __all__ = ["router"]

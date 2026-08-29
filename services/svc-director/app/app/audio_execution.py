@@ -154,10 +154,14 @@ def compile_context_audio_input(context: AudioStageContext) -> dict[str, Any]:
         persona=context.participant_persona,
         participant_metadata=context.participant_metadata,
     )
+    conversation_settings = _as_dict(context.stage_metadata.get("conversation_settings"))
+    resolved_target_locale = _clean(conversation_settings.get("target_locale")) or context.target_locale
+    translate = bool(conversation_settings.get("translate"))
+    source_language = _clean(conversation_settings.get("source_language")) or "auto"
     studio_input: dict[str, Any] = {
         "text": context.text,
-        "target_locale": context.target_locale,
-        "translate": False,
+        "target_locale": resolved_target_locale,
+        "translate": translate,
         "speaker_gender": gender,
         "voice_gender": gender,
         "context": (
@@ -168,6 +172,8 @@ def compile_context_audio_input(context: AudioStageContext) -> dict[str, Any]:
             + (f" emotion_code={context.emotion_code}" if context.emotion_code else "")
         ),
     }
+    if translate:
+        studio_input["source_language"] = source_language
     if context.voice_profile_ref:
         studio_input["voice_id"] = context.voice_profile_ref
     if context.voice_locale:
@@ -476,6 +482,7 @@ class ParticipantAudioExecutionService:
                 existing_review_id = None
                 existing_review_decision = None
             if existing_media_id is not None:
+                attempt_meta = _as_dict(latest["metadata_json"]) if latest else {}
                 # Always mint a fresh owner-service read URL; never persist or reuse an
                 # expired SAS as the canonical identity of the Audio output.
                 audio_url = await self.client.read_url(headers=headers, media_id=existing_media_id)
@@ -492,6 +499,8 @@ class ParticipantAudioExecutionService:
                     "audio_url": audio_url,
                     "review_item_id": existing_review_id,
                     "review_decision": existing_review_decision,
+                    "pricing": attempt_meta.get("pricing"),
+                    "pricing_summary": attempt_meta.get("pricing_summary"),
                 }
             if not latest or not latest["provider_job_ref"]:
                 return {
@@ -592,7 +601,11 @@ class ParticipantAudioExecutionService:
                     """,
                     attempt_id,
                     media_id,
-                    json.dumps({"audio_url": audio_url}),
+                    json.dumps({
+                        "audio_url": audio_url,
+                        "pricing": payload.get("pricing"),
+                        "pricing_summary": payload.get("pricing_summary"),
+                    }),
                 )
                 await conn.execute(
                     """
@@ -601,7 +614,12 @@ class ParticipantAudioExecutionService:
                     where stage_run_id=$1
                     """,
                     stage_run_id,
-                    json.dumps({"audio_url": audio_url, "canonical_audio_media_id": str(media_id)}),
+                    json.dumps({
+                        "audio_url": audio_url,
+                        "canonical_audio_media_id": str(media_id),
+                        "pricing": payload.get("pricing"),
+                        "pricing_summary": payload.get("pricing_summary"),
+                    }),
                 )
 
         return {
@@ -617,6 +635,8 @@ class ParticipantAudioExecutionService:
             "audio_url": audio_url,
             "review_item_id": str(review_id),
             "review_decision": "pending",
+            "pricing": payload.get("pricing"),
+            "pricing_summary": payload.get("pricing_summary"),
         }
 
 

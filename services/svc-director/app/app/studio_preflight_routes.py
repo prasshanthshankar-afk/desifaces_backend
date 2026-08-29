@@ -37,6 +37,8 @@ def _normalize_gender(value: Any) -> str | None:
 class FaceProfileIn(BaseModel):
     gender_presentation: str = Field(min_length=1, max_length=40)
     age_presentation: str | None = Field(default=None, max_length=80)
+    region_code: str | None = Field(default=None, max_length=120)  # desifaces multiperson final v4.0: face region
+    country_code: str | None = Field(default=None, max_length=8)  # desifaces native parity v4.1
 
 
 async def _load_preflight(conn, *, workflow_id: UUID, account_id: UUID) -> dict[str, Any]:
@@ -74,6 +76,9 @@ async def _load_preflight(conn, *, workflow_id: UUID, account_id: UUID) -> dict[
         explicit = _as_dict(metadata.get("explicit_face_constraints"))
         persona = _as_dict(row["persona_json"])
         gender = _normalize_gender(explicit.get("gender") or persona.get("gender_presentation"))
+        age_presentation = _clean(explicit.get("age") or persona.get("age_presentation") or persona.get("age")) or None
+        region_code = _clean(explicit.get("region_code") or persona.get("region_code")) or None
+        country_code = _clean(explicit.get("country_code") or persona.get("country_code")).upper() or None
         missing: list[str] = []
         state = _clean(row["state"])
         locked = state == "approved"
@@ -87,6 +92,9 @@ async def _load_preflight(conn, *, workflow_id: UUID, account_id: UUID) -> dict[
             "locked": locked,
             "has_saved_or_primary_face": bool(row["primary_face_media_id"]),
             "gender_presentation": gender,
+            "age_presentation": age_presentation,
+            "region_code": region_code,
+            "country_code": country_code,
             "missing_fields": missing,
             "ready_for_pricing": locked or not missing,
             "actions": (
@@ -252,6 +260,21 @@ async def set_face_profile(
             if body.age_presentation:
                 explicit["age"] = _clean(body.age_presentation)
                 persona["age"] = _clean(body.age_presentation)
+            else:
+                explicit.pop("age", None)
+                persona.pop("age_presentation", None)
+            if body.region_code:
+                explicit["region_code"] = _clean(body.region_code)
+                persona["region_code"] = _clean(body.region_code)
+            else:
+                explicit.pop("region_code", None)
+                persona.pop("region_code", None)
+            if body.country_code:
+                explicit["country_code"] = _clean(body.country_code).upper()
+                persona["country_code"] = _clean(body.country_code).upper()
+            else:
+                explicit.pop("country_code", None)
+                persona.pop("country_code", None)
             persona["gender_presentation"] = gender
             metadata["explicit_face_constraints"] = explicit
             provenance = _as_dict(metadata.get("production_provenance"))

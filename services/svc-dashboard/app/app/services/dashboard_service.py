@@ -973,6 +973,7 @@ def _build_face_library_title(item: Dict[str, Any], meta: Dict[str, Any], reuse:
     return label
 
 
+# desifaces multiperson dashboard final v4.3
 # Dashboard video display policy:
 # - Regular non-longform videos are displayable.
 # - Longform/fusion-extension child segment renders are internal implementation details
@@ -1181,13 +1182,13 @@ async def _fetch_library_view_rows(
     ), longform_source as (
       select to_jsonb(lj) as j
       from public.longform_jobs lj
-      where to_jsonb(lj)::text like '%' || $1::text || '%'
+      where lj.user_id = $1::uuid
     ), longform_scored as (
       select
         j,
         coalesce(j->>'id', j->>'job_id') as longform_job_id,
         coalesce(j->>'status', j->>'state', j->>'job_status') as job_status,
-        substring(j::text from '(https?://[^" ]+\\.mp4[^" ]*)') as video_url,
+        coalesce(nullif(j->>'final_video_url', ''), substring(j::text from '(https?://[^" ]+\\.mp4[^" ]*)')) as video_url,
         coalesce(
           nullif(substring(coalesce(j->>'thumbnail_url', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
           nullif(substring(coalesce(j->>'poster_url', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
@@ -1208,8 +1209,8 @@ async def _fetch_library_view_rows(
           nullif(substring(coalesce(j #>> '{{tags,image_url}}', '') from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), ''),
           nullif(substring(j::text from '(https?://[^" ]+\.(jpg|jpeg|png|webp)[^" ]*)'), '')
         ) as thumbnail_url,
-        (j::text ~* 'final_video|final_output|stitched_video|composed_video|timeline_output|share_url|stitch|stitched|compose|composed') as has_final_signal,
-        (j::text ~* 'child_render|internal_child|child_job_of_billable_longform_parent|segment_id|suppress_pricing|pricing_suppressed') as has_child_signal
+        ((coalesce(j->>'final_video_url', '') <> '') OR (coalesce(j->>'final_storage_path', '') <> '') OR (j::text ~* 'final_video|final_output|stitched_video|composed_video|timeline_output|share_url|stitch|stitched|compose|composed')) as has_final_signal,
+        ((j::text ~* 'child_render|internal_child|child_job_of_billable_longform_parent|segment_id|suppress_pricing|pricing_suppressed') AND coalesce(j->>'final_video_url', '') = '' AND coalesce(j->>'final_storage_path', '') = '') as has_child_signal
       from longform_source
     ), longform_final_rows as (
       select
@@ -1217,11 +1218,15 @@ async def _fetch_library_view_rows(
         $1::uuid as user_id,
         'video'::text as studio,
         'video'::text as asset_type,
-        case
-          when j::text ~* 'cinematic_video_direction' then 'Cinematic Video'
-          when j::text ~* 'talking_video' then 'Talking Video'
-          else 'Video'
-        end::text as title,
+        coalesce(
+          nullif(j #>> '{tags,story_title}', ''),
+          nullif(j #>> '{tags,title}', ''),
+          case
+            when j::text ~* 'cinematic_video_direction' then 'Cinematic Video'
+            when j::text ~* 'talking_video' then 'Talking Video'
+            else 'Video'
+          end
+        )::text as title,
         coalesce(nullif(job_status, ''), 'ready')::text as status,
         coalesce(
           case when coalesce(j->>'completed_at', '') ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}' then (j->>'completed_at')::timestamptz else null end,
@@ -1318,15 +1323,15 @@ async def _fetch_library_view_rows(
     ), longform_source as (
       select to_jsonb(lj) as j
       from public.longform_jobs lj
-      where to_jsonb(lj)::text like '%' || $1::text || '%'
+      where lj.user_id = $1::uuid
     ), longform_scored as (
       select
         j,
         coalesce(j->>'id', j->>'job_id') as longform_job_id,
         coalesce(j->>'status', j->>'state', j->>'job_status') as job_status,
-        substring(j::text from '(https?://[^" ]+\\.mp4[^" ]*)') as video_url,
-        (j::text ~* 'final_video|final_output|stitched_video|composed_video|timeline_output|share_url|stitch|stitched|compose|composed') as has_final_signal,
-        (j::text ~* 'child_render|internal_child|child_job_of_billable_longform_parent|segment_id|suppress_pricing|pricing_suppressed') as has_child_signal
+        coalesce(nullif(j->>'final_video_url', ''), substring(j::text from '(https?://[^" ]+\\.mp4[^" ]*)')) as video_url,
+        ((coalesce(j->>'final_video_url', '') <> '') OR (coalesce(j->>'final_storage_path', '') <> '') OR (j::text ~* 'final_video|final_output|stitched_video|composed_video|timeline_output|share_url|stitch|stitched|compose|composed')) as has_final_signal,
+        ((j::text ~* 'child_render|internal_child|child_job_of_billable_longform_parent|segment_id|suppress_pricing|pricing_suppressed') AND coalesce(j->>'final_video_url', '') = '' AND coalesce(j->>'final_storage_path', '') = '') as has_child_signal
       from longform_source
     ), longform_final_rows as (
       select 1

@@ -690,6 +690,8 @@ class SceneFusionExecutionService:
             item["status"] = state or "unknown"
             item["error_code"] = payload.get("error_code")
             item["error_message"] = payload.get("error_message")
+            item["pricing"] = payload.get("pricing")
+            item["pricing_summary"] = payload.get("pricing_summary")
             if state in {"failed", "canceled", "cancelled"}:
                 any_failed = True
                 all_succeeded = False
