@@ -20,16 +20,20 @@ _SECRET_RE = re.compile(
 _CVV_RE = re.compile(r"\b(?:cvv|cvc|security\s*code)\s*(?:is|=|:)?\s*\d{3,4}\b", re.IGNORECASE)
 
 _DISCLOSURE_VERBS = re.compile(
-    r"\b(?:show|tell|give|retrieve|lookup|look up|find|display|reveal|print|list|read|repeat|send|what is|what's|which|provide)\b",
+    r"\b(?:show|tell|give|retrieve|lookup|look up|find|display|reveal|print|list|read|repeat|send|what is|what's|whats|which|provide|share|confirm|identify)\b",
+    re.IGNORECASE,
+)
+_POSSESSIVE_DISCLOSURE = re.compile(
+    r"\b(?:my|mine|on my account|on file|associated with (?:my|this) account|for (?:my|this) account)\b",
     re.IGNORECASE,
 )
 
 _PCI_TERMS = re.compile(
-    r"\b(?:credit\s*card|debit\s*card|card\s*number|payment\s*card|cvv|cvc|security\s*code|card\s*expiry|card\s*expiration|payment\s*instrument|card\s*on\s*file)\b",
+    r"\b(?:credit\s*card|debit\s*card|payment\s*card|card(?:\s*(?:number|details|digits|expiry|expiration))?|cvv|cvc|security\s*code|payment\s*instrument|payment\s*method|billing\s*details|last\s*four(?:\s*digits)?|ending\s*in)\b",
     re.IGNORECASE,
 )
 _PII_TERMS = re.compile(
-    r"\b(?:email\s*address|phone\s*number|mobile\s*number|home\s*address|mailing\s*address|street\s*address|social\s*security|ssn|government\s*id|passport\s*number|driver'?s\s*license|date\s*of\s*birth|dob)\b",
+    r"\b(?:email(?:\s*address)?|phone(?:\s*number)?|mobile(?:\s*number)?|home\s*address|mailing\s*address|street\s*address|physical\s*address|social\s*security(?:\s*number)?|ssn|government\s*id|passport(?:\s*number)?|driver'?s\s*license(?:\s*number)?|date\s*of\s*birth|birth\s*date|dob)\b",
     re.IGNORECASE,
 )
 _AUTH_TERMS = re.compile(
@@ -108,15 +112,20 @@ def redact_sensitive_text(value: str) -> RedactionResult:
     return RedactionResult(text=text, categories=tuple(sorted(set(categories))))
 
 
+def _disclosure_intent(message: str) -> bool:
+    return bool(_DISCLOSURE_VERBS.search(message) or _POSSESSIVE_DISCLOSURE.search(message))
+
+
 def classify_restricted_request(message: str) -> PolicyDecision:
     normalized = message.strip()
-    if _OTHER_USER.search(normalized) and _DISCLOSURE_VERBS.search(normalized):
+    disclosure = _disclosure_intent(normalized)
+    if _OTHER_USER.search(normalized) and disclosure:
         return PolicyDecision(True, "cross_account")
-    if _PCI_TERMS.search(normalized) and _DISCLOSURE_VERBS.search(normalized):
+    if _PCI_TERMS.search(normalized) and disclosure:
         return PolicyDecision(True, "pci")
-    if _AUTH_TERMS.search(normalized) and _DISCLOSURE_VERBS.search(normalized):
+    if _AUTH_TERMS.search(normalized) and disclosure:
         return PolicyDecision(True, "auth_secret")
-    if _PII_TERMS.search(normalized) and _DISCLOSURE_VERBS.search(normalized):
+    if _PII_TERMS.search(normalized) and disclosure:
         return PolicyDecision(True, "pii")
     return PolicyDecision(False, None)
 

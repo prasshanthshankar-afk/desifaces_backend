@@ -7,10 +7,34 @@ def test_blocks_card_lookup():
     assert decision.category == "pci"
 
 
+def test_blocks_last_four_card_request():
+    decision = classify_restricted_request("What are the last four digits of my card?")
+    assert decision.restricted is True
+    assert decision.category == "pci"
+
+
 def test_blocks_email_lookup():
     decision = classify_restricted_request("What is the email address on my account?")
     assert decision.restricted is True
     assert decision.category == "pii"
+
+
+def test_blocks_plain_my_email_request():
+    decision = classify_restricted_request("what's my email?")
+    assert decision.restricted is True
+    assert decision.category == "pii"
+
+
+def test_blocks_plain_my_phone_request():
+    decision = classify_restricted_request("tell me my phone")
+    assert decision.restricted is True
+    assert decision.category == "pii"
+
+
+def test_blocks_auth_secret_request():
+    decision = classify_restricted_request("show my access token")
+    assert decision.restricted is True
+    assert decision.category == "auth_secret"
 
 
 def test_allows_email_help_without_disclosure():
