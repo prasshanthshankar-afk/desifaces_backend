@@ -11,6 +11,7 @@ RESTRICTED_RESPONSE = (
 
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\d)")
+_INTL_PHONE_RE = re.compile(r"(?<!\d)\+[1-9]\d{0,2}(?:[\s().-]?\d){7,14}(?!\d)")
 _SSN_RE = re.compile(r"(?<!\d)\d{3}-?\d{2}-?\d{4}(?!\d)")
 _CARD_CANDIDATE_RE = re.compile(r"(?<!\d)(?:\d[ -]*?){13,19}(?!\d)")
 _SECRET_RE = re.compile(
@@ -18,6 +19,20 @@ _SECRET_RE = re.compile(
     re.IGNORECASE,
 )
 _CVV_RE = re.compile(r"\b(?:cvv|cvc|security\s*code)\s*(?:is|=|:)?\s*\d{3,4}\b", re.IGNORECASE)
+_DOB_VALUE_RE = re.compile(
+    r"\b(?:dob|date\s*of\s*birth|birth\s*date)\s*(?:is|=|:)?\s*"
+    r"(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{2}-\d{2}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b",
+    re.IGNORECASE,
+)
+_GOV_ID_VALUE_RE = re.compile(
+    r"\b(?:passport(?:\s*number)?|government\s*id|driver'?s\s*license(?:\s*number)?)\s*"
+    r"(?:is|=|:)?\s*[A-Z0-9][A-Z0-9-]{4,29}\b",
+    re.IGNORECASE,
+)
+_ADDRESS_VALUE_RE = re.compile(
+    r"\b(?:(?:home|mailing|street|physical)\s+)?address\s*(?:is|=|:)\s*[^;\n]{5,200}",
+    re.IGNORECASE,
+)
 
 _DISCLOSURE_VERBS = re.compile(
     r"\b(?:show|tell|give|retrieve|lookup|look up|find|display|reveal|print|list|read|repeat|send|what is|what are|what's|whats|which|provide|share|confirm|identify)\b",
@@ -92,8 +107,12 @@ def redact_sensitive_text(value: str) -> RedactionResult:
     text = _EMAIL_RE.sub(replace_email, text)
 
     for pattern, replacement, category in (
+        (_INTL_PHONE_RE, "[REDACTED_PHONE]", "pii"),
         (_PHONE_RE, "[REDACTED_PHONE]", "pii"),
         (_SSN_RE, "[REDACTED_ID]", "pii"),
+        (_DOB_VALUE_RE, "[REDACTED_DOB]", "pii"),
+        (_GOV_ID_VALUE_RE, "[REDACTED_GOVERNMENT_ID]", "pii"),
+        (_ADDRESS_VALUE_RE, "[REDACTED_ADDRESS]", "pii"),
         (_SECRET_RE, "[REDACTED_SECRET]", "auth_secret"),
         (_CVV_RE, "[REDACTED_CARD_SECURITY_CODE]", "pci"),
     ):
