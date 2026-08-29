@@ -19,7 +19,9 @@ class Settings(BaseSettings):
     DF_ASSISTANT_EMBEDDING_MODEL: str = ""
 
     DF_DIRECTOR_BASE_URL: str = "http://svc-director:8011"
+    DF_DASHBOARD_BASE_URL: str = "http://svc-dashboard:8005"
     DF_PRICING_BASE_URL: str = "http://svc-pricing:8009"
+    DF_ASSISTANT_DISPLAY_NAME: str = "Piku"
     DF_ASSISTANT_SESSION_TTL_SECONDS: int = 86400
     DF_ASSISTANT_MAX_HISTORY_MESSAGES: int = 12
     DF_ASSISTANT_RAG_TOP_K: int = 5
