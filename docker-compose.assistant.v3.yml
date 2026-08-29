@@ -15,15 +15,18 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       DF_ASSISTANT_LLM_MODEL: ${DF_ASSISTANT_LLM_MODEL:-${DF_DIRECTOR_LLM_MODEL:-}}
       DF_ASSISTANT_EMBEDDING_MODEL: ${DF_ASSISTANT_EMBEDDING_MODEL:-}
+      DF_ASSISTANT_DISPLAY_NAME: ${DF_ASSISTANT_DISPLAY_NAME:-Piku}
       DF_ASSISTANT_SESSION_TTL_SECONDS: ${DF_ASSISTANT_SESSION_TTL_SECONDS:-86400}
       DF_ASSISTANT_MAX_HISTORY_MESSAGES: ${DF_ASSISTANT_MAX_HISTORY_MESSAGES:-12}
       DF_ASSISTANT_RAG_TOP_K: ${DF_ASSISTANT_RAG_TOP_K:-5}
       DF_DIRECTOR_BASE_URL: http://svc-director:8011
+      DF_DASHBOARD_BASE_URL: http://svc-dashboard:8005
       DF_PRICING_BASE_URL: http://svc-pricing:8009
     depends_on:
       - desifaces-db
       - desifaces-redis
       - svc-director
+      - svc-dashboard
     networks:
       - df-net
     ports:
