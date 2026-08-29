@@ -26,16 +26,10 @@ _ALLOWED_GENERATION_KEY_FRAGMENTS = (
 _ALLOWED_PRICING_KEY_FRAGMENTS = (
     "plan", "tier", "credits", "cost", "amount", "currency", "price", "unit", "quantity",
     "premium", "discount", "balance", "available", "required", "afford", "reserved",
-    "used", "included", "wallet", "promo", "billing",
+    "used", "included", "wallet", "promo", "billing", "runway", "estimate", "remaining",
+    "studio", "mode", "label", "baseline", "variant", "supported", "unsupported",
+    "top_line", "hero_lines", "source_sku",
 )
-_SCREEN_STUDIOS: dict[str, tuple[str, ...]] = {
-    "face_studio": ("face",),
-    "audio_studio": ("audio", "tts"),
-    "fusion_studio": ("fusion", "video", "longform"),
-    "story_fusion": ("fusion", "video", "longform"),
-    "media_library": ("face", "audio", "tts", "fusion", "video", "longform"),
-    "dashboard": ("face", "audio", "tts", "fusion", "video", "longform"),
-}
 
 
 def _safe_scalar(value: Any) -> Any:
@@ -47,7 +41,7 @@ def _safe_scalar(value: Any) -> Any:
 
 
 def _safe_allowlisted_dict(value: Any, *, allowed_fragments: tuple[str, ...], depth: int = 0) -> Any:
-    if depth > 3:
+    if depth > 4:
         return "[TRUNCATED]"
     if isinstance(value, dict):
         result: dict[str, Any] = {}
@@ -67,7 +61,7 @@ def _safe_allowlisted_dict(value: Any, *, allowed_fragments: tuple[str, ...], de
     if isinstance(value, (list, tuple)):
         return [
             _safe_allowlisted_dict(item, allowed_fragments=allowed_fragments, depth=depth + 1)
-            for item in value[:30]
+            for item in value[:40]
         ]
     return _safe_scalar(value)
 
@@ -152,14 +146,6 @@ def project_safe_story_context(raw: dict[str, Any], locator: AssistantContextLoc
     }
 
 
-def _job_is_relevant(screen: str, job: dict[str, Any]) -> bool:
-    allowed = _SCREEN_STUDIOS.get(screen)
-    if not allowed:
-        return False
-    studio = str(job.get("studio") or "").strip().lower()
-    return studio in allowed or screen in {"dashboard", "media_library"}
-
-
 def _safe_live_job(item: dict[str, Any], index: int) -> dict[str, Any]:
     studio = str(item.get("studio") or "generation").strip().lower()[:40]
     people_mode = str(item.get("people_mode") or "single_or_unspecified")[:40]
@@ -193,6 +179,12 @@ def project_safe_live_context(
     longform_jobs: list[dict[str, Any]],
     locator: AssistantContextLocator,
 ) -> dict[str, Any]:
+    """Project account-wide safe state.
+
+    The current screen is a conversational hint only. It is deliberately not a
+    data-access boundary: an authenticated user can ask about credits, pricing,
+    Face, Audio or Video state from any surface.
+    """
     recent_final_videos: list[dict[str, Any]] = []
     for index, item in enumerate(list(home.get("video_carousel") or ())[:8], start=1):
         if not isinstance(item, dict):
@@ -205,23 +197,21 @@ def project_safe_live_context(
             "final_output_available": True,
         })
 
-    all_jobs = [
-        item for item in [*longform_jobs, *studio_jobs]
-        if isinstance(item, dict) and _job_is_relevant(locator.screen, item)
-    ]
+    all_jobs = [item for item in [*longform_jobs, *studio_jobs] if isinstance(item, dict)]
     all_jobs.sort(
         key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
         reverse=True,
     )
     generation = [
         _safe_live_job(item, index)
-        for index, item in enumerate(all_jobs[:12], start=1)
+        for index, item in enumerate(all_jobs[:20], start=1)
     ]
 
     return {
         "surface": locator.surface,
         "screen": locator.screen,
         "context_scope": "live_user_application_state",
+        "context_policy": "account_wide_screen_is_hint",
         "live_context_available": bool(home or generation),
         "dashboard": {
             "recent_face_count": len(list(home.get("face_carousel") or ())[:50]),
@@ -235,7 +225,7 @@ def project_safe_live_context(
             "summary": _safe_pricing(home.get("pricing_summary")),
             "runway": _safe_pricing(home.get("runway_summary")),
         },
-        "allowed_actions": ["check_price"] if locator.screen in {"dashboard", "pricing"} else [],
+        "allowed_actions": ["check_price"],
     }
 
 
@@ -284,7 +274,7 @@ class ContextResolver:
             from public.studio_jobs sj
             where sj.user_id = $1
             order by coalesce(sj.updated_at, sj.created_at) desc
-            limit 20
+            limit 30
         ) recent
         """
         try:
@@ -322,7 +312,7 @@ class ContextResolver:
             from public.longform_jobs lj
             where lj.user_id = $1
             order by coalesce(lj.updated_at, lj.created_at) desc
-            limit 16
+            limit 20
         ) recent
         """
         try:
@@ -332,6 +322,33 @@ class ContextResolver:
         except Exception:
             return []
 
+    async def _fetch_story_context(
+        self,
+        locator: AssistantContextLocator,
+        *,
+        token: str,
+    ) -> dict[str, Any]:
+        if locator.story_id is None:
+            return {}
+        url = f"{settings.DF_DIRECTOR_BASE_URL}/api/director/stories/{locator.story_id}/assistant-context"
+        params = {}
+        if locator.scene_id is not None:
+            params["scene_id"] = str(locator.scene_id)
+        if locator.participant_id is not None:
+            params["participant_id"] = str(locator.participant_id)
+        response = await self._client.get(
+            url,
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if response.status_code == 404:
+            return {"context_status": "not_found"}
+        response.raise_for_status()
+        raw = response.json()
+        if not isinstance(raw, dict):
+            return {}
+        return project_safe_story_context(raw, locator)
+
     async def resolve(
         self,
         locator: AssistantContextLocator,
@@ -339,34 +356,41 @@ class ContextResolver:
         token: str,
         user_id: UUID,
     ) -> dict[str, Any]:
-        if locator.story_id is not None:
-            url = f"{settings.DF_DIRECTOR_BASE_URL}/api/director/stories/{locator.story_id}/assistant-context"
-            params = {}
-            if locator.scene_id is not None:
-                params["scene_id"] = str(locator.scene_id)
-            if locator.participant_id is not None:
-                params["participant_id"] = str(locator.participant_id)
+        home_task = self._fetch_dashboard_home(token=token)
+        studio_task = self._fetch_recent_studio_jobs(user_id)
+        longform_task = self._fetch_recent_longform_jobs(user_id)
+        story_task = self._fetch_story_context(locator, token=token)
 
-            response = await self._client.get(
-                url,
-                params=params,
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            if response.status_code == 404:
-                return {
-                    "surface": locator.surface,
-                    "screen": locator.screen,
-                    "context_status": "not_found",
-                }
-            response.raise_for_status()
-            raw = response.json()
-            if not isinstance(raw, dict):
-                return {"surface": locator.surface, "screen": locator.screen}
-            return project_safe_story_context(raw, locator)
-
-        home, studio_jobs, longform_jobs = await asyncio.gather(
-            self._fetch_dashboard_home(token=token),
-            self._fetch_recent_studio_jobs(user_id),
-            self._fetch_recent_longform_jobs(user_id),
+        home, studio_jobs, longform_jobs, story = await asyncio.gather(
+            home_task,
+            studio_task,
+            longform_task,
+            story_task,
         )
-        return project_safe_live_context(home, studio_jobs, longform_jobs, locator)
+        live = project_safe_live_context(home, studio_jobs, longform_jobs, locator)
+
+        if not story:
+            return live
+
+        # Merge Story-specific state into the account-wide live context. Account
+        # pricing and cross-studio status remain available even while the user is
+        # inside a Story stage.
+        merged = dict(live)
+        merged["creation_type"] = story.get("creation_type")
+        merged["participants"] = story.get("participants", [])
+        merged["scenes"] = story.get("scenes", [])
+        merged["dialogue"] = story.get("dialogue", [])
+        merged["current_creation_generation"] = story.get("generation", [])
+        merged["current_creation_pricing"] = story.get("pricing", {})
+        merged["story_context_status"] = story.get("context_status")
+        merged["allowed_actions"] = list(dict.fromkeys([
+            *list(live.get("allowed_actions") or ()),
+            *list(story.get("allowed_actions") or ()),
+        ]))[:30]
+        merged["live_context_available"] = bool(
+            live.get("live_context_available")
+            or story.get("participants")
+            or story.get("scenes")
+            or story.get("generation")
+        )
+        return merged
