@@ -74,6 +74,8 @@ required = [
     "'output_role', 'final'",
     "'canonical_final', true",
     "'display_scope', 'final_outputs'",
+    'signed_video_url',
+    '_storage_ref_parts',
 ]
 for marker in required:
     assert marker in helper, marker
@@ -131,9 +133,56 @@ grep -q 'HAS_STORAGE_REF' <<<"$DB_PROOF" \
   || fail "canonical media has no storage_ref"
 
 
-echo "=== 7. DEPLOYMENT RESULT ==="
+echo "=== 7. BROWSER-SAFE CANONICAL URL PROOF ==="
+docker exec -i \
+  -e STORY_WORKFLOW_ID="$STORY_WORKFLOW_ID" \
+  -e EXPECTED_FINAL_MEDIA_ID="$EXPECTED_FINAL_MEDIA_ID" \
+  df-v3-svc-dashboard python - <<'PY'
+import asyncio
+import os
+import asyncpg
+
+from app.settings import settings
+from app.services.final_video_visibility import _fetch_canonical_v3_final_items
+
+workflow_id = os.environ['STORY_WORKFLOW_ID']
+expected_media_id = os.environ['EXPECTED_FINAL_MEDIA_ID']
+
+async def main():
+    pool = await asyncpg.create_pool(settings.DATABASE_URL, min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            owner = await conn.fetchval(
+                'select owner_user_id::text from public.v3_studio_workflows where workflow_id::text = $1',
+                workflow_id,
+            )
+        assert owner, 'workflow owner missing'
+        items = await _fetch_canonical_v3_final_items(pool, owner)
+        matches = [x for x in items if str(x.get('media_asset_id') or '') == expected_media_id]
+        assert len(matches) == 1, f'expected one canonical final, got {len(matches)}'
+        item = matches[0]
+        preview = str(item.get('preview_url') or '')
+        download = str(item.get('download_url') or '')
+        reuse = item.get('reuse_payload') or {}
+        reuse_video = str(reuse.get('video_url') or '')
+        assert preview.startswith('https://'), 'preview URL is not browser-safe HTTPS'
+        assert '?' in preview, 'preview URL is not SAS-signed'
+        assert download == preview, 'download URL differs from canonical signed preview URL'
+        assert reuse_video == preview, 'reuse video URL is not the canonical signed preview URL'
+        assert item.get('canonical_final') is True
+        assert item.get('render_kind') == 'final'
+        assert item.get('output_role') == 'final'
+        print('CANONICAL_FINAL_BROWSER_URL=PASS')
+    finally:
+        await pool.close()
+
+asyncio.run(main())
+PY
+
+
+echo "=== 8. DEPLOYMENT RESULT ==="
 echo "DEPLOY_FINAL_MEDIA=PASS"
 echo "DEPLOY_SHA=$DEPLOY_SHA"
 echo "STORY_WORKFLOW_ID=$STORY_WORKFLOW_ID"
 echo "FINAL_MEDIA_ID=$EXPECTED_FINAL_MEDIA_ID"
-echo "NEXT_UI_CHECK=Dashboard Recent Videos and Saved Work Videos should each show the canonical final only; child scene/dialogue-turn clips must remain absent."
+echo "NEXT_UI_CHECK=Dashboard Recent Videos and Saved Work Videos should each show the canonical final only; child scene/dialogue-turn clips must remain absent and pages must not enter a refresh loop."
