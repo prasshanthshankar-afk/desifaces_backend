@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from urllib.parse import urlparse
 
 
 def _clean_text(value: Any) -> str:
@@ -17,6 +19,52 @@ def _as_dict(value: Any) -> Dict[str, Any]:
         return dict(value or {})
     except Exception:
         return {}
+
+
+def _storage_ref_parts(value: Any, default_container: str = "") -> Tuple[str, str]:
+    """Resolve a media storage reference into Azure container/blob parts.
+
+    V3 media rows can carry a full blob URL, azure://container/blob, an explicit
+    container/blob value, or a blob path relative to the configured output
+    container. The dashboard must normalize all four forms before SAS signing.
+    """
+    raw = _clean_text(value)
+    if not raw:
+        return "", ""
+
+    default = _clean_text(default_container).strip("/")
+
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        parsed = None
+
+    if parsed and parsed.scheme.lower() == "azure":
+        container = _clean_text(parsed.netloc).strip("/")
+        blob = _clean_text(parsed.path).lstrip("/")
+        return (container, blob) if container and blob else ("", "")
+
+    if parsed and parsed.scheme.lower() in {"http", "https"}:
+        path = _clean_text(parsed.path).lstrip("/")
+        container, sep, blob = path.partition("/")
+        return (container, blob) if sep and container and blob else ("", "")
+
+    path = raw.split("?", 1)[0].split("#", 1)[0].lstrip("/")
+    if not path:
+        return "", ""
+
+    if default:
+        prefix = f"{default}/"
+        blob = path[len(prefix):] if path.startswith(prefix) else path
+        return (default, blob) if blob else ("", "")
+
+    container, sep, blob = path.partition("/")
+    return (container, blob) if sep and container and blob else ("", "")
+
+
+def _is_browser_media_url(value: Any) -> bool:
+    text = _clean_text(value).lower()
+    return text.startswith("https://") or text.startswith("http://")
 
 
 def _video_key(item: Mapping[str, Any]) -> str:
@@ -197,24 +245,73 @@ async def _fetch_canonical_v3_final_items(pool: Any, user_id: str) -> List[Dict[
     except Exception:
         return []
 
+    video_container = (
+        _clean_text(os.getenv("AZURE_FINAL_VIDEO_CONTAINER"))
+        or _clean_text(os.getenv("AZURE_VIDEO_OUTPUT_CONTAINER"))
+        or _clean_text(getattr(settings, "AZURE_STORAGE_CONTAINER_NAME", ""))
+        or "video-output"
+    )
+    image_container = (
+        _clean_text(os.getenv("AZURE_FACE_OUTPUT_CONTAINER"))
+        or _clean_text(getattr(settings, "AZURE_STORAGE_CONTAINER_NAME", ""))
+        or "face-output"
+    )
+
     items: List[Dict[str, Any]] = []
     for row in rows:
-        normalized = _normalize_library_item(dict(row), signer)
+        candidate = dict(row)
+
+        preview_container, preview_blob = _storage_ref_parts(candidate.get("preview_url"), video_container)
+        if preview_container and preview_blob:
+            candidate["preview_container"] = preview_container
+            candidate["preview_storage_path"] = preview_blob
+            candidate["download_container"] = preview_container
+            candidate["download_storage_path"] = preview_blob
+
+        thumbnail_container, thumbnail_blob = _storage_ref_parts(candidate.get("thumbnail_url"), image_container)
+        if thumbnail_container and thumbnail_blob:
+            candidate["thumbnail_container"] = thumbnail_container
+            candidate["thumbnail_storage_path"] = thumbnail_blob
+
+        normalized = _normalize_library_item(candidate, signer)
         if not normalized:
             continue
+
+        # The canonical final contract returned to browsers contains one signed
+        # HTTP(S) URL everywhere. Never let the raw media_assets.storage_ref win
+        # through reuse_payload.video_url or Dashboard home card construction.
+        signed_video_url = _clean_text(normalized.get("preview_url") or normalized.get("download_url"))
+        if not _is_browser_media_url(signed_video_url):
+            continue
+
+        normalized["preview_url"] = signed_video_url
+        normalized["download_url"] = signed_video_url
         normalized["canonical_final"] = True
         normalized["render_kind"] = "final"
         normalized["output_role"] = "final"
         normalized["display_scope"] = "final_outputs"
+
+        signed_thumbnail_url = _clean_text(normalized.get("thumbnail_url"))
+        if not _is_browser_media_url(signed_thumbnail_url):
+            signed_thumbnail_url = ""
+            normalized["thumbnail_url"] = None
+
         reuse = _as_dict(normalized.get("reuse_payload"))
         reuse.update(
             {
+                "video_url": signed_video_url,
                 "canonical_final": True,
                 "render_kind": "final",
                 "output_role": "final",
                 "display_scope": "final_outputs",
             }
         )
+        if signed_thumbnail_url:
+            reuse["thumbnail_url"] = signed_thumbnail_url
+            reuse["poster_url"] = signed_thumbnail_url
+        else:
+            reuse.pop("thumbnail_url", None)
+            reuse.pop("poster_url", None)
         normalized["reuse_payload"] = reuse
         items.append(normalized)
     return items
@@ -264,18 +361,18 @@ async def enrich_dashboard_library_with_v3_finals(
 def _home_card(item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     reuse = _as_dict(item.get("reuse_payload"))
     video_url = _clean_text(
-        reuse.get("video_url")
-        or item.get("preview_url")
+        item.get("preview_url")
         or item.get("download_url")
+        or reuse.get("video_url")
     )
-    if not video_url:
+    if not _is_browser_media_url(video_url):
         return None
     media_id = _clean_text(item.get("media_asset_id") or reuse.get("media_asset_id"))
     library_id = _clean_text(item.get("library_id"))
     thumbnail = _clean_text(
-        reuse.get("thumbnail_url")
+        item.get("thumbnail_url")
+        or reuse.get("thumbnail_url")
         or reuse.get("poster_url")
-        or item.get("thumbnail_url")
     )
     return {
         "id": media_id or library_id,
@@ -287,8 +384,8 @@ def _home_card(item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         "url": video_url,
         "thumbnail_url": thumbnail or None,
         "poster_url": thumbnail or None,
-        "preview_url": item.get("preview_url") or video_url,
-        "download_url": item.get("download_url") or video_url,
+        "preview_url": video_url,
+        "download_url": video_url,
         "artifact_id": item.get("artifact_id"),
         "media_asset_id": media_id or None,
         "source_job_id": item.get("source_job_id"),
