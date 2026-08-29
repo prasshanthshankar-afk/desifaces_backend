@@ -85,7 +85,11 @@ class AssistantService:
             user_id=auth.user_id,
             session_id=session_id,
         )
-        context = await self._context_resolver.resolve(body.context, token=auth.token)
+        context = await self._context_resolver.resolve(
+            body.context,
+            token=auth.token,
+            user_id=auth.user_id,
+        )
         knowledge = await self._retriever.retrieve(safe_message)
         answer = await self._llm.answer(
             message=safe_message,
@@ -119,6 +123,7 @@ class AssistantService:
                 "screen": context.get("screen", body.context.screen),
                 "creation_type": context.get("creation_type"),
                 "context_scope": context.get("context_scope"),
+                "live_context_available": context.get("live_context_available"),
             },
             suggested_actions=self._actions(context),
             policy=AssistantPolicyView(
