@@ -24,9 +24,10 @@ from app.settings import settings
 # - standalone Audio Studio outputs remain visible;
 # - Story/Fusion dialogue turns, scene clips, segment renders and child jobs are hidden;
 # - Video means the final customer-facing Fusion output only;
-# - rows persisted as studio='fusion' are treated as Video and are eligible when final.
+# - rows persisted as studio='fusion' are treated as Video and are eligible only
+#   when they are not classified as internal scene/segment children.
 _STRONG_INTERNAL_RE = re.compile(
-    r"story_dialogue_workflow_id|dialogue_turn_id|"
+    r"story_dialogue_workflow_id|dialogue_turn_id|story_audio|story_voice|"
     r"child_render|child_role|internal_child|child_job_of_billable_longform_parent|"
     r"suppress_pricing|pricing_suppressed|"
     r"parent_longform_job_id|billing_parent_job_id|parent_story_job_id",
@@ -36,6 +37,7 @@ _SEGMENT_RE = re.compile(
     r"segment_id|segment_index|segment_number|scene_id|scene_index|shot_id|shot_index",
     re.IGNORECASE,
 )
+_STORY_CONTEXT_RE = re.compile(r"story_id|workflow_id|participant_id", re.IGNORECASE)
 
 
 def _json_dict(value: Any) -> Dict[str, Any]:
@@ -48,8 +50,7 @@ def _json_dict(value: Any) -> Dict[str, Any]:
         except Exception:
             return {}
     try:
-        parsed = dict(value)
-        return parsed
+        return dict(value)
     except Exception:
         return {}
 
@@ -74,11 +75,13 @@ def _studio(item: Dict[str, Any]) -> str:
     return value
 
 
-def _explicit_final(item: Dict[str, Any]) -> bool:
-    """Return True only for explicit final markers on the row itself.
+def _authoritative_final(item: Dict[str, Any]) -> bool:
+    """Return True for explicit final-output markers on the row itself.
 
-    Do not treat an arbitrary nested mention of a parent's final URL as proof that a
-    child row is itself customer-facing.
+    A generic share_url is intentionally not sufficient. Child/scene artifacts may be
+    individually playable or shareable while still being internal implementation
+    details. Final status must be expressed by final_video_url/final_storage_path or
+    an explicit render/output role.
     """
     meta = _json_dict(item.get("metadata_json") or item.get("metadata") or item.get("meta_json") or {})
     reuse = _json_dict(item.get("reuse_payload_json") or item.get("reuse_payload") or {})
@@ -90,7 +93,7 @@ def _explicit_final(item: Dict[str, Any]) -> bool:
             return True
         if output_role in {"final", "customer_final", "final_output"}:
             return True
-        for key in ("final_video_url", "final_storage_path", "share_url"):
+        for key in ("final_video_url", "final_storage_path"):
             if str(source.get(key) or "").strip():
                 return True
 
@@ -103,20 +106,24 @@ def is_internal_customer_hidden_item(item: Dict[str, Any]) -> bool:
     if studio == "face":
         return False
 
-    # An explicit final marker on this row wins. Final stitched rows can retain
-    # scene/parent context for traceability without becoming internal children.
-    if _explicit_final(item):
-        return False
-
     text = _text(item)
+    authoritative_final = _authoritative_final(item)
+
+    # Explicit final video rows can retain scene/parent traceability metadata.
+    if studio == "video" and authoritative_final:
+        return False
 
     if _STRONG_INTERNAL_RE.search(text):
         return True
 
     # Scene/segment markers are definitive for video/fusion execution artifacts.
-    # Audio is hidden on strong Story/Fusion markers above so a deliberately saved
-    # standalone audio clip is not discarded merely because its context mentions a scene.
     if studio == "video" and _SEGMENT_RE.search(text):
+        return True
+
+    # Story-produced audio is execution material even when older rows lack the
+    # newer child_render metadata. Require both story context and a scene/segment
+    # marker so standalone Audio Studio clips are preserved.
+    if studio == "audio" and _STORY_CONTEXT_RE.search(text) and _SEGMENT_RE.search(text):
         return True
 
     return False
@@ -161,11 +168,9 @@ def _dedupe(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen: Set[str] = set()
     for item in items:
         keys = _identity_keys(item)
-        stable = next(iter(sorted(keys)), "")
-        if stable and stable in seen:
+        if keys and keys.intersection(seen):
             continue
-        if stable:
-            seen.add(stable)
+        seen.update(keys)
         out.append(item)
     return out
 
@@ -184,7 +189,7 @@ def _ensure_video_thumbnail(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _policy_rows(pool: asyncpg.Pool, user_id: str) -> List[Dict[str, Any]]:
-    """Fetch the raw media rows needed to classify hidden children and Fusion finals."""
+    """Fetch raw media rows used to classify Story/Fusion internals and Fusion finals."""
     async with pool.acquire() as conn:
         try:
             rows = await conn.fetch(
@@ -200,75 +205,76 @@ async def _policy_rows(pool: asyncpg.Pool, user_id: str) -> List[Dict[str, Any]]
             )
             return [dict(row) for row in rows]
         except Exception:
-            # The base dashboard service remains authoritative if the policy read
-            # model is temporarily unavailable; never convert this into a 500.
+            # Never turn a policy-side read-model discrepancy into a 500. The base
+            # dashboard service remains available as a conservative fallback.
             return []
 
 
-async def _public_library_items(
-    pool: asyncpg.Pool,
-    user_id: str,
-    asset_type: str,
-    limit: int,
-    offset: int,
-) -> Dict[str, Any]:
-    base = await _base_get_dashboard_library(
-        pool,
-        user_id,
-        asset_type=asset_type,
-        limit=limit,
-        offset=offset,
-    )
-    items = [dict(x) for x in (base.get("items") or []) if isinstance(x, dict)]
+def _signer() -> AzureBlobSasSigner:
+    return AzureBlobSasSigner.from_connection_string(settings.AZURE_STORAGE_CONNECTION_STRING)
 
-    if asset_type == "face":
-        return {**base, "items": items, "total": len(items), "source": f"{base.get('source') or 'dashboard'}+public_media_policy"}
 
-    raw_rows = await _policy_rows(pool, user_id)
-    hidden_keys: Set[str] = set()
-    public_fusion_rows: List[Dict[str, Any]] = []
-
-    for row in raw_rows:
+def _normalize_visible_raw_rows(rows: Iterable[Dict[str, Any]], *, wanted_studio: str) -> List[Dict[str, Any]]:
+    signer = _signer()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        raw_studio = str(row.get("studio") or "").strip().lower()
+        if wanted_studio == "audio" and raw_studio != "audio":
+            continue
+        if wanted_studio == "fusion" and raw_studio != "fusion":
+            continue
         if is_internal_customer_hidden_item(row):
-            hidden_keys.update(_identity_keys(row))
             continue
-        if str(row.get("studio") or "").strip().lower() == "fusion":
-            public_fusion_rows.append(row)
+        normalized = _normalize_library_item(row, signer)
+        if normalized and not is_internal_customer_hidden_item(normalized):
+            out.append(_ensure_video_thumbnail(normalized))
+    return out
 
+
+async def _public_face_items(pool: asyncpg.Pool, user_id: str) -> List[Dict[str, Any]]:
+    payload = await _base_get_dashboard_library(pool, user_id, asset_type="face", limit=100, offset=0)
+    return [dict(x) for x in (payload.get("items") or []) if isinstance(x, dict)]
+
+
+async def _public_audio_items(pool: asyncpg.Pool, user_id: str, raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if raw_rows:
+        return _normalize_visible_raw_rows(raw_rows, wanted_studio="audio")
+
+    # Conservative fallback if the raw read model cannot be queried. Filter the
+    # normalized base rows using the same title/metadata classifier.
+    payload = await _base_get_dashboard_library(pool, user_id, asset_type="audio", limit=100, offset=0)
+    return [
+        dict(x)
+        for x in (payload.get("items") or [])
+        if isinstance(x, dict) and not is_internal_customer_hidden_item(dict(x))
+    ]
+
+
+async def _public_video_items(pool: asyncpg.Pool, user_id: str, raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Preserve the mature base service's final-longform synthesis and video SAS
+    # normalization, then supplement rows persisted as studio='fusion'.
+    payload = await _base_get_dashboard_library(pool, user_id, asset_type="video", limit=100, offset=0)
     public: List[Dict[str, Any]] = []
-    for item in items:
-        if _identity_keys(item) & hidden_keys:
+    for item in payload.get("items") or []:
+        if not isinstance(item, dict):
             continue
-        if is_internal_customer_hidden_item(item):
+        candidate = dict(item)
+        if is_internal_customer_hidden_item(candidate):
             continue
-        public.append(_ensure_video_thumbnail(item))
+        public.append(_ensure_video_thumbnail(candidate))
 
-    # The legacy type=video SQL matches studio='video' literally. Preserve its
-    # longform/final synthesis, then add customer-facing rows persisted as
-    # studio='fusion'. This is the missing path that prevented valid Fusion finals
-    # from appearing in Dashboard Recent Videos.
-    if asset_type == "video" and public_fusion_rows:
-        signer = AzureBlobSasSigner.from_connection_string(settings.AZURE_STORAGE_CONNECTION_STRING)
-        for row in public_fusion_rows:
-            normalized = _normalize_library_item(row, signer)
-            if normalized and not is_internal_customer_hidden_item(normalized):
-                public.append(_ensure_video_thumbnail(normalized))
+    if raw_rows:
+        public.extend(_normalize_visible_raw_rows(raw_rows, wanted_studio="fusion"))
 
     public = _dedupe(public)
     public.sort(key=_created_sort_key, reverse=True)
+    return public
 
-    # The API already caps limit at 100. Base results are already paged; appended
-    # Fusion rows are merged and then re-capped to the requested page size.
-    public = public[: max(1, int(limit or 50))]
 
-    return {
-        **base,
-        "items": public,
-        "total": len(public),
-        "source": f"{base.get('source') or 'dashboard'}+public_media_policy",
-        "partial": False,
-        "display_scope": "customer_final_outputs",
-    }
+def _page(items: List[Dict[str, Any]], limit: int, offset: int) -> List[Dict[str, Any]]:
+    safe_limit = max(1, min(int(limit or 50), 100))
+    safe_offset = max(0, int(offset or 0))
+    return items[safe_offset : safe_offset + safe_limit]
 
 
 async def get_dashboard_library(
@@ -281,7 +287,34 @@ async def get_dashboard_library(
     normalized_type = str(asset_type or "all").strip().lower()
     if normalized_type not in {"all", "face", "audio", "video"}:
         normalized_type = "all"
-    return await _public_library_items(pool, user_id, normalized_type, limit, offset)
+
+    raw_rows = [] if normalized_type == "face" else await _policy_rows(pool, user_id)
+
+    if normalized_type == "face":
+        public = await _public_face_items(pool, user_id)
+    elif normalized_type == "audio":
+        public = await _public_audio_items(pool, user_id, raw_rows)
+    elif normalized_type == "video":
+        public = await _public_video_items(pool, user_id, raw_rows)
+    else:
+        # Build All from already-classified public sets. Internal Story/Fusion rows
+        # therefore never consume pagination slots or leak through a broad base query.
+        faces = await _public_face_items(pool, user_id)
+        audio = await _public_audio_items(pool, user_id, raw_rows)
+        videos = await _public_video_items(pool, user_id, raw_rows)
+        public = _dedupe([*faces, *audio, *videos])
+        public.sort(key=_created_sort_key, reverse=True)
+
+    paged = _page(public, limit, offset)
+    return {
+        "items": paged,
+        "total": len(public),
+        "limit": max(1, min(int(limit or 50), 100)),
+        "offset": max(0, int(offset or 0)),
+        "source": "dashboard_public_media_policy",
+        "partial": False,
+        "display_scope": "customer_final_outputs",
+    }
 
 
 def _home_video_item(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -322,7 +355,7 @@ async def get_dashboard_home(
 ) -> Dict[str, Any]:
     home = await _base_get_dashboard_home(pool, user_id, force_refresh=force_refresh)
     video_payload = await get_dashboard_library(pool, user_id, asset_type="video", limit=10, offset=0)
-    videos = []
+    videos: List[Dict[str, Any]] = []
     for item in video_payload.get("items") or []:
         if not isinstance(item, dict):
             continue
