@@ -6,11 +6,13 @@ on:
       - "feature/v3-assistant-*"
     paths:
       - "services/svc-assistant/**"
+      - "services/shared/python/desifaces_shared/identity/**"
       - "docker-compose.assistant.v3.yml"
       - ".github/workflows/v3-assistant-static.yml"
   pull_request:
     paths:
       - "services/svc-assistant/**"
+      - "services/shared/python/desifaces_shared/identity/**"
       - "docker-compose.assistant.v3.yml"
       - ".github/workflows/v3-assistant-static.yml"
   workflow_dispatch:
@@ -30,7 +32,7 @@ jobs:
       JWT_ISSUER: desifaces
       JWT_AUDIENCE: desifaces_clients
       DF_ASSISTANT_LLM_MODEL: ""
-      PYTHONPATH: services/svc-assistant/app
+      PYTHONPATH: services/svc-assistant/app:services/shared/python
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,7 +47,7 @@ jobs:
           python -m pip install --disable-pip-version-check -r services/svc-assistant/app/requirements.txt pytest
 
       - name: Compile Assistant
-        run: python -m compileall -q services/svc-assistant/app/app
+        run: python -m compileall -q services/svc-assistant/app/app services/shared/python/desifaces_shared/identity
 
       - name: Run privacy and context tests
         run: python -m pytest -q services/svc-assistant/app/tests
