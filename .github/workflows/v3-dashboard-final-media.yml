@@ -1,6 +1,13 @@
 name: V3 Dashboard Final Media Certification
 
 on:
+  push:
+    branches:
+      - feature/v3-multiperson-core-20260818
+    paths:
+      - 'services/svc-dashboard/app/app/api/routes/dashboard.py'
+      - 'services/svc-dashboard/app/app/services/final_video_visibility.py'
+      - '.github/workflows/v3-dashboard-final-media.yml'
   pull_request:
     branches:
       - feature/v3-multiperson-core-20260818
