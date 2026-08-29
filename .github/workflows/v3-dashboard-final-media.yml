@@ -62,6 +62,9 @@ jobs:
               "'canonical_final', true",
               "'display_scope', 'final_outputs'",
               'media_assets.role is deliberately',
+              'AZURE_FINAL_VIDEO_CONTAINER',
+              'signed_video_url',
+              '_is_browser_media_url',
           ]
           for marker in required:
               assert marker in helper, marker
@@ -69,6 +72,21 @@ jobs:
           assert 'enrich_dashboard_home_with_v3_finals' in route
           assert 'enrich_dashboard_library_with_v3_finals' in route
           print('CANONICAL_FINAL_STATIC_CONTRACT=PASS')
+          PY
+
+      - name: Prove storage-reference normalization
+        env:
+          PYTHONPATH: services/svc-dashboard/app
+        run: |
+          python - <<'PY'
+          from app.services.final_video_visibility import _storage_ref_parts
+
+          expected = ('video-output', 'story/final.mp4')
+          assert _storage_ref_parts('azure://video-output/story/final.mp4', 'video-output') == expected
+          assert _storage_ref_parts('https://acct.blob.core.windows.net/video-output/story/final.mp4?sig=old', 'video-output') == expected
+          assert _storage_ref_parts('video-output/story/final.mp4', 'video-output') == expected
+          assert _storage_ref_parts('story/final.mp4', 'video-output') == expected
+          print('CANONICAL_FINAL_STORAGE_NORMALIZATION=PASS')
           PY
 
       - name: Prove final-media deduplication
