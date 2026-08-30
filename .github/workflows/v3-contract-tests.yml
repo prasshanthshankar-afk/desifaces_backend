@@ -19,6 +19,7 @@ on:
       - "migrations/2026_08_30_v3_admin_super_admin_role.sql"
       - "test/test_v3_*.py"
       - "scripts/deploy-v3-admin.sh"
+      - "scripts/grant-specific-super-admin.sh"
       - "scripts/v3-compose.sh"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
@@ -42,6 +43,7 @@ on:
       - "migrations/2026_08_30_v3_admin_super_admin_role.sql"
       - "test/test_v3_*.py"
       - "scripts/deploy-v3-admin.sh"
+      - "scripts/grant-specific-super-admin.sh"
       - "scripts/v3-compose.sh"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
@@ -90,6 +92,7 @@ jobs:
       - name: Validate certification shell syntax
         run: |
           bash -n scripts/deploy-v3-admin.sh
+          bash -n scripts/grant-specific-super-admin.sh
           bash -n scripts/v3-compose.sh
           bash -n scripts/v3-c3-authenticated-adapter-certify.sh
           bash -n scripts/v3-c4-c6-certify.sh
@@ -121,6 +124,20 @@ jobs:
             exit 1
           fi
           echo 'V3_ADMIN_DEPLOYMENT_POLICY=PASS'
+
+      - name: Validate audited specific Super Admin bootstrap policy
+        run: |
+          grep -Fq 'WHERE lower(email)=lower(current_setting('"'"'desifaces.target_super_admin_email'"'"', true))' scripts/grant-specific-super-admin.sh
+          grep -Fq 'AND is_active=true' scripts/grant-specific-super-admin.sh
+          grep -Fq "WHERE role_key='super_admin'" scripts/grant-specific-super-admin.sh
+          grep -Fq 'ON CONFLICT(user_id, role_id) DO NOTHING' scripts/grant-specific-super-admin.sh
+          grep -Fq "'admin.super_admin.controlled_bootstrap'" scripts/grant-specific-super-admin.sh
+          grep -Fq "'grant-specific-super-admin'" scripts/grant-specific-super-admin.sh
+          if grep -Eq 'UPDATE[[:space:]]+core\.users|DELETE[[:space:]]+FROM[[:space:]]+core\.user_roles' scripts/grant-specific-super-admin.sh; then
+            echo 'FAIL: controlled Super Admin bootstrap must not activate users or remove roles'
+            exit 1
+          fi
+          echo 'V3_SUPER_ADMIN_BOOTSTRAP_POLICY=PASS'
 
       - name: Validate external runtime env binding
         run: |
