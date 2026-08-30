@@ -63,8 +63,10 @@ async def _run() -> None:
         )
         assert int(count_specific or 0) == 0
 
-        # Face: same SKU for all participant counts, but coordinated workload
-        # scales by participant count.
+        # Face: Director creates each participant identity independently. The same
+        # natural variant workload therefore costs the same premium amount for a
+        # 2-person or 5-person owning workflow; cast size selects the premium SKU
+        # but must not multiply this individual character's variants again.
         face2 = select_multi_person_pricing(
             studio="face", participant_count_value=2, natural_units=2
         )
@@ -75,9 +77,9 @@ async def _run() -> None:
         assert face2.sku_code == face5.sku_code == "FACE_MULTI_PERSON"
         q_face2 = await _quote(conn, face2.variant_code, {**face2.metadata, **face2.variant_params})
         q_face5 = await _quote(conn, face5.variant_code, {**face5.metadata, **face5.variant_params})
-        assert q_face5.total_credits > q_face2.total_credits > 0
-        assert q_face2.lines[0].qty == face2.billable_units
-        assert q_face5.lines[0].qty == face5.billable_units
+        assert q_face2.total_credits == q_face5.total_credits > 0
+        assert q_face2.lines[0].qty == face2.billable_units == 2
+        assert q_face5.lines[0].qty == face5.billable_units == 2
 
         # Audio: aggregate characters are already the workload meter, so the same
         # character volume costs the same regardless of speaker count while still
