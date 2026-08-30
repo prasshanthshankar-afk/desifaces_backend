@@ -30,8 +30,17 @@ class MultiPersonPricingSelection:
     quantity_param: str
 
     @property
+    def billable_units(self) -> int:
+        # Face and Fusion orchestration cost grows with every coordinated person.
+        # Audio already captures workload through aggregate generated characters,
+        # so speaker count must not multiply the same characters a second time.
+        if self.studio in {"face", "fusion"}:
+            return max(1, self.natural_units * self.participant_count)
+        return max(1, self.natural_units)
+
+    @property
     def variant_params(self) -> dict[str, str]:
-        return {self.quantity_param: str(self.natural_units)}
+        return {self.quantity_param: str(self.billable_units)}
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -40,6 +49,13 @@ class MultiPersonPricingSelection:
             "premium": True,
             "participant_count": self.participant_count,
             "participant_count_in_sku": False,
+            "natural_units": self.natural_units,
+            "billable_units": self.billable_units,
+            "participant_scaling": (
+                "natural_units_x_participants"
+                if self.studio in {"face", "fusion"}
+                else "aggregate_natural_usage"
+            ),
             "pricing_policy": PRICING_POLICY,
         }
 
