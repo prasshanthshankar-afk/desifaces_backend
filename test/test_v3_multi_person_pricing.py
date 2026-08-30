@@ -47,7 +47,7 @@ def test_single_person_does_not_select_multi_person_sku(
         ("fusion", FUSION_MULTI_PERSON, "minutes"),
     ],
 )
-def test_all_multi_person_counts_use_one_sku_per_studio_and_scale_quantity(
+def test_all_multi_person_counts_use_one_sku_per_studio_with_correct_workload_policy(
     count: int,
     studio: str,
     expected_sku: str,
@@ -65,10 +65,17 @@ def test_all_multi_person_counts_use_one_sku_per_studio_and_scale_quantity(
     assert selection.quantity_param == quantity_param
     assert selection.metadata["participant_count_in_sku"] is False
 
-    if studio in {"face", "fusion"}:
+    if studio == "fusion":
         assert selection.billable_units == 3 * count
         assert selection.variant_params == {quantity_param: str(3 * count)}
         assert selection.metadata["participant_scaling"] == "natural_units_x_participants"
+    elif studio == "face":
+        # Director creates each character identity independently. The natural Face
+        # units already represent that character's actual variants, so multiplying
+        # again by cast size would double-charge the same workload.
+        assert selection.billable_units == 3
+        assert selection.variant_params == {quantity_param: "3"}
+        assert selection.metadata["participant_scaling"] == "per_character_natural_usage"
     else:
         # Audio is already metered by aggregate generated characters. Multiplying
         # the same characters by speaker count would double-charge the workload.
@@ -84,9 +91,18 @@ def test_participant_count_is_explicit_and_not_inferred_from_conversational_pros
     assert participant_count({"participants": [{}, {}, {}, {}]}) == 4
     assert participant_count({"subject_composition": "two_people"}) == 2
     assert participant_count({"pricing_context": {"multi_person": True}}) == 2
+    assert participant_count({"pricing_context": {"participant_count": 5}}) == 5
     assert participant_count('{"speaker_count": 3}') == 3
     assert participant_count({"context": '{"participant_count": 4}'}) == 4
     assert participant_count("a discussion among five friends") == 1
+
+
+def test_face_request_preserves_internal_orchestration_pricing_context() -> None:
+    source = (
+        ROOT / "services/svc-face/app/app/domain/models.py"
+    ).read_text(encoding="utf-8")
+    assert 'pricing_context: Dict[str, Any] = Field(default_factory=dict)' in source
+    assert "Internal orchestration-only pricing context" in source
 
 
 def test_native_meter_units_remain_studio_specific() -> None:
