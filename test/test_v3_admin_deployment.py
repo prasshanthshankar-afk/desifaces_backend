@@ -52,10 +52,15 @@ def test_runtime_governance_uses_same_advisory_lock_as_bootstrap():
     assert "and bool(before_row[\"is_active\"])" in admin_source
 
 
-def test_admin_deploy_only_recreates_core_and_never_tears_down_v3():
+def test_admin_deploy_isolated_core_replacement_is_restart_safe():
     script = _text(DEPLOY)
-    assert "./scripts/v3-compose.sh build svc-core" in script
-    assert "./scripts/v3-compose.sh up -d --no-deps svc-core" in script
+    assert 'docker build -t "$CORE_IMAGE" services/svc-core/app' in script
+    assert 'docker ps -aq --filter "name=^/${CORE_CONTAINER}$"' in script
+    assert 'grep -Fxq "$CORE_NETWORK"' in script
+    assert 'docker rm -f "$existing_core_id"' in script
+    assert "./scripts/v3-compose.sh up -d --no-deps --force-recreate svc-core" in script
+    assert "./scripts/v3-compose.sh build svc-core" not in script
+    assert "--remove-orphans" not in script
     assert "v3-compose.sh down" not in script
     assert "docker compose down" not in script
 
