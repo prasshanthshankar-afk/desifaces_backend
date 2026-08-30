@@ -13,6 +13,7 @@ from app.deps import require_admin, require_super_admin
 router = APIRouter()
 
 PRIVILEGED_ROLES = {"admin", "super_admin"}
+ADMIN_GOVERNANCE_LOCK_KEY = 86300830
 
 
 class AdminUserPatch(BaseModel):
@@ -36,6 +37,17 @@ def _request_meta(request: Request) -> tuple[str | None, str | None, str | None]
     ip = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
     return request_id, ip, user_agent
+
+
+async def _lock_admin_governance(conn) -> None:
+    """Serialize privileged governance with bootstrap and peer Admin mutations.
+
+    The same transaction advisory lock is used by deploy/bootstrap. This prevents
+    two Super Admins from concurrently observing the same active-role count and
+    both removing/deactivating the other administrator, which could otherwise
+    violate the invariant that at least one active super_admin remains.
+    """
+    await conn.execute("SELECT pg_advisory_xact_lock($1)", ADMIN_GOVERNANCE_LOCK_KEY)
 
 
 async def _roles_for_user(conn, user_id: str) -> list[str]:
@@ -172,6 +184,7 @@ async def patch_user(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await _lock_admin_governance(conn)
             before_row = await conn.fetchrow(
                 """
                 SELECT id::text AS id, email, full_name, tier, is_active
@@ -192,12 +205,16 @@ async def patch_user(
             ):
                 raise HTTPException(status_code=403, detail="super_admin_required")
 
-            if patch.is_active is False and "super_admin" in before_roles:
-                if await _active_role_count(conn, "super_admin") <= 1:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="cannot_deactivate_last_active_super_admin",
-                    )
+            if (
+                patch.is_active is False
+                and bool(before_row["is_active"])
+                and "super_admin" in before_roles
+                and await _active_role_count(conn, "super_admin") <= 1
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="cannot_deactivate_last_active_super_admin",
+                )
 
             after_row = await conn.fetchrow(
                 """
@@ -244,6 +261,7 @@ async def _grant_role(
 
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await _lock_admin_governance(conn)
             target = await conn.fetchrow(
                 "SELECT id::text AS id, email, is_active FROM core.users WHERE id = $1::uuid FOR UPDATE",
                 target_user_id,
@@ -305,6 +323,7 @@ async def _revoke_role(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await _lock_admin_governance(conn)
             target = await conn.fetchrow(
                 "SELECT id::text AS id, email, is_active FROM core.users WHERE id = $1::uuid FOR UPDATE",
                 target_user_id,
@@ -323,7 +342,11 @@ async def _revoke_role(
             if role_key not in before_roles:
                 return {"ok": True, "user_id": target_user_id, "roles": before_roles}
 
-            if role_key == "super_admin" and await _active_role_count(conn, role_key) <= 1:
+            if (
+                role_key == "super_admin"
+                and bool(target["is_active"])
+                and await _active_role_count(conn, role_key) <= 1
+            ):
                 raise HTTPException(status_code=409, detail="cannot_revoke_last_active_super_admin")
 
             await conn.execute(
