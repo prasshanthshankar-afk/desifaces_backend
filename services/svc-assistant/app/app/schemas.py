@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AssistantContextLocator(BaseModel):
@@ -24,6 +24,17 @@ class AssistantAction(BaseModel):
     type: str = Field(min_length=1, max_length=100)
     label: str = Field(min_length=1, max_length=160)
     requires_confirmation: bool = True
+    href: str | None = Field(default=None, max_length=500)
+
+    @field_validator("href")
+    @classmethod
+    def safe_internal_href(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        href = value.strip()
+        if not href.startswith("/app/"):
+            raise ValueError("assistant navigation actions must be internal /app paths")
+        return href
 
 
 class AssistantPolicyView(BaseModel):
