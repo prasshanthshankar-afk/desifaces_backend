@@ -107,12 +107,16 @@ jobs:
           fi
           echo 'V3_ADMIN_DEPLOYMENT_POLICY=PASS'
 
-      - name: Run Core Admin authorization and deployment tests
+      - name: Run Core Admin authorization, deployment and mutation tests
         env:
           PYTHONPATH: services/svc-core/app
           JWT_SECRET: v3-admin-ci-jwt-secret
           REFRESH_TOKEN_HMAC_SECRET: v3-admin-ci-refresh-secret
-        run: python -m pytest -q test/test_v3_admin_authorization.py test/test_v3_admin_deployment.py
+        run: |
+          python -m pytest -q \
+            test/test_v3_admin_authorization.py \
+            test/test_v3_admin_deployment.py \
+            test/test_v3_admin_mutations.py
 
       - name: Run canonical foundation unit tests
         env:
