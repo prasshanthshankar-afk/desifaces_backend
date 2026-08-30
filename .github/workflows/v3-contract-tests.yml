@@ -8,16 +8,19 @@ on:
     paths:
       - "services/shared/df_contracts/**"
       - "services/shared/python/desifaces_shared/identity/**"
+      - "services/shared/python/desifaces_shared/pricing/**"
       - "services/shared/python/desifaces_shared/v3/**"
       - "services/svc-face/app/**"
       - "services/svc-audio/app/**"
       - "services/svc-fusion/app/**"
       - "services/svc-pricing/app/**"
       - "migrations/2026_08_18_v3_*.sql"
+      - "migrations/2026_08_30_multi_person_premium_pricing.sql"
       - "test/test_v3_*.py"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
       - "scripts/v3-c45-runtime-certify.py"
+      - "scripts/v3-multiperson-pricing-certify.sh"
       - "docker-compose.v3.yml"
       - ".github/workflows/v3-contract-tests.yml"
   pull_request:
@@ -26,16 +29,19 @@ on:
     paths:
       - "services/shared/df_contracts/**"
       - "services/shared/python/desifaces_shared/identity/**"
+      - "services/shared/python/desifaces_shared/pricing/**"
       - "services/shared/python/desifaces_shared/v3/**"
       - "services/svc-face/app/**"
       - "services/svc-audio/app/**"
       - "services/svc-fusion/app/**"
       - "services/svc-pricing/app/**"
       - "migrations/2026_08_18_v3_*.sql"
+      - "migrations/2026_08_30_multi_person_premium_pricing.sql"
       - "test/test_v3_*.py"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
       - "scripts/v3-c45-runtime-certify.py"
+      - "scripts/v3-multiperson-pricing-certify.sh"
       - "docker-compose.v3.yml"
       - ".github/workflows/v3-contract-tests.yml"
 
@@ -55,18 +61,22 @@ jobs:
           python-version: "3.11"
 
       - name: Install focused test dependencies
-        run: python -m pip install --disable-pip-version-check pytest "pydantic>=2,<3"
+        run: python -m pip install --disable-pip-version-check pytest "pydantic>=2,<3" "httpx>=0.27,<1"
 
       - name: Compile V3 contract and compatibility code
         run: |
           python -m compileall -q \
             services/shared/df_contracts \
             services/shared/python/desifaces_shared/identity \
+            services/shared/python/desifaces_shared/pricing \
             services/shared/python/desifaces_shared/v3 \
+            services/svc-face/app/app/services/multi_person_pricing_policy.py \
             services/svc-face/app/app/services/v3_face_adapter_shadow.py \
             services/svc-face/app/app/api/v3_adapter_probe.py \
+            services/svc-audio/app/app/services/multi_person_pricing_policy.py \
             services/svc-audio/app/app/services/v3_audio_adapter_shadow.py \
             services/svc-audio/app/app/api/v3_adapter_probe.py \
+            services/svc-fusion/app/app/services/multi_person_pricing_policy.py \
             services/svc-fusion/app/app/services/v3_fusion_adapter_shadow.py \
             services/svc-fusion/app/app/api/v3_adapter_probe.py \
             services/svc-pricing/app/app/services/v3_pricing_adapter_shadow.py \
@@ -80,6 +90,7 @@ jobs:
         run: |
           bash -n scripts/v3-c3-authenticated-adapter-certify.sh
           bash -n scripts/v3-c4-c6-certify.sh
+          bash -n scripts/v3-multiperson-pricing-certify.sh
 
       - name: Run canonical foundation unit tests
         env:
@@ -93,4 +104,51 @@ jobs:
             test/test_v3_pricing_adapter.py \
             test/test_v3_account_context.py \
             test/test_v3_media_generation_foundation.py \
-            test/test_v3_subscription_cycle.py
+            test/test_v3_subscription_cycle.py \
+            test/test_v3_multi_person_pricing.py
+
+  multi-person-pricing-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pricing_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pricing_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pricing integration dependencies
+        run: |
+          python -m pip install --disable-pip-version-check pytest
+          python -m pip install --disable-pip-version-check -r services/svc-pricing/app/requirements.txt
+
+      - name: Apply pricing schema seed and multi-person migration
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d pricing_test -f migrations/001_pricing.sql
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d pricing_test -f migrations/001a_pricing_seed.sql
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d pricing_test -f migrations/2026_08_30_multi_person_premium_pricing.sql
+
+      - name: Run database-backed multi-person pricing quotes
+        env:
+          PYTHONPATH: services/svc-pricing/app:services/shared:services/shared/python:.
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/pricing_test
+          V3_MULTI_PERSON_PRICING_DB_URL: postgresql://postgres:postgres@127.0.0.1:5432/pricing_test
+        run: python -m pytest -q test/test_v3_multi_person_pricing_db.py

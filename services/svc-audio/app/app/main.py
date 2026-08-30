@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from fastapi import FastAPI
 from app.api import build_router
+from app.services.multi_person_pricing_policy import install_multi_person_pricing_policy
 
 
 def _v3_audio_adapter_probe_enabled() -> bool:
@@ -15,6 +16,10 @@ def _v3_audio_adapter_probe_enabled() -> bool:
 
 
 def create_app() -> FastAPI:
+    # Request-scoped selector. Existing single-speaker TTS remains AUDIO_TTS;
+    # explicit 2+ participant context selects AUDIO_MULTI_PERSON.
+    install_multi_person_pricing_policy()
+
     app = FastAPI(
         title=os.getenv("SERVICE_NAME", "desifaces-service"),
         version=os.getenv("SERVICE_VERSION", os.getenv("GIT_SHA", "dev")),
