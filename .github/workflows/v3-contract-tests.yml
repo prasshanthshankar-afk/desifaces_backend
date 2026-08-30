@@ -5,9 +5,11 @@ on:
     branches:
       - desifaces-v3
       - "feature/v3-*"
+      - "fix/v3-*"
     paths:
       - "services/shared/df_contracts/**"
       - "services/shared/python/desifaces_shared/identity/**"
+      - "services/shared/python/desifaces_shared/pricing/**"
       - "services/shared/python/desifaces_shared/v3/**"
       - "services/svc-face/app/**"
       - "services/svc-audio/app/**"
@@ -16,6 +18,7 @@ on:
       - "services/svc-director/app/**"
       - "migrations/2026_08_18_v3_*.sql"
       - "migrations/2026_08_19_v3_*.sql"
+      - "migrations/2026_08_30_multi_person_premium_pricing.sql"
       - "test/test_v3_*.py"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
@@ -32,6 +35,7 @@ on:
     paths:
       - "services/shared/df_contracts/**"
       - "services/shared/python/desifaces_shared/identity/**"
+      - "services/shared/python/desifaces_shared/pricing/**"
       - "services/shared/python/desifaces_shared/v3/**"
       - "services/svc-face/app/**"
       - "services/svc-audio/app/**"
@@ -40,6 +44,7 @@ on:
       - "services/svc-director/app/**"
       - "migrations/2026_08_18_v3_*.sql"
       - "migrations/2026_08_19_v3_*.sql"
+      - "migrations/2026_08_30_multi_person_premium_pricing.sql"
       - "test/test_v3_*.py"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
@@ -74,9 +79,14 @@ jobs:
           python -m compileall -q \
             services/shared/df_contracts \
             services/shared/python/desifaces_shared/identity \
+            services/shared/python/desifaces_shared/pricing \
             services/shared/python/desifaces_shared/v3 \
+            services/svc-face/app/app/domain/models.py \
+            services/svc-face/app/app/services/multi_person_pricing_policy.py \
             services/svc-face/app/app/services/v3_face_adapter_shadow.py \
             services/svc-face/app/app/api/v3_adapter_probe.py \
+            services/svc-audio/app/app/repos/tts_jobs_repo.py \
+            services/svc-audio/app/app/workers/audio_worker.py \
             services/svc-audio/app/app/services/v3_audio_adapter_shadow.py \
             services/svc-audio/app/app/api/v3_adapter_probe.py \
             services/svc-fusion/app/app/services/v3_fusion_adapter_shadow.py \
@@ -116,7 +126,8 @@ jobs:
             test/test_v3_participant_ref_normalization.py \
             test/test_v3_studio_hitl_workflow.py \
             test/test_v3_participant_face_bridge.py \
-            test/test_v3_face_execution_policy.py
+            test/test_v3_face_execution_policy.py \
+            test/test_v3_face_audio_hotfix.py
 
       - name: Run Face model hydration tests in isolated app package
         env:
