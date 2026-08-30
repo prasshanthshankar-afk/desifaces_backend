@@ -13,6 +13,7 @@ DB_USER="${DB_USER:-desifaces_v3_admin}"
 DB_NAME="${DB_NAME:-desifaces_v3}"
 MIGRATION="migrations/2026_08_30_v3_admin_super_admin_role.sql"
 CERTIFIED_ADMIN_COMMIT="${CERTIFIED_ADMIN_COMMIT:-fc960a38109d2180f131c0394a2101dc41b82459}"
+CANONICAL_ADMIN_INTEGRATION_COMMIT="3eecc38ec861ebab48a1cdd145e107a97a042d77"
 V3_ENV_FILE="${V3_ENV_FILE:-$ROOT/infra/.env}"
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "FAIL: missing required command: $1" >&2; exit 2; }; }
@@ -28,14 +29,27 @@ printf '\n===== 1. VERIFY SOURCE + RUNTIME BINDING =====\n'
 HEAD="$(git rev-parse HEAD)"
 BRANCH="$(git branch --show-current || true)"
 printf 'branch=%s\nhead=%s\n' "${BRANCH:-DETACHED}" "$HEAD"
-if ! git cat-file -e "${CERTIFIED_ADMIN_COMMIT}^{commit}" 2>/dev/null; then
-  echo "FAIL: Admin certification commit not available locally: $CERTIFIED_ADMIN_COMMIT" >&2
-  exit 3
-fi
-if ! git merge-base --is-ancestor "$CERTIFIED_ADMIN_COMMIT" "$HEAD"; then
-  echo "FAIL: current backend source does not contain Admin certification commit $CERTIFIED_ADMIN_COMMIT" >&2
+
+# The original Admin implementation was certified before it was integrated onto
+# the then-current desifaces-v3 baseline. PR #13 intentionally copied those
+# certified Admin blobs onto that newer baseline, so the original certification
+# commit is not necessarily a literal ancestor of the canonical merge. Accept
+# either approved lineage root, but continue to fail closed for unrelated source.
+certified_admin_lineage_root=""
+for candidate in "$CERTIFIED_ADMIN_COMMIT" "$CANONICAL_ADMIN_INTEGRATION_COMMIT"; do
+  if git cat-file -e "${candidate}^{commit}" 2>/dev/null && \
+     git merge-base --is-ancestor "$candidate" "$HEAD"; then
+    certified_admin_lineage_root="$candidate"
+    break
+  fi
+done
+if [[ -z "$certified_admin_lineage_root" ]]; then
+  echo 'FAIL: current backend source is outside approved Admin certification lineage.' >&2
+  echo "required_ancestor_one_of=$CERTIFIED_ADMIN_COMMIT,$CANONICAL_ADMIN_INTEGRATION_COMMIT" >&2
   exit 4
 fi
+printf 'certified_admin_lineage_root=%s\n' "$certified_admin_lineage_root"
+
 if ! git diff --quiet; then
   echo 'FAIL: tracked backend source has local modifications. Refusing ambiguous deployment.' >&2
   git status --short
@@ -219,6 +233,8 @@ printf '\n===== 9. DEPLOYMENT EVIDENCE =====\n'
 docker ps --filter "name=^/${CORE_CONTAINER}$" --format 'container={{.Names}} status={{.Status}} image={{.Image}}'
 printf 'source_head=%s\n' "$HEAD"
 printf 'certified_admin_commit=%s\n' "$CERTIFIED_ADMIN_COMMIT"
+printf 'canonical_admin_integration_commit=%s\n' "$CANONICAL_ADMIN_INTEGRATION_COMMIT"
+printf 'certified_admin_lineage_root=%s\n' "$certified_admin_lineage_root"
 printf 'active_super_admins=%s\n' "$super_count"
 printf 'runtime_env_binding=preserved_v3_workspace\n'
 printf 'compose_preflight=PASS\n'
