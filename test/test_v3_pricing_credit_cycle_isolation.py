@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -27,7 +28,10 @@ def test_stripe_webhook_uses_exact_subscription_period_cycle_identity() -> None:
     src = WEBHOOKS.read_text()
     assert "from desifaces_shared.v3.subscription_cycle import stripe_cycle_key as canonical_stripe_cycle_key" in src
     body = _function_body(src, "_fetch_plan_credit_reconciliation_context", "_reconcile_stripe_plan_credits_after_sync")
-    assert "canonical_stripe_cycle_key(gateway_subscription_id, period_start, period_end)" in body
+    assert re.search(
+        r"canonical_stripe_cycle_key\(\s*gateway_subscription_id\s*,\s*period_start\s*,\s*period_end\s*\)",
+        body,
+    )
     assert "stripe_plan_credit_cycle_identity_missing" in body
     assert "_metadata_cycle_key(ent_dict.get(\"metadata_json\"))" not in body
     assert "_metadata_cycle_key(sub_dict.get(\"metadata_json\"))" not in body
