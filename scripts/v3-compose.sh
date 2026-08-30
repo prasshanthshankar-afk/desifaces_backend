@@ -6,7 +6,10 @@ ROOT="$(
   pwd
 )"
 
-ENV_FILE="$ROOT/infra/.env"
+# Source code may execute from an isolated Git worktree while secrets/runtime
+# identity remain in the established live V3 workspace. Callers can bind that
+# preserved runtime environment explicitly without copying secrets into Git.
+ENV_FILE="${V3_ENV_FILE:-$ROOT/infra/.env}"
 BASE_FILE="$ROOT/docker-compose.yml"
 V3_FILE="$ROOT/docker-compose.v3.yml"
 
@@ -15,7 +18,7 @@ die() {
   exit 1
 }
 
-[ -f "$ENV_FILE" ] || die "missing $ENV_FILE"
+[ -f "$ENV_FILE" ] || die "missing V3 runtime env: $ENV_FILE"
 [ -f "$BASE_FILE" ] || die "missing $BASE_FILE"
 [ -f "$V3_FILE" ] || die "missing $V3_FILE"
 
