@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import httpx
 
@@ -20,10 +19,9 @@ class RecentStory:
 class RecentStoryResolver:
     """Fetch authenticated, user-scoped Director Story metadata.
 
-    The Director endpoint already scopes by account + owner user.  This resolver
-    intentionally keeps the Story UUID out of LLM/model context; only the browser
-    navigation path carries it.  Human-readable title text is privacy-redacted
-    before it is echoed back to the same authenticated user.
+    Director scopes the endpoint by account + owner user. Story UUIDs never enter
+    LLM/model context; only the browser navigation action carries the opaque path.
+    Human-readable title text is privacy-redacted before it is echoed back.
     """
 
     def __init__(self, client: httpx.AsyncClient) -> None:
@@ -35,21 +33,16 @@ class RecentStoryResolver:
             params={"limit": max(1, min(int(limit), 10))},
             headers={"Authorization": f"Bearer {token}"},
         )
-        if response.status_code in {401, 403}:
-            response.raise_for_status()
-        if response.status_code >= 400:
-            return []
+        response.raise_for_status()
         raw = response.json()
         if not isinstance(raw, list):
-            return []
+            raise ValueError("director_recent_stories_invalid_response")
 
         stories: list[RecentStory] = []
         for index, item in enumerate(raw[:10], start=1):
             if not isinstance(item, dict):
                 continue
             path = str(item.get("continue_path") or "").strip()
-            # Never accept an arbitrary upstream URL. Navigation stays inside the
-            # authenticated desifaces Multi-Person workspace.
             if not path.startswith("/app/multi-person?story="):
                 continue
             title = redact_sensitive_text(str(item.get("title") or "").strip()).text
