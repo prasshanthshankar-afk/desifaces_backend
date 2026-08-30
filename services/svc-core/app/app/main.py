@@ -5,13 +5,17 @@ import os
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
+from app.middleware import RequestIdMiddleware
+from app.routes.admin import router as admin_router
+from app.routes.admin_audit import router as admin_audit_router
+from app.routes.admin_support import router as admin_support_router
 from app.routes.auth import router as auth_router
 from app.routes.health import router as health_router
+from app.routes.help import router as help_router
+from app.routes.internal_notifications import router as internal_notifications_router
 from app.routes.masterdata import router as masterdata_router
 from app.routes.notifications import router as notifications_router
 from app.routes.support import router as support_router
-from app.routes.help import router as help_router
-from app.routes.internal_notifications import router as internal_notifications_router
 
 
 def create_app() -> FastAPI:
@@ -23,10 +27,15 @@ def create_app() -> FastAPI:
         openapi_url=os.getenv("OPENAPI_URL", "/openapi.json"),
     )
 
+    # Correlate privileged mutations and all other requests with a stable ID.
+    app.add_middleware(RequestIdMiddleware)
+
     app.include_router(health_router)
     app.include_router(auth_router)
+    app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
+    app.include_router(admin_audit_router, prefix="/api/admin", tags=["admin", "audit"])
+    app.include_router(admin_support_router, prefix="/api/admin", tags=["admin", "support"])
     app.include_router(masterdata_router)
-
     app.include_router(notifications_router)
     app.include_router(support_router)
     app.include_router(help_router)

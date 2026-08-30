@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional
 from uuid import UUID
+
 import asyncpg
+
 
 async def audit_log(
     conn: asyncpg.Connection,
@@ -16,11 +19,18 @@ async def audit_log(
     user_agent: Optional[str] = None,
     before: Optional[Dict[str, Any]] = None,
     after: Optional[Dict[str, Any]] = None,
+    strict: bool = False,
 ) -> None:
+    """Append an audit event to ``core.audit_log``.
+
+    Existing authentication flows may keep best-effort audit behavior by using
+    the default ``strict=False``. Privileged Admin mutations use
+    ``strict=True`` inside the same database transaction as the mutation so a
+    change cannot commit without its corresponding audit record.
     """
-    Append-only audit logger.
-    Never throws (best-effort) — but you can change this to strict mode later.
-    """
+    before_json = json.dumps(before, default=str) if before is not None else None
+    after_json = json.dumps(after, default=str) if after is not None else None
+
     try:
         await conn.execute(
             """
@@ -35,12 +45,13 @@ async def audit_log(
             entity_type,
             entity_id,
             request_id,
-            before,
-            after,
+            before_json,
+            after_json,
             ip,
             user_agent,
         )
     except Exception:
-        # Best-effort: do not break auth flows because audit insert failed.
-        # If you want strict mode later, re-raise.
+        if strict:
+            raise
+        # Authentication and other legacy callers remain best-effort.
         return
