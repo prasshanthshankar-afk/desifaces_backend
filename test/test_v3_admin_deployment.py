@@ -32,6 +32,15 @@ def test_admin_deploy_bootstrap_is_serialized_and_restart_safe():
     assert "V3_SUPER_ADMIN_EMAIL" in script
 
 
+def test_admin_deploy_bootstrap_role_variable_cannot_collide_with_role_id_column():
+    script = _text(DEPLOY)
+    assert "super_admin_role_id bigint;" in script
+    assert "SELECT id INTO super_admin_role_id FROM core.roles" in script
+    assert "VALUES(target_id, super_admin_role_id)" in script
+    assert "\n  role_id bigint;" not in script
+    assert "VALUES(target_id, role_id)" not in script
+
+
 def test_runtime_governance_uses_same_advisory_lock_as_bootstrap():
     admin_source = _text(ADMIN_SOURCE)
     deploy = _text(DEPLOY)
