@@ -58,7 +58,7 @@ def test_admin_deploy_isolated_core_replacement_is_restart_safe():
     assert 'docker ps -aq --filter "name=^/${CORE_CONTAINER}$"' in script
     assert 'grep -Fxq "$CORE_NETWORK"' in script
     assert 'docker rm -f "$existing_core_id"' in script
-    assert "./scripts/v3-compose.sh up -d --no-deps --force-recreate svc-core" in script
+    assert "./scripts/v3-compose.sh up -d --no-deps svc-core" in script
     assert "./scripts/v3-compose.sh build svc-core" not in script
     assert "--remove-orphans" not in script
     assert "v3-compose.sh down" not in script
