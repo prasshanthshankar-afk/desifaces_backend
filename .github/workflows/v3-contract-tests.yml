@@ -103,6 +103,8 @@ jobs:
           grep -Fq 'V3_ENV_FILE="$V3_ENV_FILE" ./scripts/v3-compose.sh config' scripts/deploy-v3-admin.sh
           grep -Fq 'V3_ENV_FILE="$V3_ENV_FILE" ./scripts/v3-compose.sh up -d --no-deps svc-core' scripts/deploy-v3-admin.sh
           grep -Fq 'ENV_FILE="${V3_ENV_FILE:-$ROOT/infra/.env}"' scripts/v3-compose.sh
+          grep -Fq 'SERVICE_ENV_FILE="$ROOT/infra/.env"' scripts/v3-compose.sh
+          grep -Fq 'ln -s "$ENV_FILE" "$SERVICE_ENV_FILE"' scripts/v3-compose.sh
           python3 - <<'PY'
           from pathlib import Path
           text = Path('scripts/deploy-v3-admin.sh').read_text()
@@ -136,13 +138,18 @@ jobs:
           cat > "$TMP/bin/docker" <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
+          [[ -L "$GITHUB_WORKSPACE/infra/.env" ]]
+          [[ "$(readlink -f "$GITHUB_WORKSPACE/infra/.env")" == "$(readlink -f "$V3_ENV_FILE")" ]]
           printf '%s\n' "$*" > "$DOCKER_CAPTURE"
           SH
           chmod +x "$TMP/bin/docker"
+          rm -f infra/.env
           PATH="$TMP/bin:$PATH" DOCKER_CAPTURE="$TMP/docker.args" V3_ENV_FILE="$TMP/runtime.env" bash scripts/v3-compose.sh config
           grep -Fq "compose --env-file $TMP/runtime.env" "$TMP/docker.args"
           grep -Fq -- '-f ' "$TMP/docker.args"
           grep -Fq 'docker-compose.v3.yml config' "$TMP/docker.args"
+          test ! -e infra/.env
+          test ! -L infra/.env
           echo 'V3_EXTERNAL_RUNTIME_ENV_BINDING=PASS'
 
       - name: Run Core Admin authorization, deployment and mutation tests
