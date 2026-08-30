@@ -7,6 +7,7 @@ from fastapi.responses import RedirectResponse
 
 from app.middleware import RequestIdMiddleware
 from app.routes.admin import router as admin_router
+from app.routes.admin_audit import router as admin_audit_router
 from app.routes.admin_support import router as admin_support_router
 from app.routes.auth import router as auth_router
 from app.routes.health import router as health_router
@@ -32,6 +33,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(auth_router)
     app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
+    app.include_router(admin_audit_router, prefix="/api/admin", tags=["admin", "audit"])
     app.include_router(admin_support_router, prefix="/api/admin", tags=["admin", "support"])
     app.include_router(masterdata_router)
     app.include_router(notifications_router)
