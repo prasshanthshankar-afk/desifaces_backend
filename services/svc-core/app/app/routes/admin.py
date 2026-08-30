@@ -4,7 +4,7 @@ from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from app.audit import audit_log
 from app.db import get_pool
@@ -17,7 +17,11 @@ ADMIN_GOVERNANCE_LOCK_KEY = 86300830
 
 
 class AdminUserPatch(BaseModel):
-    tier: Literal["free", "pro", "enterprise"] | None = None
+    model_config = ConfigDict(extra="forbid")
+
+    # Commercial tier/plan state is read-only here. Pricing/Commerce remain the
+    # authoritative owners; Admin account mutation is intentionally limited to
+    # activation state until an explicit commercial Admin contract exists.
     is_active: bool | None = None
 
 
@@ -219,14 +223,12 @@ async def patch_user(
             after_row = await conn.fetchrow(
                 """
                 UPDATE core.users
-                SET tier = COALESCE($2, tier),
-                    is_active = COALESCE($3, is_active),
+                SET is_active = COALESCE($2, is_active),
                     updated_at = now()
                 WHERE id = $1::uuid
                 RETURNING id::text AS id, email, full_name, tier, is_active
                 """,
                 target_user_id,
-                patch.tier,
                 patch.is_active,
             )
 
