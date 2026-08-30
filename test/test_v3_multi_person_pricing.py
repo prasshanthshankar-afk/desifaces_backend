@@ -117,9 +117,22 @@ def test_audio_preview_adapter_respects_shared_preview_spec_contract() -> None:
         / "services/svc-audio/app/app/services/multi_person_pricing_policy.py"
     ).read_text(encoding="utf-8")
     assert 'kwargs["sku_code"] = AUDIO_MULTI_PERSON' in source
-    assert '"chars_1k": units' in source
+    assert 'out["chars_1k"] = str(units)' in source
     assert 'kwargs["variant_code"]' not in source
     assert 'kwargs["variant_params"]' not in source
+
+
+def test_audio_preview_and_reserve_share_multi_person_context() -> None:
+    source = (
+        ROOT
+        / "services/svc-audio/app/app/services/multi_person_pricing_policy.py"
+    ).read_text(encoding="utf-8")
+    assert "def _multi_person_meta" in source
+    assert "original_preview_spec = routes.PricingPreviewSpec" in source
+    assert "original_reserve_spec = tts_module.PricingReserveSpec" in source
+    assert "tts_module.PricingReserveSpec = reserve_spec_wrapped" in source
+    assert '"participant_count": int(count)' in source
+    assert '"participant_scaling": "aggregate_natural_usage"' in source
 
 
 def test_runtime_policies_are_installed_for_face_audio_and_fusion() -> None:
