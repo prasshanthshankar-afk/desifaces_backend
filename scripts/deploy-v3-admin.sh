@@ -10,7 +10,7 @@ CORE_URL="${CORE_URL:-http://127.0.0.1:18000}"
 DB_USER="${DB_USER:-desifaces_v3_admin}"
 DB_NAME="${DB_NAME:-desifaces_v3}"
 MIGRATION="migrations/2026_08_30_v3_admin_super_admin_role.sql"
-CERTIFIED_ADMIN_COMMIT="${CERTIFIED_ADMIN_COMMIT:-5a530978a0241feaf66fa14cc56ed2ba8aa7f48f}"
+CERTIFIED_ADMIN_COMMIT="${CERTIFIED_ADMIN_COMMIT:-fc960a38109d2180f131c0394a2101dc41b82459}"
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "FAIL: missing required command: $1" >&2; exit 2; }; }
 need git
@@ -77,10 +77,9 @@ if [[ "$super_count" == "0" ]]; then
     exit 10
   fi
 
-  # Pass the selected email as a psql variable, then copy it into a transaction-local
-  # custom PostgreSQL setting before entering the DO block. psql intentionally does
-  # not interpolate variables inside dollar-quoted PL/pgSQL bodies, so the DO block
-  # reads the transaction-local setting instead of relying on a container env var.
+  # psql does not interpolate variables inside dollar-quoted PL/pgSQL bodies.
+  # Copy the selected email into a transaction-local custom setting first, then
+  # read that setting from the DO block. No container environment transport is used.
   docker exec -i \
     "$DB_CONTAINER" \
     psql -v ON_ERROR_STOP=1 -v "bootstrap_email=$bootstrap_email" -U "$DB_USER" -d "$DB_NAME" <<'SQL'
