@@ -6,12 +6,14 @@ from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 os.environ.setdefault("JWT_SECRET", "v3-admin-test-jwt-secret")
 os.environ.setdefault("REFRESH_TOKEN_HMAC_SECRET", "v3-admin-test-refresh-secret")
 
 from app import deps  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.routes.admin import AdminUserPatch  # noqa: E402
 
 
 class _Acquire:
@@ -144,6 +146,12 @@ def test_missing_user_is_denied(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         _run_require_admin(monkeypatch, db_row=None, token_roles=["admin"])
     assert exc.value.status_code == 403
+
+
+def test_admin_account_patch_is_activation_only_and_rejects_tier_ownership():
+    assert AdminUserPatch(is_active=False).model_dump(exclude_none=True) == {"is_active": False}
+    with pytest.raises(ValidationError):
+        AdminUserPatch.model_validate({"tier": "pro"})
 
 
 def test_admin_routes_include_super_admin_support_and_audit_contracts():
