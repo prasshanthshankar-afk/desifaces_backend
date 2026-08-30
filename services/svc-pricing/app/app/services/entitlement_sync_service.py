@@ -238,21 +238,49 @@ def _normalize_plan_code(plan_code: Optional[str], tier_code: Optional[str] = No
     return "free"
 
 
-def _resolve_plan_code(subscription: Dict[str, Any], metadata: Dict[str, Any]) -> str:
-    direct = _normalize_plan_code(str(metadata.get("df_plan_code") or "").strip())
-    if direct and direct != "free":
-        return direct
-
+async def _resolve_plan_code(
+    conn: asyncpg.Connection,
+    subscription: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> str:
+    # The active Stripe subscription item/price is provider truth. Subscription
+    # metadata is only a fallback hint because metadata can change while a
+    # pending_if_incomplete price update is still awaiting successful payment.
     items = _as_dict_loose(subscription.get("items"))
     data = items.get("data") or []
     if data:
         price = _as_dict_loose(_as_dict_loose(data[0]).get("price"))
         price_id = str(price.get("id") or "").strip()
         if price_id:
-            mapped_row = _as_dict_loose(price.get("metadata"))
-            mapped_code = _normalize_plan_code(mapped_row.get("df_plan_code"))
-            if mapped_code and mapped_code != "free":
-                return mapped_code
+            catalog_row = None
+            try:
+                catalog_row = await conn.fetchrow(
+                    """
+                    select plan_code
+                    from public.pricing_plan_prices
+                    where stripe_price_id = $1
+                      and is_active = true
+                    order by display_order, created_at
+                    limit 1
+                    """,
+                    price_id,
+                )
+            except Exception:
+                catalog_row = None
+            catalog_code = _normalize_plan_code(
+                str(catalog_row["plan_code"] or "").strip() if catalog_row else ""
+            )
+            if catalog_code and catalog_code != "free":
+                return catalog_code
+
+            price_metadata = _as_dict_loose(price.get("metadata"))
+            price_metadata_code = _normalize_plan_code(price_metadata.get("df_plan_code"))
+            if price_metadata_code and price_metadata_code != "free":
+                return price_metadata_code
+
+    direct = _normalize_plan_code(str(metadata.get("df_plan_code") or "").strip())
+    if direct and direct != "free":
+        return direct
 
     return "free"
 
@@ -294,6 +322,17 @@ async def _select_canonical_active_subscription_id(
           and subscription_state in ('trialing', 'active', 'past_due', 'unpaid', 'paused')
           and entitlement_state in ('active', 'grace')
         order by
+          case
+            when gateway_subscription_id = (
+              select be.metadata_json->>'gateway_subscription_id'
+              from billing_entitlements be
+              where be.user_id = $1
+                and be.effective_from <= now()
+                and (be.effective_to is null or be.effective_to > now())
+              order by be.effective_from desc, be.updated_at desc
+              limit 1
+            ) then 0 else 1
+          end,
           case when cancel_at_period_end = false then 0 else 1 end,
           updated_at desc,
           created_at desc
@@ -329,7 +368,7 @@ async def _load_plan_from_guardrails(
             return IncludedCreditsPlan(
                 tier_code="free",
                 plan_code="free",
-                included_credits_total=100,
+                included_credits_total=0,
                 overage_allowed=False,
                 wallet_topup_allowed=True,
                 hard_stop_on_insufficient_balance=True,
@@ -574,7 +613,7 @@ async def sync_subscription_and_entitlement(
         price = _as_dict_loose(_as_dict_loose(data[0]).get("price"))
         price_id = str(price.get("id") or "").strip() or None
 
-    incoming_plan_code = _resolve_plan_code(subscription, metadata)
+    incoming_plan_code = await _resolve_plan_code(conn, subscription, metadata)
     incoming_plan = await _load_plan_from_guardrails(conn, plan_code=incoming_plan_code)
     free_plan = await _load_plan_from_guardrails(conn, plan_code="free")
 
@@ -699,7 +738,10 @@ async def sync_subscription_and_entitlement(
     )
 
     canonical_subscription_id = await _select_canonical_active_subscription_id(conn, user_id=user_id)
-    if entitlement_state in {"active", "grace"} and canonical_subscription_id and canonical_subscription_id != gateway_subscription_id:
+    if canonical_subscription_id and canonical_subscription_id != gateway_subscription_id:
+        # This provider row is lifecycle history, not the canonical entitlement owner.
+        # In particular, an old subscription cancellation/update must never demote
+        # a newer active subscription to Free or re-key its included-credit cycle.
         return user_id
 
     previous_remaining = int(existing_ent.included_credits_remaining) if existing_ent else 0

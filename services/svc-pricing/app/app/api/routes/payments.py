@@ -323,8 +323,8 @@ def _build_canonical_billing_display(
     ).strip().lower()
 
     plan_total_decimal = _first_decimal(
-        plan_json.get("included_credits_total"),
         ent.get("included_credits_total"),
+        plan_json.get("included_credits_total"),
         overview_credits.get("total_credits"),
     )
     plan_total = _to_int_credits(plan_total_decimal, 0)
@@ -452,6 +452,7 @@ def _build_canonical_billing_display(
         "reserved_credits": total_reserved,
         "used_credits": included_used,
         "total_credits": plan_total,
+        "included_credits_total": plan_total,
 
         # New explicit split used by product surfaces.
         "included_available": included_available,
@@ -824,6 +825,54 @@ async def _get_current_active_subscription(conn, *, user_id: UUID) -> Optional[D
         user_id,
     )
     return dict(row) if row else None
+
+
+async def _get_live_stripe_subscription_rows(conn, *, user_id: UUID) -> List[Dict[str, Any]]:
+    rows = await conn.fetch(
+        """
+        select
+          user_id,
+          gateway_provider,
+          gateway_customer_id,
+          gateway_subscription_id,
+          gateway_price_id,
+          plan_code,
+          subscription_state,
+          entitlement_state,
+          cancel_at_period_end,
+          current_period_start,
+          current_period_end,
+          created_at,
+          updated_at
+        from payment_plan_subscriptions
+        where user_id = $1
+          and gateway_provider = 'stripe'
+          and gateway_subscription_id is not null
+          and subscription_state in ('trialing', 'active', 'past_due', 'unpaid', 'paused')
+          and entitlement_state in ('active', 'grace')
+        order by updated_at desc, created_at desc
+        """,
+        user_id,
+    )
+    return [dict(row) for row in rows]
+
+
+def _stripe_provider_subscription_is_live(subscription: Any) -> bool:
+    state = str(_record_get(subscription, "status", "") or "").strip().lower()
+    return state in {"trialing", "active", "past_due", "unpaid", "paused"}
+
+
+async def _fetch_live_stripe_provider_subscriptions(
+    gw: StripeGateway,
+    *,
+    customer_id: str,
+) -> List[Dict[str, Any]]:
+    payload = await gw.list_subscriptions(customer_id=customer_id, status="all", limit=100)
+    return [
+        dict(item)
+        for item in (payload.get("data") or [])
+        if isinstance(item, dict) and _stripe_provider_subscription_is_live(item)
+    ]
 
 
 async def _get_latest_subscription_row(conn, *, user_id: UUID):
@@ -1822,7 +1871,7 @@ def _pending_change_from_subscription_row(row) -> Optional[PendingChangeOut]:
             effective_at=effective_at,
             change_mode="period_end",
             status="scheduled",
-            target_total_credits=100,
+            target_total_credits=0,
         )
 
     return None
@@ -2656,6 +2705,23 @@ async def create_subscription_checkout_session(inp: SubscriptionCreateIn, auth: 
                     current_plan_code=md.get("current_plan_code"),
                 )
 
+        current_active = await _get_current_active_subscription(conn, user_id=auth.user_id)
+        if current_active:
+            provider = str(current_active.get("gateway_provider") or "").strip().lower()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "direct_subscription_checkout_requires_no_active_subscription",
+                    "message": (
+                        "This account already has a live subscription. Use the subscription-change endpoint "
+                        "so the existing provider subscription is modified instead of creating another one."
+                    ),
+                    "gateway_provider": provider or None,
+                    "current_plan_code": str(current_active.get("plan_code") or "") or None,
+                    "gateway_subscription_id": str(current_active.get("gateway_subscription_id") or "") or None,
+                },
+            )
+
         purpose, current_plan_code = await _determine_subscription_purpose(
             conn,
             user_id=auth.user_id,
@@ -2673,6 +2739,25 @@ async def create_subscription_checkout_session(inp: SubscriptionCreateIn, auth: 
             gw=gw,
             idempotency_key=f"stripe-customer-sync:{auth.user_id}",
         )
+        try:
+            provider_live = await _fetch_live_stripe_provider_subscriptions(
+                gw,
+                customer_id=customer["gateway_customer_id"],
+            )
+        except StripeGatewayError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        if provider_live:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "stripe_provider_live_subscription_exists",
+                    "message": (
+                        "Stripe already has a live subscription for this customer. "
+                        "Use the subscription-change endpoint instead of creating a second subscription."
+                    ),
+                    "gateway_subscription_ids": [str(item.get("id") or "") for item in provider_live],
+                },
+            )
 
         try:
             session = await gw.create_subscription_checkout_session(
@@ -3503,6 +3588,7 @@ async def change_subscription(inp: SubscriptionChangeIn, auth: AuthContext = Aut
         target_plan_code = target_plan["plan_code"]
         current_row = await _get_latest_subscription_row(conn, user_id=auth.user_id)
         current_plan_code = await _resolve_current_plan_code(conn, user_id=auth.user_id)
+        live_stripe_rows = await _get_live_stripe_subscription_rows(conn, user_id=auth.user_id)
 
     if settings.normalize_plan_code(current_plan_code) == settings.normalize_plan_code(target_plan_code):
         if current_row and bool(current_row.get("cancel_at_period_end") or False):
@@ -3549,6 +3635,18 @@ async def change_subscription(inp: SubscriptionChangeIn, auth: AuthContext = Aut
             message="This subscription is managed through Google Play on Android. Use the Google Play purchase flow to change the plan.",
         )
 
+    if len(live_stripe_rows) > 1:
+        return SubscriptionMutationOut(
+            status="manual_change_required",
+            current_plan_code=current_plan_code,
+            target_plan_code=target_plan_code,
+            change_mode=inp.change_mode or "immediate",
+            message=(
+                "Billing integrity check found multiple live Stripe subscriptions for this account. "
+                "No further plan change will be started until the duplicate provider state is reconciled."
+            ),
+        )
+
     if (not has_linked_subscription) and current_rank > _plan_rank_value("free") and target_rank <= current_rank:
         return SubscriptionMutationOut(
             status="manual_change_required",
@@ -3566,7 +3664,8 @@ async def change_subscription(inp: SubscriptionChangeIn, auth: AuthContext = Aut
 
     wants_checkout = target_rank > current_rank
 
-    if wants_checkout:
+    # First paid subscription: Checkout is allowed to create provider ownership.
+    if wants_checkout and not has_linked_subscription:
         create_out = await create_subscription_checkout_session(
             SubscriptionCreateIn(
                 plan_code=target_plan_code,
@@ -3586,7 +3685,103 @@ async def change_subscription(inp: SubscriptionChangeIn, auth: AuthContext = Aut
             target_plan_code=target_plan_code,
             change_mode=inp.change_mode or "immediate",
             checkout_url=create_out.checkout_url,
-            message="Redirect the user to checkout to complete this subscription change.",
+            message="Redirect the user to checkout to start the first paid subscription.",
+        )
+
+    # Existing Stripe subscriber: change the price on the SAME subscription.
+    # Never create a second Stripe subscription for an upgrade.
+    if wants_checkout:
+        current = dict(current_row) if current_row else {}
+        if str(current.get("gateway_provider") or "").strip().lower() != "stripe":
+            return SubscriptionMutationOut(
+                status="manual_change_required",
+                current_plan_code=current_plan_code,
+                target_plan_code=target_plan_code,
+                change_mode=inp.change_mode or "immediate",
+                message="The current paid subscription is not Stripe-managed and cannot be changed through web billing.",
+            )
+
+        subscription_id = str(current.get("gateway_subscription_id") or "").strip()
+        if (
+            len(live_stripe_rows) != 1
+            or not subscription_id
+            or str(live_stripe_rows[0].get("gateway_subscription_id") or "") != subscription_id
+        ):
+            return SubscriptionMutationOut(
+                status="manual_change_required",
+                current_plan_code=current_plan_code,
+                target_plan_code=target_plan_code,
+                change_mode=inp.change_mode or "immediate",
+                message="Stripe subscription ownership is ambiguous; no provider mutation was attempted.",
+            )
+
+        gw = _gateway()
+        try:
+            provider_sub = await gw.retrieve_subscription(subscription_id)
+            provider_customer = provider_sub.get("customer")
+            if isinstance(provider_customer, dict):
+                provider_customer_id = str(provider_customer.get("id") or "").strip()
+            else:
+                provider_customer_id = str(provider_customer or current.get("gateway_customer_id") or "").strip()
+
+            if provider_customer_id:
+                provider_live = await _fetch_live_stripe_provider_subscriptions(
+                    gw,
+                    customer_id=provider_customer_id,
+                )
+                if len(provider_live) != 1 or str(provider_live[0].get("id") or "") != subscription_id:
+                    return SubscriptionMutationOut(
+                        status="manual_change_required",
+                        current_plan_code=current_plan_code,
+                        target_plan_code=target_plan_code,
+                        change_mode=inp.change_mode or "immediate",
+                        message="stripe_provider_subscription_invariant_failed: expected exactly one live provider subscription.",
+                    )
+
+            items = _as_dict_deep_loose(provider_sub.get("items")).get("data") or []
+            if len(items) != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "stripe_subscription_item_invariant_failed",
+                        "message": "Expected exactly one recurring Stripe subscription item before changing plans.",
+                        "subscription_id": subscription_id,
+                        "item_count": len(items),
+                    },
+                )
+            subscription_item_id = str(_as_dict_deep_loose(items[0]).get("id") or "").strip()
+            new_price_id = str(target_plan.get("price_id") or "").strip()
+            if not subscription_item_id or not new_price_id:
+                raise HTTPException(status_code=409, detail="stripe_subscription_change_identity_missing")
+
+            changed = await gw.change_subscription_price(
+                subscription_id=subscription_id,
+                subscription_item_id=subscription_item_id,
+                new_price_id=new_price_id,
+                proration_behavior="always_invoice",
+                payment_behavior="pending_if_incomplete",
+                idempotency_key=inp.idempotency_key or f"sub-change:{auth.user_id}:{subscription_id}:{target_plan_code}",
+                metadata={
+                    "df_order_type": "plan_upgrade",
+                    "df_plan_code": target_plan_code,
+                    "df_currency": str(target_plan.get("currency") or "USD"),
+                    "df_user_id": str(auth.user_id),
+                    "df_service": "svc-pricing",
+                },
+            )
+        except StripeGatewayError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+
+        return SubscriptionMutationOut(
+            status="processing",
+            current_plan_code=current_plan_code,
+            target_plan_code=target_plan_code,
+            change_mode=inp.change_mode or "immediate",
+            subscription_state=str(changed.get("status") or current.get("subscription_state") or "active"),
+            message=(
+                "Stripe plan change submitted against the existing subscription. "
+                "The new plan becomes authoritative only after Stripe webhook reconciliation confirms provider state."
+            ),
         )
 
     portal = await create_billing_portal_session(

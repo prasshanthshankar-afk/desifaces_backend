@@ -221,6 +221,19 @@ class StripeGateway:
     async def create_billing_portal_session(self, *, customer_id: str, return_url: str) -> Dict[str, Any]:
         return await self._request("POST", "/v1/billing_portal/sessions", form={"customer": customer_id, "return_url": return_url})
 
+    async def list_subscriptions(
+        self,
+        *,
+        customer_id: str,
+        status: str = "all",
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        return await self._request(
+            "GET",
+            "/v1/subscriptions",
+            params={"customer": customer_id, "status": status, "limit": limit},
+        )
+
     async def retrieve_subscription(self, subscription_id: str) -> Dict[str, Any]:
         return await self._request(
             "GET",
@@ -251,12 +264,14 @@ class StripeGateway:
         subscription_item_id: str,
         new_price_id: str,
         proration_behavior: str = "always_invoice",
+        payment_behavior: str = "pending_if_incomplete",
         idempotency_key: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         form: Dict[str, Any] = {
             "items": [{"id": subscription_item_id, "price": new_price_id}],
             "proration_behavior": proration_behavior,
+            "payment_behavior": payment_behavior,
         }
         if metadata:
             form["metadata"] = metadata

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import urllib.request
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
@@ -84,6 +85,23 @@ def _metadata_cycle_key(value: Any) -> Optional[str]:
     md = _as_dict_loose(value)
     cycle_key = str(md.get("cycle_key") or "").strip()
     return cycle_key or None
+
+
+def _is_terminal_stale_provider_object(event: Dict[str, Any], exc: Exception) -> bool:
+    message = str(exc)
+    if (
+        "stripe_subscription_hydration_failed" not in message
+        or "stripe_http_404" not in message
+        or "resource_missing" not in message
+    ):
+        return False
+    try:
+        created = int(event.get("created") or 0)
+    except Exception:
+        return False
+    if created <= 0:
+        return False
+    return (int(time.time()) - created) >= (24 * 60 * 60)
 
 
 def _notifications_base_url() -> str:
@@ -482,6 +500,26 @@ async def _fetch_plan_credit_reconciliation_context(
     gateway_subscription_id = str(
         sub_dict.get("gateway_subscription_id") or subscription_id or ""
     ).strip()
+    entitlement_metadata = _as_dict_loose(ent_dict.get("metadata_json"))
+    canonical_gateway_subscription_id = str(
+        entitlement_metadata.get("gateway_subscription_id") or ""
+    ).strip()
+    if (
+        canonical_gateway_subscription_id
+        and gateway_subscription_id
+        and canonical_gateway_subscription_id != gateway_subscription_id
+    ):
+        return {
+            "user_id": user_id,
+            "plan_code": plan_code,
+            "tier_code": tier_code,
+            "included_credit_cap": included_cap,
+            "skip_reconcile": True,
+            "skip_reason": "noncanonical_subscription_event",
+            "canonical_gateway_subscription_id": canonical_gateway_subscription_id,
+            "subscription": sub_dict,
+            "entitlement": ent_dict,
+        }
     if not gateway_subscription_id or period_start is None or period_end is None:
         raise RuntimeError("stripe_plan_credit_cycle_identity_missing")
     cycle_key = canonical_stripe_cycle_key(
@@ -516,6 +554,13 @@ async def _reconcile_stripe_plan_credits_after_sync(
     )
     sub = ctx.get("subscription") or {}
     ent = ctx.get("entitlement") or {}
+    if ctx.get("skip_reconcile"):
+        return {
+            "action": "plan_credit_reconcile_skipped",
+            "reason": str(ctx.get("skip_reason") or "noncanonical_subscription_event"),
+            "subscription_id": str(sub.get("gateway_subscription_id") or subscription_id or ""),
+            "canonical_gateway_subscription_id": str(ctx.get("canonical_gateway_subscription_id") or ""),
+        }
     metadata_json = {
         "provider": "stripe",
         "source": source,
@@ -1077,6 +1122,20 @@ async def stripe_webhook(
                 await _mark_webhook_status(conn, event_id=event_id, status="ignored")
 
         except Exception as exc:
+            if _is_terminal_stale_provider_object(event, exc):
+                await _mark_webhook_status(
+                    conn,
+                    event_id=event_id,
+                    status="ignored",
+                    failure_reason=f"stale_provider_object:{exc}",
+                )
+                return {
+                    "ok": True,
+                    "event_id": event_id,
+                    "event_type": event_type,
+                    "ignored": True,
+                    "reason": "stale_provider_object",
+                }
             await _mark_webhook_status(conn, event_id=event_id, status="failed", failure_reason=str(exc))
             raise HTTPException(status_code=500, detail=f"webhook_processing_failed:{exc}")
 

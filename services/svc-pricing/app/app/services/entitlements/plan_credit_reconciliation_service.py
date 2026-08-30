@@ -340,7 +340,7 @@ async def reconcile_included_plan_credits(
     if cap is None:
         cap = await _fetch_plan_guardrail_cap(conn, plan_code=normalized_plan_code)
     if cap is None:
-        cap = Decimal("100") if normalized_plan_code == "free" else Decimal("0")
+        cap = Decimal("0")
     cap = max(Decimal("0"), cap)
 
     expired_previous_cycle = await _expire_previous_cycle_included_lots(
