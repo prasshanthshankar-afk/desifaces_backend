@@ -82,6 +82,8 @@ jobs:
             services/svc-fusion/app/app/services/v3_fusion_adapter_shadow.py \
             services/svc-fusion/app/app/api/v3_adapter_probe.py \
             services/svc-pricing/app/app/api/routes/payments.py \
+            services/svc-pricing/app/app/api/routes/payment_webhooks.py \
+            services/svc-pricing/app/app/services/entitlements/plan_credit_reconciliation_service.py \
             services/svc-pricing/app/app/services/v3_pricing_adapter_shadow.py \
             services/svc-pricing/app/app/api/v3_adapter_probe.py \
             services/svc-pricing/app/app/services/subscription_credit_integrity_service.py \
@@ -113,6 +115,7 @@ jobs:
             test/test_v3_media_generation_foundation.py \
             test/test_v3_subscription_cycle.py \
             test/test_v3_pricing_native_iap_ownership.py \
+            test/test_v3_pricing_credit_cycle_isolation.py \
             test/test_v3_multiperson_story_foundation.py \
             test/test_v3_creative_director_foundation.py \
             test/test_v3_participant_ref_normalization.py \
