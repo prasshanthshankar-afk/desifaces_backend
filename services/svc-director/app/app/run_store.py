@@ -28,6 +28,25 @@ class DirectorRunStore:
             raise DirectorRunNotFound(thread_id)
         return row
 
+    async def list_recent(self, conn, *, account_id: UUID, owner_user_id: UUID, limit: int = 10):
+        """Return only the authenticated user's recent Director runs that own a Story.
+
+        This is intentionally narrower than an account-wide story search.  A browser or
+        Assistant must never discover another user's Story merely because they share an
+        account.  The response is also deliberately small and excludes raw brief prose.
+        """
+        return await conn.fetch(
+            """select run_id,thread_id,story_id,state,created_at,updated_at,
+                      coalesce(nullif(brief_json->>'title',''),
+                               nullif(brief_json->>'story_title',''),
+                               nullif(brief_json->>'name','')) as title
+               from public.v3_director_runs
+              where account_id=$1 and owner_user_id=$2 and story_id is not null
+              order by coalesce(updated_at, created_at) desc
+              limit $3""",
+            account_id, owner_user_id, max(1, min(int(limit), 25)),
+        )
+
     async def queue_resume(self, conn, *, thread_id: str, account_id: UUID,
                            owner_user_id: UUID, resume_payload: dict[str, Any]):
         # A human revision is a new orchestration cycle, not a technical retry of
