@@ -72,13 +72,21 @@ if [[ "$super_count" == "0" ]]; then
     printf 'bootstrap_source=V3_SUPER_ADMIN_EMAIL\n'
   fi
 
-  # Bootstrap entirely inside the V3 database so no host Python package is required.
+  if [[ -z "${bootstrap_email//[[:space:]]/}" ]]; then
+    echo 'FAIL: resolved Super Admin bootstrap email is empty.' >&2
+    exit 10
+  fi
+
+  # Pass the selected email as a psql variable, then copy it into a transaction-local
+  # custom PostgreSQL setting before entering the DO block. psql intentionally does
+  # not interpolate variables inside dollar-quoted PL/pgSQL bodies, so the DO block
+  # reads the transaction-local setting instead of relying on a container env var.
   docker exec -i \
-    -e BOOTSTRAP_EMAIL="$bootstrap_email" \
     "$DB_CONTAINER" \
-    psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" <<'SQL'
+    psql -v ON_ERROR_STOP=1 -v "bootstrap_email=$bootstrap_email" -U "$DB_USER" -d "$DB_NAME" <<'SQL'
 BEGIN;
 SELECT pg_advisory_xact_lock(86300830);
+SELECT set_config('desifaces.bootstrap_email', :'bootstrap_email', true);
 DO $$
 DECLARE
   target_id uuid;
@@ -100,7 +108,7 @@ BEGIN
 
   SELECT id, email INTO target_id, target_email
   FROM core.users
-  WHERE lower(email)=lower(current_setting('BOOTSTRAP_EMAIL', true))
+  WHERE lower(email)=lower(current_setting('desifaces.bootstrap_email', true))
     AND is_active=true
   FOR UPDATE;
   IF target_id IS NULL THEN
@@ -145,6 +153,7 @@ printf '\n===== 4. BUILD + RECREATE ONLY SVC-CORE =====\n'
 ./scripts/v3-compose.sh up -d --no-deps svc-core
 
 printf '\n===== 5. WAIT FOR CORE =====\n'
+status="000"
 for _ in $(seq 1 30); do
   status="$(curl -sS -o /tmp/v3-admin-core-health.json -w '%{http_code}' "$CORE_URL/api/health" || true)"
   [[ "$status" == "200" ]] && break
