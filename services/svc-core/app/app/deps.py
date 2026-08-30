@@ -63,16 +63,10 @@ def get_optional_current_user_id(
 
 
 # -------------------------
-# Admin role required
+# Privileged role authorization
 # -------------------------
-async def require_admin(claims: dict = Depends(get_current_claims)) -> dict:
-    """Authorize an administrator from the live Core role tables.
-
-    JWT roles remain useful as a UI/session hint, but they are deliberately not
-    authoritative for privileged APIs. Every Admin request re-checks the user,
-    active-account state, and roles in Core so role revocation takes effect
-    immediately instead of waiting for access-token expiry.
-    """
+async def _require_live_role(claims: dict, *, allowed_roles: set[str], detail: str) -> dict:
+    """Authorize from live Core role tables, never from browser/JWT role claims alone."""
     user_id = _user_id_from_claims(claims)
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -97,16 +91,42 @@ async def require_admin(claims: dict = Depends(get_current_claims)) -> dict:
         )
 
     if not row or not bool(row["is_active"]):
-        raise HTTPException(status_code=403, detail="admin_required")
+        raise HTTPException(status_code=403, detail=detail)
 
-    roles = [str(role).strip().lower() for role in (row["roles"] or []) if str(role).strip()]
-    if "admin" not in roles:
-        raise HTTPException(status_code=403, detail="admin_required")
+    roles = [
+        str(role).strip().lower()
+        for role in (row["roles"] or [])
+        if str(role).strip()
+    ]
+    if not any(role in allowed_roles for role in roles):
+        raise HTTPException(status_code=403, detail=detail)
 
     live_claims = dict(claims)
     live_claims["roles"] = roles
     live_claims["sub"] = user_id
     return live_claims
+
+
+async def require_admin(claims: dict = Depends(get_current_claims)) -> dict:
+    """Authorize operational Admin access from live roles.
+
+    super_admin inherits all operational Admin capabilities. JWT roles remain a
+    presentation/session hint only; live Core role state is authoritative.
+    """
+    return await _require_live_role(
+        claims,
+        allowed_roles={"admin", "super_admin"},
+        detail="admin_required",
+    )
+
+
+async def require_super_admin(claims: dict = Depends(get_current_claims)) -> dict:
+    """Authorize administrator-role governance from the live super_admin role."""
+    return await _require_live_role(
+        claims,
+        allowed_roles={"super_admin"},
+        detail="super_admin_required",
+    )
 
 
 # -------------------------
