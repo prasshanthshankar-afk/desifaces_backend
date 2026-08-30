@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / "scripts" / "deploy-v3-admin.sh"
 MIGRATION = ROOT / "migrations" / "2026_08_30_v3_admin_super_admin_role.sql"
+ADMIN_SOURCE = ROOT / "services" / "svc-core" / "app" / "app" / "routes" / "admin.py"
 
 
 def _text(path: Path) -> str:
@@ -29,6 +30,17 @@ def test_admin_deploy_bootstrap_is_serialized_and_restart_safe():
     assert "active_super_admins_before" in script
     assert "active_super_admins_after" in script
     assert "V3_SUPER_ADMIN_EMAIL" in script
+
+
+def test_runtime_governance_uses_same_advisory_lock_as_bootstrap():
+    admin_source = _text(ADMIN_SOURCE)
+    deploy = _text(DEPLOY)
+    assert "ADMIN_GOVERNANCE_LOCK_KEY = 86300830" in admin_source
+    assert "pg_advisory_xact_lock($1)" in admin_source
+    assert "await _lock_admin_governance(conn)" in admin_source
+    assert "pg_advisory_xact_lock(86300830)" in deploy
+    assert "and bool(target[\"is_active\"])" in admin_source
+    assert "and bool(before_row[\"is_active\"])" in admin_source
 
 
 def test_admin_deploy_only_recreates_core_and_never_tears_down_v3():
