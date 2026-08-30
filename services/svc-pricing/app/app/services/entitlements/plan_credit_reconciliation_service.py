@@ -128,7 +128,8 @@ async def _fetch_active_included_cycle_totals(conn, *, user_id: UUID, cycle_key:
         where user_id = $1
           and bucket_type = 'included'
           and status = 'active'
-          and coalesce(metadata_json->>'cycle_key', $2::text) = $2::text
+          and (expires_at is null or expires_at > now())
+          and metadata_json->>'cycle_key' = $2::text
         """,
         user_id,
         cycle_key,
@@ -145,6 +146,7 @@ async def _expire_previous_cycle_included_lots(
     *,
     user_id: UUID,
     cycle_key: str,
+    current_period_start: Optional[datetime],
 ) -> int:
     """Expire only unreserved included lots from older cycles.
 
@@ -167,12 +169,23 @@ async def _expire_previous_cycle_included_lots(
         where user_id = $1
           and bucket_type = 'included'
           and status = 'active'
-          and (metadata_json ? 'cycle_key')
-          and coalesce(metadata_json->>'cycle_key', '') <> $2::text
+          and (
+            expires_at <= now()
+            or (
+              coalesce(metadata_json, '{}'::jsonb) ? 'cycle_key'
+              and coalesce(metadata_json->>'cycle_key', '') <> $2::text
+            )
+            or (
+              not (coalesce(metadata_json, '{}'::jsonb) ? 'cycle_key')
+              and $3::timestamptz is not null
+              and coalesce(granted_at, created_at) < $3::timestamptz
+            )
+          )
           and coalesce(reserved_amount, 0) = 0
         """,
         user_id,
         cycle_key,
+        current_period_start,
     )
     try:
         return int(str(result).split()[-1])
@@ -187,6 +200,7 @@ async def _adopt_legacy_included_lots_for_cycle(
     cycle_key: str,
     plan_code: str,
     source: str,
+    current_period_start: Optional[datetime],
 ) -> int:
     result = await conn.execute(
         """
@@ -203,12 +217,18 @@ async def _adopt_legacy_included_lots_for_cycle(
         where user_id = $1
           and bucket_type = 'included'
           and status = 'active'
-          and not (metadata_json ? 'cycle_key')
+          and (expires_at is null or expires_at > now())
+          and not (coalesce(metadata_json, '{}'::jsonb) ? 'cycle_key')
+          and (
+            $5::timestamptz is null
+            or coalesce(granted_at, created_at) >= $5::timestamptz
+          )
         """,
         user_id,
         cycle_key,
         plan_code,
         source,
+        current_period_start,
     )
     try:
         return int(str(result).split()[-1])
@@ -241,7 +261,8 @@ async def _reduce_included_unspent(
         where user_id = $1
           and bucket_type = 'included'
           and status = 'active'
-          and coalesce(metadata_json->>'cycle_key', $2::text) = $2::text
+          and (expires_at is null or expires_at > now())
+          and metadata_json->>'cycle_key' = $2::text
         order by granted_at desc nulls last, created_at desc
         for update
         """,
@@ -326,6 +347,7 @@ async def reconcile_included_plan_credits(
         conn,
         user_id=user_id,
         cycle_key=effective_cycle_key,
+        current_period_start=current_period_start,
     )
     adopted_legacy = await _adopt_legacy_included_lots_for_cycle(
         conn,
@@ -333,6 +355,7 @@ async def reconcile_included_plan_credits(
         cycle_key=effective_cycle_key,
         plan_code=normalized_plan_code,
         source=source,
+        current_period_start=current_period_start,
     )
 
     totals = await _fetch_active_included_cycle_totals(conn, user_id=user_id, cycle_key=effective_cycle_key)

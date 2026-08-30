@@ -17,6 +17,7 @@ from app.services.entitlement_sync_service import sync_subscription_and_entitlem
 from app.services.entitlements.plan_credit_reconciliation_service import (
     reconcile_included_plan_credits,
 )
+from desifaces_shared.v3.subscription_cycle import stripe_cycle_key as canonical_stripe_cycle_key
 
 router = APIRouter(tags=["payment-webhooks"])
 
@@ -478,10 +479,13 @@ async def _fetch_plan_credit_reconciliation_context(
 
     period_start = sub_dict.get("current_period_start")
     period_end = sub_dict.get("current_period_end")
-    cycle_key = (
-        _metadata_cycle_key(ent_dict.get("metadata_json"))
-        or _metadata_cycle_key(sub_dict.get("metadata_json"))
-        or _stripe_cycle_key(plan_code=plan_code, period_start=period_start, period_end=period_end)
+    gateway_subscription_id = str(
+        sub_dict.get("gateway_subscription_id") or subscription_id or ""
+    ).strip()
+    if not gateway_subscription_id or period_start is None or period_end is None:
+        raise RuntimeError("stripe_plan_credit_cycle_identity_missing")
+    cycle_key = canonical_stripe_cycle_key(
+        gateway_subscription_id, period_start, period_end
     )
 
     return {
