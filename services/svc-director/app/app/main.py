@@ -20,6 +20,7 @@ from desifaces_shared.v3.story_store import CanonicalStoryStore, StoryGraphNotFo
 
 from .config import settings
 from .db import close_pools, open_business_pool, open_checkpoint_pool
+from .face_pricing_context_runtime import install_director_face_pricing_context
 from .run_store import DirectorRunNotFound, DirectorRunStore
 from .runtime import create_director_graph
 from .security import DirectorAuthContext, get_director_auth
@@ -101,6 +102,10 @@ async def lifespan(app: FastAPI):
     finally:
         await close_pools()
 
+
+# Only Director-owned participant identity requests are decorated. Ordinary Face
+# Studio requests never pass through this adapter.
+install_director_face_pricing_context()
 
 app = FastAPI(title="desifaces V3 Creative Director", version="3.0", lifespan=lifespan)
 app.include_router(studio_router)
