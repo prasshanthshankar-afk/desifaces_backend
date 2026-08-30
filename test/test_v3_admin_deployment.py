@@ -14,6 +14,18 @@ def _text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def test_admin_deploy_accepts_original_or_canonical_integration_lineage():
+    script = _text(DEPLOY)
+    assert 'CERTIFIED_ADMIN_COMMIT="${CERTIFIED_ADMIN_COMMIT:-fc960a38109d2180f131c0394a2101dc41b82459}"' in script
+    assert 'CANONICAL_ADMIN_INTEGRATION_COMMIT="3eecc38ec861ebab48a1cdd145e107a97a042d77"' in script
+    assert 'for candidate in "$CERTIFIED_ADMIN_COMMIT" "$CANONICAL_ADMIN_INTEGRATION_COMMIT"; do' in script
+    assert 'git cat-file -e "${candidate}^{commit}"' in script
+    assert 'git merge-base --is-ancestor "$candidate" "$HEAD"' in script
+    assert "outside approved Admin certification lineage" in script
+    assert "certified_admin_lineage_root" in script
+    assert "current backend source does not contain Admin certification commit" not in script
+
+
 def test_admin_deploy_bootstrap_uses_psql_variable_and_transaction_local_setting():
     script = _text(DEPLOY)
     assert '-v "bootstrap_email=$bootstrap_email"' in script
