@@ -10,6 +10,7 @@ ROOT="$(
 # identity remain in the established live V3 workspace. Callers can bind that
 # preserved runtime environment explicitly without copying secrets into Git.
 ENV_FILE="${V3_ENV_FILE:-$ROOT/infra/.env}"
+SERVICE_ENV_FILE="$ROOT/infra/.env"
 BASE_FILE="$ROOT/docker-compose.yml"
 V3_FILE="$ROOT/docker-compose.v3.yml"
 
@@ -98,6 +99,39 @@ PY
 
 
 ###############################################################################
+# Bridge Compose's service-level ./infra/.env reference to the preserved V3
+# runtime environment when source executes from an isolated Git worktree.
+#
+# This is a symlink only: secrets are never copied into the source tree. The
+# link exists only for the lifetime of this wrapper invocation and is removed
+# on normal exit or signal. An existing real worktree-local env is never
+# overwritten.
+###############################################################################
+
+SERVICE_ENV_LINK_OWNED=false
+cleanup_service_env_link() {
+  if [[ "$SERVICE_ENV_LINK_OWNED" == "true" && -L "$SERVICE_ENV_FILE" ]]; then
+    rm -f "$SERVICE_ENV_FILE"
+  fi
+}
+
+if [[ "$(readlink -f "$ENV_FILE")" != "$(readlink -f "$SERVICE_ENV_FILE" 2>/dev/null || printf '%s' "$SERVICE_ENV_FILE")" ]]; then
+  mkdir -p "$(dirname "$SERVICE_ENV_FILE")"
+  if [[ -e "$SERVICE_ENV_FILE" || -L "$SERVICE_ENV_FILE" ]]; then
+    if [[ -L "$SERVICE_ENV_FILE" && "$(readlink -f "$SERVICE_ENV_FILE")" == "$(readlink -f "$ENV_FILE")" ]]; then
+      SERVICE_ENV_LINK_OWNED=true
+    else
+      die "refusing to replace existing worktree-local service env: $SERVICE_ENV_FILE"
+    fi
+  else
+    ln -s "$ENV_FILE" "$SERVICE_ENV_FILE"
+    SERVICE_ENV_LINK_OWNED=true
+  fi
+  trap cleanup_service_env_link EXIT INT TERM
+fi
+
+
+###############################################################################
 # Disallow the two most dangerous destructive forms.
 ###############################################################################
 
@@ -113,10 +147,11 @@ fi
 
 
 ###############################################################################
-# Canonical invocation.
+# Canonical invocation. Do not exec: the EXIT trap must remove the temporary
+# service-env symlink after Compose has consumed it.
 ###############################################################################
 
-exec docker compose \
+docker compose \
   --env-file "$ENV_FILE" \
   -f "$BASE_FILE" \
   -f "$V3_FILE" \
