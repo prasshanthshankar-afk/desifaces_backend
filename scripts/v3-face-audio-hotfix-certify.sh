@@ -61,11 +61,18 @@ echo "repo=$ROOT"
 echo "branch=$(git branch --show-current)"
 echo "HEAD=$(git rev-parse HEAD)"
 
-if ! git diff --quiet -- .; then
-  die "tracked working tree has unstaged modifications; certify a committed tree only"
+# The detached launcher intentionally copies the live V3 runtime environment into
+# this isolated worktree as infra/.env. That file may therefore differ from the
+# committed placeholder/template. Reject every other tracked modification while
+# allowing this one explicit runtime-only delta.
+if ! git diff --quiet -- . ':(exclude)infra/.env'; then
+  die "tracked working tree has unexpected unstaged modifications outside infra/.env"
 fi
-if ! git diff --cached --quiet -- .; then
-  die "tracked working tree has staged modifications; certify a committed tree only"
+if ! git diff --cached --quiet -- . ':(exclude)infra/.env'; then
+  die "tracked working tree has unexpected staged modifications outside infra/.env"
+fi
+if ! git diff --quiet -- infra/.env 2>/dev/null; then
+  echo "INFO: isolated runtime infra/.env differs from committed template as expected"
 fi
 
 banner "1. VERIFY V3 DATABASE / PRICING RUNTIME"
