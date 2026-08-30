@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -13,7 +14,7 @@ router = APIRouter()
 
 
 class AdminUserPatch(BaseModel):
-    tier: str | None = None
+    tier: Literal["free", "pro", "enterprise"] | None = None
     is_active: bool | None = None
 
 
@@ -33,6 +34,20 @@ def _request_meta(request: Request) -> tuple[str | None, str | None, str | None]
     ip = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
     return request_id, ip, user_agent
+
+
+async def _roles_for_user(conn, user_id: str) -> list[str]:
+    rows = await conn.fetch(
+        """
+        SELECT r.role_key
+        FROM core.user_roles ur
+        JOIN core.roles r ON r.id = ur.role_id
+        WHERE ur.user_id = $1::uuid
+        ORDER BY r.role_key
+        """,
+        user_id,
+    )
+    return [str(row["role_key"]) for row in rows]
 
 
 @router.get("/context")
@@ -146,3 +161,124 @@ async def patch_user(
             )
 
     return {"ok": True, "user": dict(after_row)}
+
+
+@router.put("/users/{user_id}/roles/admin")
+async def grant_admin_role(
+    user_id: str,
+    request: Request,
+    claims: dict = Depends(require_admin),
+):
+    target_user_id = _validated_user_id(user_id)
+    actor_user_id = _actor_user_id(claims)
+    request_id, ip, user_agent = _request_meta(request)
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            target = await conn.fetchrow(
+                "SELECT id::text AS id, email, is_active FROM core.users WHERE id = $1::uuid FOR UPDATE",
+                target_user_id,
+            )
+            if not target:
+                raise HTTPException(status_code=404, detail="user_not_found")
+            if not bool(target["is_active"]):
+                raise HTTPException(status_code=409, detail="inactive_user_cannot_be_admin")
+
+            role_id = await conn.fetchval("SELECT id FROM core.roles WHERE role_key = 'admin'")
+            if role_id is None:
+                raise HTTPException(status_code=500, detail="admin_role_not_configured")
+
+            before_roles = await _roles_for_user(conn, target_user_id)
+            await conn.execute(
+                """
+                INSERT INTO core.user_roles(user_id, role_id)
+                VALUES ($1::uuid, $2)
+                ON CONFLICT (user_id, role_id) DO NOTHING
+                """,
+                target_user_id,
+                role_id,
+            )
+            after_roles = await _roles_for_user(conn, target_user_id)
+
+            await audit_log(
+                conn,
+                action="admin.role.grant",
+                entity_type="user_role",
+                entity_id=target_user_id,
+                actor_user_id=actor_user_id,
+                request_id=request_id,
+                ip=ip,
+                user_agent=user_agent,
+                before={"roles": before_roles},
+                after={"roles": after_roles, "role": "admin"},
+                strict=True,
+            )
+
+    return {"ok": True, "user_id": target_user_id, "roles": after_roles}
+
+
+@router.delete("/users/{user_id}/roles/admin")
+async def revoke_admin_role(
+    user_id: str,
+    request: Request,
+    claims: dict = Depends(require_admin),
+):
+    target_user_id = _validated_user_id(user_id)
+    actor_user_id = _actor_user_id(claims)
+    if target_user_id == actor_user_id:
+        raise HTTPException(status_code=409, detail="admin_cannot_revoke_self")
+
+    request_id, ip, user_agent = _request_meta(request)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            target = await conn.fetchrow(
+                "SELECT id::text AS id, email, is_active FROM core.users WHERE id = $1::uuid FOR UPDATE",
+                target_user_id,
+            )
+            if not target:
+                raise HTTPException(status_code=404, detail="user_not_found")
+
+            role_id = await conn.fetchval("SELECT id FROM core.roles WHERE role_key = 'admin'")
+            if role_id is None:
+                raise HTTPException(status_code=500, detail="admin_role_not_configured")
+
+            before_roles = await _roles_for_user(conn, target_user_id)
+            if "admin" not in before_roles:
+                return {"ok": True, "user_id": target_user_id, "roles": before_roles}
+
+            active_admins = await conn.fetchval(
+                """
+                SELECT COUNT(DISTINCT u.id)
+                FROM core.users u
+                JOIN core.user_roles ur ON ur.user_id = u.id
+                JOIN core.roles r ON r.id = ur.role_id
+                WHERE u.is_active = true AND r.role_key = 'admin'
+                """
+            )
+            if int(active_admins or 0) <= 1:
+                raise HTTPException(status_code=409, detail="cannot_revoke_last_active_admin")
+
+            await conn.execute(
+                "DELETE FROM core.user_roles WHERE user_id = $1::uuid AND role_id = $2",
+                target_user_id,
+                role_id,
+            )
+            after_roles = await _roles_for_user(conn, target_user_id)
+
+            await audit_log(
+                conn,
+                action="admin.role.revoke",
+                entity_type="user_role",
+                entity_id=target_user_id,
+                actor_user_id=actor_user_id,
+                request_id=request_id,
+                ip=ip,
+                user_agent=user_agent,
+                before={"roles": before_roles, "role": "admin"},
+                after={"roles": after_roles},
+                strict=True,
+            )
+
+    return {"ok": True, "user_id": target_user_id, "roles": after_roles}
