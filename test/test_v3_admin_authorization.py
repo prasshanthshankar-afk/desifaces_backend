@@ -146,7 +146,7 @@ def test_missing_user_is_denied(monkeypatch):
     assert exc.value.status_code == 403
 
 
-def test_admin_routes_include_super_admin_and_support_contracts():
+def test_admin_routes_include_super_admin_support_and_audit_contracts():
     app = create_app()
     routes = {(route.path, method) for route in app.routes for method in getattr(route, "methods", set())}
     assert ("/api/admin/context", "GET") in routes
@@ -158,3 +158,4 @@ def test_admin_routes_include_super_admin_and_support_contracts():
     assert ("/api/admin/users/{user_id}/roles/super_admin", "PUT") in routes
     assert ("/api/admin/users/{user_id}/roles/super_admin", "DELETE") in routes
     assert ("/api/admin/support/requests", "GET") in routes
+    assert ("/api/admin/audit", "GET") in routes
