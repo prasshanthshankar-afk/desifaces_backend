@@ -19,6 +19,7 @@ on:
       - "migrations/2026_08_30_v3_admin_super_admin_role.sql"
       - "test/test_v3_*.py"
       - "scripts/deploy-v3-admin.sh"
+      - "scripts/v3-compose.sh"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
       - "scripts/v3-c45-runtime-certify.py"
@@ -41,6 +42,7 @@ on:
       - "migrations/2026_08_30_v3_admin_super_admin_role.sql"
       - "test/test_v3_*.py"
       - "scripts/deploy-v3-admin.sh"
+      - "scripts/v3-compose.sh"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
       - "scripts/v3-c45-runtime-certify.py"
@@ -88,6 +90,7 @@ jobs:
       - name: Validate certification shell syntax
         run: |
           bash -n scripts/deploy-v3-admin.sh
+          bash -n scripts/v3-compose.sh
           bash -n scripts/v3-c3-authenticated-adapter-certify.sh
           bash -n scripts/v3-c4-c6-certify.sh
 
@@ -96,7 +99,17 @@ jobs:
           grep -Fq -- '-v "bootstrap_email=$bootstrap_email"' scripts/deploy-v3-admin.sh
           grep -Fq "set_config('desifaces.bootstrap_email', :'bootstrap_email', true)" scripts/deploy-v3-admin.sh
           grep -Fq "current_setting('desifaces.bootstrap_email', true)" scripts/deploy-v3-admin.sh
-          grep -Fq './scripts/v3-compose.sh up -d --no-deps svc-core' scripts/deploy-v3-admin.sh
+          grep -Fq 'V3_ENV_FILE="${V3_ENV_FILE:-$ROOT/infra/.env}"' scripts/deploy-v3-admin.sh
+          grep -Fq 'V3_ENV_FILE="$V3_ENV_FILE" ./scripts/v3-compose.sh config' scripts/deploy-v3-admin.sh
+          grep -Fq 'V3_ENV_FILE="$V3_ENV_FILE" ./scripts/v3-compose.sh up -d --no-deps svc-core' scripts/deploy-v3-admin.sh
+          grep -Fq 'ENV_FILE="${V3_ENV_FILE:-$ROOT/infra/.env}"' scripts/v3-compose.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('scripts/deploy-v3-admin.sh').read_text()
+          preflight = text.index('./scripts/v3-compose.sh config')
+          removal = text.index('docker rm -f "$existing_core_id"')
+          assert preflight < removal, 'Compose preflight must occur before svc-core removal'
+          PY
           if grep -Fq "current_setting('BOOTSTRAP_EMAIL'" scripts/deploy-v3-admin.sh; then
             echo 'FAIL: obsolete env/current_setting bootstrap mismatch returned'
             exit 1
@@ -106,6 +119,31 @@ jobs:
             exit 1
           fi
           echo 'V3_ADMIN_DEPLOYMENT_POLICY=PASS'
+
+      - name: Validate external runtime env binding
+        run: |
+          set -euo pipefail
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
+          cat > "$TMP/runtime.env" <<'ENV'
+          POSTGRES_DB=desifaces_v3
+          POSTGRES_USER=desifaces_v3_admin
+          POSTGRES_PASSWORD=test-only
+          DATABASE_URL=postgresql://desifaces_v3_admin:test-only@desifaces-db:5432/desifaces_v3
+          REDIS_URL=redis://desifaces-redis:6379/0
+          ENV
+          mkdir -p "$TMP/bin"
+          cat > "$TMP/bin/docker" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          printf '%s\n' "$*" > "$DOCKER_CAPTURE"
+          SH
+          chmod +x "$TMP/bin/docker"
+          PATH="$TMP/bin:$PATH" DOCKER_CAPTURE="$TMP/docker.args" V3_ENV_FILE="$TMP/runtime.env" bash scripts/v3-compose.sh config
+          grep -Fq "compose --env-file $TMP/runtime.env" "$TMP/docker.args"
+          grep -Fq -- '-f ' "$TMP/docker.args"
+          grep -Fq 'docker-compose.v3.yml config' "$TMP/docker.args"
+          echo 'V3_EXTERNAL_RUNTIME_ENV_BINDING=PASS'
 
       - name: Run Core Admin authorization, deployment and mutation tests
         env:
