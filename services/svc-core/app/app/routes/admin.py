@@ -8,9 +8,11 @@ from pydantic import BaseModel
 
 from app.audit import audit_log
 from app.db import get_pool
-from app.deps import require_admin
+from app.deps import require_admin, require_super_admin
 
 router = APIRouter()
+
+PRIVILEGED_ROLES = {"admin", "super_admin"}
 
 
 class AdminUserPatch(BaseModel):
@@ -50,14 +52,29 @@ async def _roles_for_user(conn, user_id: str) -> list[str]:
     return [str(row["role_key"]) for row in rows]
 
 
+async def _active_role_count(conn, role_key: str) -> int:
+    count = await conn.fetchval(
+        """
+        SELECT COUNT(DISTINCT u.id)
+        FROM core.users u
+        JOIN core.user_roles ur ON ur.user_id = u.id
+        JOIN core.roles r ON r.id = ur.role_id
+        WHERE u.is_active = true AND r.role_key = $1
+        """,
+        role_key,
+    )
+    return int(count or 0)
+
+
 @router.get("/context")
 async def admin_context(claims: dict = Depends(require_admin)):
-    """Small live-authorization endpoint used by server-side Admin guards."""
+    """Live authorization context used by server and client Admin guards."""
     return {
         "ok": True,
         "user_id": _actor_user_id(claims),
         "email": str(claims.get("email") or "").strip().lower(),
         "roles": list(claims.get("roles") or []),
+        "is_super_admin": "super_admin" in (claims.get("roles") or []),
     }
 
 
@@ -100,6 +117,40 @@ async def list_users(
         return [dict(r) for r in rows]
 
 
+@router.get("/access/administrators")
+async def list_administrators(_: dict = Depends(require_super_admin)):
+    """Super-admin-only roster for the Access Control interface."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                u.id::text AS id,
+                u.email,
+                u.full_name,
+                u.is_active,
+                u.created_at,
+                ARRAY(
+                    SELECT r2.role_key
+                    FROM core.user_roles ur2
+                    JOIN core.roles r2 ON r2.id = ur2.role_id
+                    WHERE ur2.user_id = u.id
+                    ORDER BY r2.role_key
+                ) AS roles
+            FROM core.users u
+            WHERE EXISTS (
+                SELECT 1
+                FROM core.user_roles ur
+                JOIN core.roles r ON r.id = ur.role_id
+                WHERE ur.user_id = u.id
+                  AND r.role_key IN ('admin', 'super_admin')
+            )
+            ORDER BY u.email
+            """
+        )
+        return [dict(row) for row in rows]
+
+
 @router.patch("/users/{user_id}")
 async def patch_user(
     user_id: str,
@@ -109,6 +160,7 @@ async def patch_user(
 ):
     target_user_id = _validated_user_id(user_id)
     actor_user_id = _actor_user_id(claims)
+    actor_roles = {str(role) for role in (claims.get("roles") or [])}
     payload = patch.model_dump(exclude_none=True)
     if not payload:
         raise HTTPException(status_code=422, detail="empty_admin_user_patch")
@@ -131,6 +183,21 @@ async def patch_user(
             )
             if not before_row:
                 raise HTTPException(status_code=404, detail="user_not_found")
+
+            before_roles = await _roles_for_user(conn, target_user_id)
+            if (
+                patch.is_active is False
+                and PRIVILEGED_ROLES.intersection(before_roles)
+                and "super_admin" not in actor_roles
+            ):
+                raise HTTPException(status_code=403, detail="super_admin_required")
+
+            if patch.is_active is False and "super_admin" in before_roles:
+                if await _active_role_count(conn, "super_admin") <= 1:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="cannot_deactivate_last_active_super_admin",
+                    )
 
             after_row = await conn.fetchrow(
                 """
@@ -155,19 +222,20 @@ async def patch_user(
                 request_id=request_id,
                 ip=ip,
                 user_agent=user_agent,
-                before=dict(before_row),
-                after=dict(after_row),
+                before={**dict(before_row), "roles": before_roles},
+                after={**dict(after_row), "roles": before_roles},
                 strict=True,
             )
 
     return {"ok": True, "user": dict(after_row)}
 
 
-@router.put("/users/{user_id}/roles/admin")
-async def grant_admin_role(
+async def _grant_role(
+    *,
+    role_key: Literal["admin", "super_admin"],
     user_id: str,
     request: Request,
-    claims: dict = Depends(require_admin),
+    claims: dict,
 ):
     target_user_id = _validated_user_id(user_id)
     actor_user_id = _actor_user_id(claims)
@@ -183,11 +251,14 @@ async def grant_admin_role(
             if not target:
                 raise HTTPException(status_code=404, detail="user_not_found")
             if not bool(target["is_active"]):
-                raise HTTPException(status_code=409, detail="inactive_user_cannot_be_admin")
+                raise HTTPException(status_code=409, detail="inactive_user_cannot_receive_privileged_role")
 
-            role_id = await conn.fetchval("SELECT id FROM core.roles WHERE role_key = 'admin'")
+            role_id = await conn.fetchval(
+                "SELECT id FROM core.roles WHERE role_key = $1",
+                role_key,
+            )
             if role_id is None:
-                raise HTTPException(status_code=500, detail="admin_role_not_configured")
+                raise HTTPException(status_code=500, detail=f"{role_key}_role_not_configured")
 
             before_roles = await _roles_for_user(conn, target_user_id)
             await conn.execute(
@@ -211,23 +282,24 @@ async def grant_admin_role(
                 ip=ip,
                 user_agent=user_agent,
                 before={"roles": before_roles},
-                after={"roles": after_roles, "role": "admin"},
+                after={"roles": after_roles, "role": role_key},
                 strict=True,
             )
 
     return {"ok": True, "user_id": target_user_id, "roles": after_roles}
 
 
-@router.delete("/users/{user_id}/roles/admin")
-async def revoke_admin_role(
+async def _revoke_role(
+    *,
+    role_key: Literal["admin", "super_admin"],
     user_id: str,
     request: Request,
-    claims: dict = Depends(require_admin),
+    claims: dict,
 ):
     target_user_id = _validated_user_id(user_id)
     actor_user_id = _actor_user_id(claims)
-    if target_user_id == actor_user_id:
-        raise HTTPException(status_code=409, detail="admin_cannot_revoke_self")
+    if target_user_id == actor_user_id and role_key == "super_admin":
+        raise HTTPException(status_code=409, detail="super_admin_cannot_revoke_self")
 
     request_id, ip, user_agent = _request_meta(request)
     pool = await get_pool()
@@ -240,25 +312,19 @@ async def revoke_admin_role(
             if not target:
                 raise HTTPException(status_code=404, detail="user_not_found")
 
-            role_id = await conn.fetchval("SELECT id FROM core.roles WHERE role_key = 'admin'")
+            role_id = await conn.fetchval(
+                "SELECT id FROM core.roles WHERE role_key = $1",
+                role_key,
+            )
             if role_id is None:
-                raise HTTPException(status_code=500, detail="admin_role_not_configured")
+                raise HTTPException(status_code=500, detail=f"{role_key}_role_not_configured")
 
             before_roles = await _roles_for_user(conn, target_user_id)
-            if "admin" not in before_roles:
+            if role_key not in before_roles:
                 return {"ok": True, "user_id": target_user_id, "roles": before_roles}
 
-            active_admins = await conn.fetchval(
-                """
-                SELECT COUNT(DISTINCT u.id)
-                FROM core.users u
-                JOIN core.user_roles ur ON ur.user_id = u.id
-                JOIN core.roles r ON r.id = ur.role_id
-                WHERE u.is_active = true AND r.role_key = 'admin'
-                """
-            )
-            if int(active_admins or 0) <= 1:
-                raise HTTPException(status_code=409, detail="cannot_revoke_last_active_admin")
+            if role_key == "super_admin" and await _active_role_count(conn, role_key) <= 1:
+                raise HTTPException(status_code=409, detail="cannot_revoke_last_active_super_admin")
 
             await conn.execute(
                 "DELETE FROM core.user_roles WHERE user_id = $1::uuid AND role_id = $2",
@@ -276,9 +342,53 @@ async def revoke_admin_role(
                 request_id=request_id,
                 ip=ip,
                 user_agent=user_agent,
-                before={"roles": before_roles, "role": "admin"},
+                before={"roles": before_roles, "role": role_key},
                 after={"roles": after_roles},
                 strict=True,
             )
 
     return {"ok": True, "user_id": target_user_id, "roles": after_roles}
+
+
+@router.put("/users/{user_id}/roles/admin")
+async def grant_admin_role(
+    user_id: str,
+    request: Request,
+    claims: dict = Depends(require_super_admin),
+):
+    return await _grant_role(
+        role_key="admin", user_id=user_id, request=request, claims=claims
+    )
+
+
+@router.delete("/users/{user_id}/roles/admin")
+async def revoke_admin_role(
+    user_id: str,
+    request: Request,
+    claims: dict = Depends(require_super_admin),
+):
+    return await _revoke_role(
+        role_key="admin", user_id=user_id, request=request, claims=claims
+    )
+
+
+@router.put("/users/{user_id}/roles/super_admin")
+async def grant_super_admin_role(
+    user_id: str,
+    request: Request,
+    claims: dict = Depends(require_super_admin),
+):
+    return await _grant_role(
+        role_key="super_admin", user_id=user_id, request=request, claims=claims
+    )
+
+
+@router.delete("/users/{user_id}/roles/super_admin")
+async def revoke_super_admin_role(
+    user_id: str,
+    request: Request,
+    claims: dict = Depends(require_super_admin),
+):
+    return await _revoke_role(
+        role_key="super_admin", user_id=user_id, request=request, claims=claims
+    )
