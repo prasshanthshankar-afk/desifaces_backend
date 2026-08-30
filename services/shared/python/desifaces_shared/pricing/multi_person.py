@@ -31,10 +31,12 @@ class MultiPersonPricingSelection:
 
     @property
     def billable_units(self) -> int:
-        # Face and Fusion orchestration cost grows with every coordinated person.
-        # Audio already captures workload through aggregate generated characters,
-        # so speaker count must not multiply the same characters a second time.
-        if self.studio in {"face", "fusion"}:
+        # Face identity stages already execute independently per participant, so
+        # their natural units already represent the actual face workload. Audio
+        # likewise captures workload through aggregate generated characters.
+        # Fusion is the coordinated multi-person operation and therefore scales
+        # duration by participant count (participant-minutes).
+        if self.studio == "fusion":
             return max(1, self.natural_units * self.participant_count)
         return max(1, self.natural_units)
 
@@ -44,6 +46,11 @@ class MultiPersonPricingSelection:
 
     @property
     def metadata(self) -> dict[str, Any]:
+        participant_scaling = {
+            "face": "per_character_natural_usage",
+            "audio": "aggregate_natural_usage",
+            "fusion": "natural_units_x_participants",
+        }[self.studio]
         return {
             "multi_person": True,
             "premium": True,
@@ -51,11 +58,7 @@ class MultiPersonPricingSelection:
             "participant_count_in_sku": False,
             "natural_units": self.natural_units,
             "billable_units": self.billable_units,
-            "participant_scaling": (
-                "natural_units_x_participants"
-                if self.studio in {"face", "fusion"}
-                else "aggregate_natural_usage"
-            ),
+            "participant_scaling": participant_scaling,
             "pricing_policy": PRICING_POLICY,
         }
 
