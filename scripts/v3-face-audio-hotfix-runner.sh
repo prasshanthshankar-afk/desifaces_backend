@@ -63,8 +63,10 @@ set_status "STARTING"
   git diff --quiet -- .
   git diff --cached --quiet -- .
   test -f scripts/v3-face-audio-hotfix-certify.sh
-  chmod +x scripts/v3-face-audio-hotfix-certify.sh
 
+  # Do not chmod or otherwise mutate any tracked file after the clean-tree gate.
+  # The certifier is intentionally invoked through bash so its committed file
+  # mode remains untouched and its own clean-tree gate sees an immutable tree.
   set_status "DEPLOYING"
 
   echo
