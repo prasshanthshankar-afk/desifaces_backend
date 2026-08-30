@@ -6,6 +6,8 @@ cd "$ROOT"
 
 DB_CONTAINER="${DB_CONTAINER:-desifaces-v3-db}"
 CORE_CONTAINER="${CORE_CONTAINER:-df-v3-svc-core}"
+CORE_IMAGE="${CORE_IMAGE:-desifaces-v3-svc-core:latest}"
+CORE_NETWORK="${CORE_NETWORK:-df-v3-net}"
 CORE_URL="${CORE_URL:-http://127.0.0.1:18000}"
 DB_USER="${DB_USER:-desifaces_v3_admin}"
 DB_NAME="${DB_NAME:-desifaces_v3}"
@@ -77,9 +79,6 @@ if [[ "$super_count" == "0" ]]; then
     exit 10
   fi
 
-  # psql does not interpolate variables inside dollar-quoted PL/pgSQL bodies.
-  # Copy the selected email into a transaction-local custom setting first, then
-  # read that setting from the DO block. No container environment transport is used.
   docker exec -i \
     "$DB_CONTAINER" \
     psql -v ON_ERROR_STOP=1 -v "bootstrap_email=$bootstrap_email" -U "$DB_USER" -d "$DB_NAME" <<'SQL'
@@ -147,11 +146,24 @@ if [[ "$super_count" -lt 1 ]]; then
   exit 11
 fi
 
-printf '\n===== 4. BUILD + RECREATE ONLY SVC-CORE =====\n'
-./scripts/v3-compose.sh build svc-core
-./scripts/v3-compose.sh up -d --no-deps svc-core
+printf '\n===== 4. BUILD ONLY SVC-CORE IMAGE =====\n'
+docker build -t "$CORE_IMAGE" services/svc-core/app
 
-printf '\n===== 5. WAIT FOR CORE =====\n'
+printf '\n===== 5. REPLACE ONLY SVC-CORE =====\n'
+existing_core_id="$(docker ps -aq --filter "name=^/${CORE_CONTAINER}$" | head -n 1)"
+if [[ -n "$existing_core_id" ]]; then
+  if ! docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$existing_core_id" | grep -Fxq "$CORE_NETWORK"; then
+    echo "FAIL: existing $CORE_CONTAINER is not attached to $CORE_NETWORK; refusing to remove an ambiguous container." >&2
+    docker inspect -f 'container={{.Name}} image={{.Config.Image}} networks={{json .NetworkSettings.Networks}}' "$existing_core_id" >&2 || true
+    exit 12
+  fi
+  printf 'existing_core_container=%s\n' "$existing_core_id"
+  printf 'replacement_scope=single_verified_v3_core_container\n'
+  docker rm -f "$existing_core_id" >/dev/null
+fi
+./scripts/v3-compose.sh up -d --no-deps --force-recreate svc-core
+
+printf '\n===== 6. WAIT FOR CORE =====\n'
 status="000"
 for _ in $(seq 1 30); do
   status="$(curl -sS -o /tmp/v3-admin-core-health.json -w '%{http_code}' "$CORE_URL/api/health" || true)"
@@ -163,19 +175,19 @@ if [[ "${status:-000}" != "200" ]]; then
   docker ps -a --filter "name=^/${CORE_CONTAINER}$"
   docker logs --tail 160 "$CORE_CONTAINER" || true
   echo 'FAIL: svc-core did not become healthy.' >&2
-  exit 12
+  exit 13
 fi
 
-printf '\n===== 6. FAIL-CLOSED ADMIN API SMOKE =====\n'
+printf '\n===== 7. FAIL-CLOSED ADMIN API SMOKE =====\n'
 status="$(curl -sS -o /tmp/v3-admin-core-unauth.json -w '%{http_code}' "$CORE_URL/api/admin/context")"
 printf 'GET /api/admin/context without auth -> HTTP %s\n' "$status"
 if [[ "$status" != "401" ]]; then
   cat /tmp/v3-admin-core-unauth.json || true
   echo 'FAIL: unauthenticated Core Admin context did not return 401.' >&2
-  exit 13
+  exit 14
 fi
 
-printf '\n===== 7. CONTRACT PRESENCE =====\n'
+printf '\n===== 8. CONTRACT PRESENCE =====\n'
 openapi="$(curl -fsS "$CORE_URL/openapi.json")"
 for path in \
   '/api/admin/context' \
@@ -185,15 +197,15 @@ for path in \
   '/api/admin/audit'; do
   if ! grep -Fq "\"$path\"" <<<"$openapi"; then
     echo "FAIL: deployed Core OpenAPI missing $path" >&2
-    exit 14
+    exit 15
   fi
   printf 'route_present=%s\n' "$path"
 done
 
-printf '\n===== 8. DEPLOYMENT EVIDENCE =====\n'
+printf '\n===== 9. DEPLOYMENT EVIDENCE =====\n'
 docker ps --filter "name=^/${CORE_CONTAINER}$" --format 'container={{.Names}} status={{.Status}} image={{.Image}}'
 printf 'source_head=%s\n' "$HEAD"
 printf 'certified_admin_commit=%s\n' "$CERTIFIED_ADMIN_COMMIT"
 printf 'active_super_admins=%s\n' "$super_count"
 printf 'core_unauth_admin_context=401\n'
-printf '\nPASS: V3 Core Admin role migration, governance bootstrap, svc-core deployment and fail-closed smoke checks passed.\n'
+printf '\nPASS: V3 Core Admin role migration, governance bootstrap, isolated svc-core replacement and fail-closed smoke checks passed.\n'
