@@ -13,6 +13,7 @@ DB_USER="${DB_USER:-desifaces_v3_admin}"
 DB_NAME="${DB_NAME:-desifaces_v3}"
 MIGRATION="migrations/2026_08_30_v3_admin_super_admin_role.sql"
 CERTIFIED_ADMIN_COMMIT="${CERTIFIED_ADMIN_COMMIT:-fc960a38109d2180f131c0394a2101dc41b82459}"
+V3_ENV_FILE="${V3_ENV_FILE:-$ROOT/infra/.env}"
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "FAIL: missing required command: $1" >&2; exit 2; }; }
 need git
@@ -23,7 +24,7 @@ printf '\n============================================================\n'
 printf ' desifaces V3 ADMIN — CORE DEPLOY + CERTIFY\n'
 printf '============================================================\n'
 
-printf '\n===== 1. VERIFY SOURCE =====\n'
+printf '\n===== 1. VERIFY SOURCE + RUNTIME BINDING =====\n'
 HEAD="$(git rev-parse HEAD)"
 BRANCH="$(git branch --show-current || true)"
 printf 'branch=%s\nhead=%s\n' "${BRANCH:-DETACHED}" "$HEAD"
@@ -42,8 +43,20 @@ if ! git diff --quiet; then
 fi
 [[ -f "$MIGRATION" ]] || { echo "FAIL: missing $MIGRATION" >&2; exit 6; }
 [[ -x scripts/v3-compose.sh ]] || { echo 'FAIL: scripts/v3-compose.sh is not executable' >&2; exit 7; }
+[[ -f "$V3_ENV_FILE" ]] || { echo "FAIL: preserved V3 runtime env is missing: $V3_ENV_FILE" >&2; exit 8; }
 
-docker inspect "$DB_CONTAINER" >/dev/null 2>&1 || { echo "FAIL: V3 DB container not found: $DB_CONTAINER" >&2; exit 8; }
+docker inspect "$DB_CONTAINER" >/dev/null 2>&1 || { echo "FAIL: V3 DB container not found: $DB_CONTAINER" >&2; exit 9; }
+
+# Critical safety gate: resolve the complete Compose model using the preserved
+# runtime environment before migrations, builds, or any running container are
+# touched. This makes an isolated source worktree safe for live deployment.
+V3_ENV_FILE="$V3_ENV_FILE" ./scripts/v3-compose.sh config >/tmp/v3-admin-core-compose-resolved.yml
+if ! V3_ENV_FILE="$V3_ENV_FILE" ./scripts/v3-compose.sh config --services | grep -Fxq 'svc-core'; then
+  echo 'FAIL: resolved V3 Compose model does not contain svc-core.' >&2
+  exit 10
+fi
+printf 'runtime_env_binding=preserved_v3_workspace\n'
+printf 'compose_preflight=PASS\n'
 
 psql_v3(){ docker exec -i "$DB_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" "$@"; }
 psql_scalar(){ docker exec -i "$DB_CONTAINER" psql -Atq -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" -c "$1"; }
@@ -52,7 +65,7 @@ printf '\n===== 2. APPLY IDEMPOTENT ADMIN ROLE MIGRATION =====\n'
 psql_v3 < "$MIGRATION"
 role_count="$(psql_scalar "SELECT count(*) FROM core.roles WHERE role_key='super_admin';")"
 printf 'super_admin_role_rows=%s\n' "$role_count"
-[[ "$role_count" == "1" ]] || { echo 'FAIL: super_admin role migration did not converge to one role row.' >&2; exit 9; }
+[[ "$role_count" == "1" ]] || { echo 'FAIL: super_admin role migration did not converge to one role row.' >&2; exit 11; }
 
 printf '\n===== 3. ENSURE GOVERNANCE BOOTSTRAP =====\n'
 super_count="$(psql_scalar "SELECT count(DISTINCT u.id) FROM core.users u JOIN core.user_roles ur ON ur.user_id=u.id JOIN core.roles r ON r.id=ur.role_id WHERE u.is_active=true AND r.role_key='super_admin';")"
@@ -68,7 +81,7 @@ if [[ "$super_count" == "0" ]]; then
     else
       echo "FAIL: no active super_admin exists and active_admin_count=$admin_count." >&2
       echo 'Set V3_SUPER_ADMIN_EMAIL to one existing active Admin user and rerun this same script.' >&2
-      exit 10
+      exit 12
     fi
   else
     printf 'bootstrap_source=V3_SUPER_ADMIN_EMAIL\n'
@@ -76,7 +89,7 @@ if [[ "$super_count" == "0" ]]; then
 
   if [[ -z "${bootstrap_email//[[:space:]]/}" ]]; then
     echo 'FAIL: resolved Super Admin bootstrap email is empty.' >&2
-    exit 10
+    exit 12
   fi
 
   docker exec -i \
@@ -143,7 +156,7 @@ super_count="$(psql_scalar "SELECT count(DISTINCT u.id) FROM core.users u JOIN c
 printf 'active_super_admins_after=%s\n' "$super_count"
 if [[ "$super_count" -lt 1 ]]; then
   echo 'FAIL: no active super_admin exists after bootstrap gate.' >&2
-  exit 11
+  exit 13
 fi
 
 printf '\n===== 4. BUILD ONLY SVC-CORE IMAGE =====\n'
@@ -155,13 +168,13 @@ if [[ -n "$existing_core_id" ]]; then
   if ! docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$existing_core_id" | grep -Fxq "$CORE_NETWORK"; then
     echo "FAIL: existing $CORE_CONTAINER is not attached to $CORE_NETWORK; refusing to remove an ambiguous container." >&2
     docker inspect -f 'container={{.Name}} image={{.Config.Image}} networks={{json .NetworkSettings.Networks}}' "$existing_core_id" >&2 || true
-    exit 12
+    exit 14
   fi
   printf 'existing_core_container=%s\n' "$existing_core_id"
   printf 'replacement_scope=single_verified_v3_core_container\n'
   docker rm -f "$existing_core_id" >/dev/null
 fi
-./scripts/v3-compose.sh up -d --no-deps svc-core
+V3_ENV_FILE="$V3_ENV_FILE" ./scripts/v3-compose.sh up -d --no-deps svc-core
 
 printf '\n===== 6. WAIT FOR CORE =====\n'
 status="000"
@@ -175,7 +188,7 @@ if [[ "${status:-000}" != "200" ]]; then
   docker ps -a --filter "name=^/${CORE_CONTAINER}$"
   docker logs --tail 160 "$CORE_CONTAINER" || true
   echo 'FAIL: svc-core did not become healthy.' >&2
-  exit 13
+  exit 15
 fi
 
 printf '\n===== 7. FAIL-CLOSED ADMIN API SMOKE =====\n'
@@ -184,7 +197,7 @@ printf 'GET /api/admin/context without auth -> HTTP %s\n' "$status"
 if [[ "$status" != "401" ]]; then
   cat /tmp/v3-admin-core-unauth.json || true
   echo 'FAIL: unauthenticated Core Admin context did not return 401.' >&2
-  exit 14
+  exit 16
 fi
 
 printf '\n===== 8. CONTRACT PRESENCE =====\n'
@@ -197,7 +210,7 @@ for path in \
   '/api/admin/audit'; do
   if ! grep -Fq "\"$path\"" <<<"$openapi"; then
     echo "FAIL: deployed Core OpenAPI missing $path" >&2
-    exit 15
+    exit 17
   fi
   printf 'route_present=%s\n' "$path"
 done
@@ -207,5 +220,7 @@ docker ps --filter "name=^/${CORE_CONTAINER}$" --format 'container={{.Names}} st
 printf 'source_head=%s\n' "$HEAD"
 printf 'certified_admin_commit=%s\n' "$CERTIFIED_ADMIN_COMMIT"
 printf 'active_super_admins=%s\n' "$super_count"
+printf 'runtime_env_binding=preserved_v3_workspace\n'
+printf 'compose_preflight=PASS\n'
 printf 'core_unauth_admin_context=401\n'
 printf '\nPASS: V3 Core Admin role migration, governance bootstrap, isolated svc-core replacement and fail-closed smoke checks passed.\n'
