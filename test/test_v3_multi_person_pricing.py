@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from desifaces_shared.pricing.models import PricingPreviewSpec
+from desifaces_shared.pricing.orchestration import PricingPreviewSpec
 from desifaces_shared.pricing.multi_person import (
     AUDIO_MULTI_PERSON,
     FACE_MULTI_PERSON,
