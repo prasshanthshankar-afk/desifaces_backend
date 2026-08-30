@@ -90,7 +90,7 @@ DO $$
 DECLARE
   target_id uuid;
   target_email text;
-  role_id bigint;
+  super_admin_role_id bigint;
   existing_count integer;
   before_roles jsonb;
   after_roles jsonb;
@@ -114,8 +114,8 @@ BEGIN
     RAISE EXCEPTION 'bootstrap target is not an active Core user';
   END IF;
 
-  SELECT id INTO role_id FROM core.roles WHERE role_key='super_admin';
-  IF role_id IS NULL THEN
+  SELECT id INTO super_admin_role_id FROM core.roles WHERE role_key='super_admin';
+  IF super_admin_role_id IS NULL THEN
     RAISE EXCEPTION 'super_admin role missing';
   END IF;
 
@@ -125,7 +125,7 @@ BEGIN
   WHERE ur.user_id=target_id;
 
   INSERT INTO core.user_roles(user_id, role_id)
-  VALUES(target_id, role_id)
+  VALUES(target_id, super_admin_role_id)
   ON CONFLICT(user_id, role_id) DO NOTHING;
 
   SELECT coalesce(jsonb_agg(r.role_key ORDER BY r.role_key), '[]'::jsonb)
