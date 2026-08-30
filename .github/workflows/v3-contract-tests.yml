@@ -10,6 +10,7 @@ on:
       - "services/shared/python/desifaces_shared/identity/**"
       - "services/shared/python/desifaces_shared/v3/**"
       - "services/svc-core/app/**"
+      - "services/svc-core/tests/test_v3_admin_audit_categories.py"
       - "services/svc-face/app/**"
       - "services/svc-audio/app/**"
       - "services/svc-fusion/app/**"
@@ -34,6 +35,7 @@ on:
       - "services/shared/python/desifaces_shared/identity/**"
       - "services/shared/python/desifaces_shared/v3/**"
       - "services/svc-core/app/**"
+      - "services/svc-core/tests/test_v3_admin_audit_categories.py"
       - "services/svc-face/app/**"
       - "services/svc-audio/app/**"
       - "services/svc-fusion/app/**"
@@ -169,7 +171,7 @@ jobs:
           test ! -L infra/.env
           echo 'V3_EXTERNAL_RUNTIME_ENV_BINDING=PASS'
 
-      - name: Run Core Admin authorization, deployment and mutation tests
+      - name: Run Core Admin authorization, deployment, mutation and audit tests
         env:
           PYTHONPATH: services/svc-core/app
           JWT_SECRET: v3-admin-ci-jwt-secret
@@ -178,7 +180,8 @@ jobs:
           python -m pytest -q \
             test/test_v3_admin_authorization.py \
             test/test_v3_admin_deployment.py \
-            test/test_v3_admin_mutations.py
+            test/test_v3_admin_mutations.py \
+            services/svc-core/tests/test_v3_admin_audit_categories.py
 
       - name: Run canonical foundation unit tests
         env:
