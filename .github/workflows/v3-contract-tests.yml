@@ -16,7 +16,9 @@ on:
       - "services/svc-pricing/app/**"
       - "migrations/010_core_auth.sql"
       - "migrations/2026_08_18_v3_*.sql"
+      - "migrations/2026_08_30_v3_admin_super_admin_role.sql"
       - "test/test_v3_*.py"
+      - "scripts/deploy-v3-admin.sh"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
       - "scripts/v3-c45-runtime-certify.py"
@@ -36,7 +38,9 @@ on:
       - "services/svc-pricing/app/**"
       - "migrations/010_core_auth.sql"
       - "migrations/2026_08_18_v3_*.sql"
+      - "migrations/2026_08_30_v3_admin_super_admin_role.sql"
       - "test/test_v3_*.py"
+      - "scripts/deploy-v3-admin.sh"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
       - "scripts/v3-c45-runtime-certify.py"
@@ -83,15 +87,32 @@ jobs:
 
       - name: Validate certification shell syntax
         run: |
+          bash -n scripts/deploy-v3-admin.sh
           bash -n scripts/v3-c3-authenticated-adapter-certify.sh
           bash -n scripts/v3-c4-c6-certify.sh
 
-      - name: Run Core Admin authorization tests
+      - name: Validate Admin deployment safety policy
+        run: |
+          grep -Fq -- '-v "bootstrap_email=$bootstrap_email"' scripts/deploy-v3-admin.sh
+          grep -Fq "set_config('desifaces.bootstrap_email', :'bootstrap_email', true)" scripts/deploy-v3-admin.sh
+          grep -Fq "current_setting('desifaces.bootstrap_email', true)" scripts/deploy-v3-admin.sh
+          grep -Fq './scripts/v3-compose.sh up -d --no-deps svc-core' scripts/deploy-v3-admin.sh
+          if grep -Fq "current_setting('BOOTSTRAP_EMAIL'" scripts/deploy-v3-admin.sh; then
+            echo 'FAIL: obsolete env/current_setting bootstrap mismatch returned'
+            exit 1
+          fi
+          if grep -Fq -- '-e BOOTSTRAP_EMAIL' scripts/deploy-v3-admin.sh; then
+            echo 'FAIL: container env bootstrap transport returned'
+            exit 1
+          fi
+          echo 'V3_ADMIN_DEPLOYMENT_POLICY=PASS'
+
+      - name: Run Core Admin authorization and deployment tests
         env:
           PYTHONPATH: services/svc-core/app
           JWT_SECRET: v3-admin-ci-jwt-secret
           REFRESH_TOKEN_HMAC_SECRET: v3-admin-ci-refresh-secret
-        run: python -m pytest -q test/test_v3_admin_authorization.py
+        run: python -m pytest -q test/test_v3_admin_authorization.py test/test_v3_admin_deployment.py
 
       - name: Run canonical foundation unit tests
         env:
