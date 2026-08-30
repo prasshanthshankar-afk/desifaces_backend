@@ -161,7 +161,7 @@ if [[ -n "$existing_core_id" ]]; then
   printf 'replacement_scope=single_verified_v3_core_container\n'
   docker rm -f "$existing_core_id" >/dev/null
 fi
-./scripts/v3-compose.sh up -d --no-deps --force-recreate svc-core
+./scripts/v3-compose.sh up -d --no-deps svc-core
 
 printf '\n===== 6. WAIT FOR CORE =====\n'
 status="000"
