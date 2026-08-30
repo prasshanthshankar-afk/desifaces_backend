@@ -113,8 +113,28 @@ def _count_from_string(value: str) -> int:
 
 
 def _count_from_mapping(value: Mapping[str, Any]) -> int:
+    # Explicit numeric counts are authoritative when supplied by the caller.
     for key in ("participant_count", "participants_count", "speaker_count", "subject_count", "people_count"):
         count = _positive_int(value.get(key))
+        if count:
+            return count
+
+    # Explicit multi-person policy markers must take precedence over structural
+    # defaults. Face request normalization materializes a one-item `subjects`
+    # list for every single-person identity request, including identities that
+    # Director creates inside a multi-person story. If we inspect that derived
+    # list first, the premium orchestration context is incorrectly downgraded to
+    # participant_count=1.
+    if _truthy(value.get("multi_person")) or _truthy(value.get("multi_speaker")):
+        return MULTI_PERSON_MIN_PARTICIPANTS
+
+    pricing_context = value.get("pricing_context")
+    if isinstance(pricing_context, Mapping):
+        count = _count_from_mapping(pricing_context)
+        if count:
+            return count
+    elif isinstance(pricing_context, str):
+        count = _count_from_string(pricing_context)
         if count:
             return count
 
@@ -129,10 +149,7 @@ def _count_from_mapping(value: Mapping[str, Any]) -> int:
     if composition in {"single", "single_person", "one_person"}:
         return 1
 
-    if _truthy(value.get("multi_person")) or _truthy(value.get("multi_speaker")):
-        return MULTI_PERSON_MIN_PARTICIPANTS
-
-    for nested_key in ("pricing_context", "context", "tags", "metadata", "generation_metadata", "preview_metadata"):
+    for nested_key in ("context", "tags", "metadata", "generation_metadata", "preview_metadata"):
         nested = value.get(nested_key)
         if isinstance(nested, Mapping):
             count = _count_from_mapping(nested)

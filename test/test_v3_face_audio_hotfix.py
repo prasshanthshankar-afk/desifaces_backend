@@ -4,6 +4,7 @@ from pathlib import Path
 
 from desifaces_shared.pricing.multi_person import (
     FACE_MULTI_PERSON,
+    participant_count,
     select_multi_person_pricing,
 )
 
@@ -24,6 +25,32 @@ def test_face_multi_person_is_premium_per_character_not_cast_multiplied() -> Non
     assert face2.variant_params == face5.variant_params == {"num_edits": "1"}
     assert face2.metadata["participant_scaling"] == "per_character_natural_usage"
     assert face5.metadata["participant_count"] == 5
+
+
+def test_director_face_pricing_context_overrides_normalized_single_subject_count() -> None:
+    payload = {
+        "subject_composition_code": "single_person",
+        "subjects": [{}],
+        "num_variants": 1,
+        "pricing_context": {
+            "multi_person": True,
+            "pricing_scope": "director_participant_identity",
+            "participant_count_in_sku": False,
+        },
+    }
+
+    assert participant_count(payload) == 2
+
+
+def test_plain_single_person_payload_remains_single_person() -> None:
+    payload = {
+        "subject_composition_code": "single_person",
+        "subjects": [{}],
+        "num_variants": 1,
+        "pricing_context": {},
+    }
+
+    assert participant_count(payload) == 1
 
 
 def test_director_face_adapter_preserves_single_person_image_but_marks_pricing_multi_person() -> None:
