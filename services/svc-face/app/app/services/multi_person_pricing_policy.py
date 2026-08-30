@@ -37,15 +37,19 @@ def install_multi_person_pricing_policy() -> None:
         if selection is None:
             return pricing
 
-        metadata = dict(pricing.get("metadata") or {})
-        metadata.update(selection.metadata)
+        # svc-pricing expands pricing.meta into variant params. Keep the existing
+        # Face metadata and add the exact quantity key expected by FACE_MULTI_PERSON.
+        meta = dict(pricing.get("meta") or {})
+        meta.update(selection.metadata)
+        meta.update(selection.variant_params)
         pricing.update(
             {
                 "sku_code": selection.sku_code,
                 "variant_code": selection.variant_code,
-                "estimated_units": selection.natural_units,
+                "estimated_units": str(selection.natural_units),
                 "variant_params": selection.variant_params,
-                "metadata": metadata,
+                "meta": meta,
+                "metadata": dict(meta),
                 "multi_person": True,
                 "premium": True,
                 "participant_count": selection.participant_count,
