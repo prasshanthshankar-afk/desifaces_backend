@@ -47,7 +47,7 @@ def test_single_person_does_not_select_multi_person_sku(
         ("fusion", FUSION_MULTI_PERSON, "minutes"),
     ],
 )
-def test_all_multi_person_counts_use_one_sku_per_studio(
+def test_all_multi_person_counts_use_one_sku_per_studio_and_scale_quantity(
     count: int,
     studio: str,
     expected_sku: str,
@@ -63,16 +63,29 @@ def test_all_multi_person_counts_use_one_sku_per_studio(
     assert selection.variant_code == expected_sku
     assert selection.participant_count == count
     assert selection.quantity_param == quantity_param
-    assert selection.variant_params == {quantity_param: "3"}
     assert selection.metadata["participant_count_in_sku"] is False
+
+    if studio in {"face", "fusion"}:
+        assert selection.billable_units == 3 * count
+        assert selection.variant_params == {quantity_param: str(3 * count)}
+        assert selection.metadata["participant_scaling"] == "natural_units_x_participants"
+    else:
+        # Audio is already metered by aggregate generated characters. Multiplying
+        # the same characters by speaker count would double-charge the workload.
+        assert selection.billable_units == 3
+        assert selection.variant_params == {quantity_param: "3"}
+        assert selection.metadata["participant_scaling"] == "aggregate_natural_usage"
 
 
 def test_participant_count_is_explicit_and_not_inferred_from_conversational_prose() -> None:
+    assert participant_count(2) == 2
+    assert participant_count(5) == 5
     assert participant_count({"participant_count": 5}) == 5
     assert participant_count({"participants": [{}, {}, {}, {}]}) == 4
     assert participant_count({"subject_composition": "two_people"}) == 2
     assert participant_count({"pricing_context": {"multi_person": True}}) == 2
     assert participant_count('{"speaker_count": 3}') == 3
+    assert participant_count({"context": '{"participant_count": 4}'}) == 4
     assert participant_count("a discussion among five friends") == 1
 
 
@@ -118,6 +131,16 @@ def test_runtime_policies_are_installed_for_face_audio_and_fusion() -> None:
     for rel_path, marker in expected.items():
         source = (ROOT / rel_path).read_text(encoding="utf-8")
         assert marker in source, rel_path
+
+
+def test_face_and_fusion_propagate_exact_variant_quantity_to_pricing_meta() -> None:
+    for rel_path in (
+        "services/svc-face/app/app/services/multi_person_pricing_policy.py",
+        "services/svc-fusion/app/app/services/multi_person_pricing_policy.py",
+    ):
+        source = (ROOT / rel_path).read_text(encoding="utf-8")
+        assert "meta.update(selection.variant_params)" in source
+        assert '"meta": meta' in source
 
 
 def test_migration_has_three_participant_agnostic_skus_and_native_quantity_contracts() -> None:
