@@ -195,6 +195,11 @@ class CreatorPlatformRequest(BaseModel):
     seed: Optional[int] = None
     request_nonce: Optional[str] = None
 
+    # Internal orchestration-only pricing context. This is intentionally separate
+    # from subject_composition_code: Director creates one identity image per
+    # participant while the owning workflow can still be multi-person.
+    pricing_context: Dict[str, Any] = Field(default_factory=dict)
+
     # I2I (old + new)
     source_image_url: Optional[str] = None
     source_image_asset_id: Optional[str] = None
