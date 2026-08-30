@@ -64,7 +64,7 @@ docker exec -i "$DB_CONTAINER" sh -lc 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USE
 echo "PASS: migration applied"
 
 banner "3. CERTIFY LIVE CATALOG"
-docker exec "$DB_CONTAINER" sh -lc 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+docker exec -i "$DB_CONTAINER" sh -lc 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
 DO $$
 DECLARE
   sku_count integer;
@@ -133,7 +133,7 @@ wait_http "svc-pricing" "http://127.0.0.1:18009/api/health"
 
 banner "6. VERIFY DEPLOYED POLICY CODE"
 for container in df-v3-svc-face df-v3-svc-audio df-v3-svc-fusion; do
-  docker exec "$container" python - <<'PY'
+  docker exec -i "$container" python - <<'PY'
 from desifaces_shared.pricing.multi_person import select_multi_person_pricing
 
 assert select_multi_person_pricing(
