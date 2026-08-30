@@ -20,11 +20,29 @@ def _worker_concurrency(default_batch_size: int) -> int:
         return 32
 
 
+def _stale_after_seconds() -> int:
+    raw = str(os.getenv("DF_AUDIO_WORKER_STALE_SECONDS", "90") or "90").strip()
+    try:
+        return max(30, min(900, int(raw)))
+    except Exception:
+        return 90
+
+
+def _max_attempts() -> int:
+    raw = str(os.getenv("DF_AUDIO_WORKER_MAX_ATTEMPTS", "3") or "3").strip()
+    try:
+        return max(1, min(10, int(raw)))
+    except Exception:
+        return 3
+
+
 class AudioWorker:
     def __init__(self):
         self.poll_secs = float(settings.WORKER_POLL_SECS)
         self.batch_size = max(1, int(settings.WORKER_BATCH_SIZE))
         self.concurrency = _worker_concurrency(self.batch_size)
+        self.stale_after_seconds = _stale_after_seconds()
+        self.max_attempts = _max_attempts()
 
         self.pool = None
         self.jobs = None
@@ -34,6 +52,19 @@ class AudioWorker:
             return
         self.pool = await get_pool()
         self.jobs = TTSJobsRepo(self.pool, studio_type="audio")
+
+    async def _recover_stale_jobs(self) -> None:
+        recovered = await self.jobs.requeue_stale_running_jobs(
+            stale_after_seconds=self.stale_after_seconds,
+            max_attempts=self.max_attempts,
+            limit=max(self.batch_size, self.concurrency),
+        )
+        if recovered:
+            logger.warning(
+                "Recovered %s stale Audio jobs after expired worker lease: %s",
+                len(recovered),
+                ",".join(recovered),
+            )
 
     async def _process_one(self, job_id: str) -> None:
         orch = TTSOrchestrator(self.pool)
@@ -71,14 +102,23 @@ class AudioWorker:
     async def run_forever(self) -> None:
         await self._ensure_init()
         logger.info(
-            "AudioWorker started poll_secs=%s batch_size=%s concurrency=%s",
+            "AudioWorker started poll_secs=%s batch_size=%s concurrency=%s stale_after_seconds=%s max_attempts=%s",
             self.poll_secs,
             self.batch_size,
             self.concurrency,
+            self.stale_after_seconds,
+            self.max_attempts,
         )
+
+        # Recover abandoned claims immediately at worker startup. This is what
+        # heals jobs stranded by a container restart without creating a new job id
+        # or a second pricing reservation.
+        await self._recover_stale_jobs()
 
         while True:
             try:
+                await self._recover_stale_jobs()
+
                 claim_limit = max(self.batch_size, self.concurrency)
                 job_ids = await self.jobs.fetch_next_queued_jobs(limit=claim_limit)
                 if not job_ids:
