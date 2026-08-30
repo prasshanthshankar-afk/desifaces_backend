@@ -28,6 +28,23 @@ def _request_context(req: Any) -> Dict[str, Any]:
     return context
 
 
+def _multi_person_meta(meta: Any, *, count: int, units: Any = None) -> Dict[str, Any]:
+    out = dict(meta or {})
+    if units is not None:
+        out["chars_1k"] = str(units)
+    out.update(
+        {
+            "multi_person": True,
+            "premium": True,
+            "participant_count": int(count),
+            "participant_count_in_sku": False,
+            "participant_scaling": "aggregate_natural_usage",
+            "pricing_policy": "multi_person_workload_v1",
+        }
+    )
+    return out
+
+
 def install_multi_person_pricing_policy() -> None:
     """
     Install request-scoped Audio pricing routing.
@@ -37,7 +54,9 @@ def install_multi_person_pricing_policy() -> None:
     A ContextVar keeps concurrent requests isolated.
     """
     from app.api.routes import tts_jobs as routes
-    from app.services.tts_orchestrator import TTSOrchestrator
+    from app.services import tts_orchestrator as tts_module
+
+    TTSOrchestrator = tts_module.TTSOrchestrator
 
     if getattr(routes, "_desifaces_multi_person_pricing_installed", False):
         return
@@ -65,26 +84,17 @@ def install_multi_person_pricing_policy() -> None:
         _participant_count_ctx.set(count)
         payload = dict(original_build_payload(*args, **kwargs) or {})
         if count >= 2:
-            pricing_context = payload.get("pricing_context")
-            if not isinstance(pricing_context, dict):
-                pricing_context = {}
-            pricing_context.update(
-                {
-                    "multi_person": True,
-                    "premium": True,
-                    "participant_count": count,
-                    "participant_count_in_sku": False,
-                    "pricing_policy": "multi_person_workload_v1",
-                }
+            payload["pricing_context"] = _multi_person_meta(
+                payload.get("pricing_context"),
+                count=count,
             )
-            payload["pricing_context"] = pricing_context
         return payload
 
     routes._build_audio_payload = build_payload_wrapped
 
     original_init = TTSOrchestrator.__init__
 
-    def init_wrapped(self: TTSOrchestrator, *args: Any, **kwargs: Any) -> None:
+    def init_wrapped(self: Any, *args: Any, **kwargs: Any) -> None:
         original_init(self, *args, **kwargs)
         if _participant_count_ctx.get() >= 2:
             # Instance-level override: no class/global SKU mutation and therefore
@@ -105,19 +115,31 @@ def install_multi_person_pricing_policy() -> None:
             units = str(kwargs.get("units") or "1")
             kwargs["sku_code"] = AUDIO_MULTI_PERSON
             kwargs["units"] = units
-            meta = dict(kwargs.get("meta") or {})
-            meta.update(
-                {
-                    "chars_1k": units,
-                    "multi_person": True,
-                    "premium": True,
-                    "participant_count": count,
-                    "participant_count_in_sku": False,
-                    "pricing_policy": "multi_person_workload_v1",
-                }
+            kwargs["meta"] = _multi_person_meta(
+                kwargs.get("meta"),
+                count=count,
+                units=units,
             )
-            kwargs["meta"] = meta
         return original_preview_spec(*args, **kwargs)
 
     routes.PricingPreviewSpec = preview_spec_wrapped
+
+    # create_job builds PricingReserveSpec inside TTSOrchestrator. Preserve the
+    # same participant context used by preview so quote confirmation and reserve
+    # cannot diverge for a multi-person request.
+    original_reserve_spec = tts_module.PricingReserveSpec
+
+    def reserve_spec_wrapped(*args: Any, **kwargs: Any):
+        count = _participant_count_ctx.get()
+        if count >= 2:
+            units = str(kwargs.get("units") or "1")
+            kwargs["sku_code"] = AUDIO_MULTI_PERSON
+            kwargs["meta"] = _multi_person_meta(
+                kwargs.get("meta"),
+                count=count,
+                units=units,
+            )
+        return original_reserve_spec(*args, **kwargs)
+
+    tts_module.PricingReserveSpec = reserve_spec_wrapped
     routes._desifaces_multi_person_pricing_installed = True
