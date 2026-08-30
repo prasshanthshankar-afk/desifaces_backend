@@ -27,6 +27,7 @@ on:
       - "scripts/v3-multiperson-story-runtime-certify.py"
       - "scripts/v3-mps-functional-test.sh"
       - "scripts/v3-mps2-visual-face-proof.sh"
+      - "scripts/v3-face-audio-hotfix-*.sh"
       - "docker-compose.v3.yml"
       - ".github/workflows/v3-contract-tests.yml"
   pull_request:
@@ -53,6 +54,7 @@ on:
       - "scripts/v3-multiperson-story-runtime-certify.py"
       - "scripts/v3-mps-functional-test.sh"
       - "scripts/v3-mps2-visual-face-proof.sh"
+      - "scripts/v3-face-audio-hotfix-*.sh"
       - "docker-compose.v3.yml"
       - ".github/workflows/v3-contract-tests.yml"
 
@@ -107,6 +109,10 @@ jobs:
           bash -n scripts/v3-multiperson-story-certify.sh
           bash -n scripts/v3-mps-functional-test.sh
           bash -n scripts/v3-mps2-visual-face-proof.sh
+          bash -n scripts/v3-face-audio-hotfix-certify.sh
+          bash -n scripts/v3-face-audio-hotfix-runner.sh
+          bash -n scripts/v3-face-audio-hotfix-launch.sh
+          bash -n scripts/v3-face-audio-hotfix-status.sh
 
       - name: Run canonical and Director unit tests
         env:
