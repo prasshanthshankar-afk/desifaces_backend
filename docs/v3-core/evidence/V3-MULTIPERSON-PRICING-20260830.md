@@ -165,7 +165,9 @@ The initial premium unit-rate policy is `1.25x` the corresponding baseline catal
 
 The change is additive. One-person requests continue through the pre-existing service SKU selection. Explicit 2+ participant context switches only the owning studio operation to its multi-person premium SKU. Participant count is retained as metadata. Face and Fusion expand their existing quantity parameters to participant-scaled workload; Audio retains aggregate `chars_1k` to avoid double charging. The migration creates only new catalog rows and does not mutate existing single-person rows. Audio selection is request-scoped to prevent cross-request premium leakage. The policy is installed idempotently at service startup.
 
-## 14. Test and certification result
+## 14. Test and certification plan
+
+Certification plan and observed result:
 
 - Unit tests: participant normalization, 1-person fallback, 2/3/4/5+ same-SKU selection, workload unit conversion and policy wiring covered by the V3 canonical suite.
 - Contract tests: shared pricing preview compatibility and Audio preview/reserve metadata parity covered.
