@@ -1504,15 +1504,24 @@ async def _fetch_active_payment_sources(conn, *, user_id: UUID) -> List[str]:
 
 
 def _is_apple_managed_subscription(row: Optional[Dict[str, Any]]) -> bool:
-    return _subscription_provider(row) == "apple_iap"
+    return (
+        _subscription_provider(row) == "apple_iap"
+        and _subscription_row_is_live(row)
+    )
 
 
 def _is_google_play_managed_subscription(row: Optional[Dict[str, Any]]) -> bool:
-    return _subscription_provider(row) == "google_play"
+    return (
+        _subscription_provider(row) == "google_play"
+        and _subscription_row_is_live(row)
+    )
 
 
 def _is_native_iap_managed_subscription(row: Optional[Dict[str, Any]]) -> bool:
-    return _subscription_provider(row) in {"apple_iap", "google_play"}
+    return (
+        _subscription_provider(row) in {"apple_iap", "google_play"}
+        and _subscription_row_is_live(row)
+    )
 
 
 async def _sync_subscription_cycle_credits(conn, *, user_id: UUID) -> Dict[str, Any]:
