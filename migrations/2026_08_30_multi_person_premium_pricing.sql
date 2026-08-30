@@ -1,304 +1,289 @@
--- desifaces V3: Multi-Person Premium Pricing v1
--- Date: 2026-08-30
+-- desifaces V3: simplified multi-person premium pricing
 --
--- Scope:
---   * Adds dedicated 2-person and 3-person premium SKUs for Face, Audio and Fusion.
---   * Adds matching pricing variants so callers can stay on the existing
---     quote -> reserve -> finalize pricing lifecycle.
---   * Clones every existing pricebook override from the corresponding
---     single-person SKU, applying the multi-person premium multiplier.
---   * Does NOT change subscription entitlements, payment products, credit packs,
---     or any existing single-person SKU/variant.
+-- Commercial/architecture rule:
+--   * Single-person flows keep their existing pricing unchanged.
+--   * Every 2+ person flow uses ONE domain-level multi-person pricing entry point.
+--   * Participant count is pricing metadata/input, NEVER part of the SKU code.
+--   * Workload scales through the caller-supplied `premium_units` quantity.
+--   * The same catalog supports 2, 3, 4, 5 ... participants without new SKUs.
 --
--- Commercial policy v1:
---   * 2-person: 1.75x the corresponding single-person unit price/credits.
---   * 3-person: 2.50x the corresponding single-person unit price/credits.
+-- New customer-pricing entry points (and only these three):
+--   FACE_MULTI_PERSON
+--   AUDIO_MULTI_PERSON
+--   FUSION_MULTI_PERSON
 --
--- The premium reflects multi-character orchestration, multiple face/audio
--- pipelines, synchronization/composition overhead and additional revision load.
--- Customer pricing remains driven by svc-pricing; provider COGS remains separate.
+-- V1 premium unit-rate policy:
+--   multi-person unit rate = corresponding baseline unit rate * 1.25
+--   total charge then scales with `premium_units` supplied by orchestration.
+--
+-- This migration intentionally DOES NOT modify:
+--   subscriptions, entitlements, credit packs, payment products,
+--   Apple/Google/Stripe configuration, or any single-person SKU/price.
 
 BEGIN;
 
--- ---------------------------------------------------------------------------
--- 1) Source -> premium SKU map
--- ---------------------------------------------------------------------------
-CREATE TEMP TABLE tmp_multi_person_sku_map (
-  source_code       text NOT NULL,
-  target_code       text PRIMARY KEY,
-  participant_count integer NOT NULL CHECK (participant_count IN (2, 3)),
-  multiplier        numeric(10,4) NOT NULL,
-  target_name       text NOT NULL
+CREATE TEMP TABLE _multi_person_pricing_map (
+  target_code text PRIMARY KEY,
+  source_code text NOT NULL,
+  display_name text NOT NULL,
+  target_unit text NOT NULL,
+  category text NOT NULL,
+  premium_rate_multiplier numeric(10,6) NOT NULL
 ) ON COMMIT DROP;
 
-INSERT INTO tmp_multi_person_sku_map
-  (source_code, target_code, participant_count, multiplier, target_name)
+INSERT INTO _multi_person_pricing_map
+  (target_code, source_code, display_name, target_unit, category, premium_rate_multiplier)
 VALUES
-  -- Face Studio
-  ('IMG_STD_RUN',           'IMG_STD_RUN_MP2',           2, 1.7500, 'Image Generation Standard - Multi-Person 2'),
-  ('IMG_STD_RUN',           'IMG_STD_RUN_MP3',           3, 2.5000, 'Image Generation Standard - Multi-Person 3'),
-  ('IMG_HD_RUN',            'IMG_HD_RUN_MP2',            2, 1.7500, 'Image Generation HD - Multi-Person 2'),
-  ('IMG_HD_RUN',            'IMG_HD_RUN_MP3',            3, 2.5000, 'Image Generation HD - Multi-Person 3'),
-  ('FACE_EDIT_PREMIUM_RUN', 'FACE_EDIT_PREMIUM_RUN_MP2', 2, 1.7500, 'Premium Face Edit / Identity-lock - Multi-Person 2'),
-  ('FACE_EDIT_PREMIUM_RUN', 'FACE_EDIT_PREMIUM_RUN_MP3', 3, 2.5000, 'Premium Face Edit / Identity-lock - Multi-Person 3'),
+  ('FACE_MULTI_PERSON',   'FACE_EDIT_PREMIUM_RUN', 'Face Studio - Multi-Person Premium',   'premium_unit', 'face',   1.25),
+  ('AUDIO_MULTI_PERSON',  'AUDIO_TTS_1K_CHARS',    'Audio Studio - Multi-Person Premium',  'premium_unit', 'audio',  1.25),
+  ('FUSION_MULTI_PERSON', 'FUSION_TALK_MIN',       'Fusion Studio - Multi-Person Premium', 'premium_unit', 'fusion', 1.25);
 
-  -- Audio Studio
-  ('AUDIO_TTS_1K_CHARS',    'AUDIO_TTS_1K_CHARS_MP2',    2, 1.7500, 'TTS - Multi-Person 2 (per 1k characters)'),
-  ('AUDIO_TTS_1K_CHARS',    'AUDIO_TTS_1K_CHARS_MP3',    3, 2.5000, 'TTS - Multi-Person 3 (per 1k characters)'),
-
-  -- Fusion Studio
-  ('FUSION_TALK_MIN',       'FUSION_TALK_MIN_MP2',       2, 1.7500, 'Talking Video - Multi-Person 2 (per minute)'),
-  ('FUSION_TALK_MIN',       'FUSION_TALK_MIN_MP3',       3, 2.5000, 'Talking Video - Multi-Person 3 (per minute)');
-
--- Fail closed if the expected single-person source catalog is not present.
+-- Fail closed if the baseline catalog required to derive V1 rates is incomplete.
 DO $$
 DECLARE
   missing_sources text;
 BEGIN
-  SELECT string_agg(DISTINCT m.source_code, ', ' ORDER BY m.source_code)
+  SELECT string_agg(m.source_code, ', ' ORDER BY m.source_code)
     INTO missing_sources
-  FROM tmp_multi_person_sku_map m
+  FROM _multi_person_pricing_map m
   LEFT JOIN pricing_skus s ON s.code = m.source_code
   WHERE s.code IS NULL;
 
   IF missing_sources IS NOT NULL THEN
-    RAISE EXCEPTION 'Multi-person pricing migration blocked; missing source SKU(s): %', missing_sources;
+    RAISE EXCEPTION 'Multi-person pricing migration aborted; missing baseline SKU(s): %', missing_sources;
   END IF;
 END $$;
 
 -- ---------------------------------------------------------------------------
--- 2) Premium SKU catalog
+-- 1. Exactly three generic multi-person SKUs.
+--    No MP2 / MP3 / MP4 / MP5 SKU proliferation.
 -- ---------------------------------------------------------------------------
-INSERT INTO pricing_skus
-  (code, name, unit, category, provider_hint, default_unit_credits,
-   status, effective_from, effective_to, metadata_json)
+INSERT INTO pricing_skus (
+  code,
+  name,
+  unit,
+  category,
+  provider_hint,
+  default_unit_credits,
+  status,
+  effective_from,
+  effective_to,
+  metadata_json
+)
 SELECT
   m.target_code,
-  m.target_name,
-  s.unit,
-  s.category,
-  s.provider_hint,
-  CEIL(s.default_unit_credits * m.multiplier)::bigint,
-  s.status,
-  '2026-08-30 00:00:00+00'::timestamptz,
-  s.effective_to,
-  COALESCE(s.metadata_json, '{}'::jsonb) || jsonb_build_object(
+  m.display_name,
+  m.target_unit,
+  m.category,
+  src.provider_hint,
+  CEIL(src.default_unit_credits * m.premium_rate_multiplier)::bigint,
+  'active',
+  now(),
+  NULL,
+  jsonb_build_object(
     'multi_person', true,
     'premium', true,
-    'participant_count', m.participant_count,
-    'pricing_multiplier', m.multiplier,
+    'participant_count_in_sku', false,
+    'minimum_participants', 2,
+    'pricing_policy', 'multi_person_workload_v1',
+    'billing_quantity', 'caller_computed_premium_units',
+    'quantity_param', 'premium_units',
+    'premium_rate_multiplier', m.premium_rate_multiplier,
     'source_sku', m.source_code,
-    'pricing_policy', 'multi_person_complexity_premium_v1',
-    'pricing_seed', '20260830_multi_person_premium_v1'
+    'catalog_rule', 'one_sku_per_studio'
   )
-FROM tmp_multi_person_sku_map m
-JOIN pricing_skus s ON s.code = m.source_code
-ON CONFLICT (code) DO UPDATE
-SET name                 = EXCLUDED.name,
-    unit                 = EXCLUDED.unit,
-    category             = EXCLUDED.category,
-    provider_hint        = EXCLUDED.provider_hint,
-    default_unit_credits = EXCLUDED.default_unit_credits,
-    status               = EXCLUDED.status,
-    effective_to         = EXCLUDED.effective_to,
-    metadata_json        = EXCLUDED.metadata_json;
+FROM _multi_person_pricing_map m
+JOIN pricing_skus src ON src.code = m.source_code
+ON CONFLICT (code) DO UPDATE SET
+  name = EXCLUDED.name,
+  unit = EXCLUDED.unit,
+  category = EXCLUDED.category,
+  provider_hint = EXCLUDED.provider_hint,
+  default_unit_credits = EXCLUDED.default_unit_credits,
+  status = 'active',
+  effective_to = NULL,
+  metadata_json = pricing_skus.metadata_json || EXCLUDED.metadata_json;
 
 -- ---------------------------------------------------------------------------
--- 3) Clone all existing web/mobile/API pricebook overrides
+-- 2. Clone every applicable pricebook row from the baseline SKU and apply the
+--    same 1.25 premium unit-rate uplift. Quantity remains completely separate.
 -- ---------------------------------------------------------------------------
--- This intentionally derives from the current source-SKU price in each pricebook.
--- It therefore preserves channel/currency policy (USD/INR, web/mobile/API) without
--- duplicating those business rules in application code.
-INSERT INTO pricing_sku_prices
-  (pricebook_id, sku_code, unit_credits_override, unit_money_override,
-   min_qty, max_qty, metadata_json)
+INSERT INTO pricing_sku_prices (
+  pricebook_id,
+  sku_code,
+  unit_credits_override,
+  unit_money_override,
+  min_qty,
+  max_qty,
+  metadata_json
+)
 SELECT
   p.pricebook_id,
   m.target_code,
   CASE
     WHEN p.unit_credits_override IS NULL THEN NULL
-    ELSE CEIL(p.unit_credits_override * m.multiplier)::bigint
+    ELSE CEIL(p.unit_credits_override * m.premium_rate_multiplier)::bigint
   END,
   CASE
     WHEN p.unit_money_override IS NULL THEN NULL
-    ELSE ROUND(p.unit_money_override * m.multiplier, 2)
+    ELSE ROUND(p.unit_money_override * m.premium_rate_multiplier, 8)
   END,
   p.min_qty,
   p.max_qty,
   COALESCE(p.metadata_json, '{}'::jsonb) || jsonb_build_object(
     'multi_person', true,
     'premium', true,
-    'participant_count', m.participant_count,
-    'pricing_multiplier', m.multiplier,
-    'source_sku', m.source_code,
-    'pricing_policy', 'multi_person_complexity_premium_v1',
-    'pricing_seed', '20260830_multi_person_premium_v1'
+    'participant_count_in_sku', false,
+    'pricing_policy', 'multi_person_workload_v1',
+    'quantity_param', 'premium_units',
+    'premium_rate_multiplier', m.premium_rate_multiplier,
+    'source_sku', m.source_code
   )
-FROM tmp_multi_person_sku_map m
+FROM _multi_person_pricing_map m
 JOIN pricing_sku_prices p ON p.sku_code = m.source_code
-ON CONFLICT (pricebook_id, sku_code) DO UPDATE
-SET unit_credits_override = EXCLUDED.unit_credits_override,
-    unit_money_override   = EXCLUDED.unit_money_override,
-    min_qty               = EXCLUDED.min_qty,
-    max_qty               = EXCLUDED.max_qty,
-    metadata_json         = EXCLUDED.metadata_json;
+ON CONFLICT (pricebook_id, sku_code) DO UPDATE SET
+  unit_credits_override = EXCLUDED.unit_credits_override,
+  unit_money_override = EXCLUDED.unit_money_override,
+  min_qty = EXCLUDED.min_qty,
+  max_qty = EXCLUDED.max_qty,
+  metadata_json = pricing_sku_prices.metadata_json || EXCLUDED.metadata_json;
 
 -- ---------------------------------------------------------------------------
--- 4) Source -> premium variant map
+-- 3. Matching variant codes keep preview/quote integration simple.
+--    Variant code == SKU code intentionally. They are separate catalog tables.
 -- ---------------------------------------------------------------------------
-CREATE TEMP TABLE tmp_multi_person_variant_map (
-  source_variant    text NOT NULL,
-  target_variant    text PRIMARY KEY,
-  participant_count integer NOT NULL CHECK (participant_count IN (2, 3)),
-  multiplier        numeric(10,4) NOT NULL,
-  target_name       text NOT NULL
-) ON COMMIT DROP;
-
-INSERT INTO tmp_multi_person_variant_map
-  (source_variant, target_variant, participant_count, multiplier, target_name)
-VALUES
-  -- Face Studio
-  ('FACE_IMAGE_STD_BATCH',    'FACE_IMAGE_STD_BATCH_MP2',    2, 1.7500, 'Face Studio: Standard images - Multi-Person 2'),
-  ('FACE_IMAGE_STD_BATCH',    'FACE_IMAGE_STD_BATCH_MP3',    3, 2.5000, 'Face Studio: Standard images - Multi-Person 3'),
-  ('FACE_IMAGE_HD_BATCH',     'FACE_IMAGE_HD_BATCH_MP2',     2, 1.7500, 'Face Studio: HD images - Multi-Person 2'),
-  ('FACE_IMAGE_HD_BATCH',     'FACE_IMAGE_HD_BATCH_MP3',     3, 2.5000, 'Face Studio: HD images - Multi-Person 3'),
-  ('FACE_EDIT_PREMIUM_BATCH', 'FACE_EDIT_PREMIUM_BATCH_MP2', 2, 1.7500, 'Face Studio: Premium edits - Multi-Person 2'),
-  ('FACE_EDIT_PREMIUM_BATCH', 'FACE_EDIT_PREMIUM_BATCH_MP3', 3, 2.5000, 'Face Studio: Premium edits - Multi-Person 3'),
-
-  -- Audio Studio
-  ('AUDIO_TTS',               'AUDIO_TTS_MP2',               2, 1.7500, 'Audio Studio: TTS - Multi-Person 2'),
-  ('AUDIO_TTS',               'AUDIO_TTS_MP3',               3, 2.5000, 'Audio Studio: TTS - Multi-Person 3'),
-
-  -- Fusion Studio
-  ('FUSION_TALKING_VIDEO',    'FUSION_TALKING_VIDEO_MP2',    2, 1.7500, 'Fusion Studio: Talking video - Multi-Person 2'),
-  ('FUSION_TALKING_VIDEO',    'FUSION_TALKING_VIDEO_MP3',    3, 2.5000, 'Fusion Studio: Talking video - Multi-Person 3');
-
--- Fail closed if the corresponding single-person variants are unavailable.
-DO $$
-DECLARE
-  missing_variants text;
-BEGIN
-  SELECT string_agg(DISTINCT m.source_variant, ', ' ORDER BY m.source_variant)
-    INTO missing_variants
-  FROM tmp_multi_person_variant_map m
-  LEFT JOIN pricing_variants v ON v.code = m.source_variant
-  WHERE v.code IS NULL;
-
-  IF missing_variants IS NOT NULL THEN
-    RAISE EXCEPTION 'Multi-person pricing migration blocked; missing source variant(s): %', missing_variants;
-  END IF;
-END $$;
-
-INSERT INTO pricing_variants
-  (code, name, category, is_active, metadata_json)
+INSERT INTO pricing_variants (
+  code,
+  name,
+  category,
+  is_active,
+  metadata_json
+)
 SELECT
-  m.target_variant,
-  m.target_name,
-  v.category,
-  v.is_active,
-  COALESCE(v.metadata_json, '{}'::jsonb) || jsonb_build_object(
+  m.target_code,
+  m.display_name,
+  m.category,
+  true,
+  jsonb_build_object(
     'multi_person', true,
     'premium', true,
-    'participant_count', m.participant_count,
-    'pricing_multiplier', m.multiplier,
-    'source_variant', m.source_variant,
-    'pricing_policy', 'multi_person_complexity_premium_v1',
-    'pricing_seed', '20260830_multi_person_premium_v1'
+    'participant_count_in_sku', false,
+    'minimum_participants', 2,
+    'pricing_policy', 'multi_person_workload_v1',
+    'quantity_param', 'premium_units',
+    'catalog_rule', 'one_variant_per_studio'
   )
-FROM tmp_multi_person_variant_map m
-JOIN pricing_variants v ON v.code = m.source_variant
-ON CONFLICT (code) DO UPDATE
-SET name          = EXCLUDED.name,
-    category      = EXCLUDED.category,
-    is_active     = EXCLUDED.is_active,
-    metadata_json = EXCLUDED.metadata_json;
+FROM _multi_person_pricing_map m
+ON CONFLICT (code) DO UPDATE SET
+  name = EXCLUDED.name,
+  category = EXCLUDED.category,
+  is_active = true,
+  metadata_json = pricing_variants.metadata_json || EXCLUDED.metadata_json;
 
--- Clone each source variant line while substituting the matching MP2/MP3 SKU.
-INSERT INTO pricing_variant_lines
-  (variant_code, sku_code, qty_mode, qty_value, qty_param, metadata_json)
+-- Keep one deterministic line per multi-person variant. This migration owns
+-- these new variant codes, so replacing their lines is safe and idempotent.
+DELETE FROM pricing_variant_lines
+WHERE variant_code IN ('FACE_MULTI_PERSON', 'AUDIO_MULTI_PERSON', 'FUSION_MULTI_PERSON');
+
+INSERT INTO pricing_variant_lines (
+  variant_code,
+  sku_code,
+  qty_mode,
+  qty_value,
+  qty_param,
+  metadata_json
+)
 SELECT
-  vm.target_variant,
-  sm.target_code,
-  line.qty_mode,
-  line.qty_value,
-  line.qty_param,
-  COALESCE(line.metadata_json, '{}'::jsonb) || jsonb_build_object(
+  m.target_code,
+  m.target_code,
+  'param',
+  NULL,
+  'premium_units',
+  jsonb_build_object(
     'multi_person', true,
-    'premium', true,
-    'participant_count', vm.participant_count,
-    'source_variant', vm.source_variant,
-    'source_sku', sm.source_code,
-    'pricing_policy', 'multi_person_complexity_premium_v1'
+    'participant_count_in_sku', false,
+    'pricing_policy', 'multi_person_workload_v1'
   )
-FROM tmp_multi_person_variant_map vm
-JOIN pricing_variant_lines line
-  ON line.variant_code = vm.source_variant
-JOIN tmp_multi_person_sku_map sm
-  ON sm.source_code = line.sku_code
- AND sm.participant_count = vm.participant_count
-ON CONFLICT (variant_code, sku_code, qty_mode, qty_param) DO UPDATE
-SET qty_value     = EXCLUDED.qty_value,
-    metadata_json = EXCLUDED.metadata_json;
+FROM _multi_person_pricing_map m;
 
 -- ---------------------------------------------------------------------------
--- 5) Certification gates
+-- 4. Certification gates: fail the transaction rather than leave a partial or
+--    proliferated catalog.
 -- ---------------------------------------------------------------------------
 DO $$
 DECLARE
   sku_count integer;
   variant_count integer;
-  variant_line_count integer;
-  bad_credit_rows integer;
-  bad_money_rows integer;
+  line_count integer;
+  bad_catalog_count integer;
+  bad_credit_price_count integer;
+  bad_money_price_count integer;
 BEGIN
   SELECT count(*) INTO sku_count
-  FROM pricing_skus s
-  JOIN tmp_multi_person_sku_map m ON m.target_code = s.code;
-
-  IF sku_count <> 10 THEN
-    RAISE EXCEPTION 'Multi-person pricing certification failed: expected 10 premium SKUs, found %', sku_count;
-  END IF;
+  FROM pricing_skus
+  WHERE code IN ('FACE_MULTI_PERSON', 'AUDIO_MULTI_PERSON', 'FUSION_MULTI_PERSON');
 
   SELECT count(*) INTO variant_count
-  FROM pricing_variants v
-  JOIN tmp_multi_person_variant_map m ON m.target_variant = v.code;
+  FROM pricing_variants
+  WHERE code IN ('FACE_MULTI_PERSON', 'AUDIO_MULTI_PERSON', 'FUSION_MULTI_PERSON');
 
-  IF variant_count <> 10 THEN
-    RAISE EXCEPTION 'Multi-person pricing certification failed: expected 10 premium variants, found %', variant_count;
+  SELECT count(*) INTO line_count
+  FROM pricing_variant_lines
+  WHERE variant_code IN ('FACE_MULTI_PERSON', 'AUDIO_MULTI_PERSON', 'FUSION_MULTI_PERSON')
+    AND sku_code = variant_code
+    AND qty_mode = 'param'
+    AND qty_param = 'premium_units';
+
+  SELECT count(*) INTO bad_catalog_count
+  FROM pricing_skus
+  WHERE code IN ('FACE_MULTI_PERSON', 'AUDIO_MULTI_PERSON', 'FUSION_MULTI_PERSON')
+    AND (
+      COALESCE((metadata_json ->> 'participant_count_in_sku')::boolean, true) <> false
+      OR metadata_json ->> 'quantity_param' <> 'premium_units'
+    );
+
+  SELECT count(*) INTO bad_credit_price_count
+  FROM _multi_person_pricing_map m
+  JOIN pricing_sku_prices src_price ON src_price.sku_code = m.source_code
+  JOIN pricing_sku_prices mp_price
+    ON mp_price.pricebook_id = src_price.pricebook_id
+   AND mp_price.sku_code = m.target_code
+  WHERE src_price.unit_credits_override IS NOT NULL
+    AND mp_price.unit_credits_override IS DISTINCT FROM
+        CEIL(src_price.unit_credits_override * m.premium_rate_multiplier)::bigint;
+
+  SELECT count(*) INTO bad_money_price_count
+  FROM _multi_person_pricing_map m
+  JOIN pricing_sku_prices src_price ON src_price.sku_code = m.source_code
+  JOIN pricing_sku_prices mp_price
+    ON mp_price.pricebook_id = src_price.pricebook_id
+   AND mp_price.sku_code = m.target_code
+  WHERE src_price.unit_money_override IS NOT NULL
+    AND mp_price.unit_money_override IS DISTINCT FROM
+        ROUND(src_price.unit_money_override * m.premium_rate_multiplier, 8);
+
+  IF sku_count <> 3 THEN
+    RAISE EXCEPTION 'Expected exactly 3 multi-person SKUs, found %', sku_count;
   END IF;
 
-  SELECT count(*) INTO variant_line_count
-  FROM pricing_variant_lines l
-  JOIN tmp_multi_person_variant_map m ON m.target_variant = l.variant_code;
-
-  IF variant_line_count <> 10 THEN
-    RAISE EXCEPTION 'Multi-person pricing certification failed: expected 10 premium variant lines, found %', variant_line_count;
+  IF variant_count <> 3 THEN
+    RAISE EXCEPTION 'Expected exactly 3 multi-person variants, found %', variant_count;
   END IF;
 
-  SELECT count(*) INTO bad_credit_rows
-  FROM tmp_multi_person_sku_map m
-  JOIN pricing_sku_prices src ON src.sku_code = m.source_code
-  JOIN pricing_sku_prices dst
-    ON dst.pricebook_id = src.pricebook_id
-   AND dst.sku_code = m.target_code
-  WHERE src.unit_credits_override IS NOT NULL
-    AND dst.unit_credits_override <> CEIL(src.unit_credits_override * m.multiplier)::bigint;
-
-  IF bad_credit_rows <> 0 THEN
-    RAISE EXCEPTION 'Multi-person pricing certification failed: % pricebook credit override mismatch(es)', bad_credit_rows;
+  IF line_count <> 3 THEN
+    RAISE EXCEPTION 'Expected exactly 3 multi-person variant lines, found %', line_count;
   END IF;
 
-  SELECT count(*) INTO bad_money_rows
-  FROM tmp_multi_person_sku_map m
-  JOIN pricing_sku_prices src ON src.sku_code = m.source_code
-  JOIN pricing_sku_prices dst
-    ON dst.pricebook_id = src.pricebook_id
-   AND dst.sku_code = m.target_code
-  WHERE src.unit_money_override IS NOT NULL
-    AND dst.unit_money_override <> ROUND(src.unit_money_override * m.multiplier, 2);
+  IF bad_catalog_count <> 0 THEN
+    RAISE EXCEPTION 'Multi-person catalog metadata/quantity contract invalid for % SKU(s)', bad_catalog_count;
+  END IF;
 
-  IF bad_money_rows <> 0 THEN
-    RAISE EXCEPTION 'Multi-person pricing certification failed: % pricebook money override mismatch(es)', bad_money_rows;
+  IF bad_credit_price_count <> 0 THEN
+    RAISE EXCEPTION 'Multi-person credit price certification failed for % pricebook row(s)', bad_credit_price_count;
+  END IF;
+
+  IF bad_money_price_count <> 0 THEN
+    RAISE EXCEPTION 'Multi-person money price certification failed for % pricebook row(s)', bad_money_price_count;
   END IF;
 END $$;
 
