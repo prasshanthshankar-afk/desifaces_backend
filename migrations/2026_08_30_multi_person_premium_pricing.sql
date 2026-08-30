@@ -107,6 +107,10 @@ ON CONFLICT (code) DO UPDATE SET
 -- ---------------------------------------------------------------------------
 -- 2. Clone every applicable pricebook row from the baseline SKU and apply the
 --    same 1.25 premium unit-rate uplift. Quantity remains completely separate.
+--
+--    IMPORTANT: multi-person rows intentionally do NOT inherit the source
+--    min/max quantity caps. `premium_units` must scale for 2, 4, 5 or more
+--    participants/workload without creating another SKU or hitting max_qty=1.
 -- ---------------------------------------------------------------------------
 INSERT INTO pricing_sku_prices (
   pricebook_id,
@@ -128,8 +132,8 @@ SELECT
     WHEN p.unit_money_override IS NULL THEN NULL
     ELSE ROUND(p.unit_money_override * m.premium_rate_multiplier, 8)
   END,
-  p.min_qty,
-  p.max_qty,
+  1,
+  NULL,
   COALESCE(p.metadata_json, '{}'::jsonb) || jsonb_build_object(
     'multi_person', true,
     'premium', true,
@@ -137,15 +141,16 @@ SELECT
     'pricing_policy', 'multi_person_workload_v1',
     'quantity_param', 'premium_units',
     'premium_rate_multiplier', m.premium_rate_multiplier,
-    'source_sku', m.source_code
+    'source_sku', m.source_code,
+    'unbounded_workload_quantity', true
   )
 FROM _multi_person_pricing_map m
 JOIN pricing_sku_prices p ON p.sku_code = m.source_code
 ON CONFLICT (pricebook_id, sku_code) DO UPDATE SET
   unit_credits_override = EXCLUDED.unit_credits_override,
   unit_money_override = EXCLUDED.unit_money_override,
-  min_qty = EXCLUDED.min_qty,
-  max_qty = EXCLUDED.max_qty,
+  min_qty = 1,
+  max_qty = NULL,
   metadata_json = pricing_sku_prices.metadata_json || EXCLUDED.metadata_json;
 
 -- ---------------------------------------------------------------------------
@@ -208,7 +213,7 @@ FROM _multi_person_pricing_map m;
 
 -- ---------------------------------------------------------------------------
 -- 4. Certification gates: fail the transaction rather than leave a partial or
---    proliferated catalog.
+--    incorrectly capped catalog.
 -- ---------------------------------------------------------------------------
 DO $$
 DECLARE
@@ -216,6 +221,8 @@ DECLARE
   variant_count integer;
   line_count integer;
   bad_catalog_count integer;
+  missing_pricebook_rows integer;
+  bad_quantity_cap_count integer;
   bad_credit_price_count integer;
   bad_money_price_count integer;
 BEGIN
@@ -239,8 +246,21 @@ BEGIN
   WHERE code IN ('FACE_MULTI_PERSON', 'AUDIO_MULTI_PERSON', 'FUSION_MULTI_PERSON')
     AND (
       COALESCE((metadata_json ->> 'participant_count_in_sku')::boolean, true) <> false
-      OR metadata_json ->> 'quantity_param' <> 'premium_units'
+      OR (metadata_json ->> 'quantity_param') IS DISTINCT FROM 'premium_units'
     );
+
+  SELECT count(*) INTO missing_pricebook_rows
+  FROM _multi_person_pricing_map m
+  JOIN pricing_sku_prices src_price ON src_price.sku_code = m.source_code
+  LEFT JOIN pricing_sku_prices mp_price
+    ON mp_price.pricebook_id = src_price.pricebook_id
+   AND mp_price.sku_code = m.target_code
+  WHERE mp_price.sku_code IS NULL;
+
+  SELECT count(*) INTO bad_quantity_cap_count
+  FROM pricing_sku_prices
+  WHERE sku_code IN ('FACE_MULTI_PERSON', 'AUDIO_MULTI_PERSON', 'FUSION_MULTI_PERSON')
+    AND (min_qty IS DISTINCT FROM 1 OR max_qty IS NOT NULL);
 
   SELECT count(*) INTO bad_credit_price_count
   FROM _multi_person_pricing_map m
@@ -276,6 +296,14 @@ BEGIN
 
   IF bad_catalog_count <> 0 THEN
     RAISE EXCEPTION 'Multi-person catalog metadata/quantity contract invalid for % SKU(s)', bad_catalog_count;
+  END IF;
+
+  IF missing_pricebook_rows <> 0 THEN
+    RAISE EXCEPTION 'Multi-person pricebook cloning incomplete for % source row(s)', missing_pricebook_rows;
+  END IF;
+
+  IF bad_quantity_cap_count <> 0 THEN
+    RAISE EXCEPTION 'Multi-person pricebook quantity cap invalid for % row(s)', bad_quantity_cap_count;
   END IF;
 
   IF bad_credit_price_count <> 0 THEN
