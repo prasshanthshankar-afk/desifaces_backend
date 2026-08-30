@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from pydantic import BaseModel, Field
 
@@ -31,6 +32,15 @@ from .studio_routes_runtime import router as studio_router
 class ResumeIn(BaseModel):
     approved: bool
     feedback: str | None = Field(default=None, max_length=12000)
+
+
+class RecentStoryView(BaseModel):
+    story_id: UUID
+    thread_id: str
+    state: str
+    title: str | None = None
+    updated_at: datetime | None = None
+    continue_path: str
 
 
 def _coerce_interrupt_value(value: Any) -> dict | None:
@@ -103,8 +113,6 @@ async def lifespan(app: FastAPI):
         await close_pools()
 
 
-# Only Director-owned participant identity requests are decorated. Ordinary Face
-# Studio requests never pass through this adapter.
 install_director_face_pricing_context()
 
 app = FastAPI(title="desifaces V3 Creative Director", version="3.0", lifespan=lifespan)
@@ -183,6 +191,28 @@ async def get_run(thread_id: str, auth: DirectorAuthContext = Depends(get_direct
     if not values:
         return _queue_view(row)
     return _checkpoint_view(thread_id, values, persisted_interrupt=_snapshot_interrupt(snapshot))
+
+
+@app.get("/api/director/stories/recent", response_model=list[RecentStoryView])
+async def recent_stories(
+    limit: int = Query(default=10, ge=1, le=25),
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    async with app.state.business_pool.acquire() as conn:
+        rows = await app.state.run_store.list_recent(
+            conn, account_id=auth.account_id, owner_user_id=auth.user_id, limit=limit,
+        )
+    return [
+        RecentStoryView(
+            story_id=UUID(str(row["story_id"])),
+            thread_id=str(row["thread_id"]),
+            state=str(row["state"]),
+            title=str(row["title"])[:160] if row["title"] else None,
+            updated_at=row["updated_at"],
+            continue_path=f"/app/multi-person?story={row['story_id']}",
+        )
+        for row in rows
+    ]
 
 
 @app.get("/api/director/stories/{story_id}/workspace", response_model=StoryWorkspaceView)
