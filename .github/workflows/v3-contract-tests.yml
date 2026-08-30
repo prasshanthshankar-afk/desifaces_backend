@@ -103,3 +103,49 @@ jobs:
             test/test_v3_media_generation_foundation.py \
             test/test_v3_subscription_cycle.py \
             test/test_v3_multi_person_pricing.py
+
+  multi-person-pricing-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pricing_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pricing_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pricing integration dependencies
+        run: |
+          python -m pip install --disable-pip-version-check pytest
+          python -m pip install --disable-pip-version-check -r services/svc-pricing/app/requirements.txt
+
+      - name: Apply pricing schema seed and multi-person migration
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d pricing_test -f migrations/001_pricing.sql
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d pricing_test -f migrations/001a_pricing_seed.sql
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d pricing_test -f migrations/2026_08_30_multi_person_premium_pricing.sql
+
+      - name: Run database-backed multi-person pricing quotes
+        env:
+          PYTHONPATH: services/svc-pricing/app:services/shared:services/shared/python:.
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/pricing_test
+          V3_MULTI_PERSON_PRICING_DB_URL: postgresql://postgres:postgres@127.0.0.1:5432/pricing_test
+        run: python -m pytest -q test/test_v3_multi_person_pricing_db.py
