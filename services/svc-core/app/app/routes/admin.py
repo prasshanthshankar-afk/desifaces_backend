@@ -203,7 +203,7 @@ async def patch_user(
 
             before_roles = await _roles_for_user(conn, target_user_id)
             if (
-                patch.is_active is False
+                patch.is_active is not None
                 and PRIVILEGED_ROLES.intersection(before_roles)
                 and "super_admin" not in actor_roles
             ):
