@@ -3,11 +3,7 @@ from __future__ import annotations
 from contextvars import ContextVar
 from typing import Any, Dict
 
-from desifaces_shared.pricing.multi_person import (
-    AUDIO_MULTI_PERSON,
-    audio_units_from_chars,
-    participant_count,
-)
+from desifaces_shared.pricing.multi_person import AUDIO_MULTI_PERSON, participant_count
 
 _participant_count_ctx: ContextVar[int] = ContextVar(
     "desifaces_audio_pricing_participant_count",
@@ -46,8 +42,9 @@ def install_multi_person_pricing_policy() -> None:
     if getattr(routes, "_desifaces_multi_person_pricing_installed", False):
         return
 
-    # Accept forward-compatible structured pricing context without changing the
-    # existing required TTS request fields. Existing clients remain unaffected.
+    # Forward-compatible structured pricing context is additive. Existing clients
+    # remain unaffected; the existing `context` string can also carry JSON such as
+    # {"participant_count": 3}.
     try:
         routes.TTSCreateRequest.model_config = dict(routes.TTSCreateRequest.model_config or {})
         routes.TTSCreateRequest.model_config["extra"] = "allow"
@@ -76,6 +73,7 @@ def install_multi_person_pricing_policy() -> None:
                     "multi_person": True,
                     "premium": True,
                     "participant_count": count,
+                    "participant_count_in_sku": False,
                     "pricing_policy": "multi_person_workload_v1",
                 }
             )
@@ -100,19 +98,21 @@ def install_multi_person_pricing_policy() -> None:
     def preview_spec_wrapped(*args: Any, **kwargs: Any):
         count = _participant_count_ctx.get()
         if count >= 2:
+            # PricingPreviewSpec intentionally exposes only sku_code + units + meta.
+            # svc-pricing expands req.meta into quote params, so the native AUDIO
+            # quantity parameter belongs in meta rather than invented constructor
+            # fields such as variant_code/variant_params.
+            units = str(kwargs.get("units") or "1")
             kwargs["sku_code"] = AUDIO_MULTI_PERSON
-            kwargs["variant_code"] = AUDIO_MULTI_PERSON
-            params = dict(kwargs.get("variant_params") or {})
-            chars = params.get("chars") or params.get("text_length") or 1
-            units = audio_units_from_chars(chars)
-            kwargs["units"] = str(units)
-            kwargs["variant_params"] = {"chars_1k": str(units)}
+            kwargs["units"] = units
             meta = dict(kwargs.get("meta") or {})
             meta.update(
                 {
+                    "chars_1k": units,
                     "multi_person": True,
                     "premium": True,
                     "participant_count": count,
+                    "participant_count_in_sku": False,
                     "pricing_policy": "multi_person_workload_v1",
                 }
             )
