@@ -60,6 +60,41 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _count_from_string(value: str) -> int:
+    """Return an explicitly encoded count from a string, or 0 when absent."""
+    text = str(value or "").strip()
+    if not text:
+        return 0
+
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, Mapping):
+        return _count_from_mapping(parsed)
+
+    # Explicit machine-readable markers only. We intentionally do not infer
+    # multi-person billing from conversational prose.
+    for pattern in (
+        r"(?:participant_count|participants_count|speaker_count|subject_count|people_count)\s*[:=]\s*(\d+)",
+        r"(?:participants|speakers|subjects|people)\s*[:=]\s*(\d+)",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            count = _positive_int(match.group(1))
+            if count:
+                return count
+
+    if re.search(
+        r"(?:multi_person|multi_speaker)\s*[:=]\s*(?:true|1|yes|on)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return MULTI_PERSON_MIN_PARTICIPANTS
+
+    return 0
+
+
 def _count_from_mapping(value: Mapping[str, Any]) -> int:
     for key in ("participant_count", "participants_count", "speaker_count", "subject_count", "people_count"):
         count = _positive_int(value.get(key))
@@ -86,41 +121,30 @@ def _count_from_mapping(value: Mapping[str, Any]) -> int:
             count = _count_from_mapping(nested)
             if count:
                 return count
+        elif isinstance(nested, str):
+            count = _count_from_string(nested)
+            if count:
+                return count
 
     return 0
 
 
 def participant_count(value: Any, *, default: int = 1) -> int:
     """Resolve an explicitly supplied participant count without guessing from prose."""
+    fallback = max(1, int(default))
+
+    # Callers frequently already have a normalized numeric count. Treat bool
+    # separately because bool is an int subclass and must not become participant 1.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _positive_int(value) or fallback
+
     if isinstance(value, Mapping):
-        return _count_from_mapping(value) or max(1, int(default))
+        return _count_from_mapping(value) or fallback
 
     if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return max(1, int(default))
-        try:
-            parsed = json.loads(text)
-        except Exception:
-            parsed = None
-        if isinstance(parsed, Mapping):
-            return _count_from_mapping(parsed) or max(1, int(default))
+        return _count_from_string(value) or fallback
 
-        # Explicit machine-readable markers only. We intentionally do not infer
-        # multi-person billing from conversational prose.
-        for pattern in (
-            r"(?:participant_count|participants_count|speaker_count|subject_count|people_count)\s*[:=]\s*(\d+)",
-            r"(?:participants|speakers|subjects|people)\s*[:=]\s*(\d+)",
-        ):
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                count = _positive_int(match.group(1))
-                if count:
-                    return count
-        if re.search(r"(?:multi_person|multi_speaker)\s*[:=]\s*(?:true|1|yes|on)", text, flags=re.IGNORECASE):
-            return MULTI_PERSON_MIN_PARTICIPANTS
-
-    return max(1, int(default))
+    return fallback
 
 
 def is_multi_person(value: Any) -> bool:
