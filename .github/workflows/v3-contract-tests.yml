@@ -5,18 +5,25 @@ on:
     branches:
       - desifaces-v3
       - "feature/v3-*"
+      - "release/v3-*"
     paths:
       - "services/shared/df_contracts/**"
       - "services/shared/python/desifaces_shared/identity/**"
       - "services/shared/python/desifaces_shared/pricing/**"
       - "services/shared/python/desifaces_shared/v3/**"
+      - "services/svc-core/app/**"
       - "services/svc-face/app/**"
       - "services/svc-audio/app/**"
       - "services/svc-fusion/app/**"
       - "services/svc-pricing/app/**"
+      - "migrations/010_core_auth.sql"
       - "migrations/2026_08_18_v3_*.sql"
+      - "migrations/2026_08_30_v3_admin_super_admin_role.sql"
       - "migrations/2026_08_30_multi_person_premium_pricing.sql"
       - "test/test_v3_*.py"
+      - "scripts/deploy-v3-admin.sh"
+      - "scripts/grant-specific-super-admin.sh"
+      - "scripts/v3-compose.sh"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
       - "scripts/v3-c45-runtime-certify.py"
@@ -31,13 +38,19 @@ on:
       - "services/shared/python/desifaces_shared/identity/**"
       - "services/shared/python/desifaces_shared/pricing/**"
       - "services/shared/python/desifaces_shared/v3/**"
+      - "services/svc-core/app/**"
       - "services/svc-face/app/**"
       - "services/svc-audio/app/**"
       - "services/svc-fusion/app/**"
       - "services/svc-pricing/app/**"
+      - "migrations/010_core_auth.sql"
       - "migrations/2026_08_18_v3_*.sql"
+      - "migrations/2026_08_30_v3_admin_super_admin_role.sql"
       - "migrations/2026_08_30_multi_person_premium_pricing.sql"
       - "test/test_v3_*.py"
+      - "scripts/deploy-v3-admin.sh"
+      - "scripts/grant-specific-super-admin.sh"
+      - "scripts/v3-compose.sh"
       - "scripts/v3-c3-authenticated-adapter-certify.sh"
       - "scripts/v3-c4-c6-certify.sh"
       - "scripts/v3-c45-runtime-certify.py"
@@ -61,15 +74,16 @@ jobs:
           python-version: "3.11"
 
       - name: Install focused test dependencies
-        run: python -m pip install --disable-pip-version-check pytest "pydantic>=2,<3" "httpx>=0.27,<1"
+        run: python -m pip install --disable-pip-version-check pytest "pydantic>=2,<3" "httpx>=0.27,<1" -r services/svc-core/app/app/requirements.txt
 
-      - name: Compile V3 contract and compatibility code
+      - name: Compile V3 contract, Core Admin, pricing and compatibility code
         run: |
           python -m compileall -q \
             services/shared/df_contracts \
             services/shared/python/desifaces_shared/identity \
             services/shared/python/desifaces_shared/pricing \
             services/shared/python/desifaces_shared/v3 \
+            services/svc-core/app/app \
             services/svc-face/app/app/services/multi_person_pricing_policy.py \
             services/svc-face/app/app/services/v3_face_adapter_shadow.py \
             services/svc-face/app/app/api/v3_adapter_probe.py \
@@ -88,9 +102,95 @@ jobs:
 
       - name: Validate certification shell syntax
         run: |
+          bash -n scripts/deploy-v3-admin.sh
+          bash -n scripts/grant-specific-super-admin.sh
+          bash -n scripts/v3-compose.sh
           bash -n scripts/v3-c3-authenticated-adapter-certify.sh
           bash -n scripts/v3-c4-c6-certify.sh
           bash -n scripts/v3-multiperson-pricing-certify.sh
+
+      - name: Validate Admin deployment safety policy
+        run: |
+          grep -Fq -- '-v "bootstrap_email=$bootstrap_email"' scripts/deploy-v3-admin.sh
+          grep -Fq "set_config('desifaces.bootstrap_email', :'bootstrap_email', true)" scripts/deploy-v3-admin.sh
+          grep -Fq "current_setting('desifaces.bootstrap_email', true)" scripts/deploy-v3-admin.sh
+          grep -Fq 'V3_ENV_FILE="${V3_ENV_FILE:-$ROOT/infra/.env}"' scripts/deploy-v3-admin.sh
+          grep -Fq 'V3_ENV_FILE="$V3_ENV_FILE" ./scripts/v3-compose.sh config' scripts/deploy-v3-admin.sh
+          grep -Fq 'V3_ENV_FILE="$V3_ENV_FILE" ./scripts/v3-compose.sh up -d --no-deps svc-core' scripts/deploy-v3-admin.sh
+          grep -Fq 'ENV_FILE="${V3_ENV_FILE:-$ROOT/infra/.env}"' scripts/v3-compose.sh
+          grep -Fq 'SERVICE_ENV_FILE="$ROOT/infra/.env"' scripts/v3-compose.sh
+          grep -Fq 'ln -s "$ENV_FILE" "$SERVICE_ENV_FILE"' scripts/v3-compose.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('scripts/deploy-v3-admin.sh').read_text()
+          preflight = text.index('./scripts/v3-compose.sh config')
+          removal = text.index('docker rm -f "$existing_core_id"')
+          assert preflight < removal, 'Compose preflight must occur before svc-core removal'
+          PY
+          if grep -Fq "current_setting('BOOTSTRAP_EMAIL'" scripts/deploy-v3-admin.sh; then
+            echo 'FAIL: obsolete env/current_setting bootstrap mismatch returned'
+            exit 1
+          fi
+          if grep -Fq -- '-e BOOTSTRAP_EMAIL' scripts/deploy-v3-admin.sh; then
+            echo 'FAIL: container env bootstrap transport returned'
+            exit 1
+          fi
+          echo 'V3_ADMIN_DEPLOYMENT_POLICY=PASS'
+
+      - name: Validate audited specific Super Admin bootstrap policy
+        run: |
+          grep -Fq 'WHERE lower(email)=lower(current_setting('"'"'desifaces.target_super_admin_email'"'"', true))' scripts/grant-specific-super-admin.sh
+          grep -Fq 'AND is_active=true' scripts/grant-specific-super-admin.sh
+          grep -Fq "WHERE role_key='super_admin'" scripts/grant-specific-super-admin.sh
+          grep -Fq 'ON CONFLICT(user_id, role_id) DO NOTHING' scripts/grant-specific-super-admin.sh
+          grep -Fq "'admin.super_admin.controlled_bootstrap'" scripts/grant-specific-super-admin.sh
+          grep -Fq "'grant-specific-super-admin'" scripts/grant-specific-super-admin.sh
+          if grep -Eq 'UPDATE[[:space:]]+core\.users|DELETE[[:space:]]+FROM[[:space:]]+core\.user_roles' scripts/grant-specific-super-admin.sh; then
+            echo 'FAIL: controlled Super Admin bootstrap must not activate users or remove roles'
+            exit 1
+          fi
+          echo 'V3_SUPER_ADMIN_BOOTSTRAP_POLICY=PASS'
+
+      - name: Validate external runtime env binding
+        run: |
+          set -euo pipefail
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
+          cat > "$TMP/runtime.env" <<'ENV'
+          POSTGRES_DB=desifaces_v3
+          POSTGRES_USER=desifaces_v3_admin
+          POSTGRES_PASSWORD=test-only
+          DATABASE_URL=postgresql://desifaces_v3_admin:test-only@desifaces-db:5432/desifaces_v3
+          REDIS_URL=redis://desifaces-redis:6379/0
+          ENV
+          mkdir -p "$TMP/bin"
+          cat > "$TMP/bin/docker" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [[ -L "$GITHUB_WORKSPACE/infra/.env" ]]
+          [[ "$(readlink -f "$GITHUB_WORKSPACE/infra/.env")" == "$(readlink -f "$V3_ENV_FILE")" ]]
+          printf '%s\n' "$*" > "$DOCKER_CAPTURE"
+          SH
+          chmod +x "$TMP/bin/docker"
+          rm -f infra/.env
+          PATH="$TMP/bin:$PATH" DOCKER_CAPTURE="$TMP/docker.args" V3_ENV_FILE="$TMP/runtime.env" bash scripts/v3-compose.sh config
+          grep -Fq "compose --env-file $TMP/runtime.env" "$TMP/docker.args"
+          grep -Fq -- '-f ' "$TMP/docker.args"
+          grep -Fq 'docker-compose.v3.yml config' "$TMP/docker.args"
+          test ! -e infra/.env
+          test ! -L infra/.env
+          echo 'V3_EXTERNAL_RUNTIME_ENV_BINDING=PASS'
+
+      - name: Run Core Admin authorization, deployment and mutation tests
+        env:
+          PYTHONPATH: services/svc-core/app
+          JWT_SECRET: v3-admin-ci-jwt-secret
+          REFRESH_TOKEN_HMAC_SECRET: v3-admin-ci-refresh-secret
+        run: |
+          python -m pytest -q \
+            test/test_v3_admin_authorization.py \
+            test/test_v3_admin_deployment.py \
+            test/test_v3_admin_mutations.py
 
       - name: Run canonical foundation unit tests
         env:
