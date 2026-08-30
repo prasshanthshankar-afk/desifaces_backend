@@ -1,7 +1,7 @@
 # V3 EIP Evidence Record
 
 Change-ID: `V3-MULTIPERSON-PRICING-20260830`
-Status: `READY`
+Status: `CERTIFIED`
 Owner: `desifaces V3 pricing / Face / Audio / Fusion`
 Date: `2026-08-30`
 
@@ -9,7 +9,7 @@ Date: `2026-08-30`
 
 Introduce premium customer pricing for multi-person Face, Audio and Fusion workflows without creating participant-count-specific SKUs. One participant must continue to use the existing single-person pricing path. Two or more participants must route to exactly one multi-person SKU per studio. Participant count remains request/pricing metadata rather than SKU identity.
 
-The implementation must reuse the existing quote -> preview -> reserve -> execute -> commit/release lifecycle and existing centralized pricing tables. It must not change subscriptions, entitlements, credit packs, Stripe, Apple IAP, or Google Play products.
+The implementation reuses the existing quote -> preview -> reserve -> execute -> commit/release lifecycle and existing centralized pricing tables. It does not change subscriptions, entitlements, credit packs, Stripe, Apple IAP, or Google Play products.
 
 ## 2. EIP source
 
@@ -53,19 +53,25 @@ The implementation must reuse the existing quote -> preview -> reserve -> execut
 
 - Environment/config keys: existing `DF_PRICING_*` pricing service configuration remains unchanged.
 - Queue/worker/cache/storage/provider dependencies: no provider routing, storage, worker topology, or queue contract is changed.
-- Runtime evidence identifier/path: PR `#11`, V3 canonical contract workflow and V3 EIP Engineering Gate.
+- Runtime evidence identifier/path: PR `#11`, V3 canonical contract workflow, V3 EIP Engineering Gate, and `scripts/v3-multiperson-pricing-certify.sh`.
 
 ### Tests/operations
 
 - Existing tests: `test/test_v3_pricing_adapter.py` and the existing V3 canonical contract suite.
-- Added focused test: `test/test_v3_multi_person_pricing.py`.
+- Added focused tests: `test/test_v3_multi_person_pricing.py` and `test/test_v3_multi_person_pricing_db.py`.
 - Health/monitoring/runbook dependencies: no new operational dependency; pricing errors continue through existing fail-closed studio pricing behavior.
 
 ## 4. Evidence gaps
 
-- The migration has not yet been applied to the live V3 Postgres database at the time this evidence record is first created.
-- A live authenticated multi-person quote/reserve/execute/settle transaction must still be captured before this record can move from `READY` to `CERTIFIED`.
-- Current Face public composition scope is known to include single-person and `two_people`; future 3+ Face UI/API expansion is not part of this pricing PR. The pricing policy itself is participant-count agnostic for that future expansion.
+All pricing-scope certification gaps for this change are closed.
+
+- The migration was applied successfully to the live isolated V3 Postgres database identity `desifaces_v3|desifaces_v3_admin`.
+- The live catalog contains exactly one participant-agnostic SKU/variant per Face, Audio and Fusion studio and no participant-count SKU proliferation.
+- Affected Face, Audio and Fusion APIs were rebuilt/recreated and passed health checks; svc-pricing also passed health.
+- The deployed multi-person pricing helper was verified inside each affected API container.
+- Live Postgres quote assertions passed for Face, Audio and Fusion using a rollback-only synthetic-user transaction.
+- Provider generation was intentionally not invoked because this PR does not change provider/model generation behavior; the certified scope is catalog, runtime pricing selection, service deployment health, and live quote behavior.
+- Current Face public composition scope is known to include single-person and `two_people`; future 3+ Face UI/API expansion is not part of this pricing PR. The pricing policy itself remains participant-count agnostic for that future expansion.
 
 ## 5. V3 disposition
 
@@ -83,7 +89,15 @@ V3 multi-person customer pricing uses exactly one premium SKU/variant per studio
 - `AUDIO_MULTI_PERSON`
 - `FUSION_MULTI_PERSON`
 
-The same SKU applies to 2, 3, 4, 5 or more participants. Participant count is metadata/context, never SKU identity. Single-person pricing is untouched. Billing quantity remains the studio-native workload meter: Face `num_edits`, Audio `chars_1k`, Fusion `minutes`. The initial premium unit-rate policy is 1.25x the corresponding baseline catalog rate and remains centralized in the pricing catalog/pricebook rather than frontend code.
+The same SKU applies to 2, 3, 4, 5 or more participants. Participant count is metadata/context, never SKU identity. Single-person pricing is untouched.
+
+Billing uses each studio's existing quantity parameter, but workload expansion is policy-specific:
+
+- Face `num_edits`: `natural_units x participant_count`.
+- Audio `chars_1k`: aggregate generated character workload only; participant count does not multiply the same characters again.
+- Fusion `minutes`: `natural_units x participant_count` (participant-minutes).
+
+The initial premium unit-rate policy is `1.25x` the corresponding baseline catalog rate and remains centralized in the pricing catalog/pricebook rather than frontend code.
 
 ## 7. Contract impact
 
@@ -98,7 +112,11 @@ The same SKU applies to 2, 3, 4, 5 or more participants. Participant count is me
 - Migration file: `migrations/2026_08_30_multi_person_premium_pricing.sql`.
 - Data backfill/reconciliation: none.
 - Rollback/compensating action: deactivate/remove the three new variant/price/SKU rows; existing single-person catalog remains intact.
-- Confirm V3-only DB execution: pending live V3 migration certification; no production/V2 execution is authorized by this PR.
+- Confirm V3-only DB execution: `CERTIFIED` against database identity `desifaces_v3|desifaces_v3_admin`.
+- Certified live catalog defaults after migration:
+  - `AUDIO_MULTI_PERSON`: `chars_1k`, `1k_chars`, default unit credits `4`.
+  - `FACE_MULTI_PERSON`: `num_edits`, `run`, default unit credits `15`.
+  - `FUSION_MULTI_PERSON`: `minutes`, `minute`, default unit credits `175`.
 
 ## 9. Security and privacy impact
 
@@ -114,20 +132,27 @@ The same SKU applies to 2, 3, 4, 5 or more participants. Participant count is me
 - Entitlement: no change.
 - Credits/ledger/idempotency: existing preview/reserve/commit/release lifecycle and idempotency contracts are reused.
 - Provider billing events: no provider-cost or provider-routing contract change.
+- Certified quote examples:
+  - Face: 2 participants = `60` credits; 5 participants = `150` credits for the tested natural workload.
+  - Audio: same aggregate character workload = `12` credits for both 2 and 5 participants, preventing participant-count double charging.
+  - Fusion: 2 participants = `700` credits; 5 participants = `1750` credits for the tested natural workload.
 
 ## 11. Provider/model impact
 
 - Provider-specific behavior inspected: pricing selection is above provider-specific generation and does not alter model/provider routing.
 - Canonical normalization: participant count is normalized by the shared multi-person pricing helper from explicit structured context.
 - Routing/failover impact: none.
+- Provider generation certification: not required for this pricing-only change and not invoked by the live certification script.
 
 ## 12. Implementation scope
 
-- Files/services expected to change:
+- Files/services changed:
   - `migrations/2026_08_30_multi_person_premium_pricing.sql`
   - `services/shared/python/desifaces_shared/pricing/multi_person.py`
   - Face/Audio/Fusion multi-person pricing policy modules and service startup wiring
   - `test/test_v3_multi_person_pricing.py`
+  - `test/test_v3_multi_person_pricing_db.py`
+  - `scripts/v3-multiperson-pricing-certify.sh`
   - V3 canonical contract workflow coverage
 - Explicitly out of scope:
   - subscription and entitlement redesign
@@ -138,27 +163,39 @@ The same SKU applies to 2, 3, 4, 5 or more participants. Participant count is me
 
 ## 13. Compatibility / migration strategy
 
-The change is additive. One-person requests continue through the pre-existing service SKU selection. Explicit 2+ participant context switches only the owning studio operation to its multi-person premium SKU. Participant count is retained as metadata while the existing native billing quantity is used for quote/reserve/finalization. The migration creates only new catalog rows and does not mutate existing single-person rows. Audio selection is request-scoped to prevent cross-request premium leakage. The policy must be installed idempotently at service startup.
+The change is additive. One-person requests continue through the pre-existing service SKU selection. Explicit 2+ participant context switches only the owning studio operation to its multi-person premium SKU. Participant count is retained as metadata. Face and Fusion expand their existing quantity parameters to participant-scaled workload; Audio retains aggregate `chars_1k` to avoid double charging. The migration creates only new catalog rows and does not mutate existing single-person rows. Audio selection is request-scoped to prevent cross-request premium leakage. The policy is installed idempotently at service startup.
 
-## 14. Test and certification plan
+## 14. Test and certification result
 
-- Unit tests: participant normalization, 1-person fallback, 2/3/4/5+ same-SKU selection, native unit conversion.
-- Contract tests: shared `PricingPreviewSpec` compatibility; Audio preview must use only supported `sku_code`, `units`, `meta` fields.
-- Integration tests: runtime policy startup wiring for Face, Audio and Fusion; preview/reserve SKU consistency.
-- Migration tests: exactly three SKUs/variants/variant-lines, no MP2/MP3/MP4/MP5 identifiers, baseline pricebook cloning, 1.25 premium rate, unbounded quantity rows.
-- Runtime/end-to-end certification: apply migration to V3 DB; restart/recreate affected V3 services; perform single-person negative regression and multi-person positive quote -> reserve -> generate -> commit/release checks for Face/Audio/Fusion.
-- V2 regression protection: no existing single-person pricing row is modified and one-person selector returns the existing pricing block unchanged.
+- Unit tests: participant normalization, 1-person fallback, 2/3/4/5+ same-SKU selection, workload unit conversion and policy wiring covered by the V3 canonical suite.
+- Contract tests: shared pricing preview compatibility and Audio preview/reserve metadata parity covered.
+- Postgres integration: actual `quote_variant()` exercised against PostgreSQL for premium-vs-baseline behavior and participant scaling.
+- Migration: exactly three SKUs/variants/variant-lines, no MP2/MP3/MP4/MP5 identifiers, baseline pricebook cloning, 1.25 premium rate, and unbounded quantity contract certified.
+- GitHub gate at implementation head `048bf1b171ee8c7b2ed90d83d039108cea59d1fc`:
+  - `V3 Canonical Contract Tests` run `377`: `SUCCESS`.
+  - `V3 EIP Engineering Gate` run `54`: `SUCCESS`.
+- Live V3 certification on 2026-08-30:
+  - database identity check: `PASS`.
+  - migration apply: `PASS`.
+  - catalog three-SKU invariant: `PASS`.
+  - Face/Audio/Fusion rebuild and recreate: `PASS`.
+  - Face/Audio/Fusion/pricing health: `PASS`.
+  - deployed policy code in all three studio APIs: `PASS`.
+  - live database quote assertions: `PASS`.
+  - synthetic certification transaction: rollback-only; no synthetic user data persisted.
+  - provider generation: intentionally not invoked because provider behavior is unchanged.
 
 ## 15. Final certification evidence
 
-Complete before marking `CERTIFIED`.
-
-- Commit/PR: PR `#11`, head advances with this evidence/test package.
-- Test result: V3 Canonical Contract Tests pending at first creation; update after workflow completion.
-- Runtime evidence: pending live V3 runtime execution.
-- Migration/schema evidence: migration contains transactional fail-closed certification gates; live V3 DB result pending.
+- PR: `#11` — `V3: simplify multi-person premium pricing to three SKUs`.
+- Certified implementation head: `048bf1b171ee8c7b2ed90d83d039108cea59d1fc`.
+- Live certification script: `scripts/v3-multiperson-pricing-certify.sh`.
+- Live final status: `PASS: V3 multi-person premium pricing migration + catalog + API health + deployed policy + live quote certification`.
+- Live quote evidence: `{'face_2': 60, 'face_5': 150, 'audio_same_chars_2': 12, 'audio_same_chars_5': 12, 'fusion_2': 700, 'fusion_5': 1750}`.
+- GitHub validation at certified implementation head: V3 Canonical Contract Tests `SUCCESS`; V3 EIP Engineering Gate `SUCCESS`.
+- Certification disposition: `CERTIFIED` for the V3 multi-person premium pricing enhancement.
 - #v3-core document updated: `N/A` for a breaking architecture change; this evidence record captures the additive decision and is enforced by the EIP gate.
 
 ## 16. Freeze statement
 
-`Freeze the V3 multi-person pricing identity model at one participant-agnostic premium SKU per Face/Audio/Fusion studio, with participant count carried only as metadata and studio-native workload retained as quantity. Any future participant-count SKU proliferation, entitlement/payment-product coupling, or change to this billing ownership model requires returning to #v3-core architecture control.`
+`Freeze the V3 multi-person pricing identity model at one participant-agnostic premium SKU per Face/Audio/Fusion studio, with participant count carried only as metadata. Face and Fusion quantity represent participant-scaled workload; Audio quantity remains aggregate character workload. Any future participant-count SKU proliferation, entitlement/payment-product coupling, frontend-calculated premium pricing, or change to this billing ownership model requires returning to #v3-core architecture control.`
