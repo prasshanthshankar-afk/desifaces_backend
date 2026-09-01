@@ -9,10 +9,12 @@ from app.db import get_pool
 from app.repos.fusion_jobs_repo import FusionJobsRepo
 from app.services.fusion_orchestrator import FusionOrchestrator
 from app.services.fusion_quality_policy import install_fusion_quality_policy
+from app.services.fusion_performance_policy import install_fusion_performance_policy
 
 logger = logging.getLogger("fusion_worker")
 
 install_fusion_quality_policy()
+install_fusion_performance_policy()
 
 
 async def run_forever() -> None:
