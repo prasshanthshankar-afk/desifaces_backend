@@ -9,6 +9,7 @@ from app.api import build_router
 from app.config import settings
 from app.db import get_pool
 from app.services.fusion_orchestrator import FusionOrchestrator
+from app.services.pricing_confirmation_policy import install_pricing_confirmation_policy
 
 logger = logging.getLogger("svc-fusion.main")
 
@@ -51,6 +52,8 @@ async def _recovery_loop() -> None:
 
 
 def create_app() -> FastAPI:
+    install_pricing_confirmation_policy()
+
     app = FastAPI(
         title=os.getenv("SERVICE_NAME", "desifaces-service"),
         version=os.getenv("SERVICE_VERSION", os.getenv("GIT_SHA", "dev")),
