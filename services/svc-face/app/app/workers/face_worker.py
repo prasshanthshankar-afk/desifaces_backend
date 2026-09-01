@@ -8,12 +8,15 @@ from typing import Optional
 
 from ..repos.face_jobs_repo import FaceJobsRepo
 from ..services.creator_orchestrator import CreatorOrchestrator
+from ..services.face_performance_policy import install_face_performance_policy
 from app.db import get_pool, close_pool
 
 logger = logging.getLogger("face_worker")
 
 MAX_TRIES_DEFAULT = 3
 IDLE_SLEEP_SECONDS = 3
+
+install_face_performance_policy()
 
 
 class WorkerProcess:
@@ -31,16 +34,14 @@ class WorkerProcess:
             return MAX_TRIES_DEFAULT
 
     async def _count_outputs(self, job_id: str) -> int:
-        # face_job_outputs is the canonical “did anything get produced” table for Face jobs
         q = "SELECT COUNT(*) FROM face_job_outputs WHERE job_id = $1::uuid"
         try:
-            n = await self.repo.fetch_scalar(q, job_id)  # BaseRepository.fetch_scalar
+            n = await self.repo.fetch_scalar(q, job_id)
             return int(n or 0)
         except Exception:
             return 0
 
     async def _count_artifacts(self, job_id: str) -> int:
-        # fallback: artifacts can also indicate successful output
         q = "SELECT COUNT(*) FROM artifacts WHERE job_id = $1::uuid AND kind = 'face_image'"
         try:
             n = await self.repo.fetch_scalar(q, job_id)
@@ -86,20 +87,16 @@ class WorkerProcess:
                         },
                     )
 
-                    # Run orchestrator
                     await self.orchestrator.process_job(job_id)
 
-                    # Re-read job after orchestrator returns (source of truth)
                     job_after = await self.repo.get_job(job_id)
                     status_after = self._norm_status(getattr(job_after, "status", None))
                     err_after = getattr(job_after, "error_message", None)
 
-                    # If orchestrator returned but job is still running/queued -> that's a bug.
                     if status_after in ("running", "queued"):
                         msg = f"Orchestrator returned but job still {status_after}"
                         logger.error(msg, extra={"job_id": job_id, "status": status_after})
 
-                        # Treat as a worker error and reschedule/fail
                         if attempt < max_tries:
                             delay = min(60, 5 * (2 ** (attempt - 1)))
                             await self.repo.reschedule_job(
@@ -117,100 +114,81 @@ class WorkerProcess:
                                 error_message=msg,
                                 meta_patch={"worker_id": self.worker_id},
                             )
-
-                        # Don’t print “finished” as success
-                        await asyncio.sleep(0)
+                            logger.error("Job failed after incomplete processing", extra={"job_id": job_id})
                         continue
 
-                    # If succeeded, sanity-check we actually produced outputs
-                    if status_after in ("succeeded", "success"):
+                    if status_after == "failed":
+                        if attempt < max_tries:
+                            delay = min(60, 5 * (2 ** (attempt - 1)))
+                            await self.repo.reschedule_job(
+                                job_id=job_id,
+                                delay_seconds=delay,
+                                error_code="RETRYABLE_FAILURE",
+                                error_message=err_after or "Face job failed",
+                            )
+                            logger.info("Failed job rescheduled", extra={"job_id": job_id, "delay": delay, "attempt": attempt})
+                        else:
+                            logger.error("Job exhausted retries", extra={"job_id": job_id, "error": err_after})
+                        continue
+
+                    if status_after == "succeeded":
                         outputs = await self._count_outputs(job_id)
                         artifacts = await self._count_artifacts(job_id)
-
-                        if outputs == 0 and artifacts == 0:
-                            msg = "Job marked succeeded but produced zero outputs/artifacts"
+                        if outputs <= 0 and artifacts <= 0:
+                            msg = "Face job marked succeeded but no outputs/artifacts were found"
                             logger.error(msg, extra={"job_id": job_id})
-
-                            # treat like a failure, reschedule if allowed
-                            if attempt < max_tries:
-                                delay = min(60, 5 * (2 ** (attempt - 1)))
-                                await self.repo.reschedule_job(
-                                    job_id=job_id,
-                                    delay_seconds=delay,
-                                    error_code="NO_OUTPUTS",
-                                    error_message=msg,
-                                )
-                                logger.info(
-                                    "Job rescheduled",
-                                    extra={"job_id": job_id, "delay": delay, "attempt": attempt, "reason": "NO_OUTPUTS"},
-                                )
-                            else:
-                                await self.repo.update_status(
-                                    job_id,
-                                    "failed",
-                                    error_code="NO_OUTPUTS",
-                                    error_message=msg,
-                                    meta_patch={"worker_id": self.worker_id},
-                                )
-
-                            await asyncio.sleep(0)
+                            await self.repo.update_status(
+                                job_id,
+                                "failed",
+                                error_code="MISSING_OUTPUT",
+                                error_message=msg,
+                                meta_patch={"worker_id": self.worker_id},
+                            )
                             continue
+                        logger.info("Face job succeeded", extra={"job_id": job_id, "outputs": outputs, "artifacts": artifacts})
+                        continue
 
-                        logger.info(
-                            "Job succeeded",
-                            extra={"job_id": job_id, "outputs": outputs, "artifacts": artifacts},
-                        )
-                    else:
-                        # failed/cancelled/etc.
-                        logger.info(
-                            "Job finished",
-                            extra={"job_id": job_id, "status": status_after, "error": err_after},
-                        )
-
-                except Exception as e:
-                    logger.exception(
-                        "Job failed (worker exception)",
-                        extra={"job_id": job_id, "worker_id": self.worker_id, "error": str(e)},
-                    )
-
-                    # Load job again to get attempt_count after claim increment
-                    job = await self.repo.get_job(job_id)
-                    attempt = int(getattr(job, "attempt_count", 1) or 1)
-                    max_tries = await self._get_max_tries(job)
-
-                    if attempt < max_tries:
-                        delay = min(60, 5 * (2 ** (attempt - 1)))
-                        await self.repo.reschedule_job(
-                            job_id=job_id,
-                            delay_seconds=delay,
-                            error_code="worker_error",
-                            error_message=str(e),
-                        )
-                        logger.info("Job rescheduled", extra={"job_id": job_id, "delay": delay, "attempt": attempt})
-                    else:
-                        await self.repo.update_status(
-                            job_id,
-                            "failed",
-                            error_code="worker_error",
-                            error_message=str(e),
-                            meta_patch={"worker_id": self.worker_id},
-                        )
-
-                await asyncio.sleep(0)
-
+                except Exception as exc:
+                    logger.exception("Face worker job exception", extra={"job_id": job_id, "error": str(exc)})
+                    try:
+                        job = await self.repo.get_job(job_id)
+                        attempt = int(getattr(job, "attempt_count", 1) or 1)
+                        max_tries = await self._get_max_tries(job)
+                        if attempt < max_tries:
+                            delay = min(60, 5 * (2 ** (attempt - 1)))
+                            await self.repo.reschedule_job(
+                                job_id=job_id,
+                                delay_seconds=delay,
+                                error_code="WORKER_EXCEPTION",
+                                error_message=str(exc),
+                            )
+                        else:
+                            await self.repo.update_status(
+                                job_id,
+                                "failed",
+                                error_code="WORKER_EXCEPTION",
+                                error_message=str(exc),
+                                meta_patch={"worker_id": self.worker_id},
+                            )
+                    except Exception:
+                        logger.exception("Failed handling Face worker exception", extra={"job_id": job_id})
         finally:
             await close_pool()
-            logger.info("Face worker stopped", extra={"worker_id": self.worker_id})
 
     def stop_worker(self):
         self.running = False
-        logger.info("Face worker stopping", extra={"worker_id": self.worker_id})
+
+
+def main() -> None:
+    worker = WorkerProcess()
+    try:
+        asyncio.run(worker.main())
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        logger.exception("Face worker fatal error")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-    asyncio.run(WorkerProcess().main())
+    main()
