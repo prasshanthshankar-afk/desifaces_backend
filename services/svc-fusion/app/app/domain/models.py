@@ -87,6 +87,11 @@ class VoiceTTS(BaseModel):
     language: Optional[str] = Field(default=None, max_length=64)
 
 
+class PricingConfirmationInput(BaseModel):
+    quote_id: str = Field(min_length=1, max_length=128)
+    preview_fingerprint: str = Field(min_length=1, max_length=128)
+
+
 class FusionJobCreate(BaseModel):
     face_image_url: Optional[HttpUrl] = None
     face_artifact_id: Optional[str] = None
@@ -105,6 +110,7 @@ class FusionJobCreate(BaseModel):
     reference_image_urls: List[str] = Field(default_factory=list)
     reference_image_artifact_ids: List[str] = Field(default_factory=list)
     tags: Dict[str, Any] = Field(default_factory=dict)
+    pricing_confirmation: Optional[PricingConfirmationInput] = None
 
     @model_validator(mode="after")
     def validate_inputs(self) -> "FusionJobCreate":
@@ -130,7 +136,7 @@ class FusionJobCreate(BaseModel):
         self.reference_image_artifact_ids = cleaned_artifact_ids
 
         provider = _normalize_provider_name(self.provider)
-        self.provider = provider  # normalize aliases for downstream orchestration
+        self.provider = provider
 
         has_face_url = self.face_image_url is not None
         has_face_artifact = bool(self.face_artifact_id)
