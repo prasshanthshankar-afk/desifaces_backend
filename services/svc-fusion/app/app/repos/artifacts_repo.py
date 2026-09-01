@@ -38,7 +38,7 @@ class ArtifactsRepo:
         Args:
             job_id: UUID of the parent job (studio_jobs.id)
             kind: Type/kind of artifact
-            url: URL/location of the artifact (often Azure Blob SAS, HeyGen URL, etc.)
+            url: URL/location of the artifact (often Azure Blob SAS, provider URL, etc.)
             content_type: Optional MIME type
             meta_json: Optional metadata dict (stored as jsonb)
             sha256: Optional checksum
@@ -56,13 +56,19 @@ class ArtifactsRepo:
             await conn.execute(q, job_id, kind, url, content_type, sha256, bytes, payload_str)
 
     async def get_artifact_by_id(self, artifact_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Fetch a single artifact row by artifact UUID.
+        """Resolve a reusable Studio input UUID to an artifact-shaped row.
 
-        Returns a dict with:
-          id, job_id, kind, url, content_type, sha256, bytes, meta_json, created_at
+        desifaces persists generated Studio media in two related namespaces:
+          1. public.artifacts.id     - job-scoped artifacts
+          2. public.media_assets.id  - reusable Studio media
+
+        Core Fusion historically resolved only public.artifacts.id while Face /
+        Saved Work and Fusion Extension can carry media_assets.id in the same
+        face_artifact_id / audio_artifact_id fields. Resolve artifacts first for
+        backward compatibility, then fall back to media_assets and normalize the
+        row to the artifact contract expected by Fusion's SAS resolver.
         """
-        q = """
+        artifact_q = """
         SELECT
           id::text        AS id,
           job_id::text    AS job_id,
@@ -72,13 +78,35 @@ class ArtifactsRepo:
           sha256          AS sha256,
           bytes           AS bytes,
           meta_json       AS meta_json,
-          created_at      AS created_at
+          created_at      AS created_at,
+          'artifacts'::text AS source_store
         FROM public.artifacts
         WHERE id = $1::uuid
         LIMIT 1
         """
+        media_q = """
+        SELECT
+          id::text          AS id,
+          NULL::text        AS job_id,
+          kind              AS kind,
+          storage_ref       AS url,
+          content_type      AS content_type,
+          sha256            AS sha256,
+          bytes             AS bytes,
+          meta_json         AS meta_json,
+          created_at        AS created_at,
+          'media_assets'::text AS source_store
+        FROM public.media_assets
+        WHERE id = $1::uuid
+        LIMIT 1
+        """
+
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(q, artifact_id)
+            row = await conn.fetchrow(artifact_q, artifact_id)
+            if row:
+                return dict(row)
+
+            row = await conn.fetchrow(media_q, artifact_id)
             return dict(row) if row else None
 
     async def get_artifacts_by_job_id(self, job_id: str) -> List[Dict[str, Any]]:
