@@ -57,6 +57,7 @@ python3 -m py_compile "$TMP/artifacts_repo.py" "$TMP/models.py" "$TMP/pricing_co
 grep -q 'public.media_assets' "$TMP/artifacts_repo.py"
 grep -q 'pricing_confirmation' "$TMP/models.py"
 grep -q 'PRICING_CONFIRMATION_MISMATCH' "$TMP/pricing_confirmation_policy.py"
+grep -q 'preview_fingerprint' "$TMP/pricing_confirmation_policy.py"
 echo "PASS: reusable inputs + confirmed-pricing policy source validated"
 
 echo
@@ -124,7 +125,10 @@ for _ in $(seq 1 30); do
   sleep 2
 done
 [ "$ok" -eq 1 ]
+worker_running="$(docker inspect -f '{{.State.Running}}' "$WORKER" 2>/dev/null || echo false)"
+[ "$worker_running" = "true" ]
 echo "PASS: Fusion API HTTP_200"
+echo "PASS: Fusion worker running"
 
 echo
 echo "===== 5. LOADED INPUT + PRICING CONTRACT ====="
@@ -134,9 +138,8 @@ for c in "$API" "$WORKER"; do
 done
 
 echo
-echo "===== 6. RESERVE PROPAGATION CONTRACT ====="
-docker exec "$API" python -c 'import asyncio; from desifaces_shared.pricing.models import PricingReserveRequest; from app.services.pricing_confirmation_policy import _ConfirmationPricingClientProxy; C=type("C",(),{"enabled":True}); c=C(); c.received=None; async def_reserve=None' >/dev/null 2>&1 || true
-docker exec "$API" python -c 'from app.domain.models import FusionJobCreate; r=FusionJobCreate.model_validate({"face_artifact_id":"11111111-1111-4111-8111-111111111111","voice_mode":"audio","voice_audio":{"type":"audio","audio_artifact_id":"22222222-2222-4222-8222-222222222222"},"video":{"aspect_ratio":"9:16","duration_sec":6},"provider":"omnihuman_v15","consent":{"external_provider_ok":True},"pricing_confirmation":{"quote_id":"qt_probe","preview_fingerprint":"fp_probe"}}); d=r.model_dump(exclude_none=True); assert d["pricing_confirmation"]["quote_id"]=="qt_probe"; print("PASS: pricing confirmation survives Fusion request validation")'
+echo "===== 6. CONFIRMATION + RESERVE PROPAGATION CONTRACT ====="
+docker exec "$API" python -c 'import inspect; from app.domain.models import FusionJobCreate; from app.services.pricing_confirmation_policy import _ConfirmationPricingClientProxy; r=FusionJobCreate.model_validate({"face_artifact_id":"11111111-1111-4111-8111-111111111111","voice_mode":"audio","voice_audio":{"type":"audio","audio_artifact_id":"22222222-2222-4222-8222-222222222222"},"video":{"aspect_ratio":"9:16","duration_sec":6},"provider":"omnihuman_v15","consent":{"external_provider_ok":True},"pricing_confirmation":{"quote_id":"qt_probe","preview_fingerprint":"fp_probe"}}); d=r.model_dump(exclude_none=True); assert d["pricing_confirmation"]["quote_id"]=="qt_probe"; s=inspect.getsource(_ConfirmationPricingClientProxy.reserve); assert "quote_id" in s and "preview_fingerprint" in s and "model_copy" in s; print("PASS: confirmation survives validation and is propagated to reserve")'
 
 echo
 echo "============================================================"
@@ -145,9 +148,10 @@ echo "============================================================"
 echo "branch=$BRANCH"
 echo "rollback_dir=$TMP"
 echo "api=healthy"
-echo "worker=healthy_after_restart"
+echo "worker=healthy"
 echo "pricing_confirmation=enforced"
 echo "quote_binding=fresh_preview_match_required"
+echo "reserve_traceability=quote_id+preview_fingerprint"
 echo "db=untouched"
 echo "redis=untouched"
 echo "web=untouched"
