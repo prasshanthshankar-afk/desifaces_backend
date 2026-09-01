@@ -8,8 +8,11 @@ from app.config import settings
 from app.db import get_pool
 from app.repos.fusion_jobs_repo import FusionJobsRepo
 from app.services.fusion_orchestrator import FusionOrchestrator
+from app.services.fusion_quality_policy import install_fusion_quality_policy
 
 logger = logging.getLogger("fusion_worker")
+
+install_fusion_quality_policy()
 
 
 async def run_forever() -> None:
@@ -32,7 +35,6 @@ async def run_forever() -> None:
                 except Exception as e:
                     msg = str(e)
                     logger.exception("job_unhandled_exception", extra={"job_id": job_id, "error": msg})
-                    # HARD safety: ensure job isn't stuck in running
                     try:
                         await orch.jobs.set_status(job_id, "failed", error_code="WORKER_CRASH", error_message=msg)
                     except Exception:
@@ -43,13 +45,12 @@ async def run_forever() -> None:
         except Exception as e:
             msg = str(e)
             logger.exception("worker_loop_exception", extra={"job_id": current_job_id, "error": msg})
-            # Only mark failed if we actually have a job id in flight
             if current_job_id:
                 try:
                     await orch.jobs.set_status(current_job_id, "failed", error_code="WORKER_CRASH", error_message=msg)
                 except Exception:
                     logger.exception("job_fail_marking_failed", extra={"job_id": current_job_id})
-            await asyncio.sleep(1.0)  # small backoff to avoid tight crash loops
+            await asyncio.sleep(1.0)
 
 
 if __name__ == "__main__":
