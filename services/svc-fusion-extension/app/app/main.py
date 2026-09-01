@@ -6,8 +6,11 @@ from app.db import init_db
 from app.api.health import router as health_router
 from app.api.routes.longform import router as longform_router
 from app.config import settings
+from app.services.longform_pricing_confirmation_policy import install_longform_pricing_confirmation_policy
 
 from app.workers.longform_worker import worker_loop
+
+install_longform_pricing_confirmation_policy()
 
 
 def create_app() -> FastAPI:
