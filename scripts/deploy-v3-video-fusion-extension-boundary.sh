@@ -90,7 +90,7 @@ echo "PASS: restarted Fusion Extension API only"
 echo
 echo "===== 4. EXTENSION RUNTIME CONTRACT ====="
 sleep 4
-docker exec "$EXT_API" python - <<'PY'
+docker exec -i "$EXT_API" python - <<'PY'
 import app.main
 import app.api.routes.longform as route
 import app.services.longform_pricing_confirmation_policy as policy
@@ -102,10 +102,49 @@ raw = {
 }
 normalized = route._normalize_longform_request_body(raw)
 assert normalized.get('tags', {}).get('pricing_confirmation', {}).get('quote_id') == 'qt_probe'
+assert normalized.get('tags', {}).get('pricing_confirmation', {}).get('preview_fingerprint') == 'fp_probe'
 assert getattr(route.reserve_longform_pricing_for_job, '_df_longform_confirmation_policy', False)
 print('PASS: confirmed quote survives longform API normalization')
 PY
-docker exec "$EXT_API" python - <<'PY'
+
+docker exec -i "$EXT_API" python - <<'PY'
+from app.services.longform_orchestrator import build_longform_execution_payloads
+payload = {
+    'image_ref': '11111111-1111-1111-1111-111111111111',
+    'face_artifact_id': '11111111-1111-1111-1111-111111111111',
+    'script': 'This is a ninety second saved Voice boundary probe. ' * 30,
+    'script_text': 'This is a ninety second saved Voice boundary probe. ' * 30,
+    'longform_profile': 'talking_video',
+    'quality_tier': 'premium',
+    'requested_duration_sec': 90,
+    'duration_sec': 90,
+    'pricing_duration_sec': 90,
+    'segment_seconds': 90,
+    'max_segment_seconds': 90,
+    'tags': {
+        'longform_profile': 'talking_video',
+        'quality_tier': 'premium',
+        'requested_duration_sec': 90,
+        'duration_sec': 90,
+        'voice_audio_artifact_id': '22222222-2222-2222-2222-222222222222',
+        'voice_audio_duration_sec': 90,
+        'selected_audio': {
+            'audio_artifact_id': '22222222-2222-2222-2222-222222222222',
+            'audio_duration_sec': 90,
+        },
+    },
+}
+planned = build_longform_execution_payloads(payload)
+segments = planned.get('segments') or []
+durations = [int(x.get('duration_sec') or 0) for x in segments]
+print('planner_segment_durations=', durations)
+assert len(segments) >= 3, f'expected multiple segments for 90s; got {durations}'
+assert durations and max(durations) <= 30, f'provider-unsafe segment found: {durations}'
+assert sum(durations) >= 80, f'planner lost substantial duration: {durations}'
+print('PASS: 90-second Voice is segmented into provider-safe child durations')
+PY
+
+docker exec -i "$EXT_API" python - <<'PY'
 import json, urllib.request
 with urllib.request.urlopen('http://127.0.0.1:8006/api/health', timeout=8) as r:
     body=json.loads(r.read().decode())
@@ -138,6 +177,7 @@ echo "saved_voice=reused-not-regenerated"
 echo "real_audio_duration=required"
 echo "saved_script=required"
 echo "provider_safe_segmentation=extension-owned"
+echo "ninety_second_probe=passed"
 echo "child_pricing=suppressed"
 echo "parent_pricing=confirmed-and-bound"
 echo "final_video=parent-stitched-output"
