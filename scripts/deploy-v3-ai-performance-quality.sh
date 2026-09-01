@@ -114,7 +114,6 @@ echo
 echo "===== 6. API PRESERVATION ====="
 curl -fsS http://127.0.0.1:18002/api/health >/dev/null
 echo "PASS: Fusion API HTTP_200"
-# Face service port in V3 runtime is 18003.
 curl -fsS http://127.0.0.1:18003/api/health >/dev/null
 echo "PASS: Face API HTTP_200"
 
@@ -135,9 +134,9 @@ echo "fusion_input_staging=parallel"
 echo "face_variant_concurrency=4-default-bounded"
 echo "face_price_visibility=deployed"
 echo "long_running_hourglass=deployed"
-echo "premium_video=omnihuman-1080p-capable"
+echo "premium_video=omnihuman-up-to-1080p"
 echo "fast_video=omnihuman-720p-turbo"
-echo "economy_video=veed-fabric-480p"
+echo "veed_fabric=economy-longform-priced-path-not-single-person"
 echo "db=untouched"
 echo "redis=untouched"
 echo "pricing_service=untouched"
