@@ -7,77 +7,119 @@ resolve_container(){
   docker ps -a --filter "label=com.docker.compose.service=${service}" --format '{{.Names}}' | head -1
 }
 
-DB="$(resolve_container "${DB_CONTAINER:-desifaces-v3-db}" desifaces-db)"
 EXT_API="$(resolve_container "${EXT_API_CONTAINER:-df-v3-svc-fusion-extension}" svc-fusion-extension)"
 EXT_WORKER="$(resolve_container "${EXT_WORKER_CONTAINER:-df-v3-svc-fusion-extension-worker}" svc-fusion-extension-worker)"
 STITCH_WORKER="$(resolve_container "${STITCH_WORKER_CONTAINER:-df-v3-svc-fusion-extension-stitch-worker}" svc-fusion-extension-stitch-worker)"
 
-[ -n "$DB" ] || { echo "FAIL: database container not found" >&2; exit 2; }
 [ -n "$EXT_API" ] || { echo "FAIL: Fusion Extension API container not found" >&2; exit 2; }
 
-PSQL=(docker exec "$DB" psql -U desifaces_admin -d desifaces -v ON_ERROR_STOP=1 -P pager=off)
-LATEST="$(${PSQL[@]} -Atc "select id::text from public.longform_jobs order by created_at desc limit 1")"
-[ -n "$LATEST" ] || { echo "NO_LONGFORM_JOBS"; exit 0; }
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+EVIDENCE="/tmp/v3-longform-stabilization-${STAMP}.log"
 
 printf '============================================================\n'
 printf ' desifaces V3 — LONGFORM PRICING STABILIZATION\n'
 printf '============================================================\n'
-printf 'job_id=%s\n' "$LATEST"
+printf 'db_access=svc-fusion-extension:DATABASE_URL\n'
 
-printf '\n===== BEFORE =====\n'
-${PSQL[@]} -x -c "
-select j.id,j.user_id,j.status,j.error_code,left(coalesce(j.error_message,''),500) as error_message,
-       j.total_segments,j.completed_segments,
-       (j.final_storage_path is not null) as has_final_storage,
-       (j.final_video_url is not null and j.final_video_url <> '') as has_final_video,
-       r.id as reservation_id,r.status as reservation_status,r.reserved_credits,r.sku_code,r.service_name,r.service_action,
-       r.quote_json #>> '{meta,requested_duration_sec}' as pricing_duration_sec,
-       r.quote_json #>> '{meta,segment_count}' as pricing_segment_count,
-       r.quote_json #>> '{meta,segment_durations_sec}' as pricing_segment_durations_sec
-from public.longform_jobs j
-left join lateral (
-  select * from public.pricing_credit_reservations r0
-  where r0.job_ref=j.id::text
-  order by r0.created_at desc limit 1
-) r on true
-where j.id='${LATEST}'::uuid;"
+# Use the same asyncpg DATABASE_URL connection as the running Fusion Extension API.
+# This avoids host-local PostgreSQL sockets and any hardcoded DB role assumptions.
+docker exec -i "$EXT_API" python - >"$EVIDENCE" <<'PY'
+import asyncio, json
+from decimal import Decimal
+from datetime import date, datetime
+from uuid import UUID
 
-printf '\n===== SAFE RELEASE GATE =====\n'
-docker exec -e DF_STABILIZE_JOB_ID="$LATEST" "$EXT_API" python - <<'PY'
-import asyncio, os
 from app.db import get_db_pool
 from app.services.longform_orchestrator import release_longform_pricing_for_job
 
 TERMINAL_FAILED = {'failed','error','canceled','cancelled','blocked'}
 
+
+def safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (datetime, date, UUID)):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [safe(v) for v in value]
+    try:
+        return safe(dict(value))
+    except Exception:
+        return str(value)
+
+
+def line(label, value):
+    print(f"{label}={'' if value is None else value}")
+
+
+async def latest_reservation(conn, job_id):
+    return await conn.fetchrow(
+        """
+        select id::text,status,reserved_credits,sku_code,service_name,service_action,
+               quote_json,created_at,updated_at
+        from public.pricing_credit_reservations
+        where job_ref=$1
+        order by created_at desc limit 1
+        """,
+        job_id,
+    )
+
+
 async def main():
-    job_id = os.environ['DF_STABILIZE_JOB_ID']
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             select id::text,user_id::text,status,error_code,error_message,
-                   final_storage_path,final_video_url,tags
-            from public.longform_jobs where id=$1::uuid
-            """, job_id,
+                   total_segments,completed_segments,final_storage_path,final_video_url,tags,
+                   created_at,updated_at
+            from public.longform_jobs
+            order by created_at desc
+            limit 1
+            """
         )
         if not row:
-            print('ACTION=NONE reason=parent_not_found')
+            print('NO_LONGFORM_JOBS')
             return
-        reservation = await conn.fetchrow(
-            """
-            select id::text,status,reserved_credits
-            from public.pricing_credit_reservations
-            where job_ref=$1
-            order by created_at desc limit 1
-            """, job_id,
-        )
+
+        job_id = str(row['id'])
+        reservation = await latest_reservation(conn, job_id)
+        quote = safe(reservation['quote_json']) if reservation else {}
+        if isinstance(quote, str):
+            try: quote = json.loads(quote)
+            except Exception: quote = {}
+        meta = quote.get('meta') if isinstance(quote, dict) else {}
+        meta = meta if isinstance(meta, dict) else {}
+
+        print('===== BEFORE =====')
+        line('job_id', job_id)
+        line('user_id', row['user_id'])
+        line('parent_status', row['status'])
+        line('parent_error_code', row['error_code'])
+        line('parent_error_message', str(row['error_message'] or '')[:700].replace('\n',' '))
+        line('total_segments', row['total_segments'])
+        line('completed_segments', row['completed_segments'])
+        line('has_final_storage', bool(row['final_storage_path']))
+        line('has_final_video', bool(row['final_video_url']))
+        line('reservation_id', reservation['id'] if reservation else None)
+        line('reservation_status', reservation['status'] if reservation else None)
+        line('reserved_credits', reservation['reserved_credits'] if reservation else None)
+        line('reservation_sku', reservation['sku_code'] if reservation else None)
+        line('reservation_service', reservation['service_name'] if reservation else None)
+        line('reservation_action', reservation['service_action'] if reservation else None)
+        line('pricing_duration_sec', meta.get('requested_duration_sec') or meta.get('duration_sec'))
+        line('pricing_segment_count', meta.get('segment_count'))
+        line('pricing_segment_durations_sec', json.dumps(safe(meta.get('segment_durations_sec')), separators=(',',':')) if meta.get('segment_durations_sec') is not None else None)
+
         parent_status = str(row['status'] or '').lower()
         reservation_status = str((reservation['status'] if reservation else '') or '').lower()
         has_final = bool(row['final_storage_path'] or row['final_video_url'])
-        print(f'parent_status={parent_status}')
-        print(f'reservation_status={reservation_status or "none"}')
-        print(f'has_final={str(has_final).lower()}')
+
+        print('===== SAFE RELEASE GATE =====')
         if parent_status in TERMINAL_FAILED and reservation_status == 'reserved' and not has_final:
             pricing = await release_longform_pricing_for_job(
                 conn,
@@ -87,7 +129,7 @@ async def main():
                 tags=dict(row['tags'] or {}),
             )
             print('ACTION=RELEASED_FAILED_PARENT_RESERVATION')
-            print(f'new_pricing_state={pricing.get("state")}')
+            line('new_pricing_state', pricing.get('state'))
         elif parent_status in TERMINAL_FAILED and reservation_status == 'released':
             print('ACTION=NONE reason=already_released')
         elif parent_status in {'succeeded','completed'}:
@@ -95,46 +137,77 @@ async def main():
         else:
             print('ACTION=NONE reason=parent_not_terminal_failed')
 
+        reservation2 = await latest_reservation(conn, job_id)
+        print('===== AFTER =====')
+        line('parent_status_after', row['status'])
+        line('reservation_status_after', reservation2['status'] if reservation2 else None)
+        line('reserved_credits_after', reservation2['reserved_credits'] if reservation2 else None)
+
+        print('===== SEGMENTS =====')
+        segments = await conn.fetch(
+            """
+            select segment_index,status,duration_sec,fusion_job_id::text,error_code,error_message
+            from public.longform_segments
+            where job_id=$1::uuid
+            order by segment_index
+            """,
+            job_id,
+        )
+        for s in segments:
+            print('|'.join([
+                str(s['segment_index']), str(s['status'] or ''), str(s['duration_sec'] or ''),
+                str(s['fusion_job_id'] or ''), str(s['error_code'] or ''),
+                str(s['error_message'] or '')[:240].replace('\n',' '),
+            ]))
+
+        print('===== RESERVATION LEDGER =====')
+        if reservation2:
+            events = await conn.fetch(
+                """
+                select event_type,credits_delta,sku_code,service_name,service_action,created_at
+                from public.pricing_credit_ledger_events
+                where reservation_id=$1::uuid
+                order by created_at desc
+                limit 20
+                """,
+                reservation2['id'],
+            )
+            for e in events:
+                print(json.dumps(safe(dict(e)), sort_keys=True, separators=(',',':')))
+
+        print('===== ACCOUNT BALANCE =====')
+        overview = await conn.fetchrow(
+            """
+            select plan_json,lots_json,legacy_account_json
+            from public.v_pricing_account_overview
+            where user_id=$1::uuid
+            limit 1
+            """,
+            str(row['user_id']),
+        )
+        if overview:
+            print(json.dumps(safe(dict(overview)), sort_keys=True, separators=(',',':')))
+
 asyncio.run(main())
 PY
 
-printf '\n===== AFTER =====\n'
-${PSQL[@]} -x -c "
-select j.status as parent_status,j.error_code,left(coalesce(j.error_message,''),500) as error_message,
-       r.status as reservation_status,r.reserved_credits,
-       to_jsonb(r)->>'final_charged_credits' as final_charged_credits,
-       r.updated_at
-from public.longform_jobs j
-left join lateral (
-  select * from public.pricing_credit_reservations r0
-  where r0.job_ref=j.id::text
-  order by r0.created_at desc limit 1
-) r on true
-where j.id='${LATEST}'::uuid;"
-
-printf '\n===== LATEST SEGMENTS =====\n'
-${PSQL[@]} -Atc "
-select concat_ws('|',segment_index,status,duration_sec,coalesce(fusion_job_id::text,''),coalesce(error_code,''),left(coalesce(error_message,''),180))
-from public.longform_segments where job_id='${LATEST}'::uuid order by segment_index;"
-
-printf '\n===== ACCOUNT BALANCE =====\n'
-${PSQL[@]} -x -c "
-select to_jsonb(v)->'lots_json' as lots_json,
-       to_jsonb(v)->'legacy_account_json' as legacy_account_json
-from public.v_pricing_account_overview v
-where v.user_id=(select user_id from public.longform_jobs where id='${LATEST}'::uuid)
-limit 1;" || true
+cat "$EVIDENCE"
+LATEST="$(sed -n 's/^job_id=//p' "$EVIDENCE" | head -1)"
 
 printf '\n===== BOUNDED ERROR LOGS =====\n'
-for c in "$EXT_API" "$EXT_WORKER" "$STITCH_WORKER"; do
-  [ -n "$c" ] || continue
-  printf -- '--- %s ---\n' "$c"
-  docker logs "$c" --since 90m 2>&1 \
-    | grep -F "$LATEST" \
-    | tail -n 50 \
-    | sed -E 's#https?://[^ ]+#<url-redacted>#g' || true
-done
+if [ -n "$LATEST" ]; then
+  for c in "$EXT_API" "$EXT_WORKER" "$STITCH_WORKER"; do
+    [ -n "$c" ] || continue
+    printf -- '--- %s ---\n' "$c"
+    docker logs "$c" --since 120m 2>&1 \
+      | grep -F "$LATEST" \
+      | tail -n 60 \
+      | sed -E 's#https?://[^ ]+#<url-redacted>#g' || true
+  done
+fi
 
 printf '\nNO_SERVICE_RESTARTS=YES\n'
 printf 'NO_DB_SCHEMA_CHANGES=YES\n'
+printf 'DB_CONNECTION_SOURCE=FUSION_EXTENSION_RUNTIME\n'
+printf 'evidence=%s\n' "$EVIDENCE"
 printf '============================================================\n'
