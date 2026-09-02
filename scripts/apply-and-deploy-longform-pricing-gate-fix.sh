@@ -28,6 +28,7 @@ cd "$WT"
 ROUTE="services/svc-fusion-extension/app/app/api/routes/longform.py"
 REPO="services/svc-fusion-extension/app/app/repos/longform_jobs_repo.py"
 TEST="services/svc-fusion-extension/tests/test_longform_pricing_gate_order.py"
+mkdir -p "$(dirname "$TEST")"
 
 python3 - <<'PY'
 from pathlib import Path
