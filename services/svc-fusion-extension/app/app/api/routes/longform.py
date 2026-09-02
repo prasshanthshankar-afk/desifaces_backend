@@ -1627,17 +1627,12 @@ async def create_longform_job(
                 auth_token=worker_auth_token,
                 voice_gender_mode=voice_gender_mode,
                 voice_gender=voice_gender,
+                initial_status="pricing_pending",
             )
 
-            for seg in segments:
-                await segs_repo.insert_segment(
-                    conn,
-                    job_id=job_id,
-                    segment_index=int(seg["segment_index"]),
-                    text_chunk=str(seg.get("text_chunk") or seg.get("script_text") or ""),
-                    duration_sec=_clamp_fusion_duration(int(seg.get("duration_sec") or req.segment_seconds)),
-                )
-
+        # Pricing is the execution gate. No runnable segment may exist before
+        # the parent reservation succeeds. This keeps financial authority in
+        # svc-pricing and prevents workers from observing pre-reservation work.
         try:
             async with conn.transaction():
                 pricing = await reserve_longform_pricing_for_job(
@@ -1687,6 +1682,30 @@ async def create_longform_job(
                 )
             _raise_http_for_pricing_error(mapped_exc)
             raise
+
+        # Reservation succeeded. Only now materialize runnable segments and
+        # activate the parent for worker execution. Keep both operations in one
+        # transaction so workers can never observe a partially activated job.
+        async with conn.transaction():
+            for seg in segments:
+                await segs_repo.insert_segment(
+                    conn,
+                    job_id=job_id,
+                    segment_index=int(seg["segment_index"]),
+                    text_chunk=str(seg.get("text_chunk") or seg.get("script_text") or ""),
+                    duration_sec=_clamp_fusion_duration(int(seg.get("duration_sec") or req.segment_seconds)),
+                )
+            await conn.execute(
+                """
+                UPDATE public.longform_jobs
+                SET status = 'queued',
+                    error_code = NULL,
+                    error_message = NULL,
+                    updated_at = now()
+                WHERE id = $1::uuid
+                """,
+                job_id,
+            )
 
         row = await jobs_repo.get_job(conn, job_id, user_id)
 

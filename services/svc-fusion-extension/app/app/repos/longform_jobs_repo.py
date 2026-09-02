@@ -62,6 +62,7 @@ class LongformJobsRepo:
         auth_token: Optional[str] = None,
         voice_gender_mode: Optional[str] = None,
         voice_gender: Optional[str] = None,
+        initial_status: str = "queued",
     ) -> str:
         auth_token_norm = _normalize_bearer(auth_token)
         vg = _norm_gender(voice_gender)
@@ -99,7 +100,7 @@ class LongformJobsRepo:
               $8::text,
               $9::int,
               0,
-              'queued',
+              $13::text,
               $10::text,
               $11::text,
               $12::text
@@ -118,6 +119,7 @@ class LongformJobsRepo:
             auth_token_norm,
             vgm,
             vg,
+            str(initial_status or "queued"),
         )
         return str(row["id"])
 
