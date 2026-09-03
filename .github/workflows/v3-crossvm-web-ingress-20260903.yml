@@ -25,15 +25,38 @@ jobs:
           bash -n scripts/cutover-public-web-on-gpu-20260903.sh
       - name: Launch topology safety
         run: |
-          grep -Fq 'dev-app.desifaces.ai' scripts/prepare-v3-web-bridge-on-dev-20260903.sh
+          grep -Fq 'dev-api.desifaces.ai' scripts/prepare-v3-web-bridge-on-dev-20260903.sh
+          grep -Fq '/__v3web__/' scripts/prepare-v3-web-bridge-on-dev-20260903.sh
           grep -Fq 'http://127.0.0.1:13000' scripts/prepare-v3-web-bridge-on-dev-20260903.sh
-          grep -Fq 'DEV_APP_BRIDGE_ROLLBACK=ATTEMPTED' scripts/prepare-v3-web-bridge-on-dev-20260903.sh
+          grep -Fq 'DEV_API_V3_BRIDGE_ROLLBACK=ATTEMPTED' scripts/prepare-v3-web-bridge-on-dev-20260903.sh
+          grep -Fq 'DEV_API_V3_PATH_BRIDGE=PASS' scripts/prepare-v3-web-bridge-on-dev-20260903.sh
+
           grep -Fq 'web.desifaces.ai' scripts/cutover-public-web-on-gpu-20260903.sh
-          grep -Fq 'https://${UPSTREAM_HOST}' scripts/cutover-public-web-on-gpu-20260903.sh
+          grep -Fq 'dev-api.desifaces.ai' scripts/cutover-public-web-on-gpu-20260903.sh
+          grep -Fq '/__v3web__/' scripts/cutover-public-web-on-gpu-20260903.sh
           grep -Fq 'proxy_ssl_verify on;' scripts/cutover-public-web-on-gpu-20260903.sh
           grep -Fq 'PUBLIC_WEB_ROLLBACK=ATTEMPTED' scripts/cutover-public-web-on-gpu-20260903.sh
+          grep -Fq 'PUBLIC_WEB_V3=PASS' scripts/cutover-public-web-on-gpu-20260903.sh
+
+          if grep -Fq 'dev-app.desifaces.ai' scripts/prepare-v3-web-bridge-on-dev-20260903.sh scripts/cutover-public-web-on-gpu-20260903.sh; then
+            echo 'FAIL: obsolete dev-app TLS bridge must not be used'
+            exit 1
+          fi
           if grep -Eq '0\.0\.0\.0:13000|:13000:3000' scripts/prepare-v3-web-bridge-on-dev-20260903.sh scripts/cutover-public-web-on-gpu-20260903.sh; then
             echo 'FAIL: V3 web port must remain loopback-only'
             exit 1
           fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+          dev=Path('scripts/prepare-v3-web-bridge-on-dev-20260903.sh').read_text()
+          gpu=Path('scripts/cutover-public-web-on-gpu-20260903.sh').read_text()
+          assert "BRIDGE_PREFIX=\"${BRIDGE_PREFIX:-/__v3web__/}\"" in dev
+          assert "proxy_pass {target}/;" in dev
+          assert "UPSTREAM_PREFIX=\"${UPSTREAM_PREFIX:-/__v3web__/}\"" in gpu
+          assert "proxy_pass https://{upstream}{prefix};" in gpu
+          assert '/var/backups/desifaces-nginx' in dev
+          assert '/var/backups/desifaces-nginx' in gpu
+          print('V3_PATH_REWRITE_CONTRACT=PASS')
+          PY
           echo 'V3_CROSSVM_WEB_INGRESS_STATIC_GATE=PASS'
