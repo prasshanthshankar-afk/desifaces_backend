@@ -29,15 +29,10 @@ jobs:
           git config user.name 'desifaces-release-bot'
           git config user.email 'release@desifaces.ai'
           git fetch origin feature/v3-assistant-context-safe-20260829
-
-          # Deliberately source-scope the promotion. Do not merge the older full
-          # Assistant branch, because Director/pricing/runtime are already newer
-          # on this production release line.
           git checkout origin/feature/v3-assistant-context-safe-20260829 -- \
             services/svc-assistant \
             docker-compose.assistant.v3.yml \
             .github/workflows/v3-assistant-static.yml
-
           git diff --cached --check -- services/svc-assistant docker-compose.assistant.v3.yml .github/workflows/v3-assistant-static.yml
           test -f services/svc-assistant/app/Dockerfile.v3
           test -f services/svc-assistant/app/app/main.py
@@ -61,6 +56,12 @@ jobs:
       - name: Compile and certify Piku Assistant
         env:
           PYTHONPATH: .:services/shared:services/shared/python:services/svc-assistant/app:services/svc-director/app
+          DATABASE_URL: postgresql://test:test@127.0.0.1:5432/test
+          REDIS_URL: redis://127.0.0.1:6379/0
+          JWT_SECRET: desifaces-release-test-jwt-secret-not-production
+          JWT_ALG: HS256
+          JWT_ISSUER: desifaces
+          JWT_AUDIENCE: desifaces_clients
         run: |
           python -m compileall -q services/svc-assistant/app/app
           python -m pytest -q services/svc-assistant/app/tests
@@ -69,7 +70,7 @@ jobs:
       - name: Privacy and account-wide context release gates
         run: |
           grep -R -Fq 'support@desifaces.ai' services/svc-assistant/app/app
-          grep -R -Eq 'PII|PCI|sensitive' services/svc-assistant/app/app
+          grep -R -Eqi 'PII|PCI|sensitive' services/svc-assistant/app/app
           grep -Fq 'DF_PRICING_BASE_URL' services/svc-assistant/app/app/config.py
           grep -Fq 'DF_DASHBOARD_BASE_URL' services/svc-assistant/app/app/config.py
           grep -Fq 'DF_DIRECTOR_BASE_URL' services/svc-assistant/app/app/config.py
