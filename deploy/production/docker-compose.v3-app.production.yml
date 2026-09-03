@@ -1,0 +1,159 @@
+# desifaces.ai V3 production application overlay
+#
+# IMPORTANT:
+# - This file is intentionally used WITH the existing production docker-compose.yml.
+# - It does NOT redefine PostgreSQL, Redis, volumes, or df-net.
+# - Production continues to use desifaces-db + desifaces-redis and the existing df-net.
+# - Do NOT replace this with docker-compose.v3.yml; that file is the isolated V3/dev topology.
+
+services:
+  svc-face:
+    environment:
+      DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED: "true"
+
+  svc-audio:
+    environment:
+      DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED: "true"
+
+  svc-fusion:
+    environment:
+      FUSION_RECOVERY_ENABLED: "false"
+      DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED: "true"
+      AZURE_VIDEO_OUTPUT_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
+      AZURE_FINAL_VIDEO_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
+
+  svc-pricing:
+    image: desifaces-v3-svc-pricing-production
+    build:
+      context: .
+      dockerfile: services/svc-pricing/app/Dockerfile.v3
+    environment:
+      DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED: "true"
+      DF_SUBSCRIPTION_RECONCILER_ENABLED: "false"
+
+  svc-fusion-worker:
+    environment:
+      AZURE_VIDEO_OUTPUT_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
+      AZURE_FINAL_VIDEO_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
+
+  svc-fusion-extension:
+    environment:
+      WORKER_ENABLED: "false"
+      STITCH_WORKER_ENABLED: "false"
+      AZURE_VIDEO_OUTPUT_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
+      AZURE_FINAL_VIDEO_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
+
+  svc-fusion-extension-worker:
+    environment:
+      AZURE_VIDEO_OUTPUT_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
+      AZURE_FINAL_VIDEO_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
+
+  svc-fusion-extension-stitch-worker:
+    environment:
+      PYTHONPATH: "/app:/repo:/repo/services/shared:/repo/services/shared/python"
+      DF_V3_SCENE_COORDINATOR_ENABLED: "true"
+      DF_V3_SCENE_COORDINATOR_POLL_SECONDS: "2"
+      DF_V3_SCENE_COORDINATOR_BATCH_SIZE: "4"
+      DF_V3_SCENE_COORDINATOR_STATUS_CONCURRENCY: "32"
+      SVC_FUSION_BASE_URL: ${SVC_FUSION_BASE_URL:-http://svc-fusion:8002}
+      AZURE_VIDEO_OUTPUT_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
+      AZURE_FINAL_VIDEO_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
+
+  # V3-only Creative Director control-plane API.
+  svc-director:
+    container_name: df-v3-svc-director
+    image: desifaces-v3-svc-director-production
+    build:
+      context: .
+      dockerfile: services/svc-director/app/Dockerfile.v3
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?production DATABASE_URL is required}
+      JWT_SECRET: ${JWT_SECRET:?production JWT_SECRET is required}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DF_DIRECTOR_LLM_MODEL: ${DF_DIRECTOR_LLM_MODEL:-}
+      DF_DIRECTOR_EMBEDDING_MODEL: ${DF_DIRECTOR_EMBEDDING_MODEL:-}
+      DF_DIRECTOR_REVIEW_REQUIRED: ${DF_DIRECTOR_REVIEW_REQUIRED:-true}
+      DF_DIRECTOR_MAX_REVISIONS: ${DF_DIRECTOR_MAX_REVISIONS:-3}
+      DF_DIRECTOR_CHECKPOINTER_AUTO_SETUP: "true"
+      LANGGRAPH_STRICT_MSGPACK: "true"
+      DF_V3_FUSION_BACKGROUND_COORDINATOR_ENABLED: "true"
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+    networks:
+      - df-net
+    ports:
+      - "127.0.0.1:18011:8011"
+
+  # Dedicated durable orchestration runner; provider execution remains in
+  # Face/Audio/Fusion workers.
+  svc-director-worker:
+    container_name: df-v3-svc-director-worker
+    image: desifaces-v3-svc-director-production
+    build:
+      context: .
+      dockerfile: services/svc-director/app/Dockerfile.v3
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?production DATABASE_URL is required}
+      JWT_SECRET: ${JWT_SECRET:?production JWT_SECRET is required}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DF_DIRECTOR_LLM_MODEL: ${DF_DIRECTOR_LLM_MODEL:-}
+      DF_DIRECTOR_EMBEDDING_MODEL: ${DF_DIRECTOR_EMBEDDING_MODEL:-}
+      DF_DIRECTOR_REVIEW_REQUIRED: ${DF_DIRECTOR_REVIEW_REQUIRED:-true}
+      DF_DIRECTOR_MAX_REVISIONS: ${DF_DIRECTOR_MAX_REVISIONS:-3}
+      DF_DIRECTOR_CHECKPOINTER_AUTO_SETUP: "true"
+      LANGGRAPH_STRICT_MSGPACK: "true"
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+    networks:
+      - df-net
+    command: ["python", "-m", "app.worker"]
+
+  # Piku customer assistant. It receives deterministic application context;
+  # direct unrestricted customer-data access is not part of this service.
+  svc-assistant:
+    container_name: df-v3-svc-assistant
+    image: desifaces-v3-svc-assistant-production
+    build:
+      context: .
+      dockerfile: services/svc-assistant/app/Dockerfile.v3
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?production DATABASE_URL is required}
+      REDIS_URL: ${REDIS_URL:-redis://desifaces-redis:6379/0}
+      JWT_SECRET: ${JWT_SECRET:?production JWT_SECRET is required}
+      JWT_ALG: ${JWT_ALG:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-desifaces}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-desifaces_clients}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DF_ASSISTANT_LLM_MODEL: ${DF_ASSISTANT_LLM_MODEL:-${DF_DIRECTOR_LLM_MODEL:-}}
+      DF_ASSISTANT_EMBEDDING_MODEL: ${DF_ASSISTANT_EMBEDDING_MODEL:-}
+      DF_ASSISTANT_DISPLAY_NAME: ${DF_ASSISTANT_DISPLAY_NAME:-Piku}
+      DF_ASSISTANT_SESSION_TTL_SECONDS: ${DF_ASSISTANT_SESSION_TTL_SECONDS:-86400}
+      DF_ASSISTANT_MAX_HISTORY_MESSAGES: ${DF_ASSISTANT_MAX_HISTORY_MESSAGES:-12}
+      DF_ASSISTANT_RAG_TOP_K: ${DF_ASSISTANT_RAG_TOP_K:-5}
+      DF_DIRECTOR_BASE_URL: http://svc-director:8011
+      DF_DASHBOARD_BASE_URL: http://svc-dashboard:8005
+      DF_PRICING_BASE_URL: http://svc-pricing:8009
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+      desifaces-redis:
+        condition: service_started
+      svc-director:
+        condition: service_started
+      svc-dashboard:
+        condition: service_started
+    networks:
+      - df-net
+    ports:
+      - "127.0.0.1:18012:8012"
