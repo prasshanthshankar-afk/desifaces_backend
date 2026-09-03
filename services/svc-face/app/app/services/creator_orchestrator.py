@@ -3284,7 +3284,15 @@ class CreatorOrchestrator:
                     return_exceptions=False,
                 )
 
+            # FACE_PARTIAL_RESULT_V1: successful variants are preserved and billed,
+            # but failed requested variants are never silently hidden from clients.
             completed_count = await self._count_completed_variants(job_id)
+            final_variants_state = await self._load_variants_state(job_id)
+            failed_count = sum(
+                1
+                for vv in final_variants_state.values()
+                if str(self._coerce_dict(vv).get("status") or "").strip().lower() == "failed"
+            )
             if completed_count > 0:
                 pricing = await self._commit_pricing_for_job(
                     job_id=job_id,
@@ -3292,34 +3300,54 @@ class CreatorOrchestrator:
                     pricing=pricing,
                     actual_units=completed_count,
                 )
+                partial_result = completed_count < variants_requested or failed_count > 0
                 await self.jobs_repo.update_status(
                     job_id,
                     "succeeded",
                     meta_patch={
                         "variants_completed": completed_count,
                         "variants_requested": variants_requested,
+                        "variants_failed": failed_count,
+                        "partial_success": partial_result,
                     },
+                )
+                title = "Some Face variants are ready" if partial_result else "Your Face output is ready"
+                body = (
+                    f"{completed_count} of {variants_requested} requested Face variants completed. Only completed variants are charged."
+                    if partial_result
+                    else "Your desifaces.ai Face generation completed successfully."
                 )
                 await _emit_notification_best_effort(
                     {
-                        "event_type": "FACE_READY",
+                        "event_type": "FACE_PARTIAL" if partial_result else "FACE_READY",
                         "category": "jobs",
                         "priority": "important",
                         "source_service": "svc-face",
                         "source_ref_type": "job",
                         "source_ref_id": str(job_id),
                         "actor_user_id": None,
-                        "title": "Your Face output is ready",
-                        "body": "Your desifaces.ai Face generation completed successfully.",
+                        "title": title,
+                        "body": body,
                         "action_route": "/notifications",
                         "action_label": "View result",
                         "image_url": None,
-                        "payload_json": {"job_id": str(job_id), "completed_variants": int(completed_count)},
-                        "metadata_json": {"job_id": str(job_id), "completed_variants": int(completed_count)},
-                        "dedupe_key": f"face-ready:{job_id}",
+                        "payload_json": {
+                            "job_id": str(job_id),
+                            "completed_variants": int(completed_count),
+                            "requested_variants": int(variants_requested),
+                            "failed_variants": int(failed_count),
+                            "partial_success": bool(partial_result),
+                        },
+                        "metadata_json": {
+                            "job_id": str(job_id),
+                            "completed_variants": int(completed_count),
+                            "requested_variants": int(variants_requested),
+                            "failed_variants": int(failed_count),
+                        },
+                        "dedupe_key": f"face-ready:{job_id}:{'partial' if partial_result else 'complete'}",
                         "recipients": [{"user_id": str(user_id), "channels": {"in_app": True, "push": True, "email": True}}],
                     },
-                    context={"job_id": str(job_id), "user_id": str(user_id), "event_type": "FACE_READY"},
+                    context={"job_id": str(job_id), "user_id": str(user_id), "event_type": "FACE_PARTIAL" if partial_result else "FACE_READY"},
                 )
             else:
                 await self._fail_job(
@@ -4179,9 +4207,18 @@ class CreatorOrchestrator:
             message = f"Generating Face variants — {completed_count} of {requested_count} complete."
         elif status == JobStatus.SUCCEEDED:
             percent = 100
-            stage = "complete"
-            message = f"Generated {completed_count} Face variants successfully."
+            missing_count = max(0, requested_count - completed_count)
+            partial_success = missing_count > 0
+            stage = "partial" if partial_success else "complete"
+            message = (
+                f"{completed_count} of {requested_count} Face variants completed. "
+                f"{missing_count} variant{'s' if missing_count != 1 else ''} could not be completed. "
+                "Only completed variants are charged."
+                if partial_success
+                else f"Generated {completed_count} Face variants successfully."
+            )
         elif status in {JobStatus.FAILED, JobStatus.CANCELLED}:
+            partial_success = False
             percent = max(0, min(99, int(round(10 + 84 * (completed_count / requested_count)))))
             stage = "stopped"
             message = "Face generation stopped before all requested variants completed."
@@ -4195,6 +4232,8 @@ class CreatorOrchestrator:
             "current_step": "Image generation" if stage == "generating" else stage,
             "variants_completed": completed_count,
             "variants_requested": requested_count,
+            "variants_failed": max(0, requested_count - completed_count) if status == JobStatus.SUCCEEDED else 0,
+            "partial_success": bool(partial_success) if status == JobStatus.SUCCEEDED else False,
             "elapsed_seconds": elapsed,
             "is_delayed": delayed,
             "delay_message": delay_message,

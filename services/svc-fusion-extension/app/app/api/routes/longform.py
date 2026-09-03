@@ -101,10 +101,18 @@ def _longform_progress(job: Any, segments: list[Any]) -> Dict[str, Any]:
         percent = max(0, min(99, int(round(10 + (segment_fraction * 78)))))
         stage, message = "stopped", str(job.get("error_message") or "Video generation stopped before completion.")
     else:
-        percent = max(10, min(89, int(round(10 + (segment_fraction * 78)))))
+        # TRUTHFUL_PROVIDER_PROGRESS_V1: provider APIs expose state, not a reliable
+        # fractional completion percentage. Completed outputs drive progress;
+        # active provider jobs add only a small bounded activity credit.
+        completed_fraction = (completed / max(1, total)) if total else 0.0
+        activity_credit = min(10.0, (10.0 * running / max(1, total))) if running else 0.0
+        percent = max(10, min(85, int(round(15 + (completed_fraction * 65) + activity_credit))))
         stage = "rendering"
         if total:
-            message = f"Rendering video parts in parallel — {completed} of {total} complete."
+            message = (
+                f"Rendering video parts in parallel — {completed} of {total} complete. "
+                f"{running} running now."
+            )
         else:
             message = "Rendering your video…"
 
