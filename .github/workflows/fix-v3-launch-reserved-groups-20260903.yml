@@ -25,16 +25,17 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
           p = Path('scripts/launch-v3-production-20260903.sh')
           s = p.read_text()
           original = s
-          occurrences = s.count('GROUPS')
+          occurrences = len(re.findall(r'(?<![A-Za-z0-9_])GROUPS(?![A-Za-z0-9_])', s))
           if occurrences < 2:
               raise SystemExit(f'expected launcher GROUPS references, found {occurrences}')
-          s = s.replace('GROUPS', 'SERVICE_GROUPS')
+          s = re.sub(r'(?<![A-Za-z0-9_])GROUPS(?![A-Za-z0-9_])', 'SERVICE_GROUPS', s)
           if s == original:
               raise SystemExit('launcher was not changed')
-          if 'GROUPS=(' in s or '${GROUPS[' in s:
+          if re.search(r'(?<![A-Za-z0-9_])GROUPS=', s) or '${GROUPS[' in s:
               raise SystemExit('reserved GROUPS reference remains')
           if 'SERVICE_GROUPS=(pricing audio face fusion extension)' not in s:
               raise SystemExit('service group declaration missing after repair')
