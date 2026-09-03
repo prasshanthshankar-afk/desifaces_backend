@@ -35,6 +35,7 @@ from app.services.longform_orchestrator import (
     reserve_longform_pricing_for_job,
 )
 from app.services.sas_service import AzureBlobService
+from app.services.video_direction_contract import apply_video_direction
 
 router = APIRouter(prefix="/api/longform", tags=["longform"])
 
@@ -472,6 +473,7 @@ def _normalize_longform_request_body(raw: Any) -> Dict[str, Any]:
         or ''
     ).lower()
     provider_hint = (_safe_str(body.get('provider_hint')) or _safe_str(tags.get('provider_hint')) or '').lower()
+    provider_options = _as_dict_loose(body.get('provider_options'))
 
     if resolved_profile == 'talking_video':
         is_talking_economy = (
@@ -483,8 +485,6 @@ def _normalize_longform_request_body(raw: Any) -> Dict[str, Any]:
 
         body['quality_tier'] = 'economy' if is_talking_economy else 'premium'
         tags['quality_tier'] = body['quality_tier']
-
-        provider_options = _as_dict_loose(body.get('provider_options'))
 
         if is_talking_economy:
             body['provider_hint'] = 'veed_fabric'
@@ -534,6 +534,13 @@ def _normalize_longform_request_body(raw: Any) -> Dict[str, Any]:
     elif requested_quality_tier:
         body['quality_tier'] = requested_quality_tier
         tags.setdefault('quality_tier', requested_quality_tier)
+
+    # VIDEO_DIRECTION_CONTRACT_V1: provider-neutral customer direction.
+    # Current provider routing above remains authoritative and unchanged.
+    body, tags, provider_options = apply_video_direction(body, tags, provider_options)
+    if _safe_str(body.get('background_mode')):
+        provider_options['background_mode'] = body.get('background_mode')
+    body['provider_options'] = provider_options
 
     if not _safe_str(body.get('background_mode')):
         body['background_mode'] = 'movement_based' if resolved_profile == 'cinematic_video_direction' else 'fixed'

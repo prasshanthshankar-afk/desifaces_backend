@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.safety_service import SafetyService
@@ -95,6 +96,23 @@ class CreatorPromptService:
         if isinstance(g, dict) and "value" in g:
             return str(g.get("value") or "").strip()
         return str(g).strip()
+
+    @staticmethod
+    def _infer_gender_from_prompt(text: Any) -> str:
+        """Infer only an explicit binary presentation term from user text.
+
+        Ambiguous prompts return empty and fall through to the existing product
+        default. Never infer from geography, name, attire, occupation, or other
+        stereotypes.
+        """
+        value = str(text or "").strip().lower()
+        if not value:
+            return ""
+        female = bool(re.search(r"\b(female|woman|women|girl|lady|ladies)\b", value))
+        male = bool(re.search(r"\b(male|man|men|boy|gentleman|gentlemen)\b", value))
+        if female == male:
+            return ""
+        return "female" if female else "male"
 
     @staticmethod
     def _pick_one(rng: random.Random, arr: Any) -> Optional[Any]:
@@ -309,11 +327,16 @@ class CreatorPromptService:
             region=region,
         )
 
-        # Gender policy
+        # FACE_VARIANT_GENDER_METADATA_V1: use one resolved gender value for
+        # both generation prompting and persisted Face metadata.
         gender = explicit_gender
         if (not is_i2i) and (not gender):
-            gender = "female"  # T2I default
-        # I2I: keep empty unless UI explicitly sends it
+            gender = self._infer_gender_from_prompt(translated_prompt)
+        if (not is_i2i) and (not gender):
+            gender = "female"  # preserve existing T2I product default
+        if (not is_i2i) and gender in {"male", "female"}:
+            request_dict["gender"] = gender
+        # I2I: keep empty unless the source/request already supplies it.
 
         def gender_phrase(g: str) -> Optional[str]:
             g = (g or "").strip().lower()

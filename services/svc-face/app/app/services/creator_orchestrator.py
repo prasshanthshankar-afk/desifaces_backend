@@ -3760,6 +3760,11 @@ class CreatorOrchestrator:
 
             creative_variations = self._coerce_dict(variant.get("creative_variations"))
             identity_signature = variant.get("identity_signature")
+            # FACE_VARIANT_TECHNICAL_GENDER_V1
+            gender = self._coerce_gender(request_dict.get("gender"))
+            if gender:
+                technical["gender"] = gender
+                technical["gender_presentation"] = gender
 
             asset_id = await self.assets_repo.create_asset(
                 user_id=user_id,
@@ -3797,8 +3802,6 @@ class CreatorOrchestrator:
                 if isinstance(x, dict):
                     return x.get("code")
                 return getattr(x, "code", None)
-
-            gender = self._coerce_gender(request_dict.get("gender"))
 
             profile_id = await self.profiles_repo.create_profile(
                 user_id=user_id,
