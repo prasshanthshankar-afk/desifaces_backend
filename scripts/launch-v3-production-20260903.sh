@@ -43,7 +43,7 @@ REQUIRED_CONTAINERS=(
 for c in "${REQUIRED_CONTAINERS[@]}"; do exists "$c" || fail "required live V3 container not found: $c"; done
 
 # group|source root|container rel paths|containers
-GROUPS=(pricing audio face fusion extension)
+SERVICE_GROUPS=(pricing audio face fusion extension)
 declare -A SRC_ROOT RELS CONTAINERS
 SRC_ROOT[pricing]="services/svc-pricing/app"
 RELS[pricing]="app/api/routes/spending.py app/services/customer_spending_service.py app/main.py"
@@ -92,7 +92,7 @@ rollback(){
     log ""
     log "===== AUTOMATIC ROLLBACK ====="
     if (( RUNTIME_CHANGED == 1 )); then
-      for g in "${GROUPS[@]}"; do
+      for g in "${SERVICE_GROUPS[@]}"; do
         for c in ${CONTAINERS[$g]}; do
           for rel in ${RELS[$g]}; do restore_file "$c" "$rel"; done
         done
@@ -193,7 +193,7 @@ log "BACKEND_SOURCE_GATE=PASS"
 
 log ""
 log "===== 2. SNAPSHOT LIVE SERVICE FILES ====="
-for g in "${GROUPS[@]}"; do
+for g in "${SERVICE_GROUPS[@]}"; do
   for c in ${CONTAINERS[$g]}; do
     for rel in ${RELS[$g]}; do snapshot_file "$c" "$rel"; done
   done
@@ -219,7 +219,7 @@ fi
 log ""
 log "===== 4. DEPLOY PINNED SOURCE TO AFFECTED V3 SERVICES ====="
 RUNTIME_CHANGED=1
-for g in "${GROUPS[@]}"; do
+for g in "${SERVICE_GROUPS[@]}"; do
   for c in ${CONTAINERS[$g]}; do
     for rel in ${RELS[$g]}; do
       src="$BWT/${SRC_ROOT[$g]}/$rel"
@@ -255,7 +255,7 @@ log "===== 6. MAKE CURRENT SERVICE SOURCE DURABLE IN LOCAL IMAGE TAGS ====="
 # One representative per service image family is enough when API/workers share the tag;
 # if tags differ, patch each distinct container tag.
 declare -A SEEN_TAGS
-for g in "${GROUPS[@]}"; do
+for g in "${SERVICE_GROUPS[@]}"; do
   for c in ${CONTAINERS[$g]}; do
     tag="$(docker inspect -f '{{.Config.Image}}' "$c")"
     key="$g|$tag"
