@@ -2,18 +2,21 @@
 set -Eeuo pipefail
 
 PUBLIC_HOST="${PUBLIC_HOST:-web.desifaces.ai}"
-UPSTREAM_HOST="${UPSTREAM_HOST:-dev-app.desifaces.ai}"
-UPSTREAM_URL="https://${UPSTREAM_HOST}"
+UPSTREAM_HOST="${UPSTREAM_HOST:-dev-api.desifaces.ai}"
+UPSTREAM_PREFIX="${UPSTREAM_PREFIX:-/__v3web__/}"
+UPSTREAM_URL="https://${UPSTREAM_HOST}${UPSTREAM_PREFIX}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 CONFIG=""
 BACKUP=""
 CHANGED=0
+TMP=""
 
 log(){ printf '%s\n' "$*"; }
 fail(){ printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"; }
-for x in sudo nginx curl python3 grep cp cmp; do need "$x"; done
+for x in sudo nginx curl python3 grep cp cmp mktemp; do need "$x"; done
 
+cleanup_files(){ [[ -z "$TMP" ]] || rm -f "$TMP" || true; }
 rollback(){
   local rc=$?
   set +e
@@ -22,19 +25,22 @@ rollback(){
     sudo nginx -t >/dev/null 2>&1 && sudo systemctl reload nginx >/dev/null 2>&1 || true
     log "PUBLIC_WEB_ROLLBACK=ATTEMPTED backup=$BACKUP"
   fi
+  cleanup_files
   exit "$rc"
 }
 trap rollback EXIT
+
+[[ "$UPSTREAM_PREFIX" == /*/ ]] || fail "UPSTREAM_PREFIX must start and end with /"
 
 log "============================================================"
 log " desifaces.ai — PUBLIC WEB CUTOVER TO V3"
 log "============================================================"
 log "public_host=$PUBLIC_HOST upstream=$UPSTREAM_URL"
 
-code="$(curl -sS --max-time 20 -o /tmp/df-v3-upstream-precheck.html -w '%{http_code}' "$UPSTREAM_URL/auth/login")"
-[[ "$code" == "200" ]] || fail "$UPSTREAM_HOST bridge is not reachable (HTTP $code)"
-grep -qi 'desifaces' /tmp/df-v3-upstream-precheck.html || fail "upstream bridge response missing desifaces branding"
-log "V3_UPSTREAM_BRIDGE=PASS"
+code="$(curl -sS --max-time 30 -o /tmp/df-v3-upstream-precheck.html -w '%{http_code}' "${UPSTREAM_URL}auth/login")"
+[[ "$code" == "200" ]] || fail "$UPSTREAM_HOST V3 bridge is not reachable (HTTP $code)"
+grep -qi 'desifaces' /tmp/df-v3-upstream-precheck.html || fail "upstream V3 bridge response missing desifaces branding"
+log "V3_UPSTREAM_BRIDGE=PASS url=${UPSTREAM_URL}auth/login"
 
 mapfile -t FILES < <(sudo grep -RIl -E "server_name[[:space:]]+${PUBLIC_HOST//./\\.}([[:space:];]|$)" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null \
   | grep -Ev '(\.bak$|\.backup$|\.before-|\.pre-|~$)' \
@@ -56,17 +62,12 @@ log "backup=$BACKUP"
 
 TMP="$(mktemp)"
 sudo cat "$CONFIG" > "$TMP"
-python3 - "$TMP" "$PUBLIC_HOST" "$UPSTREAM_HOST" <<'PY'
+python3 - "$TMP" "$PUBLIC_HOST" "$UPSTREAM_HOST" "$UPSTREAM_PREFIX" <<'PY'
 from pathlib import Path
 import re, sys
-p=Path(sys.argv[1]); public=sys.argv[2]; upstream=sys.argv[3]
-s=p.read_text()
+p=Path(sys.argv[1]); public=sys.argv[2]; upstream=sys.argv[3]; prefix=sys.argv[4]
+s=p.read_text(); lines=s.splitlines()
 marker='DESIFACES_V3_PUBLIC_WEB_CUTOVER_20260903'
-if marker in s:
-    print('PUBLIC_V3_CUTOVER_ALREADY_PRESENT=YES')
-    raise SystemExit(0)
-
-lines=s.splitlines()
 blocks=[]; start=None; depth=0
 for i,line in enumerate(lines):
     if start is None and re.match(r'^\s*server\s*\{', line):
@@ -79,25 +80,37 @@ for i,line in enumerate(lines):
 hits=[]
 for a,b in blocks:
     text='\n'.join(lines[a:b+1])
-    if re.search(rf'(?m)^\s*server_name\s+{re.escape(public)}\s*;', text) and re.search(r'(?m)^\s*listen\s+443\b', text):
+    if re.search(rf'(?m)^\s*server_name\s+{re.escape(public)}\s*;', text) and re.search(r'(?m)^\s*listen\s+(?:\[::\]:)?443\b', text):
         hits.append((a,b))
 if len(hits)!=1:
     raise SystemExit(f'expected exactly one HTTPS {public} server block, found {len(hits)}')
 a,b=hits[0]
 block=lines[a:b+1]
+block_text='\n'.join(block)
+if marker in block_text:
+    if f'proxy_pass https://{upstream}{prefix};' not in block_text:
+        raise SystemExit('existing V3 marker points to an unexpected upstream')
+    print('PUBLIC_V3_CUTOVER_ALREADY_PRESENT=YES')
+    raise SystemExit(0)
+
 proxy_idxs=[i for i,l in enumerate(block) if re.search(r'^\s*proxy_pass\s+', l)]
 if len(proxy_idxs)!=1:
     raise SystemExit(f'expected exactly one proxy_pass in {public} HTTPS block, found {len(proxy_idxs)}')
 pi=proxy_idxs[0]
 indent=block[pi][:len(block[pi])-len(block[pi].lstrip())]
 old=block[pi].strip()
-if not (old.startswith('proxy_pass http://df_web') or '127.0.0.1:3000' in old):
+allowed=(
+    old.startswith('proxy_pass http://df_web'),
+    '127.0.0.1:3000' in old,
+)
+if not any(allowed):
     raise SystemExit(f'unexpected existing web upstream: {old}')
-block[pi]=f'{indent}proxy_pass https://{upstream};'
+block[pi]=f'{indent}proxy_pass https://{upstream}{prefix};'
 
 host_idxs=[i for i,l in enumerate(block) if re.search(r'^\s*proxy_set_header\s+Host\s+', l)]
 if host_idxs:
-    hi=host_idxs[0]; hindent=block[hi][:len(block[hi])-len(block[hi].lstrip())]
+    hi=host_idxs[0]
+    hindent=block[hi][:len(block[hi])-len(block[hi].lstrip())]
     block[hi]=f'{hindent}proxy_set_header Host {upstream};'
     insert_at=hi+1
 else:
@@ -108,12 +121,12 @@ extra=[
     f'{indent}proxy_ssl_name {upstream};',
     f'{indent}proxy_ssl_verify on;',
     f'{indent}proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;',
-    f'{indent}proxy_set_header X-Forwarded-Host $host;',
+    f'{indent}proxy_set_header X-Forwarded-Host {public};',
 ]
 block[insert_at:insert_at]=extra
 lines[a:b+1]=block
 p.write_text('\n'.join(lines).rstrip()+'\n')
-print(f'PUBLIC_WEB_UPSTREAM=https://{upstream}')
+print(f'PUBLIC_WEB_UPSTREAM=https://{upstream}{prefix}')
 PY
 
 if cmp -s "$TMP" <(sudo cat "$CONFIG"); then
@@ -125,7 +138,6 @@ else
   sudo systemctl reload nginx
   log "PUBLIC_WEB_CHANGE=APPLIED"
 fi
-rm -f "$TMP"
 
 code="$(curl -sS --max-time 30 -o /tmp/df-v3-public-web.html -w '%{http_code}' "https://$PUBLIC_HOST/auth/login")"
 [[ "$code" == "200" ]] || fail "public $PUBLIC_HOST returned HTTP $code after cutover"
@@ -133,5 +145,6 @@ grep -qi 'desifaces' /tmp/df-v3-public-web.html || fail "public response missing
 log "PUBLIC_WEB_V3=PASS url=https://$PUBLIC_HOST/auth/login"
 
 CHANGED=0
+cleanup_files
 trap - EXIT
 exit 0
