@@ -75,10 +75,27 @@ async def get_auth_context(
     if uid is None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
-    cc = (x_country_code or "").strip().upper()
-    if cc and len(cc) != 2:
-        # Allow empty; if provided, must look like ISO2
+    header_cc = (x_country_code or "").strip().upper()
+    if header_cc and (len(header_cc) != 2 or not header_cc.isalpha()):
         raise HTTPException(status_code=400, detail="invalid X-Country-Code")
+
+    # CANONICAL_LOGIN_COUNTRY_V1: once authentication succeeds, country/currency
+    # comes from core.users. A header may bootstrap older accounts only when the
+    # canonical DB value is still empty; it cannot override an existing value.
+    pool = await ensure_db_pool()
+    async with pool.acquire() as conn:
+        db_cc = await conn.fetchval(
+            "SELECT country_code FROM core.users WHERE id=$1::uuid", uid
+        )
+        cc = str(db_cc or "").strip().upper()
+        if not cc and header_cc:
+            cc = header_cc
+            await conn.execute(
+                "UPDATE core.users SET country_code=$2, updated_at=now() WHERE id=$1::uuid AND country_code IS NULL",
+                uid, cc,
+            )
+        if cc and (len(cc) != 2 or not cc.isalpha()):
+            raise HTTPException(status_code=500, detail="invalid_canonical_country_code")
 
     return AuthContext(user_id=uid, bearer_token=bearer, country_code=cc)
 

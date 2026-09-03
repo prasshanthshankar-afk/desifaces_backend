@@ -73,7 +73,7 @@ REFRESH_TTL_SECONDS = int(os.getenv("REFRESH_TTL_SECONDS", "2592000"))  # 30 day
 #-------------------------
 # JWT minting and decoding
 #-------------------------
-def mint_access_jwt(*, user_id: str, email: str, tier: str, roles: List[str]) -> str:
+def mint_access_jwt(*, user_id: str, email: str, tier: str, roles: List[str], country_code: str | None = None) -> str:
     now = int(time.time())
     payload = {
         "iss": _JWT_ISSUER,
@@ -85,6 +85,7 @@ def mint_access_jwt(*, user_id: str, email: str, tier: str, roles: List[str]) ->
         "email": email,
         "tier": tier,
         "roles": roles,
+        "country_code": (str(country_code or "").strip().upper() or None),
     }
     return jwt.encode(payload, _JWT_SECRET, algorithm=_JWT_ALG)
 
