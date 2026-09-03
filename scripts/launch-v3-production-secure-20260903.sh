@@ -9,13 +9,33 @@ need(){ command -v "$1" >/dev/null 2>&1 || { echo "FAIL: missing required comman
 need gh
 need base64
 
-TMP="$(mktemp /tmp/desifaces-v3-production-cutover.XXXXXX.sh)"
-trap 'rm -f "$TMP"' EXIT
+BASE="$(mktemp /tmp/desifaces-v3-production-cutover.XXXXXX.sh)"
+INGRESS="$(mktemp /tmp/desifaces-v3-public-ingress.XXXXXX.sh)"
+trap 'rm -f "$BASE" "$INGRESS"' EXIT
 
 gh api \
   'repos/prasshanthshankar-afk/desifaces_backend/contents/scripts/launch-v3-production-20260903.sh?ref=main' \
-  --jq .content | base64 -d > "$TMP"
+  --jq .content | base64 -d > "$BASE"
+gh api \
+  'repos/prasshanthshankar-afk/desifaces_backend/contents/scripts/ensure-v3-web-public-ingress-20260903.sh?ref=main' \
+  --jq .content | base64 -d > "$INGRESS"
 
-bash -n "$TMP"
+bash -n "$BASE"
+bash -n "$INGRESS"
 echo "SECURE_LAUNCH_PINS=PASS backend_sha=$BACKEND_SHA web_sha=$WEB_SHA"
-exec bash "$TMP"
+
+echo ""
+echo "===== APPLICATION CUTOVER ====="
+bash "$BASE"
+
+echo ""
+echo "===== PUBLIC HTTPS CUTOVER ====="
+bash "$INGRESS"
+
+echo ""
+echo "============================================================"
+echo " desifaces.ai SEPTEMBER 3 WEB LAUNCH PASS"
+echo "============================================================"
+echo "backend_sha=$BACKEND_SHA"
+echo "web_sha=$WEB_SHA"
+echo "public_web=https://web.desifaces.ai"
