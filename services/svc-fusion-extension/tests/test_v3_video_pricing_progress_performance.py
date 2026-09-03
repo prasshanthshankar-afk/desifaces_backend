@@ -3,8 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-BACKEND_ROOT = ROOT.parents[1]
+ROOT = Path(__file__).resolve().parents[1]  # services/svc-fusion-extension
+REPO_ROOT = ROOT.parents[1]
 
 pricing_path = ROOT / "app/app/services/premium_actual_seconds_pricing.py"
 spec = importlib.util.spec_from_file_location("premium_actual_seconds_pricing", pricing_path)
@@ -54,15 +54,13 @@ assert "await asyncio.gather" in stitch
 assert "status = 'stitching_running'" in stitch
 assert "STITCH_WORKER_BATCH_SIZE" in stitch
 
-face = (BACKEND_ROOT / "svc-face/app/app/services/creator_orchestrator.py").read_text()
+face = (REPO_ROOT / "services/svc-face/app/app/services/creator_orchestrator.py").read_text()
 assert "FACE_PROGRESS_DETAIL_V1" in face
 # Existing Face variant parallelism must remain in place.
 assert "await asyncio.gather" in face
 assert "_face_variant_concurrency()" in face
 
-migration = (BACKEND_ROOT.parents[0] / "migrations/2026_09_03_talking_video_premium_actual_seconds.sql")
-if not migration.exists():
-    migration = Path("migrations/2026_09_03_talking_video_premium_actual_seconds.sql")
+migration = REPO_ROOT / "migrations/2026_09_03_talking_video_premium_actual_seconds.sql"
 text = migration.read_text()
 assert "LONGFORM_TALK_PREMIUM_SECOND" in text
 assert "default_unit_credits" in text
