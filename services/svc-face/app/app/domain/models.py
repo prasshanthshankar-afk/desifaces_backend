@@ -25,7 +25,6 @@ class JobStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
-    PARTIAL_SUCCESS = "partial_success"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
@@ -480,20 +479,24 @@ class FaceProfileDB(BaseModel):
 
     id: str
     user_id: str
-    source_job_id: Optional[str] = None
-    display_name: Optional[str] = None
-    primary_asset_id: Optional[str] = None
-    is_active: bool = True
+    display_name: Optional[str]
+    primary_image_asset_id: str
+    attributes_json: Dict[str, Any]
+    meta_json: Dict[str, Any]
+    status: str = "active"
     created_at: datetime
     updated_at: datetime
 
 
-class FaceJobOutputDB(BaseModel):
+class MediaAssetDB(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     id: str
-    job_id: str
-    variant_number: int
-    face_profile_id: Optional[str] = None
-    media_asset_id: Optional[str] = None
+    user_id: str
+    kind: str
+    storage_ref: str
+    content_type: str
+    bytes: int
+    meta_json: Dict[str, Any]
     created_at: datetime
+    updated_at: datetime
