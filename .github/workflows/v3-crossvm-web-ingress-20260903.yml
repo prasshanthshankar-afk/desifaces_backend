@@ -1,0 +1,39 @@
+name: V3 Cross-VM Web Ingress Certification
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'scripts/prepare-v3-web-bridge-on-dev-20260903.sh'
+      - 'scripts/cutover-public-web-on-gpu-20260903.sh'
+      - '.github/workflows/v3-crossvm-web-ingress-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: |
+          bash -n scripts/prepare-v3-web-bridge-on-dev-20260903.sh
+          bash -n scripts/cutover-public-web-on-gpu-20260903.sh
+      - name: Launch topology safety
+        run: |
+          grep -Fq 'dev-app.desifaces.ai' scripts/prepare-v3-web-bridge-on-dev-20260903.sh
+          grep -Fq 'http://127.0.0.1:13000' scripts/prepare-v3-web-bridge-on-dev-20260903.sh
+          grep -Fq 'DEV_APP_BRIDGE_ROLLBACK=ATTEMPTED' scripts/prepare-v3-web-bridge-on-dev-20260903.sh
+          grep -Fq 'web.desifaces.ai' scripts/cutover-public-web-on-gpu-20260903.sh
+          grep -Fq 'https://${UPSTREAM_HOST}' scripts/cutover-public-web-on-gpu-20260903.sh
+          grep -Fq 'proxy_ssl_verify on;' scripts/cutover-public-web-on-gpu-20260903.sh
+          grep -Fq 'PUBLIC_WEB_ROLLBACK=ATTEMPTED' scripts/cutover-public-web-on-gpu-20260903.sh
+          if grep -Eq '0\.0\.0\.0:13000|:13000:3000' scripts/prepare-v3-web-bridge-on-dev-20260903.sh scripts/cutover-public-web-on-gpu-20260903.sh; then
+            echo 'FAIL: V3 web port must remain loopback-only'
+            exit 1
+          fi
+          echo 'V3_CROSSVM_WEB_INGRESS_STATIC_GATE=PASS'
