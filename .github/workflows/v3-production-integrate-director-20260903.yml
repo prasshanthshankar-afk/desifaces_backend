@@ -50,8 +50,6 @@ jobs:
           diff -u /tmp/expected-conflicts.txt /tmp/actual-conflicts.txt
           echo 'DIRECTOR_CONFLICT_SET=PASS'
 
-          # September launch behavior remains authoritative for pricing, Face startup,
-          # the current Fusion worker and the consolidated contract-test workflow.
           git checkout --ours -- \
             .github/workflows/v3-contract-tests.yml \
             migrations/2026_08_30_multi_person_premium_pricing.sql \
@@ -67,8 +65,6 @@ jobs:
             services/svc-face/app/app/services/multi_person_pricing_policy.py \
             services/svc-fusion/app/app/workers/fusion_worker.py
 
-          # Keep both the secure external-env worktree bridge and the canonical V3
-          # Fusion storage-container guard.
           git checkout --ours -- scripts/v3-compose.sh
           python3 - <<'PY'
           from pathlib import Path
@@ -85,8 +81,6 @@ jobs:
           PY
           git add scripts/v3-compose.sh
 
-          # Preserve the current concurrent canonical longform stitcher and add the
-          # V3 Story scene reconciler as a side-by-side loop.
           git checkout --ours -- services/svc-fusion-extension/app/app/workers/stitch_worker.py
           python3 - <<'PY'
           from pathlib import Path
@@ -110,7 +104,9 @@ jobs:
 
           unresolved="$(git diff --name-only --diff-filter=U)"
           [[ -z "$unresolved" ]] || { echo "FAIL: unresolved conflicts"; echo "$unresolved"; exit 1; }
-          git diff --cached --check
+          # Historical evidence Markdown intentionally uses hard-break trailing spaces;
+          # runtime/release source must still pass whitespace validation.
+          git diff --cached --check -- .github migrations scripts services test
           grep -Fq 'DF_V3_FUSION_OUTPUT_CONTAINER' scripts/v3-compose.sh
           grep -Fq 'SERVICE_ENV_LINK_OWNED' scripts/v3-compose.sh
           grep -Fq 'v3_scene_coordinator_loop' services/svc-fusion-extension/app/app/workers/stitch_worker.py
@@ -169,7 +165,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           git status --short
-          git diff --cached --check
+          git diff --cached --check -- .github migrations scripts services test
           git commit -m 'release(v3): integrate Director and Story runtime for production'
           git push origin HEAD:release/v3-production-launch-20260903
           echo "DIRECTOR_RELEASE_SHA=$(git rev-parse HEAD)"
