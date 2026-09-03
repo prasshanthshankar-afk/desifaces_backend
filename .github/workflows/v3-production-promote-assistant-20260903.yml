@@ -1,0 +1,85 @@
+name: V3 Production Promote Assistant
+
+on:
+  push:
+    branches:
+      - release/v3-production-launch-20260903
+    paths:
+      - '.github/workflows/v3-production-promote-assistant-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  promote-certify-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout integrated V3 production release
+        uses: actions/checkout@v4
+        with:
+          ref: release/v3-production-launch-20260903
+          fetch-depth: 0
+
+      - name: Promote only certified Piku Assistant component
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'desifaces-release-bot'
+          git config user.email 'release@desifaces.ai'
+          git fetch origin feature/v3-assistant-context-safe-20260829
+
+          # Deliberately source-scope the promotion. Do not merge the older full
+          # Assistant branch, because Director/pricing/runtime are already newer
+          # on this production release line.
+          git checkout origin/feature/v3-assistant-context-safe-20260829 -- \
+            services/svc-assistant \
+            docker-compose.assistant.v3.yml \
+            .github/workflows/v3-assistant-static.yml
+
+          git diff --cached --check -- services/svc-assistant docker-compose.assistant.v3.yml .github/workflows/v3-assistant-static.yml
+          test -f services/svc-assistant/app/Dockerfile.v3
+          test -f services/svc-assistant/app/app/main.py
+          test -f services/svc-assistant/app/app/context.py
+          test -f services/svc-assistant/app/app/service.py
+          grep -Fq 'container_name: df-v3-svc-assistant' docker-compose.assistant.v3.yml
+          grep -Fq '127.0.0.1:18012:8012' docker-compose.assistant.v3.yml
+          grep -Fq 'DF_DIRECTOR_BASE_URL' docker-compose.assistant.v3.yml
+          grep -Fq 'DF_PRICING_BASE_URL' docker-compose.assistant.v3.yml
+          echo ASSISTANT_SOURCE_PROMOTION=PASS
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Assistant dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -q pytest
+          python -m pip install --disable-pip-version-check -q -r services/svc-assistant/app/requirements.txt
+
+      - name: Compile and certify Piku Assistant
+        env:
+          PYTHONPATH: .:services/shared:services/shared/python:services/svc-assistant/app:services/svc-director/app
+        run: |
+          python -m compileall -q services/svc-assistant/app/app
+          python -m pytest -q services/svc-assistant/app/tests
+          echo ASSISTANT_TESTS=PASS
+
+      - name: Privacy and account-wide context release gates
+        run: |
+          grep -R -Fq 'support@desifaces.ai' services/svc-assistant/app/app
+          grep -R -Eq 'PII|PCI|sensitive' services/svc-assistant/app/app
+          grep -Fq 'DF_PRICING_BASE_URL' services/svc-assistant/app/app/config.py
+          grep -Fq 'DF_DASHBOARD_BASE_URL' services/svc-assistant/app/app/config.py
+          grep -Fq 'DF_DIRECTOR_BASE_URL' services/svc-assistant/app/app/config.py
+          echo ASSISTANT_PRIVACY_CONTEXT_GATE=PASS
+
+      - name: Commit certified Assistant promotion
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git diff --cached --check -- services/svc-assistant docker-compose.assistant.v3.yml .github/workflows/v3-assistant-static.yml
+          git commit -m 'release(v3): promote certified Piku Assistant for production'
+          git push origin HEAD:release/v3-production-launch-20260903
+          echo "ASSISTANT_RELEASE_SHA=$(git rev-parse HEAD)"
