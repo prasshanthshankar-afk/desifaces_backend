@@ -1,0 +1,72 @@
+name: V3 Launch Country Currency 2026-09-03
+
+on:
+  push:
+    branches:
+      - release/v3-production-deploy-20260903
+    paths:
+      - 'scripts/apply-v3-launch-country-currency-20260903.py'
+      - 'scripts/test-v3-launch-country-currency-20260903.py'
+      - 'migrations/2026_09_03_login_country_currency.sql'
+      - 'deploy/production/migrations-v3-production-20260903.txt'
+      - '.github/workflows/v3-launch-country-currency-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release/v3-production-deploy-20260903
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply launch currency patch
+        run: python3 scripts/apply-v3-launch-country-currency-20260903.py
+
+      - name: Source and syntax contract
+        run: python3 scripts/test-v3-launch-country-currency-20260903.py
+
+      - name: Compile affected services
+        run: |
+          python3 -m compileall -q services/svc-core/app/app
+          python3 -m compileall -q services/svc-pricing/app/app
+
+      - name: Existing pricing country matrix contract
+        env:
+          DATABASE_URL: postgresql://unused:unused@localhost/unused
+          JWT_SECRET: launch-ci-secret
+          REFRESH_TOKEN_HMAC_SECRET: launch-ci-refresh-secret
+        run: |
+          PYTHONPATH=services/svc-pricing/app python3 - <<'PY'
+          from app.config import settings
+          assert settings.currency_for_country('IN') == 'INR'
+          assert settings.currency_for_country('in') == 'INR'
+          for cc in ('US','GB','AE','SG','CA','',None):
+              assert settings.currency_for_country(cc) == 'USD', cc
+          print('RUNTIME_CURRENCY_MATRIX=PASS')
+          PY
+
+      - name: Commit certified source only
+        run: |
+          if git diff --quiet; then
+            echo 'No source changes required.'
+            exit 0
+          fi
+          git config user.name 'desifaces-release-bot'
+          git config user.email 'release@desifaces.ai'
+          git add \
+            services/svc-core/app/app/routes/auth.py \
+            services/svc-core/app/app/security.py \
+            services/svc-pricing/app/app/api/deps.py
+          git diff --cached --check
+          git commit -m 'feat(launch): enforce authenticated country currency invariant'
+          git push origin HEAD:release/v3-production-deploy-20260903
