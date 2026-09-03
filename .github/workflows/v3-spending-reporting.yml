@@ -1,6 +1,16 @@
 name: V3 Spending Reporting Certification
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/svc-pricing/app/app/api/routes/spending.py'
+      - 'services/svc-pricing/app/app/services/customer_spending_service.py'
+      - 'services/svc-pricing/app/app/main.py'
+      - 'scripts/test-v3-spending-reporting.py'
+      - 'scripts/launch-v3-production-20260903.sh'
+      - '.github/workflows/v3-spending-reporting.yml'
   pull_request:
     branches:
       - main
@@ -9,6 +19,7 @@ on:
       - 'services/svc-pricing/app/app/services/customer_spending_service.py'
       - 'services/svc-pricing/app/app/main.py'
       - 'scripts/test-v3-spending-reporting.py'
+      - 'scripts/launch-v3-production-20260903.sh'
       - '.github/workflows/v3-spending-reporting.yml'
   workflow_dispatch:
 
@@ -36,3 +47,6 @@ jobs:
           python3 -m py_compile
           services/svc-pricing/app/app/api/routes/spending.py
           services/svc-pricing/app/app/services/customer_spending_service.py
+
+      - name: Production cutover launcher syntax gate
+        run: bash -n scripts/launch-v3-production-20260903.sh
