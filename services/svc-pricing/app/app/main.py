@@ -19,6 +19,7 @@ from app.api.routes.reservations import router as reservations_router
 from app.api.routes.payments import router as payments_router
 from app.api.routes.payment_webhooks import router as payment_webhooks_router
 from app.api.routes.bootstrap import router as pricing_bootstrap_router
+from app.api.routes.spending import router as spending_router
 
 
 logger = logging.getLogger(__name__)
@@ -150,6 +151,7 @@ def create_app() -> FastAPI:
     app.include_router(payments_router)
     app.include_router(payment_webhooks_router)
     app.include_router(pricing_bootstrap_router)
+    app.include_router(spending_router)
 
     # Additive V3-only read-only canonical mapping probe. Import lazily so V2
     # pricing startup never depends on V3 contract packaging when the flag is off.

@@ -183,73 +183,72 @@ class TTSResolutionPlanner:
                     "invalid_context_resolution_result"
                 )
 
-        try:
-            model: ResolvedTTSModel = (
-                await self.model_resolver.resolve(
-                    TTSModelResolutionRequest(
-                        canonical_locale=canonical_locale,
-                        text_length=int(
-                            request.text_length
-                        ),
-                        output_format=(
-                            request.output_format
-                        ),
-                        country_code=(
-                            request.country_code
-                        ),
-                        region_code=(
-                            request.region_code
-                        ),
-                        accent_code=(
-                            request.accent_code
-                        ),
-                        requires_style=bool(
-                            request.requires_style
-                        ),
-                        requires_emotion=bool(
-                            request.requires_emotion
-                        ),
-                        requires_streaming=bool(
-                            request.requires_streaming
-                        ),
-                        requested_voice=(
-                            request.requested_voice
-                        ),
-                        requested_gender=(
-                            request.requested_gender
-                        ),
-                    )
-                )
+        # STALE_REQUESTED_VOICE_FALLBACK_V1: the selected Face gender and
+        # locale are authoritative. A stale/ineligible voice id is only a
+        # preference and must not block a valid same-gender resolution.
+        requested_voice = str(request.requested_voice or "").strip()
+        if requested_voice.lower() in {"", "auto"}:
+            requested_voice = ""
+        effective_requested_voice = requested_voice or None
+
+        def _model_request(voice_id):
+            return TTSModelResolutionRequest(
+                canonical_locale=canonical_locale,
+                text_length=int(request.text_length),
+                output_format=request.output_format,
+                country_code=request.country_code,
+                region_code=request.region_code,
+                accent_code=request.accent_code,
+                requires_style=bool(request.requires_style),
+                requires_emotion=bool(request.requires_emotion),
+                requires_streaming=bool(request.requires_streaming),
+                requested_voice=voice_id,
+                requested_gender=request.requested_gender,
             )
-        except Exception as exc:
-            raise TTSResolutionPlanError(
-                f"model_resolution_failed:{exc}"
-            ) from exc
 
         try:
-            voice: ResolvedTTSVoice = (
-                await self.voice_resolver.resolve(
-                    TTSVoiceResolutionRequest(
-                        provider_code=(
-                            model.provider_code
-                        ),
-                        model_code=model.model_code,
-                        canonical_locale=(
-                            canonical_locale
-                        ),
-                        requested_voice=(
-                            request.requested_voice
-                        ),
-                        requested_gender=(
-                            request.requested_gender
-                        ),
-                    )
-                )
+            model: ResolvedTTSModel = await self.model_resolver.resolve(
+                _model_request(effective_requested_voice)
             )
         except Exception as exc:
-            raise TTSResolutionPlanError(
-                f"voice_resolution_failed:{exc}"
-            ) from exc
+            if requested_voice and "requested_voice_not_eligible_for_any_model" in str(exc):
+                effective_requested_voice = None
+                try:
+                    model = await self.model_resolver.resolve(_model_request(None))
+                except Exception as fallback_exc:
+                    raise TTSResolutionPlanError(
+                        f"model_resolution_failed:{fallback_exc}"
+                    ) from fallback_exc
+            else:
+                raise TTSResolutionPlanError(
+                    f"model_resolution_failed:{exc}"
+                ) from exc
+
+        def _voice_request(voice_id):
+            return TTSVoiceResolutionRequest(
+                provider_code=model.provider_code,
+                model_code=model.model_code,
+                canonical_locale=canonical_locale,
+                requested_voice=voice_id,
+                requested_gender=request.requested_gender,
+            )
+
+        try:
+            voice: ResolvedTTSVoice = await self.voice_resolver.resolve(
+                _voice_request(effective_requested_voice)
+            )
+        except Exception as exc:
+            if effective_requested_voice and "requested_voice_not_eligible" in str(exc):
+                try:
+                    voice = await self.voice_resolver.resolve(_voice_request(None))
+                except Exception as fallback_exc:
+                    raise TTSResolutionPlanError(
+                        f"voice_resolution_failed:{fallback_exc}"
+                    ) from fallback_exc
+            else:
+                raise TTSResolutionPlanError(
+                    f"voice_resolution_failed:{exc}"
+                ) from exc
 
         if voice.provider_code != model.provider_code:
             raise TTSResolutionPlanError(

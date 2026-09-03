@@ -1,0 +1,38 @@
+name: V3 Spending Reporting Certification
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'services/svc-pricing/app/app/api/routes/spending.py'
+      - 'services/svc-pricing/app/app/services/customer_spending_service.py'
+      - 'services/svc-pricing/app/app/main.py'
+      - 'scripts/test-v3-spending-reporting.py'
+      - '.github/workflows/v3-spending-reporting.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  spending-reporting:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Spending source integrity gate
+        run: python3 scripts/test-v3-spending-reporting.py
+
+      - name: Python syntax gate
+        run: >-
+          python3 -m py_compile
+          services/svc-pricing/app/app/api/routes/spending.py
+          services/svc-pricing/app/app/services/customer_spending_service.py

@@ -12,6 +12,7 @@ import secrets
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -3283,7 +3284,15 @@ class CreatorOrchestrator:
                     return_exceptions=False,
                 )
 
+            # FACE_PARTIAL_RESULT_V1: successful variants are preserved and billed,
+            # but failed requested variants are never silently hidden from clients.
             completed_count = await self._count_completed_variants(job_id)
+            final_variants_state = await self._load_variants_state(job_id)
+            failed_count = sum(
+                1
+                for vv in final_variants_state.values()
+                if str(self._coerce_dict(vv).get("status") or "").strip().lower() == "failed"
+            )
             if completed_count > 0:
                 pricing = await self._commit_pricing_for_job(
                     job_id=job_id,
@@ -3291,34 +3300,54 @@ class CreatorOrchestrator:
                     pricing=pricing,
                     actual_units=completed_count,
                 )
+                partial_result = completed_count < variants_requested or failed_count > 0
                 await self.jobs_repo.update_status(
                     job_id,
                     "succeeded",
                     meta_patch={
                         "variants_completed": completed_count,
                         "variants_requested": variants_requested,
+                        "variants_failed": failed_count,
+                        "partial_success": partial_result,
                     },
+                )
+                title = "Some Face variants are ready" if partial_result else "Your Face output is ready"
+                body = (
+                    f"{completed_count} of {variants_requested} requested Face variants completed. Only completed variants are charged."
+                    if partial_result
+                    else "Your desifaces.ai Face generation completed successfully."
                 )
                 await _emit_notification_best_effort(
                     {
-                        "event_type": "FACE_READY",
+                        "event_type": "FACE_PARTIAL" if partial_result else "FACE_READY",
                         "category": "jobs",
                         "priority": "important",
                         "source_service": "svc-face",
                         "source_ref_type": "job",
                         "source_ref_id": str(job_id),
                         "actor_user_id": None,
-                        "title": "Your Face output is ready",
-                        "body": "Your desifaces.ai Face generation completed successfully.",
+                        "title": title,
+                        "body": body,
                         "action_route": "/notifications",
                         "action_label": "View result",
                         "image_url": None,
-                        "payload_json": {"job_id": str(job_id), "completed_variants": int(completed_count)},
-                        "metadata_json": {"job_id": str(job_id), "completed_variants": int(completed_count)},
-                        "dedupe_key": f"face-ready:{job_id}",
+                        "payload_json": {
+                            "job_id": str(job_id),
+                            "completed_variants": int(completed_count),
+                            "requested_variants": int(variants_requested),
+                            "failed_variants": int(failed_count),
+                            "partial_success": bool(partial_result),
+                        },
+                        "metadata_json": {
+                            "job_id": str(job_id),
+                            "completed_variants": int(completed_count),
+                            "requested_variants": int(variants_requested),
+                            "failed_variants": int(failed_count),
+                        },
+                        "dedupe_key": f"face-ready:{job_id}:{'partial' if partial_result else 'complete'}",
                         "recipients": [{"user_id": str(user_id), "channels": {"in_app": True, "push": True, "email": True}}],
                     },
-                    context={"job_id": str(job_id), "user_id": str(user_id), "event_type": "FACE_READY"},
+                    context={"job_id": str(job_id), "user_id": str(user_id), "event_type": "FACE_PARTIAL" if partial_result else "FACE_READY"},
                 )
             else:
                 await self._fail_job(
@@ -3731,6 +3760,11 @@ class CreatorOrchestrator:
 
             creative_variations = self._coerce_dict(variant.get("creative_variations"))
             identity_signature = variant.get("identity_signature")
+            # FACE_VARIANT_TECHNICAL_GENDER_V1
+            gender = self._coerce_gender(request_dict.get("gender"))
+            if gender:
+                technical["gender"] = gender
+                technical["gender_presentation"] = gender
 
             asset_id = await self.assets_repo.create_asset(
                 user_id=user_id,
@@ -3768,8 +3802,6 @@ class CreatorOrchestrator:
                 if isinstance(x, dict):
                     return x.get("code")
                 return getattr(x, "code", None)
-
-            gender = self._coerce_gender(request_dict.get("gender"))
 
             profile_id = await self.profiles_repo.create_profile(
                 user_id=user_id,
@@ -4091,7 +4123,12 @@ class CreatorOrchestrator:
         except Exception:
             status_enum = JobStatus.QUEUED
 
-        progress = self._get_progress_info(status_enum, len(variants), requested)
+        progress = self._get_progress_info(
+            status_enum,
+            len(variants),
+            requested,
+            created_at=self._row_get(job, "created_at", None),
+        )
         if progress is not None:
             if meta_json.get("variants_failed") is not None:
                 progress["variants_failed"] = int(meta_json.get("variants_failed") or 0)
@@ -4133,29 +4170,75 @@ class CreatorOrchestrator:
         }
         return messages.get(status, "Unknown status")
 
+    # FACE_PROGRESS_DETAIL_V1: status is derived from persisted job/variant state.
     def _get_progress_info(
         self,
         status: JobStatus,
         variants_count: int,
         requested: Optional[int],
+        *,
+        created_at: Any = None,
     ) -> Optional[Dict[str, Any]]:
-        if status == JobStatus.RUNNING:
-            base: Dict[str, Any] = {
-                "message": "Generating creator platform variants...",
-                "current_step": "Image generation",
-                "variants_completed": variants_count,
-            }
-            if requested is not None:
-                base["variants_requested"] = requested
-            return base
+        requested_count = max(1, int(requested or variants_count or 1))
+        completed_count = max(0, min(int(variants_count or 0), requested_count))
+        elapsed = 0
+        if created_at:
+            try:
+                dt = created_at
+                if isinstance(dt, str):
+                    dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                elapsed = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+            except Exception:
+                elapsed = 0
 
-        if status == JobStatus.SUCCEEDED:
-            base = {
-                "message": f"Generated {variants_count} variants successfully",
-                "variants_completed": variants_count,
-            }
-            if requested is not None:
-                base["variants_requested"] = requested
-            return base
+        delayed = status in {JobStatus.QUEUED, JobStatus.RUNNING} and elapsed >= 90
+        delay_message = (
+            "Face generation is taking longer than usual, but your job is still active. "
+            "You can leave this screen and return later; your progress is preserved."
+            if delayed else None
+        )
 
-        return None
+        if status == JobStatus.QUEUED:
+            percent = 5
+            stage = "queued"
+            message = "Face generation is queued and preparing your request…"
+        elif status == JobStatus.RUNNING:
+            percent = max(10, min(94, int(round(10 + 84 * (completed_count / requested_count)))))
+            stage = "generating"
+            message = f"Generating Face variants — {completed_count} of {requested_count} complete."
+        elif status == JobStatus.SUCCEEDED:
+            percent = 100
+            missing_count = max(0, requested_count - completed_count)
+            partial_success = missing_count > 0
+            stage = "partial" if partial_success else "complete"
+            message = (
+                f"{completed_count} of {requested_count} Face variants completed. "
+                f"{missing_count} variant{'s' if missing_count != 1 else ''} could not be completed. "
+                "Only completed variants are charged."
+                if partial_success
+                else f"Generated {completed_count} Face variants successfully."
+            )
+        elif status in {JobStatus.FAILED, JobStatus.CANCELLED}:
+            partial_success = False
+            percent = max(0, min(99, int(round(10 + 84 * (completed_count / requested_count)))))
+            stage = "stopped"
+            message = "Face generation stopped before all requested variants completed."
+        else:
+            return None
+
+        return {
+            "percent": percent,
+            "stage": stage,
+            "message": message,
+            "current_step": "Image generation" if stage == "generating" else stage,
+            "variants_completed": completed_count,
+            "variants_requested": requested_count,
+            "variants_failed": max(0, requested_count - completed_count) if status == JobStatus.SUCCEEDED else 0,
+            "partial_success": bool(partial_success) if status == JobStatus.SUCCEEDED else False,
+            "elapsed_seconds": elapsed,
+            "is_delayed": delayed,
+            "delay_message": delay_message,
+            "source": "backend_job_state",
+        }
