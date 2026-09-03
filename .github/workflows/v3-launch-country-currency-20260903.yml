@@ -40,6 +40,9 @@ jobs:
           python3 -m compileall -q services/svc-core/app/app
           python3 -m compileall -q services/svc-pricing/app/app
 
+      - name: Install pricing config dependencies
+        run: python3 -m pip install --disable-pip-version-check -q pydantic==2.8.2 pydantic-settings==2.4.0
+
       - name: Existing pricing country matrix contract
         env:
           DATABASE_URL: postgresql://unused:unused@localhost/unused
