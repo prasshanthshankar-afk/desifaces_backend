@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 ROOT="${BACKEND_ROOT:-/home/azureuser/workspace/desifaces-v3}"
+WEB_ROOT="${WEB_ROOT:-/home/azureuser/workspace/desifaces-web-review}"
 BRANCH="feature/v3-web-e2e-ux-closeout-20260903"
 TMP="/tmp/deploy-v3-web-e2e-ux-closeout.final.sh"
 
@@ -63,13 +64,21 @@ s=s.replace(marker,proof+marker,1)
 p.write_text(s)
 PY
 
-for required in \
-  scripts/apply-v3-voice-legacy-face-gender.py \
-  services/svc-audio/app/app/services/tts_model_resolver.py; do
-  git cat-file -e "origin/$BRANCH:$required" 2>/dev/null || {
-    echo "FAIL: required closeout resource missing: $required" >&2
-    exit 2
-  }
-done
+# Backend-owned closeout resources are verified in the backend repository.
+git cat-file -e "origin/$BRANCH:services/svc-audio/app/app/services/tts_model_resolver.py" 2>/dev/null || {
+  echo 'FAIL: backend closeout resource missing: tts_model_resolver.py' >&2
+  exit 2
+}
+
+# Web-owned closeout resources must be checked in the web repository, not here.
+[[ -d "$WEB_ROOT/.git" ]] || {
+  echo "FAIL: web repository not found: $WEB_ROOT" >&2
+  exit 2
+}
+git -C "$WEB_ROOT" fetch -q origin "$BRANCH"
+git -C "$WEB_ROOT" cat-file -e "origin/$BRANCH:scripts/apply-v3-voice-legacy-face-gender.py" 2>/dev/null || {
+  echo 'FAIL: web closeout resource missing: apply-v3-voice-legacy-face-gender.py' >&2
+  exit 2
+}
 
 exec bash "$TMP"
