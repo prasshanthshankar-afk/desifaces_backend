@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import asyncpg
@@ -53,6 +54,91 @@ class LongformPricingPreviewResponse(BaseModel):
     summary: Dict[str, Any] = Field(default_factory=dict)
     insufficient_balance: bool = False
     message: Optional[str] = None
+
+
+# LONGFORM_PROGRESS_V1: backend-derived progress shared by every client.
+def _longform_progress(job: Any, segments: list[Any]) -> Dict[str, Any]:
+    status_value = str(job.get("status") or "queued").strip().lower()
+    total = int(job.get("total_segments") or len(segments) or 0)
+    states = [str(s.get("status") or "queued").strip().lower() for s in segments]
+    completed = sum(1 for s in states if s == "succeeded")
+    failed = sum(1 for s in states if s in {"failed", "error", "canceled", "cancelled"})
+    running_states = {
+        "audio_running", "provider_running", "provider_processing", "video_running",
+        "running", "processing", "submitted", "fallback_running",
+        "provider_degraded_retrying", "switching_to_fallback",
+    }
+    running = sum(1 for s in states if s in running_states)
+    queued = sum(1 for s in states if s == "queued")
+
+    weights = {
+        "queued": 0.0,
+        "audio_running": 0.20,
+        "submitted": 0.40,
+        "provider_running": 0.55,
+        "provider_processing": 0.55,
+        "video_running": 0.65,
+        "running": 0.55,
+        "processing": 0.55,
+        "provider_degraded_retrying": 0.50,
+        "switching_to_fallback": 0.50,
+        "fallback_running": 0.60,
+        "succeeded": 1.0,
+        "failed": 1.0,
+        "error": 1.0,
+    }
+    segment_fraction = (sum(weights.get(s, 0.25 if s not in {"queued", ""} else 0.0) for s in states) / max(1, total)) if total else 0.0
+
+    if status_value == "pricing_pending":
+        percent, stage, message = 5, "pricing", "Confirming the video price and reserving credits…"
+    elif status_value == "queued":
+        percent, stage, message = 10, "queued", "Video is queued and preparing parallel renders…"
+    elif status_value in {"stitching", "stitching_running", "stitching_active"}:
+        percent, stage, message = 92, "stitching", "All video parts are ready. Building your final video…"
+    elif status_value == "succeeded":
+        percent, stage, message = 100, "complete", "Your video is ready."
+    elif status_value in {"failed", "error", "blocked", "canceled", "cancelled"}:
+        percent = max(0, min(99, int(round(10 + (segment_fraction * 78)))))
+        stage, message = "stopped", str(job.get("error_message") or "Video generation stopped before completion.")
+    else:
+        percent = max(10, min(89, int(round(10 + (segment_fraction * 78)))))
+        stage = "rendering"
+        if total:
+            message = f"Rendering video parts in parallel — {completed} of {total} complete."
+        else:
+            message = "Rendering your video…"
+
+    elapsed = 0
+    created_at = job.get("created_at")
+    if created_at:
+        try:
+            if isinstance(created_at, str):
+                created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            elapsed = max(0, int((datetime.now(timezone.utc) - created_at).total_seconds()))
+        except Exception:
+            elapsed = 0
+    delayed = status_value not in {"succeeded", "failed", "error", "blocked", "canceled", "cancelled"} and elapsed >= 180
+    delay_message = (
+        "This video is taking longer than usual, but the job is still active. "
+        "You can leave this screen and return later; your progress is preserved."
+        if delayed else None
+    )
+    return {
+        "percent": percent,
+        "stage": stage,
+        "message": message,
+        "segments_total": total,
+        "segments_completed": completed,
+        "segments_running": running,
+        "segments_queued": queued,
+        "segments_failed": failed,
+        "elapsed_seconds": elapsed,
+        "is_delayed": delayed,
+        "delay_message": delay_message,
+        "source": "backend_segment_state",
+    }
 
 
 def _clamp_fusion_duration(sec: int) -> int:
@@ -1758,6 +1844,8 @@ async def get_longform_job(
 
         pricing_view, pricing_summary_view = await _load_latest_pricing_view(conn, str(row["id"]), {"tags": tags})
         run_receipt_view = _build_run_receipt_view(pricing_view, pricing_summary_view)
+        progress_rows = await segs_repo.list_segments_for_job(conn, str(row["id"]))
+        progress_view = _longform_progress(row, [dict(item) for item in progress_rows])
 
         return LongformJobView(
             id=str(row["id"]),
@@ -1768,6 +1856,7 @@ async def get_longform_job(
             max_segment_seconds=row["max_segment_seconds"],
             total_segments=row["total_segments"],
             completed_segments=row["completed_segments"],
+            progress=progress_view,
             final_video_url=final_url,
             final_storage_path=row["final_storage_path"],
             error_code=row["error_code"],

@@ -71,6 +71,16 @@ from app.domain.models import (
 from app.repos.longform_jobs_repo import LongformJobsRepo
 from app.repos.longform_segments_repo import LongformSegmentsRepo
 from app.services.stitch_service import compose_timeline, download_to_local, probe_duration_seconds, upload_final_mp4
+from app.services.premium_actual_seconds_pricing import (
+    PREMIUM_ACTUAL_SECONDS_ACTION,
+    PREMIUM_ACTUAL_SECONDS_SKU,
+    PREMIUM_ACTUAL_SECONDS_VARIANT,
+    PREMIUM_CREDITS_PER_SECOND,
+    PREMIUM_MIN_BILLABLE_SECONDS,
+    is_premium_actual_seconds_variant,
+    premium_actual_seconds_meta,
+    premium_billable_seconds,
+)
 
 
 def _safe_str(value: Any) -> Optional[str]:
@@ -1020,6 +1030,63 @@ def build_longform_pricing_preview_spec(user_id: str, payload: Dict[str, Any]) -
         json.dumps({"user_id": str(user_id), "payload": payload}, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     ).hexdigest()
 
+    # PREMIUM_ACTUAL_SECONDS_PREVIEW_V1: customer price follows actual duration; execution
+    # segmentation remains provider/internal metadata only.
+    if profile == "talking_video" and quality == "premium":
+        requested_for_pricing = (
+            _safe_int(payload.get("pricing_duration_sec"), 0)
+            or requested_duration_sec
+            or _pricing_duration_seconds(payload, tags)
+        )
+        actual_duration_sec = max(1, _safe_int(requested_for_pricing, 1))
+        billable_seconds = premium_billable_seconds(actual_duration_sec)
+        provider_limit_sec = max(1, _economy_provider_limit_sec(payload, tags))
+        execution_segment_plan = _economy_segment_plan_seconds(
+            actual_duration_sec,
+            segment_limit_sec=provider_limit_sec,
+        )
+        meta = {
+            "longform_profile": profile,
+            "service_action": PREMIUM_ACTUAL_SECONDS_ACTION,
+            "variant_code": PREMIUM_ACTUAL_SECONDS_VARIANT,
+            "leaf_sku_code": PREMIUM_ACTUAL_SECONDS_SKU,
+            "aspect_ratio": _safe_str(payload.get("aspect_ratio")) or "9:16",
+            "camera_angle": _safe_str(payload.get("camera_angle")) or _safe_str(tags.get("camera_angle")),
+            "camera_framing": _safe_str(payload.get("camera_framing")) or _safe_str(tags.get("camera_framing")),
+            "camera_motion_style": _safe_str(payload.get("camera_motion_style")) or _safe_str(tags.get("camera_motion_style")),
+            "background_mode": _safe_str(payload.get("background_mode")) or _safe_str(tags.get("background_mode")),
+            "quality_tier": quality,
+            "provider_hint": _provider_hint(payload, tags),
+            "execution_provider_family": _execution_provider_family(payload, tags),
+            "preview_fingerprint": request_fingerprint,
+            "estimated_duration_sec": actual_duration_sec,
+            "duration_sec": actual_duration_sec,
+            "requested_duration_sec": requested_duration_sec or actual_duration_sec,
+            "detected_audio_duration_sec": _safe_int(_effective_voice_audio_source(payload).get("duration_sec"), 0),
+            "provider_limit_sec": provider_limit_sec,
+            "units": str(billable_seconds),
+            "requested_units": str(billable_seconds),
+            "quantity": billable_seconds,
+            "billing_quantity": billable_seconds,
+            "segmented": len(execution_segment_plan) > 1,
+            "segment_count": len(execution_segment_plan),
+            "segment_durations_sec": execution_segment_plan,
+            "pricing_strategy": "premium_actual_seconds",
+            "selected_mode": "talking_video_premium",
+            **premium_actual_seconds_meta(actual_duration_sec),
+        }
+        return PricingPreviewSpec(
+            user_id=str(user_id),
+            service_name="svc-fusion-extension",
+            service_action=PREMIUM_ACTUAL_SECONDS_ACTION,
+            sku_code=PREMIUM_ACTUAL_SECONDS_VARIANT,
+            units=str(billable_seconds),
+            external_ref_type="longform_job_preview",
+            external_ref_id=f"preview:{request_fingerprint}",
+            idempotency_key=f"svc-fusion-extension:preview:{user_id}:{request_fingerprint}",
+            meta=meta,
+        )
+
     if profile == "talking_video" and quality in {"economy", "premium"}:
         requested_for_pricing = (
             _safe_int(payload.get("pricing_duration_sec"), 0)
@@ -1162,6 +1229,122 @@ async def reserve_longform_pricing_for_job(conn, *, user_id: str, job_id: str, p
     tags = _as_dict_loose(payload.get("tags"))
     profile = _pricing_profile(payload, tags)
     quality = _quality_tier(payload, tags)
+
+    # PREMIUM_ACTUAL_SECONDS_RESERVE_V1: reserve the parent against the authoritative
+    # actual-duration quote. Never derive customer units from child segment count.
+    if profile == "talking_video" and quality == "premium":
+        requested_duration_sec = _requested_duration_hint_seconds(payload, tags)
+        requested_for_pricing = (
+            _safe_int(payload.get("pricing_duration_sec"), 0)
+            or requested_duration_sec
+            or _pricing_duration_seconds(payload, tags)
+        )
+        actual_duration_sec = max(1, _safe_int(requested_for_pricing, 1))
+        billable_seconds = premium_billable_seconds(actual_duration_sec)
+        units = str(billable_seconds)
+        provider_limit_sec = max(1, _economy_provider_limit_sec(payload, tags))
+        execution_segment_plan = _economy_segment_plan_seconds(
+            actual_duration_sec,
+            segment_limit_sec=provider_limit_sec,
+        )
+        confirmation = _as_dict_loose(payload.get("pricing_confirmation"))
+        confirmed_variant_code = _safe_str(confirmation.get("variant_code"))
+        confirmed_units = _safe_str(confirmation.get("estimated_units")) or _safe_str(confirmation.get("requested_units"))
+        if confirmed_variant_code and confirmed_variant_code != PREMIUM_ACTUAL_SECONDS_VARIANT:
+            raise PricingClientError("PRICING_CONFIRMATION_VARIANT_MISMATCH")
+        if confirmed_units and _safe_int(confirmed_units, -1) != billable_seconds:
+            raise PricingClientError("PRICING_CONFIRMATION_UNITS_MISMATCH")
+
+        if not bool(getattr(client, "enabled", False)):
+            if _pricing_required():
+                raise PricingClientError(f"PRICING_CLIENT_DISABLED: {_pricing_disabled_reason()}")
+            pricing = {
+                "enabled": False,
+                "state": "disabled",
+                "variant_code": PREMIUM_ACTUAL_SECONDS_VARIANT,
+                "sku_code": PREMIUM_ACTUAL_SECONDS_SKU,
+                "leaf_sku_code": PREMIUM_ACTUAL_SECONDS_SKU,
+                "message": _pricing_disabled_reason(),
+            }
+            await _persist_job_pricing(conn, job_id, pricing, build_pricing_summary(pricing))
+            return pricing
+
+        reserve_meta = {
+            "longform_profile": profile,
+            "longform_job_id": str(job_id),
+            "service_job_id": str(job_id),
+            "service_job_table": "longform_jobs",
+            "pricing_entity_kind": "service_job",
+            "omit_studio_job_id": True,
+            "external_ref_type": "longform_job",
+            "service_name": "svc-fusion-extension",
+            "service_action": PREMIUM_ACTUAL_SECONDS_ACTION,
+            "variant_code": PREMIUM_ACTUAL_SECONDS_VARIANT,
+            "leaf_sku_code": PREMIUM_ACTUAL_SECONDS_SKU,
+            "aspect_ratio": _safe_str(payload.get("aspect_ratio")) or "9:16",
+            "camera_angle": _safe_str(payload.get("camera_angle")) or _safe_str(tags.get("camera_angle")),
+            "camera_framing": _safe_str(payload.get("camera_framing")) or _safe_str(tags.get("camera_framing")),
+            "camera_motion_style": _safe_str(payload.get("camera_motion_style")) or _safe_str(tags.get("camera_motion_style")),
+            "background_mode": _safe_str(payload.get("background_mode")) or _safe_str(tags.get("background_mode")),
+            "quality_tier": quality,
+            "provider_hint": _provider_hint(payload, tags),
+            "execution_provider_family": _execution_provider_family(payload, tags),
+            "estimated_duration_sec": actual_duration_sec,
+            "duration_sec": actual_duration_sec,
+            "requested_duration_sec": requested_duration_sec or actual_duration_sec,
+            "detected_audio_duration_sec": _safe_int(_effective_voice_audio_source(payload).get("duration_sec"), 0),
+            "provider_limit_sec": provider_limit_sec,
+            "units": units,
+            "requested_units": units,
+            "quantity": billable_seconds,
+            "billing_quantity": billable_seconds,
+            "segmented": len(execution_segment_plan) > 1,
+            "segment_count": len(execution_segment_plan),
+            "segment_durations_sec": execution_segment_plan,
+            "pricing_strategy": "premium_actual_seconds",
+            "selected_mode": "talking_video_premium",
+            **premium_actual_seconds_meta(actual_duration_sec),
+        }
+        reserve_spec = PricingReserveSpec(
+            user_id=str(user_id),
+            service_name="svc-fusion-extension",
+            service_action=PREMIUM_ACTUAL_SECONDS_ACTION,
+            sku_code=PREMIUM_ACTUAL_SECONDS_VARIANT,
+            units=units,
+            external_ref_type="longform_job",
+            external_ref_id=str(job_id),
+            idempotency_key=f"svc-fusion-extension:job:{job_id}:reserve",
+            meta=reserve_meta,
+            quote_id=_safe_str(confirmation.get("quote_id")),
+            preview_fingerprint=_safe_str(confirmation.get("preview_fingerprint")),
+        )
+        resp = await client.reserve(build_reserve_request(reserve_spec))
+        artifact = make_reserved_artifact(
+            resp,
+            service_name="svc-fusion-extension",
+            service_action=PREMIUM_ACTUAL_SECONDS_ACTION,
+            sku_code=PREMIUM_ACTUAL_SECONDS_VARIANT,
+            estimated_units=units,
+            unit_type="second",
+            meta=reserve_meta,
+        )
+        pricing = dict(artifact.get("pricing") or {})
+        pricing["enabled"] = True
+        pricing["state"] = "reserved"
+        pricing["quote_id"] = _safe_str(getattr(resp, "quote_id", None)) or pricing.get("quote_id") or _safe_str(confirmation.get("quote_id"))
+        pricing["preview_fingerprint"] = _safe_str(getattr(resp, "preview_fingerprint", None)) or pricing.get("preview_fingerprint") or _safe_str(confirmation.get("preview_fingerprint"))
+        pricing["variant_code"] = PREMIUM_ACTUAL_SECONDS_VARIANT
+        pricing["sku_code"] = PREMIUM_ACTUAL_SECONDS_SKU
+        pricing["leaf_sku_code"] = PREMIUM_ACTUAL_SECONDS_SKU
+        summary = dict(artifact.get("pricing_summary") or build_pricing_summary(pricing))
+        await _backfill_reservation_leaf_sku(
+            conn,
+            reservation_id=_safe_str(pricing.get("reservation_id")) or _safe_str(getattr(resp, "reservation_id", None)),
+            variant_code=PREMIUM_ACTUAL_SECONDS_VARIANT,
+            leaf_sku_code=PREMIUM_ACTUAL_SECONDS_SKU,
+        )
+        await _persist_job_pricing(conn, job_id, pricing, summary)
+        return pricing
 
     if profile == "talking_video" and quality in {"economy", "premium"}:
         requested_duration_sec = _requested_duration_hint_seconds(payload, tags)
@@ -1414,14 +1597,45 @@ async def commit_longform_pricing_for_job(conn, *, job_row: Dict[str, Any], fina
         or ""
     )
 
+    # PREMIUM_ACTUAL_SECONDS_COMMIT_V1: keep final charge at or below the confirmed
+    # actual-second reservation. A provider/stitch timing drift cannot increase
+    # the customer's confirmed price.
+    is_premium_actual_seconds = (
+        is_premium_actual_seconds_variant(reserved_variant_code)
+        or (
+            str(pricing_meta.get("billing_basis") or "").strip().lower() == "actual_seconds"
+            and str(_pricing_profile({}, tags)).strip().lower() == "talking_video"
+        )
+    )
     is_talking_video_bucket = (
         reserved_bucket_code.startswith("economy_")
         or reserved_bucket_code.startswith("premium_")
         or reserved_variant_code.startswith("TALKING_VIDEO_ECONOMY_")
-        or reserved_variant_code.startswith("TALKING_VIDEO_PREMIUM_")
+        or (reserved_variant_code.startswith("TALKING_VIDEO_PREMIUM_") and not is_premium_actual_seconds)
     )
 
-    if is_talking_video_bucket:
+    if is_premium_actual_seconds:
+        effective_variant_code = PREMIUM_ACTUAL_SECONDS_VARIANT
+        effective_leaf_sku_code = PREMIUM_ACTUAL_SECONDS_SKU
+        effective_bucket_code = ""
+        effective_bucket_max_sec = None
+        reserved_billable_seconds = max(
+            PREMIUM_MIN_BILLABLE_SECONDS,
+            _safe_int(pricing.get("estimated_units"), 0)
+            or _safe_int(pricing_meta.get("billable_seconds"), 0)
+            or PREMIUM_MIN_BILLABLE_SECONDS,
+        )
+        measured_duration = (
+            final_duration_sec
+            or pricing_meta.get("actual_duration_sec")
+            or pricing_meta.get("duration_sec")
+            or reserved_billable_seconds
+        )
+        measured_billable_seconds = premium_billable_seconds(measured_duration)
+        units = str(min(reserved_billable_seconds, measured_billable_seconds))
+        minutes = _minutes_int_from_duration(measured_duration)
+        service_action = reserved_service_action or PREMIUM_ACTUAL_SECONDS_ACTION
+    elif is_talking_video_bucket:
         effective_variant_code = reserved_variant_code
         effective_leaf_sku_code = reserved_leaf_sku_code
         effective_bucket_code = reserved_bucket_code
@@ -1479,6 +1693,12 @@ async def commit_longform_pricing_for_job(conn, *, job_row: Dict[str, Any], fina
         "units": units,
         "requested_units": units,
         "minutes": minutes,
+        "billing_basis": "actual_seconds" if is_premium_actual_seconds else pricing_meta.get("billing_basis"),
+        "billable_seconds": _safe_int(units, 0) if is_premium_actual_seconds else pricing_meta.get("billable_seconds"),
+        "min_billable_seconds": PREMIUM_MIN_BILLABLE_SECONDS if is_premium_actual_seconds else pricing_meta.get("min_billable_seconds"),
+        "credits_per_second": PREMIUM_CREDITS_PER_SECOND if is_premium_actual_seconds else pricing_meta.get("credits_per_second"),
+        "platform_neutral": True if is_premium_actual_seconds else pricing_meta.get("platform_neutral"),
+        "provider_neutral": True if is_premium_actual_seconds else pricing_meta.get("provider_neutral"),
         "talking_video_bucket_code": effective_bucket_code or None,
         "talking_video_bucket_max_sec": effective_bucket_max_sec,
         "economy_bucket_code": effective_bucket_code if str(effective_bucket_code or "").startswith("economy_") else None,
@@ -2910,7 +3130,9 @@ async def stitch_if_ready(
     job_id = str(job_row["id"])
     job_status = _safe_str(job_row.get("status")) or LongformJobStatus.queued.value
 
-    if job_status not in {LongformJobStatus.running.value, LongformJobStatus.stitching.value}:
+    # DEDICATED_STITCH_LEASE_V1: stitching_running is an internal lease
+    # owned by the dedicated stitch worker. It prevents duplicate finalization.
+    if job_status not in {LongformJobStatus.running.value, LongformJobStatus.stitching.value, "stitching_running"}:
         return
 
     if await segs.any_failed(conn, job_id):
@@ -2946,7 +3168,10 @@ async def stitch_if_ready(
     if total <= 0 or done != total:
         return
 
-    await jobs.set_status(conn, job_id, LongformJobStatus.stitching.value)
+    # Preserve an active dedicated-worker lease. Direct/legacy callers that
+    # arrive from running still transition to the historical stitching state.
+    if job_status != "stitching_running":
+        await jobs.set_status(conn, job_id, LongformJobStatus.stitching.value)
 
     rows = await segs.list_by_job(conn, job_id)
     rows = sorted(rows, key=lambda r: int(r.get("segment_index") or 0))

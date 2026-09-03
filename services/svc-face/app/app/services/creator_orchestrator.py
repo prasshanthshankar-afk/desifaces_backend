@@ -12,6 +12,7 @@ import secrets
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -4091,7 +4092,12 @@ class CreatorOrchestrator:
         except Exception:
             status_enum = JobStatus.QUEUED
 
-        progress = self._get_progress_info(status_enum, len(variants), requested)
+        progress = self._get_progress_info(
+            status_enum,
+            len(variants),
+            requested,
+            created_at=self._row_get(job, "created_at", None),
+        )
         if progress is not None:
             if meta_json.get("variants_failed") is not None:
                 progress["variants_failed"] = int(meta_json.get("variants_failed") or 0)
@@ -4133,29 +4139,64 @@ class CreatorOrchestrator:
         }
         return messages.get(status, "Unknown status")
 
+    # FACE_PROGRESS_DETAIL_V1: status is derived from persisted job/variant state.
     def _get_progress_info(
         self,
         status: JobStatus,
         variants_count: int,
         requested: Optional[int],
+        *,
+        created_at: Any = None,
     ) -> Optional[Dict[str, Any]]:
-        if status == JobStatus.RUNNING:
-            base: Dict[str, Any] = {
-                "message": "Generating creator platform variants...",
-                "current_step": "Image generation",
-                "variants_completed": variants_count,
-            }
-            if requested is not None:
-                base["variants_requested"] = requested
-            return base
+        requested_count = max(1, int(requested or variants_count or 1))
+        completed_count = max(0, min(int(variants_count or 0), requested_count))
+        elapsed = 0
+        if created_at:
+            try:
+                dt = created_at
+                if isinstance(dt, str):
+                    dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                elapsed = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+            except Exception:
+                elapsed = 0
 
-        if status == JobStatus.SUCCEEDED:
-            base = {
-                "message": f"Generated {variants_count} variants successfully",
-                "variants_completed": variants_count,
-            }
-            if requested is not None:
-                base["variants_requested"] = requested
-            return base
+        delayed = status in {JobStatus.QUEUED, JobStatus.RUNNING} and elapsed >= 90
+        delay_message = (
+            "Face generation is taking longer than usual, but your job is still active. "
+            "You can leave this screen and return later; your progress is preserved."
+            if delayed else None
+        )
 
-        return None
+        if status == JobStatus.QUEUED:
+            percent = 5
+            stage = "queued"
+            message = "Face generation is queued and preparing your request…"
+        elif status == JobStatus.RUNNING:
+            percent = max(10, min(94, int(round(10 + 84 * (completed_count / requested_count)))))
+            stage = "generating"
+            message = f"Generating Face variants — {completed_count} of {requested_count} complete."
+        elif status == JobStatus.SUCCEEDED:
+            percent = 100
+            stage = "complete"
+            message = f"Generated {completed_count} Face variants successfully."
+        elif status in {JobStatus.FAILED, JobStatus.CANCELLED}:
+            percent = max(0, min(99, int(round(10 + 84 * (completed_count / requested_count)))))
+            stage = "stopped"
+            message = "Face generation stopped before all requested variants completed."
+        else:
+            return None
+
+        return {
+            "percent": percent,
+            "stage": stage,
+            "message": message,
+            "current_step": "Image generation" if stage == "generating" else stage,
+            "variants_completed": completed_count,
+            "variants_requested": requested_count,
+            "elapsed_seconds": elapsed,
+            "is_delayed": delayed,
+            "delay_message": delay_message,
+            "source": "backend_job_state",
+        }
