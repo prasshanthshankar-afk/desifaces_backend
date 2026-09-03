@@ -1,0 +1,163 @@
+name: V3 Production Integrate Director Final
+
+on:
+  push:
+    branches:
+      - release/v3-production-launch-20260903
+    paths:
+      - '.github/workflows/v3-production-integrate-director-final-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  integrate-certify-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release/v3-production-launch-20260903
+          fetch-depth: 0
+
+      - name: Merge Director lineage with reconciled pricing contract
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'desifaces-release-bot'
+          git config user.email 'release@desifaces.ai'
+          git fetch origin feature/v3-assistant-operational-20260830
+          set +e
+          git merge --no-commit --no-ff origin/feature/v3-assistant-operational-20260830
+          rc=$?
+          set -e
+          [[ "$rc" -eq 1 ]] || { echo "FAIL: expected audited merge conflicts rc=1, got rc=$rc"; exit 1; }
+
+          cat > /tmp/expected.txt <<'EOF'
+          .github/workflows/v3-contract-tests.yml
+          migrations/2026_08_30_multi_person_premium_pricing.sql
+          scripts/v3-compose.sh
+          services/shared/python/desifaces_shared/pricing/multi_person.py
+          services/svc-face/app/app/main.py
+          services/svc-face/app/app/services/multi_person_pricing_policy.py
+          services/svc-fusion-extension/app/app/workers/stitch_worker.py
+          services/svc-fusion/app/app/workers/fusion_worker.py
+          EOF
+          git diff --name-only --diff-filter=U | sort > /tmp/actual.txt
+          diff -u /tmp/expected.txt /tmp/actual.txt
+          echo DIRECTOR_CONFLICT_SET=PASS
+
+          # Current launch remains authoritative for catalog/migration, Face wiring,
+          # Fusion performance and consolidated CI. Director's later shared pricing
+          # helper is authoritative for avoiding per-character Face double billing.
+          git checkout --ours -- \
+            .github/workflows/v3-contract-tests.yml \
+            migrations/2026_08_30_multi_person_premium_pricing.sql \
+            services/svc-face/app/app/main.py \
+            services/svc-face/app/app/services/multi_person_pricing_policy.py \
+            services/svc-fusion/app/app/workers/fusion_worker.py
+          git checkout --theirs -- services/shared/python/desifaces_shared/pricing/multi_person.py
+          git add \
+            .github/workflows/v3-contract-tests.yml \
+            migrations/2026_08_30_multi_person_premium_pricing.sql \
+            services/svc-face/app/app/main.py \
+            services/svc-face/app/app/services/multi_person_pricing_policy.py \
+            services/svc-fusion/app/app/workers/fusion_worker.py \
+            services/shared/python/desifaces_shared/pricing/multi_person.py
+
+          # Reconcile the September pricing regression test with the corrected
+          # multi-person billing model: Face per generated character, Audio aggregate
+          # characters, Fusion participant-minutes.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('test/test_v3_multi_person_pricing.py')
+          s = p.read_text()
+          old = '''    if studio in {"face", "fusion"}:\n        assert selection.billable_units == 3 * count\n        assert selection.variant_params == {quantity_param: str(3 * count)}\n        assert selection.metadata["participant_scaling"] == "natural_units_x_participants"\n    else:\n        # Audio is already metered by aggregate generated characters. Multiplying\n        # the same characters by speaker count would double-charge the workload.\n        assert selection.billable_units == 3\n        assert selection.variant_params == {quantity_param: "3"}\n        assert selection.metadata["participant_scaling"] == "aggregate_natural_usage"\n'''
+          new = '''    if studio == "fusion":\n        assert selection.billable_units == 3 * count\n        assert selection.variant_params == {quantity_param: str(3 * count)}\n        assert selection.metadata["participant_scaling"] == "natural_units_x_participants"\n    elif studio == "face":\n        # Each participant identity is already an independent premium Face job.\n        # Multiplying that job again by total cast size would double-charge Face.\n        assert selection.billable_units == 3\n        assert selection.variant_params == {quantity_param: "3"}\n        assert selection.metadata["participant_scaling"] == "per_character_natural_usage"\n    else:\n        # Audio is already metered by aggregate generated characters.\n        assert selection.billable_units == 3\n        assert selection.variant_params == {quantity_param: "3"}\n        assert selection.metadata["participant_scaling"] == "aggregate_natural_usage"\n'''
+          if old not in s:
+              raise SystemExit('September pricing assertion block not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git add test/test_v3_multi_person_pricing.py
+
+          # Preserve secure worktree env handling and add canonical V3 output storage.
+          git checkout --ours -- scripts/v3-compose.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('scripts/v3-compose.sh'); s=p.read_text()
+          anchor='''###############################################################################\n# Disallow the two most dangerous destructive forms.\n###############################################################################\n'''
+          if anchor not in s: raise SystemExit('v3-compose anchor missing')
+          marker='# Pin V3 Fusion final media to one explicit storage-container contract.'
+          if marker not in s:
+              block='''###############################################################################\n# Pin V3 Fusion final media to one explicit storage-container contract.\n###############################################################################\n\nDF_V3_FUSION_OUTPUT_CONTAINER="${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}"\ncontainer_len=${#DF_V3_FUSION_OUTPUT_CONTAINER}\nif (( container_len < 3 || container_len > 63 )) \\\n  || [[ ! "$DF_V3_FUSION_OUTPUT_CONTAINER" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]] \\\n  || [[ "$DF_V3_FUSION_OUTPUT_CONTAINER" == *--* ]]; then\n  die "invalid DF_V3_FUSION_OUTPUT_CONTAINER: $DF_V3_FUSION_OUTPUT_CONTAINER"\nfi\nexport DF_V3_FUSION_OUTPUT_CONTAINER\nexport AZURE_FINAL_VIDEO_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER"\nexport AZURE_VIDEO_OUTPUT_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER"\n\n'''
+              s=s.replace(anchor,block+anchor,1)
+          p.write_text(s)
+          PY
+          git add scripts/v3-compose.sh
+
+          # Preserve the newer canonical concurrent stitcher; add V3 Story coordinator.
+          git checkout --ours -- services/svc-fusion-extension/app/app/workers/stitch_worker.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('services/svc-fusion-extension/app/app/workers/stitch_worker.py'); s=p.read_text()
+          anchor='from app.services.longform_orchestrator import stitch_if_ready\n'
+          imp='from app.workers.v3_scene_coordinator import v3_scene_coordinator_loop\n'
+          if imp not in s:
+              if anchor not in s: raise SystemExit('stitch import anchor missing')
+              s=s.replace(anchor,anchor+imp,1)
+          old='''\n\nif __name__ == "__main__":\n    asyncio.run(stitch_loop())\n'''
+          new='''\n\nasync def main() -> None:\n    """Run canonical longform stitching and V3 Story reconciliation together."""\n    await asyncio.gather(stitch_loop(), v3_scene_coordinator_loop())\n\n\nif __name__ == "__main__":\n    asyncio.run(main())\n'''
+          if 'v3_scene_coordinator_loop()' not in s:
+              if old not in s: raise SystemExit('stitch main anchor missing')
+              s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          git add services/svc-fusion-extension/app/app/workers/stitch_worker.py
+
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --cached --check -- .github migrations scripts services test
+          grep -Fq 'if self.studio == "fusion"' services/shared/python/desifaces_shared/pricing/multi_person.py
+          grep -Fq 'pricing_context = value.get("pricing_context")' services/shared/python/desifaces_shared/pricing/multi_person.py
+          grep -Fq 'claim_next_jobs' services/svc-fusion/app/app/workers/fusion_worker.py
+          grep -Fq 'v3_scene_coordinator_loop' services/svc-fusion-extension/app/app/workers/stitch_worker.py
+          echo DIRECTOR_MERGE_RESOLUTION=PASS
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -q pytest
+          python -m pip install --disable-pip-version-check -q -r services/svc-director/app/requirements.txt
+
+      - name: Compile integrated runtime
+        run: |
+          bash -n scripts/v3-compose.sh
+          python -m compileall -q services/shared/df_contracts services/shared/python/desifaces_shared/pricing services/shared/python/desifaces_shared/v3 services/svc-director/app services/svc-face/app/app services/svc-audio/app/app services/svc-fusion/app/app services/svc-fusion-extension/app/app services/svc-dashboard/app/app
+          echo DIRECTOR_INTEGRATED_COMPILE=PASS
+
+      - name: Certify pricing plus Director Story behavior
+        env:
+          PYTHONPATH: .:services/shared:services/shared/python:services/svc-director/app
+        run: |
+          python -m pytest -q \
+            test/test_v3_multi_person_pricing.py \
+            test/test_v3_multiperson_story_foundation.py \
+            test/test_v3_creative_director_foundation.py \
+            test/test_v3_participant_ref_normalization.py \
+            test/test_v3_studio_hitl_workflow.py \
+            test/test_v3_participant_face_bridge.py \
+            test/test_v3_face_execution_policy.py \
+            test/test_v3_face_audio_hotfix.py
+          echo DIRECTOR_PRICING_STORY_TESTS=PASS
+
+      - name: Commit certified Director integration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git diff --cached --check -- .github migrations scripts services test
+          git commit -m 'release(v3): integrate Director Story runtime and reconcile premium pricing'
+          git push origin HEAD:release/v3-production-launch-20260903
+          echo "DIRECTOR_RELEASE_SHA=$(git rev-parse HEAD)"
