@@ -25,6 +25,8 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          git config user.name 'desifaces-release-bot'
+          git config user.email 'release@desifaces.ai'
           git fetch origin feature/v3-assistant-operational-20260830
           set +e
           git merge --no-commit --no-ff origin/feature/v3-assistant-operational-20260830
