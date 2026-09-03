@@ -28,6 +28,9 @@ assert "PREMIUM_ACTUAL_SECONDS_COMMIT_V1" in orchestrator
 assert '"pricing_strategy": "premium_actual_seconds"' in orchestrator
 assert 'unit_type="second"' in orchestrator
 assert "PRICING_CONFIRMATION_UNITS_MISMATCH" in orchestrator
+assert "DEDICATED_STITCH_LEASE_V1" in orchestrator
+assert '"stitching_running"' in orchestrator
+assert "commit_longform_pricing_for_job" in orchestrator
 
 route = (ROOT / "app/app/api/routes/longform.py").read_text()
 assert 'initial_status="pricing_pending"' in route  # preserve prior financial gate
@@ -47,12 +50,18 @@ assert "STITCH_WORKER_BATCH_SIZE: int = Field(default=4)" in config
 worker = (ROOT / "app/app/workers/longform_worker.py").read_text()
 assert "await asyncio.gather" in worker
 assert "fetch_next_segments" in worker
+assert "DEDICATED_STITCH_HANDOFF_V1" in worker
+assert "await stitch_if_ready(jobs_repo, segs_repo, conn, dict(latest_job))" not in worker
 
 stitch = (ROOT / "app/app/workers/stitch_worker.py").read_text()
-assert "_download_segments_parallel" in stitch
+assert "_claim_stitch_jobs" in stitch
+assert "stitching_running" in stitch
+assert "await stitch_if_ready" in stitch
 assert "await asyncio.gather" in stitch
-assert "status = 'stitching_running'" in stitch
 assert "STITCH_WORKER_BATCH_SIZE" in stitch
+# No duplicate final-video or pricing-commit implementation in the worker.
+assert "_ffmpeg_concat" not in stitch
+assert "pricing_credit_reservations" not in stitch
 
 face = (REPO_ROOT / "services/svc-face/app/app/services/creator_orchestrator.py").read_text()
 assert "FACE_PROGRESS_DETAIL_V1" in face
@@ -66,5 +75,6 @@ assert "LONGFORM_TALK_PREMIUM_SECOND" in text
 assert "default_unit_credits" in text
 assert "15" in text
 assert "platform_neutral" in text
+assert "pb.channel IN ('web', 'mobile')" in text
 
 print("V3_VIDEO_PRICING_PROGRESS_PERFORMANCE_TEST=PASS")
