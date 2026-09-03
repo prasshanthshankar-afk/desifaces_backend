@@ -148,7 +148,17 @@ class TTSModelResolver:
         if requested_voice.lower() in {"", "auto"}:
             requested_voice = ""
 
-        if requested_voice:
+        requested_gender = str(
+            request.requested_gender or ""
+        ).strip().lower()
+        if requested_gender in {"", "auto", "unspecified"}:
+            requested_gender = ""
+
+        # FACE_GENDER_MODEL_ELIGIBILITY_V1: when Face gender is supplied,
+        # the selected model must expose at least one eligible voice for that
+        # gender. This remains entirely SQL/catalog driven and adds no provider
+        # or locale preference in application code.
+        if requested_voice or requested_gender:
             compatible_candidates = []
 
             for candidate in candidates:
@@ -156,17 +166,22 @@ class TTSModelResolver:
                     provider_code=candidate.provider_code,
                     model_code=candidate.model_code,
                     canonical_locale=locale,
-                    requested_voice=requested_voice,
-                    requested_gender=request.requested_gender,
+                    requested_voice=requested_voice or None,
+                    requested_gender=requested_gender or None,
                 )
 
                 if voice_candidates:
                     compatible_candidates.append(candidate)
 
             if not compatible_candidates:
+                if requested_voice:
+                    raise TTSModelResolutionError(
+                        "requested_voice_not_eligible_for_any_model:"
+                        f"{locale}/{requested_voice}"
+                    )
                 raise TTSModelResolutionError(
-                    "requested_voice_not_eligible_for_any_model:"
-                    f"{locale}/{requested_voice}"
+                    "requested_gender_not_eligible_for_any_model:"
+                    f"{locale}/{requested_gender}"
                 )
 
             candidates = compatible_candidates

@@ -1271,9 +1271,9 @@ async def _mark_segment_succeeded_and_progress(
         """,
         longform_job_id,
     )
-    latest_job = await jobs_repo.get_job(conn, longform_job_id)
-    if latest_job:
-        await stitch_if_ready(jobs_repo, segs_repo, conn, dict(latest_job))
+    # DEDICATED_STITCH_HANDOFF_V1: when completed_segments reaches total_segments
+    # the SQL above sets parent status='stitching'. The dedicated stitch worker
+    # owns canonical finalization so segment workers immediately return to rendering.
 
 
 # -----------------------------
@@ -2924,6 +2924,24 @@ async def _process_segment(seg: Dict[str, Any], pool) -> None:
             )
 
 
+def _effective_max_inflight_per_job() -> int:
+    """Launch performance floor for independent segment fan-out.
+
+    Older deployments may still carry MAX_INFLIGHT_SEGMENTS_PER_JOB=2 in the
+    environment. Preserve higher operator settings, but do not allow that legacy
+    default to serialize a typical 60-120 second parent into waves of two.
+    """
+    try:
+        configured = max(1, int(settings.MAX_INFLIGHT_SEGMENTS_PER_JOB))
+    except Exception:
+        configured = 1
+    try:
+        batch = max(1, int(settings.WORKER_BATCH_SIZE))
+    except Exception:
+        batch = 8
+    return min(batch, max(configured, min(8, batch)))
+
+
 def _segment_worker_concurrency() -> int:
     configured = (
         os.getenv("LONGFORM_SEGMENT_CONCURRENCY")
@@ -2983,7 +3001,7 @@ async def worker_loop() -> None:
         "longform_worker started (batch=%s poll=%.2fs max_inflight=%s)",
         settings.WORKER_BATCH_SIZE,
         float(settings.WORKER_POLL_SECONDS),
-        settings.MAX_INFLIGHT_SEGMENTS_PER_JOB,
+        _effective_max_inflight_per_job(),
     )
 
     while True:
@@ -2991,7 +3009,7 @@ async def worker_loop() -> None:
             segs = await segs_repo.fetch_next_segments(
                 conn,
                 settings.WORKER_BATCH_SIZE,
-                settings.MAX_INFLIGHT_SEGMENTS_PER_JOB,
+                _effective_max_inflight_per_job(),
             )
 
         if not segs:

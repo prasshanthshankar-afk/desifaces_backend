@@ -621,6 +621,7 @@ class LongformJobView(BaseModel):
     pricing_summary: Dict[str, Any] = Field(default_factory=dict)
     run_receipt: Optional[Dict[str, Any]] = None
     runReceipt: Optional[Dict[str, Any]] = None
+    progress: Dict[str, Any] = Field(default_factory=dict)
 
 
 # -------------------------
