@@ -11,6 +11,7 @@ on:
       - 'scripts/test-v3-spending-reporting.py'
       - 'scripts/launch-v3-production-20260903.sh'
       - 'scripts/launch-v3-production-secure-20260903.sh'
+      - 'scripts/ensure-v3-web-public-ingress-20260903.sh'
       - '.github/workflows/v3-spending-reporting.yml'
   pull_request:
     branches:
@@ -22,6 +23,7 @@ on:
       - 'scripts/test-v3-spending-reporting.py'
       - 'scripts/launch-v3-production-20260903.sh'
       - 'scripts/launch-v3-production-secure-20260903.sh'
+      - 'scripts/ensure-v3-web-public-ingress-20260903.sh'
       - '.github/workflows/v3-spending-reporting.yml'
   workflow_dispatch:
 
@@ -54,6 +56,10 @@ jobs:
         run: |
           bash -n scripts/launch-v3-production-20260903.sh
           bash -n scripts/launch-v3-production-secure-20260903.sh
+          bash -n scripts/ensure-v3-web-public-ingress-20260903.sh
           grep -Fq '21267cf8f0a25622ceb83f74e3abb8aea5f11b6a' scripts/launch-v3-production-secure-20260903.sh
           grep -Fq '38ee936c2e4c22697c78d30d54292879ef81c96c' scripts/launch-v3-production-secure-20260903.sh
-          echo 'SECURE_CUTOVER_PIN_GATE=PASS'
+          grep -Fq 'web.desifaces.ai' scripts/ensure-v3-web-public-ingress-20260903.sh
+          grep -Fq 'TARGET_PORT:-13000' scripts/ensure-v3-web-public-ingress-20260903.sh
+          grep -Fq 'nginx -t' scripts/ensure-v3-web-public-ingress-20260903.sh
+          echo 'SECURE_CUTOVER_PIN_AND_INGRESS_GATE=PASS'
