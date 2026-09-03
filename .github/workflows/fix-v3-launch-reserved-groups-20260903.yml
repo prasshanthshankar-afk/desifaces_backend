@@ -1,0 +1,66 @@
+name: Fix V3 Launch Reserved GROUPS Variable
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/fix-v3-launch-reserved-groups-20260903.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  repair-certify-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Replace Bash reserved GROUPS variable
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/launch-v3-production-20260903.sh')
+          s = p.read_text()
+          original = s
+          occurrences = s.count('GROUPS')
+          if occurrences < 2:
+              raise SystemExit(f'expected launcher GROUPS references, found {occurrences}')
+          s = s.replace('GROUPS', 'SERVICE_GROUPS')
+          if s == original:
+              raise SystemExit('launcher was not changed')
+          if 'GROUPS=(' in s or '${GROUPS[' in s:
+              raise SystemExit('reserved GROUPS reference remains')
+          if 'SERVICE_GROUPS=(pricing audio face fusion extension)' not in s:
+              raise SystemExit('service group declaration missing after repair')
+          p.write_text(s)
+          print(f'RESERVED_GROUPS_REPLACED={occurrences}')
+          PY
+
+      - name: Launcher syntax and nounset regression gate
+        run: |
+          bash -n scripts/launch-v3-production-20260903.sh
+          ! grep -Eq '(^|[^A-Za-z0-9_])GROUPS=' scripts/launch-v3-production-20260903.sh
+          ! grep -Fq '${GROUPS[' scripts/launch-v3-production-20260903.sh
+          grep -Fq 'SERVICE_GROUPS=(pricing audio face fusion extension)' scripts/launch-v3-production-20260903.sh
+          bash -euo pipefail -c '
+            SERVICE_GROUPS=(pricing audio face fusion extension)
+            declare -A CONTAINERS
+            for g in "${SERVICE_GROUPS[@]}"; do CONTAINERS[$g]="container-$g"; done
+            for g in "${SERVICE_GROUPS[@]}"; do test -n "${CONTAINERS[$g]}"; done
+          '
+          echo 'V3_LAUNCH_RESERVED_GROUPS_REGRESSION=PASS'
+
+      - name: Commit certified launcher repair
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/launch-v3-production-20260903.sh
+          git diff --cached --check
+          git commit -m 'fix(release): avoid Bash reserved GROUPS in V3 launch'
+          git push origin HEAD:main
