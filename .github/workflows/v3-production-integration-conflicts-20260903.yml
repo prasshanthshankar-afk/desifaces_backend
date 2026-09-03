@@ -1,0 +1,39 @@
+name: V3 Production Integration Conflict Inventory
+
+on:
+  push:
+    branches:
+      - release/v3-production-launch-20260903
+    paths:
+      - '.github/workflows/v3-production-integration-conflicts-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout production release base
+        uses: actions/checkout@v4
+        with:
+          ref: release/v3-production-launch-20260903
+          fetch-depth: 0
+      - name: Inventory Director merge conflicts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git fetch origin feature/v3-assistant-operational-20260830
+          set +e
+          git merge --no-commit --no-ff origin/feature/v3-assistant-operational-20260830
+          rc=$?
+          set -e
+          echo "DIRECTOR_MERGE_RC=$rc"
+          echo "DIRECTOR_CONFLICTS_BEGIN"
+          git diff --name-only --diff-filter=U | sort
+          echo "DIRECTOR_CONFLICTS_END"
+          git status --short
+          git merge --abort || true
+          exit "$rc"
