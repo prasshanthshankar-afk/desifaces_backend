@@ -105,7 +105,6 @@ class FaceJobsRepo(BaseRepository):
 
         if clear_error_on_success and s in ("succeeded", "success"):
             s = "succeeded"
-            # if caller didn't pass errors, keep them cleared
             if error_code is None:
                 error_code = None
             if error_message is None:
@@ -114,7 +113,6 @@ class FaceJobsRepo(BaseRepository):
         if s in ("failed", "running", "queued", "cancelled", "succeeded"):
             pass
         else:
-            # avoid weird statuses
             s = "queued"
 
         patch_jsonb = None if meta_patch is None else self.prepare_jsonb_param(meta_patch)
@@ -155,9 +153,6 @@ class FaceJobsRepo(BaseRepository):
             },
         )
 
-    # ------------------------------------------------------------------
-    # Backward-compatible aliases (your orchestrator calls update_status)
-    # ------------------------------------------------------------------
     async def update_status(
         self,
         job_id: str,
@@ -181,7 +176,7 @@ class FaceJobsRepo(BaseRepository):
         Claim jobs ready to run:
         - status queued
         - next_run_at <= now()
-        Mark running and increment attempt_count.
+        Mark running, stamp worker claim time and increment attempt_count.
         """
         query = """
         WITH claimed_jobs AS (
@@ -198,6 +193,8 @@ class FaceJobsRepo(BaseRepository):
         SET
           status = 'running',
           attempt_count = attempt_count + 1,
+          meta_json = COALESCE(j.meta_json, '{}'::jsonb)
+                      || jsonb_build_object('worker_claimed_at', now()::text),
           updated_at = now()
         FROM claimed_jobs cj
         WHERE j.id = cj.id
@@ -207,9 +204,6 @@ class FaceJobsRepo(BaseRepository):
         return [str(r["id"]) for r in rows]
 
     async def reschedule_job(self, job_id: str, delay_seconds: int, error_code: str, error_message: str) -> None:
-        """
-        Put job back to queued with backoff and error recorded.
-        """
         query = """
         UPDATE studio_jobs
         SET

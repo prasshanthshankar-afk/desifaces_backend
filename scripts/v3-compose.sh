@@ -132,6 +132,21 @@ fi
 
 
 ###############################################################################
+# Pin V3 Fusion final media to one explicit storage-container contract.
+###############################################################################
+
+DF_V3_FUSION_OUTPUT_CONTAINER="${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}"
+container_len=${#DF_V3_FUSION_OUTPUT_CONTAINER}
+if (( container_len < 3 || container_len > 63 )) \
+  || [[ ! "$DF_V3_FUSION_OUTPUT_CONTAINER" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]] \
+  || [[ "$DF_V3_FUSION_OUTPUT_CONTAINER" == *--* ]]; then
+  die "invalid DF_V3_FUSION_OUTPUT_CONTAINER: $DF_V3_FUSION_OUTPUT_CONTAINER"
+fi
+export DF_V3_FUSION_OUTPUT_CONTAINER
+export AZURE_FINAL_VIDEO_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER"
+export AZURE_VIDEO_OUTPUT_CONTAINER="$DF_V3_FUSION_OUTPUT_CONTAINER"
+
+###############################################################################
 # Disallow the two most dangerous destructive forms.
 ###############################################################################
 

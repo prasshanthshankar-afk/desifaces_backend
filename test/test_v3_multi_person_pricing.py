@@ -65,13 +65,18 @@ def test_all_multi_person_counts_use_one_sku_per_studio_and_scale_quantity(
     assert selection.quantity_param == quantity_param
     assert selection.metadata["participant_count_in_sku"] is False
 
-    if studio in {"face", "fusion"}:
+    if studio == "fusion":
         assert selection.billable_units == 3 * count
         assert selection.variant_params == {quantity_param: str(3 * count)}
         assert selection.metadata["participant_scaling"] == "natural_units_x_participants"
+    elif studio == "face":
+        # Each participant identity is already an independent premium Face job.
+        # Multiplying that job again by total cast size would double-charge Face.
+        assert selection.billable_units == 3
+        assert selection.variant_params == {quantity_param: "3"}
+        assert selection.metadata["participant_scaling"] == "per_character_natural_usage"
     else:
-        # Audio is already metered by aggregate generated characters. Multiplying
-        # the same characters by speaker count would double-charge the workload.
+        # Audio is already metered by aggregate generated characters.
         assert selection.billable_units == 3
         assert selection.variant_params == {quantity_param: "3"}
         assert selection.metadata["participant_scaling"] == "aggregate_natural_usage"

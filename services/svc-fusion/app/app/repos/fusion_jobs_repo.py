@@ -58,6 +58,8 @@ class FusionJobsRepo:
         )
         UPDATE studio_jobs j
         SET status = 'running',
+            meta_json = COALESCE(j.meta_json, '{}'::jsonb)
+                        || jsonb_build_object('worker_claimed_at', now()::text),
             updated_at = now()
         FROM cte
         WHERE j.id = cte.id

@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY services/svc-fusion-extension/app/app/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy only what this service needs plus repo content used to locate desifaces_shared
+# Copy only what this service needs plus repo content used by shared V3 packages.
 COPY services/svc-fusion-extension/app/app /app/app
 COPY . /repo
 
@@ -36,7 +36,20 @@ RUN set -eux; \
     fi; \
     ln -s "$shared_dir" /app/desifaces_shared
 
-ENV PYTHONPATH=/app:/repo
+# Shared V3 code spans two package roots:
+# - services/shared/python/desifaces_shared
+# - services/shared/df_contracts (+ df_core)
+ENV PYTHONPATH=/app:/repo:/repo/services/shared:/repo/services/shared/python
+
+# Fail the image build immediately if canonical shared V3 contracts are not importable.
+RUN python - <<'PY'
+import df_contracts
+from desifaces_shared.v3.studio_workflow_store import CanonicalStudioWorkflowStore
+
+assert CanonicalStudioWorkflowStore is not None
+print("[docker-shared-import] df_contracts=ready")
+print("[docker-shared-import] desifaces_shared.v3=ready")
+PY
 
 # Prepare rembg model cache directory.
 RUN mkdir -p "${U2NET_HOME}"
