@@ -36,6 +36,16 @@ jobs:
           echo "DIRECTOR_CONFLICTS_BEGIN"
           git diff --name-only --diff-filter=U | sort
           echo "DIRECTOR_CONFLICTS_END"
-          git status --short
+          echo "DIRECTOR_CONFLICT_HUNKS_BEGIN"
+          git diff --cc -- \
+            .github/workflows/v3-contract-tests.yml \
+            migrations/2026_08_30_multi_person_premium_pricing.sql \
+            scripts/v3-compose.sh \
+            services/shared/python/desifaces_shared/pricing/multi_person.py \
+            services/svc-face/app/app/main.py \
+            services/svc-face/app/app/services/multi_person_pricing_policy.py \
+            services/svc-fusion-extension/app/app/workers/stitch_worker.py \
+            services/svc-fusion/app/app/workers/fusion_worker.py || true
+          echo "DIRECTOR_CONFLICT_HUNKS_END"
           git merge --abort || true
           exit "$rc"
