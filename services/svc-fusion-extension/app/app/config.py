@@ -30,20 +30,22 @@ class Settings(BaseSettings):
     AUDIO_POLL_SECONDS: float = Field(default=1.5)
     AUDIO_TIMEOUT_SECONDS: int = Field(default=300)   # TTS can be slower under load
     FUSION_POLL_SECONDS: float = Field(default=3.0)
-    FUSION_TIMEOUT_SECONDS: int = Field(default=900)  # HeyGen segment gen can take minutes
+    FUSION_TIMEOUT_SECONDS: int = Field(default=900)  # provider segment gen can take minutes
 
     # Chunking defaults (MUST respect svc-fusion duration_sec <= 120)
     DEFAULT_SEGMENT_SECONDS: int = Field(default=60)
     MAX_SEGMENT_SECONDS: int = Field(default=120)
 
-    # Guardrails / throttling
-    MAX_INFLIGHT_SEGMENTS_PER_JOB: int = Field(default=2)
+    # Guardrails / throttling. A typical 60-120s parent should be able to fan out
+    # all independent provider-safe segments instead of running them two at a time.
+    MAX_INFLIGHT_SEGMENTS_PER_JOB: int = Field(default=8)
     MAX_TOTAL_SEGMENTS_PER_JOB: int = Field(default=500)  # safety rail
 
-    # Stitch worker knobs
+    # Stitch worker knobs. Independent parent stitch jobs can execute concurrently;
+    # each parent still produces one deterministic ordered final artifact.
     STITCH_WORKER_ENABLED: bool = Field(default=True)
     STITCH_WORKER_POLL_SECONDS: float = Field(default=2.0)
-    STITCH_WORKER_BATCH_SIZE: int = Field(default=2)
+    STITCH_WORKER_BATCH_SIZE: int = Field(default=4)
 
     # Azure storage for FINAL stitched output
     AZURE_STORAGE_CONNECTION_STRING: str = Field(...)
