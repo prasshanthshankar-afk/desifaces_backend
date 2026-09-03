@@ -12,12 +12,12 @@ CHANGED=0
 log(){ printf '%s\n' "$*"; }
 fail(){ printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"; }
-for x in sudo nginx curl python3 grep cp; do need "$x"; done
+for x in sudo nginx curl python3 grep cp cmp; do need "$x"; done
 
 rollback(){
   local rc=$?
   set +e
-  if (( rc != 0 && CHANGED == 1 )) && [[ -n "$BACKUP" && -n "$CONFIG" && -f "$BACKUP" ]]; then
+  if (( rc != 0 && CHANGED == 1 )) && [[ -n "$BACKUP" && -n "$CONFIG" ]] && sudo test -f "$BACKUP"; then
     sudo cp "$BACKUP" "$CONFIG" || true
     sudo nginx -t >/dev/null 2>&1 && sudo systemctl reload nginx >/dev/null 2>&1 || true
     log "PUBLIC_WEB_ROLLBACK=ATTEMPTED backup=$BACKUP"
@@ -36,15 +36,20 @@ code="$(curl -sS --max-time 20 -o /tmp/df-v3-upstream-precheck.html -w '%{http_c
 grep -qi 'desifaces' /tmp/df-v3-upstream-precheck.html || fail "upstream bridge response missing desifaces branding"
 log "V3_UPSTREAM_BRIDGE=PASS"
 
-mapfile -t FILES < <(sudo grep -RIl -E "server_name[[:space:]]+${PUBLIC_HOST//./\\.}([[:space:];]|$)" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null | sort -u)
+mapfile -t FILES < <(sudo grep -RIl -E "server_name[[:space:]]+${PUBLIC_HOST//./\\.}([[:space:];]|$)" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null \
+  | grep -Ev '(\.bak$|\.backup$|\.before-|\.pre-|~$)' \
+  | sort -u)
 ((${#FILES[@]} >= 1)) || fail "could not locate active nginx config for $PUBLIC_HOST"
 for f in "${FILES[@]}"; do
-  if sudo grep -q 'proxy_pass' "$f" && sudo grep -q "$PUBLIC_HOST" "$f"; then
+  if sudo grep -q 'proxy_pass' "$f" && sudo grep -Eq "server_name[[:space:]]+${PUBLIC_HOST//./\\.}[[:space:]]*;" "$f"; then
     CONFIG="$f"; break
   fi
 done
 [[ -n "$CONFIG" ]] || fail "could not identify the HTTPS proxy file for $PUBLIC_HOST"
-BACKUP="${CONFIG}.pre-v3-public-web-${STAMP}"
+
+BACKUP_DIR="/var/backups/desifaces-nginx"
+sudo mkdir -p "$BACKUP_DIR"
+BACKUP="$BACKUP_DIR/$(basename "$CONFIG").pre-v3-public-web-${STAMP}"
 sudo cp "$CONFIG" "$BACKUP"
 log "nginx_file=$CONFIG"
 log "backup=$BACKUP"
