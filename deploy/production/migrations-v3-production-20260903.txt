@@ -36,3 +36,4 @@ migrations/2026_08_24_v3_studio_attempt_terminal_guard.sql
 migrations/2026_08_30_multi_person_premium_pricing.sql
 migrations/2026_08_30_v3_admin_super_admin_role.sql
 migrations/2026_09_03_talking_video_premium_actual_seconds.sql
+migrations/2026_09_03_login_country_currency.sql
