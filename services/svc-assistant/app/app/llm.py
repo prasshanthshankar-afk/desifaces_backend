@@ -29,11 +29,25 @@ Do not say that you performed an action unless an action result is explicitly su
 
 class AssistantLLM:
     def __init__(self) -> None:
-        self._model = ChatOpenAI(model=settings.DF_ASSISTANT_LLM_MODEL) if settings.DF_ASSISTANT_LLM_MODEL else None
+        self._model = None
+        self._configuration_error: str | None = None
+        if not settings.DF_ASSISTANT_LLM_MODEL:
+            self._configuration_error = "assistant_llm_model_not_configured"
+            return
+        try:
+            self._model = ChatOpenAI(model=settings.DF_ASSISTANT_LLM_MODEL)
+        except Exception as exc:
+            # Keep the FastAPI runtime alive so /api/health can report the
+            # configuration problem deterministically instead of crash-looping.
+            self._configuration_error = f"{type(exc).__name__}: {exc}"
 
     @property
     def configured(self) -> bool:
         return self._model is not None
+
+    @property
+    def configuration_error(self) -> str | None:
+        return self._configuration_error
 
     async def answer(
         self,
