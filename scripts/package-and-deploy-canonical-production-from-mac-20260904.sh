@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 BACKEND_REPO="prasshanthshankar-afk/desifaces_backend"
-BACKEND_RELEASE_SHA="91bbb1f2ab9f84c585b6f293d18ad36083b0a5fa"
+BACKEND_RELEASE_SHA="728c2d23af7c1907ef88b684f1d41147e34860d2"
 BACKEND_APPLICATION_SHA="b81c3e6a2e74528c059d14c0adffab4a67af1816"
 WEB_REPO="prasshanthshankar-afk/desifaces_web"
 WEB_SHA="e51de0181bc9dd74c4ace4ec5ab8891f26be83d2"
@@ -60,6 +60,16 @@ gh repo clone "$WEB_REPO" "$RUN/web" -- --filter=blob:none --no-checkout >/dev/n
 ! find "$RUN/package" -name .git -type d -print -quit | grep -q . || fail "package unexpectedly contains Git metadata"
 [[ -f "$RUN/package/deploy/production/run-canonical-production-deploy-20260904.sh" ]] || fail "canonical deploy runner missing"
 [[ -f "$RUN/package/web-app/web/Dockerfile" ]] || fail "web release missing"
+python3 - "$RUN/package/deploy/production/migrations-v3-production-20260903.txt" <<'PY'
+from pathlib import Path
+import sys
+rows=[x.strip() for x in Path(sys.argv[1]).read_text().splitlines() if x.strip() and not x.lstrip().startswith('#')]
+media='migrations/2026_08_18_v3_media_lifecycle.sql'
+generation='migrations/2026_08_18_v3_generation_persistence.sql'
+if rows.index(media) >= rows.index(generation):
+    raise SystemExit('FAIL: packaged migration dependency order is unsafe')
+print('PACKAGED_MIGRATION_DEPENDENCY_ORDER=PASS')
+PY
 
 cat > "$RUN/package/RELEASE" <<EOF
 product=desifaces.ai
