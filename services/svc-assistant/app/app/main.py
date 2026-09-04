@@ -56,6 +56,7 @@ async def health():
     except Exception:
         redis_ok = False
     llm_ready = app.state.llm.configured
+    knowledge_ready = app.state.retriever.chunk_count > 0
     return {
         "ok": redis_ok,
         "service": "svc-assistant",
@@ -65,10 +66,14 @@ async def health():
         "llm_configuration_error": app.state.llm.configuration_error,
         "embedding_configured": bool(settings.DF_ASSISTANT_EMBEDDING_MODEL),
         "knowledge_chunks": app.state.retriever.chunk_count,
+        "knowledge_files_loaded": app.state.retriever.loaded_file_count,
+        "knowledge_files_skipped": app.state.retriever.skipped_file_count,
+        "knowledge_skipped_files": list(app.state.retriever.skipped_files),
+        "knowledge_ready": knowledge_ready,
         "live_context": "dashboard+user_scoped_generation+director_story",
         "privacy_guard": "deterministic_pre_and_post_llm",
         "support_route": "support@desifaces.ai",
-        "runtime_ready": redis_ok and llm_ready,
+        "runtime_ready": redis_ok and llm_ready and knowledge_ready,
     }
 
 
