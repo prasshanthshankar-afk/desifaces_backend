@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 REPO="prasshanthshankar-afk/desifaces_backend"
-RELEASE_SHA="6e167aba07dae46ec32ea6dabf18cd4d970180de"
+RELEASE_SHA="b2e80e7034730810c01380c8b00f08468dd7847d"
 APPLICATION_SHA="9b76329062b9e338e7276c7b7154e12fd5128e3d"
 SSH_HOST="${SSH_HOST:-desifaces-gpu}"
 ROOT="/home/azureuser/workspace/desifaces"
@@ -45,10 +45,27 @@ gh repo clone "$REPO" "$RUN/repo" -- --filter=blob:none --no-checkout >/dev/null
 FILES=(
   services/svc-assistant/app/app/llm.py
   services/svc-assistant/app/app/main.py
+  services/svc-assistant/app/app/retrieval.py
   services/svc-assistant/app/tests/test_llm_startup_resilience.py
+  services/svc-assistant/app/tests/test_retrieval_startup_resilience.py
+  services/svc-assistant/knowledge/pricing.md
+  services/svc-assistant/knowledge/privacy_and_support.md
+  services/svc-assistant/knowledge/product_basics.md
+  services/svc-assistant/knowledge/troubleshooting.md
   deploy/production/certify-production-data-backend-resume-20260904.sh
 )
 for p in "${FILES[@]}"; do mkdir -p "$RUN/patch/$(dirname "$p")"; cp "$RUN/repo/$p" "$RUN/patch/$p"; done
+python3 - "$RUN/patch/services/svc-assistant/knowledge" <<'PY'
+from pathlib import Path
+import sys
+root=Path(sys.argv[1])
+expected={'pricing.md','privacy_and_support.md','product_basics.md','troubleshooting.md'}
+found={p.name for p in root.glob('*.md')}
+assert expected <= found, (expected, found)
+for p in sorted(root.glob('*.md')):
+    p.read_text(encoding='utf-8')
+print('CANONICAL_KNOWLEDGE_UTF8=PASS files='+str(len(found)))
+PY
 tar --no-xattrs -C "$RUN/patch" -czf "$PATCH" . 2>/dev/null || tar -C "$RUN/patch" -czf "$PATCH" .
 [[ -s "$PATCH" ]] || fail "resume patch is empty"
 echo "BACKEND_RESUME_PACKAGE=PASS"
@@ -57,15 +74,28 @@ scp -q "$PATCH" "$SSH_HOST:$REMOTE_PATCH"
 ssh -tt "$SSH_HOST" "ROOT='$ROOT' REMOTE_PATCH='$REMOTE_PATCH' STAMP='$STAMP' BASELINE_BACKUP='$BASELINE_BACKUP' APPLICATION_SHA='$APPLICATION_SHA' RELEASE_SHA='$RELEASE_SHA' bash -s" <<'REMOTE'
 set -Eeuo pipefail
 BACKUP="/home/azureuser/backups/desifaces-backend-source-pre-resume-$STAMP"
+CREATED="$BACKUP/created-files.txt"
 mkdir -p "$BACKUP"
+: > "$CREATED"
 FILES=(
   services/svc-assistant/app/app/llm.py
   services/svc-assistant/app/app/main.py
+  services/svc-assistant/app/app/retrieval.py
   services/svc-assistant/app/tests/test_llm_startup_resilience.py
+  services/svc-assistant/app/tests/test_retrieval_startup_resilience.py
+  services/svc-assistant/knowledge/pricing.md
+  services/svc-assistant/knowledge/privacy_and_support.md
+  services/svc-assistant/knowledge/product_basics.md
+  services/svc-assistant/knowledge/troubleshooting.md
   deploy/production/certify-production-data-backend-resume-20260904.sh
 )
 for p in "${FILES[@]}"; do
-  if [[ -f "$ROOT/$p" ]]; then mkdir -p "$BACKUP/$(dirname "$p")"; cp -p "$ROOT/$p" "$BACKUP/$p"; fi
+  if [[ -f "$ROOT/$p" ]]; then
+    mkdir -p "$BACKUP/$(dirname "$p")"
+    cp -p "$ROOT/$p" "$BACKUP/$p"
+  else
+    printf '%s\n' "$p" >> "$CREATED"
+  fi
 done
 cp -p "$ROOT/RELEASE" "$BACKUP/RELEASE"
 rollback(){
@@ -73,6 +103,7 @@ rollback(){
   set +e
   if (( rc != 0 )); then
     for p in "${FILES[@]}"; do [[ -f "$BACKUP/$p" ]] && cp -p "$BACKUP/$p" "$ROOT/$p" || true; done
+    while IFS= read -r p; do [[ -n "$p" ]] && rm -f "$ROOT/$p" || true; done < "$CREATED"
     cp -p "$BACKUP/RELEASE" "$ROOT/RELEASE" || true
     echo "BACKEND_SOURCE_ROLLBACK=APPLIED"
   fi
@@ -82,6 +113,17 @@ rollback(){
 trap rollback EXIT
 
 tar -xzf "$REMOTE_PATCH" -C "$ROOT"
+python3 - "$ROOT/services/svc-assistant/knowledge" <<'PY'
+from pathlib import Path
+import sys
+root=Path(sys.argv[1])
+expected=['pricing.md','privacy_and_support.md','product_basics.md','troubleshooting.md']
+for name in expected:
+    p=root/name
+    assert p.is_file(), p
+    p.read_text(encoding='utf-8')
+print('PRODUCTION_CANONICAL_KNOWLEDGE_UTF8=PASS files=4')
+PY
 chmod +x "$ROOT/deploy/production/certify-production-data-backend-resume-20260904.sh"
 BASELINE_BACKUP="$BASELINE_BACKUP" ROOT="$ROOT" bash "$ROOT/deploy/production/certify-production-data-backend-resume-20260904.sh"
 python3 - "$ROOT/RELEASE" "$APPLICATION_SHA" "$RELEASE_SHA" <<'PY'
