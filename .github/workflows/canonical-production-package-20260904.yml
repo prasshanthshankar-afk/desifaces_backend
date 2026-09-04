@@ -1,0 +1,47 @@
+name: Canonical Production Package 2026-09-04
+
+on:
+  push:
+    branches:
+      - release/v3-production-deploy-20260903
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release/v3-production-deploy-20260903
+
+      - name: Bash syntax
+        run: |
+          set -euo pipefail
+          bash -n deploy/production/run-canonical-production-deploy-20260904.sh
+          bash -n scripts/package-and-deploy-canonical-production-from-mac-20260904.sh
+
+      - name: Production topology safety
+        run: |
+          set -euo pipefail
+          REMOTE=deploy/production/run-canonical-production-deploy-20260904.sh
+          MAC=scripts/package-and-deploy-canonical-production-from-mac-20260904.sh
+          grep -q '/home/azureuser/workspace/desifaces' "$REMOTE"
+          grep -q '/home/azureuser/workspace/desifaces' "$MAC"
+          grep -q 'source_policy=immutable_export_no_git' "$MAC"
+          grep -q 'PRODUCTION_SINGLE_PACKAGE' "$MAC"
+          grep -q 'DB_CLONE_MIGRATION_CERTIFICATION=PASS' "$REMOTE"
+          grep -q 'LIVE_DB_MIGRATIONS=PASS' "$REMOTE"
+          grep -q 'CANONICAL_PRODUCTION_DEPLOY=PASS' "$REMOTE"
+          grep -q 'desifaces-db' "$REMOTE"
+          grep -q 'desifaces-redis' "$REMOTE"
+          ! grep -q 'gh repo clone' "$REMOTE"
+          ! grep -q 'gh api' "$REMOTE"
+          ! grep -q 'git clone' "$REMOTE"
+          ! grep -q 'desifaces-v3-db' "$REMOTE"
+          ! grep -q 'dev-api.desifaces.ai' "$REMOTE"
+          ! grep -q 'desifaces-dev' "$REMOTE"
+          echo CANONICAL_PRODUCTION_PACKAGE_STATIC=PASS
