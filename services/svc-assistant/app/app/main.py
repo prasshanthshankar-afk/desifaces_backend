@@ -55,18 +55,20 @@ async def health():
         redis_ok = bool(await app.state.redis.ping())
     except Exception:
         redis_ok = False
+    llm_ready = app.state.llm.configured
     return {
         "ok": redis_ok,
         "service": "svc-assistant",
         "display_name": settings.DF_ASSISTANT_DISPLAY_NAME,
         "mode": "context_safe_read_only",
-        "llm_configured": app.state.llm.configured,
+        "llm_configured": llm_ready,
+        "llm_configuration_error": app.state.llm.configuration_error,
         "embedding_configured": bool(settings.DF_ASSISTANT_EMBEDDING_MODEL),
         "knowledge_chunks": app.state.retriever.chunk_count,
         "live_context": "dashboard+user_scoped_generation+director_story",
         "privacy_guard": "deterministic_pre_and_post_llm",
         "support_route": "support@desifaces.ai",
-        "runtime_ready": redis_ok and app.state.llm.configured,
+        "runtime_ready": redis_ok and llm_ready,
     }
 
 
