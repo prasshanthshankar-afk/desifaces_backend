@@ -50,9 +50,20 @@ class SafeKnowledgeRetriever:
     def __init__(self) -> None:
         root = Path(settings.DF_ASSISTANT_KNOWLEDGE_DIR)
         self._chunks: list[KnowledgeChunk] = []
+        self._loaded_files: list[str] = []
+        self._skipped_files: list[str] = []
         if root.exists():
             for path in sorted(root.glob("*.md")):
-                self._chunks.extend(_chunk_document(path, path.read_text(encoding="utf-8")))
+                try:
+                    text = path.read_text(encoding="utf-8-sig")
+                except (UnicodeDecodeError, OSError):
+                    # A malformed optional knowledge document must never take
+                    # down the customer-facing Assistant runtime. Production
+                    # health exposes the skipped-file count for operations.
+                    self._skipped_files.append(path.name)
+                    continue
+                self._chunks.extend(_chunk_document(path, text))
+                self._loaded_files.append(path.name)
         self._embeddings = (
             OpenAIEmbeddings(model=settings.DF_ASSISTANT_EMBEDDING_MODEL)
             if settings.DF_ASSISTANT_EMBEDDING_MODEL and settings.OPENAI_API_KEY
@@ -63,6 +74,18 @@ class SafeKnowledgeRetriever:
     @property
     def chunk_count(self) -> int:
         return len(self._chunks)
+
+    @property
+    def loaded_file_count(self) -> int:
+        return len(self._loaded_files)
+
+    @property
+    def skipped_file_count(self) -> int:
+        return len(self._skipped_files)
+
+    @property
+    def skipped_files(self) -> tuple[str, ...]:
+        return tuple(self._skipped_files)
 
     async def retrieve(self, query: str) -> list[KnowledgeChunk]:
         if not self._chunks:
