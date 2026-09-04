@@ -145,7 +145,7 @@ log "INDIA_CURRENCY_INVARIANT=PASS"
 
 log ""
 log "===== 4. REQUIRED V3 SCHEMA ====="
-for reg in public.v3_generation_requests public.v3_generation_jobs public.v3_media_assets public.v3_story_projects public.v3_studio_workflows; do
+for reg in public.v3_generation_requests public.v3_generation_jobs public.v3_media_assets public.v3_projects public.v3_studio_workflows; do
   reg_exists "$DB_NAME" "$reg" || fail "required V3 schema object missing: $reg"
 done
 [[ "$(psqlq "$DB_NAME" "select exists(select 1 from information_schema.columns where table_schema='core' and table_name='users' and column_name='country_code');")" == "t" ]] || fail "core.users.country_code missing"
