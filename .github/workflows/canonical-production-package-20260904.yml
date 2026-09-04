@@ -24,6 +24,22 @@ jobs:
           bash -n deploy/production/run-canonical-production-deploy-20260904.sh
           bash -n scripts/package-and-deploy-canonical-production-from-mac-20260904.sh
 
+      - name: Migration dependency order
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('deploy/production/migrations-v3-production-20260903.txt')
+          rows = [x.strip() for x in p.read_text().splitlines() if x.strip() and not x.lstrip().startswith('#')]
+          media = 'migrations/2026_08_18_v3_media_lifecycle.sql'
+          generation = 'migrations/2026_08_18_v3_generation_persistence.sql'
+          if media not in rows or generation not in rows:
+              raise SystemExit('required V3 media/generation migrations missing from manifest')
+          if rows.index(media) >= rows.index(generation):
+              raise SystemExit('media_lifecycle must precede generation_persistence: generation adds FK on media_assets.parent_generation_job_id')
+          print('MIGRATION_DEPENDENCY_ORDER=PASS')
+          PY
+
       - name: Production topology safety
         run: |
           set -euo pipefail
