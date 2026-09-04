@@ -88,7 +88,25 @@ jobs:
           grep -q 'configuration_error' services/svc-assistant/app/app/llm.py
           grep -q 'llm_configuration_error' services/svc-assistant/app/app/main.py
           grep -q 'test_assistant_llm_constructor_error_does_not_crash' services/svc-assistant/app/tests/test_llm_startup_resilience.py
+          grep -q 'skipped_file_count' services/svc-assistant/app/app/retrieval.py
+          grep -q 'test_invalid_utf8_knowledge_file_is_skipped' services/svc-assistant/app/tests/test_retrieval_startup_resilience.py
+          grep -q 'knowledge_files_loaded' services/svc-assistant/app/app/main.py
+          grep -q 'PRODUCTION_CANONICAL_KNOWLEDGE_UTF8=PASS' scripts/apply-production-backend-resume-from-mac-20260904.sh
           echo ASSISTANT_STARTUP_RESILIENCE=PASS
+
+      - name: Canonical Assistant knowledge UTF-8
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          root=Path('services/svc-assistant/knowledge')
+          expected={'pricing.md','privacy_and_support.md','product_basics.md','troubleshooting.md'}
+          found={p.name for p in root.glob('*.md')}
+          assert expected <= found
+          for name in sorted(expected):
+              (root/name).read_text(encoding='utf-8')
+          print('CANONICAL_ASSISTANT_KNOWLEDGE_UTF8=PASS')
+          PY
 
       - name: Production overlay syntax
         env:
