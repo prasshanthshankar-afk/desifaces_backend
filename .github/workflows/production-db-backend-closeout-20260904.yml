@@ -1,0 +1,86 @@
+name: Production DB and Backend Closeout 2026-09-04
+
+on:
+  push:
+    branches:
+      - release/v3-production-backend-closeout-20260904
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: postgresql://assistant:assistant@127.0.0.1:5432/assistant
+      REDIS_URL: redis://127.0.0.1:6379/0
+      JWT_SECRET: production-closeout-static-secret
+      JWT_ALG: HS256
+      JWT_ISSUER: desifaces
+      JWT_AUDIENCE: desifaces_clients
+      DF_ASSISTANT_LLM_MODEL: ""
+      PYTHONPATH: services/svc-assistant/app:services/shared/python
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Bash syntax
+        run: |
+          set -euo pipefail
+          bash -n deploy/production/certify-production-data-backend-20260904.sh
+          bash -n deploy/production/resume-after-assistant-fix-20260904.sh
+
+      - name: Customer-data red-line policy
+        run: |
+          set -euo pipefail
+          S=deploy/production/certify-production-data-backend-20260904.sh
+          grep -q 'database_write_policy=READ_ONLY_LIVE_DB' "$S"
+          grep -q 'CUSTOMER_DATA_PRESERVATION=PASS' "$S"
+          grep -q 'baseline_primary_keys_missing' "$S"
+          grep -q 'row_count_decreased' "$S"
+          grep -q 'PRODUCTION_DATABASE=PASS' "$S"
+          grep -q 'PRODUCTION_BACKEND=PASS' "$S"
+          ! grep -Eq 'docker compose down|down -v|volume prune|docker volume rm|truncate[[:space:]]+table|drop[[:space:]]+database[[:space:]]+desifaces|pg_restore[^\n]*-d[[:space:]]+desifaces([[:space:]]|$)' "$S"
+          echo CUSTOMER_DATA_RED_LINE_STATIC=PASS
+
+      - name: Migration dependency order remains correct
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('deploy/production/migrations-v3-production-20260903.txt').read_text()
+          media=p.index('2026_08_18_v3_media_lifecycle.sql')
+          gen=p.index('2026_08_18_v3_generation_persistence.sql')
+          assert media < gen, 'media lifecycle must precede generation persistence'
+          print('MIGRATION_DEPENDENCY_ORDER=PASS')
+          PY
+
+      - name: Install Assistant dependencies
+        run: python -m pip install --disable-pip-version-check -r services/svc-assistant/app/requirements.txt pytest
+
+      - name: Compile Assistant
+        run: python -m compileall -q services/svc-assistant/app/app services/shared/python/desifaces_shared
+
+      - name: Assistant tests
+        run: python -m pytest -q services/svc-assistant/app/tests
+
+      - name: Assistant startup resilience policy
+        run: |
+          set -euo pipefail
+          grep -q 'configuration_error' services/svc-assistant/app/app/llm.py
+          grep -q 'llm_configuration_error' services/svc-assistant/app/app/main.py
+          grep -q 'test_assistant_llm_constructor_error_does_not_crash' services/svc-assistant/app/tests/test_llm_startup_resilience.py
+          echo ASSISTANT_STARTUP_RESILIENCE=PASS
+
+      - name: Production overlay syntax
+        env:
+          DATABASE_URL: postgresql://prod:prod@desifaces-db:5432/desifaces
+          JWT_SECRET: static-production-secret
+        run: |
+          docker compose --env-file /dev/null -f docker-compose.yml -f deploy/production/docker-compose.v3-app.production.yml config >/dev/null
+          echo PRODUCTION_BACKEND_COMPOSE=PASS
