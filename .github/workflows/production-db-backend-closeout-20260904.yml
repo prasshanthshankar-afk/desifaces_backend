@@ -82,5 +82,8 @@ jobs:
           DATABASE_URL: postgresql://prod:prod@desifaces-db:5432/desifaces
           JWT_SECRET: static-production-secret
         run: |
+          set -euo pipefail
+          mkdir -p infra
+          : > infra/.env
           docker compose --env-file /dev/null -f docker-compose.yml -f deploy/production/docker-compose.v3-app.production.yml config >/dev/null
           echo PRODUCTION_BACKEND_COMPOSE=PASS
