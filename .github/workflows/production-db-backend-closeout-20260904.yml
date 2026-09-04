@@ -33,21 +33,28 @@ jobs:
         run: |
           set -euo pipefail
           bash -n deploy/production/certify-production-data-backend-20260904.sh
+          bash -n deploy/production/certify-production-data-backend-resume-20260904.sh
           bash -n deploy/production/resume-after-assistant-fix-20260904.sh
           bash -n scripts/apply-production-backend-closeout-from-mac-20260904.sh
+          bash -n scripts/apply-production-backend-resume-from-mac-20260904.sh
 
       - name: Customer-data red-line policy
         run: |
           set -euo pipefail
-          S=deploy/production/certify-production-data-backend-20260904.sh
-          M=scripts/apply-production-backend-closeout-from-mac-20260904.sh
+          S=deploy/production/certify-production-data-backend-resume-20260904.sh
+          M=scripts/apply-production-backend-resume-from-mac-20260904.sh
           grep -q 'database_write_policy=READ_ONLY_LIVE_DB' "$S"
+          grep -q 'live_db_restore=FORBIDDEN' "$S"
           grep -q 'CUSTOMER_DATA_PRESERVATION=PASS' "$S"
           grep -q 'baseline_primary_keys_missing' "$S"
           grep -q 'row_count_decreased' "$S"
+          grep -q 'orphan_credit_account_regression' "$S"
+          grep -q 'LEGACY_INTEGRITY_PRESERVED' "$S"
           grep -q 'PRODUCTION_DATABASE=PASS' "$S"
           grep -q 'PRODUCTION_BACKEND=PASS' "$S"
           grep -q 'BASELINE_BACKUP=' "$M"
+          grep -q 'database_migrations=NONE' "$M"
+          grep -q 'live_db_restore=NONE' "$M"
           grep -q 'web_action=NONE' "$M"
           grep -q 'mobile_action=NONE' "$M"
           ! grep -Eq 'docker compose down|down -v|volume prune|docker volume rm|truncate[[:space:]]+table|drop[[:space:]]+database[[:space:]]+desifaces|pg_restore[^\n]*-d[[:space:]]+desifaces([[:space:]]|$)' "$S" "$M"
