@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 REPO="prasshanthshankar-afk/desifaces_backend"
-RELEASE_SHA="85db7b518e87f56984e972e98c90f741dc1ef774"
+RELEASE_SHA="94291567edfe8f3deb236942319f5a6307de60b7"
 APPLICATION_SHA="9b76329062b9e338e7276c7b7154e12fd5128e3d"
 SSH_HOST="${SSH_HOST:-desifaces-gpu}"
 ROOT="/home/azureuser/workspace/desifaces"
