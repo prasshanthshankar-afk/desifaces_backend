@@ -1,0 +1,37 @@
+name: Full Stack Sync Certification 2026-09-08
+
+on:
+  push:
+    branches:
+      - audit/full-stack-sync-20260908
+    paths:
+      - scripts/apply-production-full-stack-sync-20260908.sh
+      - .github/workflows/full-stack-sync-certification-20260908.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: bash -n scripts/apply-production-full-stack-sync-20260908.sh
+      - name: Safety invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=scripts/apply-production-full-stack-sync-20260908.sh
+          grep -q 'CUSTOMER_DATA_ACTION=NONE' "$f"
+          grep -q 'PRICING_DATA_ACTION=NONE' "$f"
+          grep -q 'DB_RESTORE_ACTION=NONE' "$f"
+          grep -q 'DB_MASTERDATA_MODE=ADDITIVE_UPSERT_ONLY' "$f"
+          grep -q 'CUSTOMER_DATA_PRESERVED=PASS' "$f"
+          grep -q 'OPENAI_IMAGE_MODEL_T2I gpt-image-2' "$f"
+          grep -q 'OPENAI_IMAGE_MODEL_EDIT gpt-image-2' "$f"
+          ! grep -Eq 'docker compose down[[:space:]]+-v|docker volume prune|DROP DATABASE[[:space:]]+desifaces|TRUNCATE[[:space:]]+(core\.|public\.)' "$f"
+      - name: No production source replacement
+        run: |
+          ! grep -Eq 'git clone.*desifaces-gpu|gh repo clone.*desifaces-gpu|rm -rf /home/azureuser/workspace/desifaces' scripts/apply-production-full-stack-sync-20260908.sh
