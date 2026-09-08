@@ -11,7 +11,7 @@ trap 'rm -rf "$RUN" >/dev/null 2>&1 || true' EXIT
 
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"; }
-for x in ssh scp awk grep sort python3 gh; do need "$x"; done
+for x in ssh scp awk grep sort python3 gh diff curl; do need "$x"; done
 [[ "$(uname -s)" == "Darwin" ]] || fail "run from the Mac release environment"
 
 echo "============================================================"
@@ -128,9 +128,10 @@ echo "PRODUCTION_BACKUP=$BACKUP_DIR"
 echo "PRODUCTION_SAFETY_SNAPSHOT=PASS"
 scp -q "$RUN"/md/*.csv "$PROD_HOST:/tmp/"
 
-# Helper SQL used in clone and live DB. All tables use PK/first plain UNIQUE key.
+# Transactional merge SQL shared by clone validation and live execution.
 cat > "$RUN/merge.sql" <<'SQL'
 \set ON_ERROR_STOP on
+BEGIN;
 DO $$
 DECLARE
   t text;
@@ -186,17 +187,12 @@ BEGIN
       AND NOT (c.column_name = ANY(keyarr))
       AND c.column_name NOT IN ('created_at','updated_at','discovered_at','last_seen_at','last_synced_at','refreshed_at');
 
-    IF updates IS NULL THEN
-      updates := format('%1$I = EXCLUDED.%1$I', keyarr[1]);
-    END IF;
-
-    q := format(
-      'INSERT INTO public.%1$I (%2$s) SELECT %2$s FROM sync_stage.%1$I ON CONFLICT (%3$s) DO UPDATE SET %4$s',
-      t, cols, keys, updates
-    );
+    IF updates IS NULL THEN updates := format('%1$I = EXCLUDED.%1$I', keyarr[1]); END IF;
+    q := format('INSERT INTO public.%1$I (%2$s) SELECT %2$s FROM sync_stage.%1$I ON CONFLICT (%3$s) DO UPDATE SET %4$s',t,cols,keys,updates);
     EXECUTE q;
   END LOOP;
 END $$;
+COMMIT;
 SQL
 scp -q "$RUN/merge.sql" "$PROD_HOST:/tmp/desifaces-sync-merge-$STAMP.sql"
 
@@ -221,7 +217,7 @@ for t in face_generation_regions tts_languages tts_locales tts_locale_aliases tt
   docker exec "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$AUDIT_DB" -c "CREATE TABLE sync_stage.\"$t\" AS SELECT * FROM public.\"$t\" WITH NO DATA"
   cat "/tmp/$t.csv" | docker exec -i "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$AUDIT_DB" -c "COPY sync_stage.\"$t\" FROM STDIN WITH CSV HEADER"
 done
-docker exec -i "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$AUDIT_DB" < "/tmp/desifaces-sync-merge-$STAMP.sql"
+cat "/tmp/desifaces-sync-merge-$STAMP.sql" | docker exec -i "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$AUDIT_DB"
 
 COUNTRIES="$(docker exec "$DB_C" psql -X -A -t -U "$DB_USER" -d "$AUDIT_DB" -c "
 SELECT count(DISTINCT l.country_code)
@@ -260,7 +256,7 @@ printf '%s\t%s\n' DF_DIRECTOR_LLM_MODEL gpt-5.6-sol >> "$ENV_PATCH"
 printf '%s\t%s\n' DF_ASSISTANT_LLM_MODEL gpt-5.6-terra >> "$ENV_PATCH"
 printf '%s\t%s\n' ENABLE_PUBLISH_YT false >> "$ENV_PATCH"
 scp -q "$ENV_PATCH" "$PROD_HOST:/tmp/desifaces-env-patch-$STAMP.tsv"
-ssh "$PROD_HOST" "PROD_ROOT='$PROD_ROOT' STAMP='$STAMP' bash -s" <<'REMOTE'
+ssh "$PROD_HOST" "PROD_ROOT='$PROD_ROOT' STAMP='$STAMP' BACKUP_DIR='$BACKUP_DIR' bash -s" <<'REMOTE'
 set -Eeuo pipefail
 ENV="$PROD_ROOT/infra/.env"; PATCH="/tmp/desifaces-env-patch-$STAMP.tsv"
 python3 - "$ENV" "$PATCH" <<'PY'
@@ -287,19 +283,15 @@ env.write_text('\n'.join(out)+'\n')
 PY
 chmod 600 "$ENV"
 grep -E '^(OPENAI_IMAGE_MODEL_T2I|OPENAI_IMAGE_MODEL_EDIT|DF_DIRECTOR_LLM_MODEL|DF_ASSISTANT_LLM_MODEL)=' "$ENV"
-echo "PRODUCTION_ENV_PATCH=PASS"
-REMOTE
-
-# Validate effective compose config BEFORE live DB change or container recreation.
-ssh "$PROD_HOST" "PROD_ROOT='$PROD_ROOT' bash -s" <<'REMOTE'
-set -Eeuo pipefail
 cd "$PROD_ROOT"; BASE=docker-compose.yml; OV=deploy/production/docker-compose.v3-app.production.yml
-[[ -f "$OV" ]] || { echo "FAIL: production overlay missing"; exit 5; }
+[[ -f "$OV" ]] || { cp "$BACKUP_DIR/infra.env.pre-sync" "$ENV"; echo "FAIL: production overlay missing"; exit 5; }
 resolved="$(docker compose --env-file infra/.env -f "$BASE" -f "$OV" config)"
 if printf '%s\n' "$resolved" | grep -E 'OPENAI_IMAGE_MODEL_(T2I|EDIT):.*gpt-image-1\.5' >/dev/null; then
-  echo "FAIL: compose still resolves gpt-image-1.5; stopping before live DB change"
+  cp "$BACKUP_DIR/infra.env.pre-sync" "$ENV"
+  echo "FAIL: compose still resolves gpt-image-1.5; env restored and live DB untouched"
   exit 5
 fi
+echo "PRODUCTION_ENV_PATCH=PASS"
 echo "COMPOSE_MODEL_PARITY_PRECHECK=PASS"
 REMOTE
 
@@ -318,11 +310,6 @@ for t in face_generation_regions tts_languages tts_locales tts_locale_aliases tt
   docker exec "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" -c "CREATE TABLE sync_stage.\"$t\" AS SELECT * FROM public.\"$t\" WITH NO DATA"
   cat "/tmp/$t.csv" | docker exec -i "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" -c "COPY sync_stage.\"$t\" FROM STDIN WITH CSV HEADER"
 done
-docker exec -i "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" <<SQL
-BEGIN;
-\i /dev/stdin
-SQL
-# psql inside the DB container cannot see host /tmp; stream the merge SQL explicitly.
 cat "/tmp/desifaces-sync-merge-$STAMP.sql" | docker exec -i "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME"
 docker exec "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" -c 'DROP SCHEMA sync_stage CASCADE'
 echo "LIVE_MASTERDATA_UPSERT=PASS"
@@ -419,9 +406,7 @@ for t in core.users media_assets pricing_credit_accounts pricing_credit_lots pri
     n="$(docker exec "$DB_C" psql -X -A -t -U "$DB_USER" -d "$DB_NAME" -c "select count(*) from $t" | tr -d '[:space:]')"; echo "$t|$n" >> "$BACKUP_DIR/customer-counts.after"
   fi
 done
-if ! diff -u "$BACKUP_DIR/customer-counts.before" "$BACKUP_DIR/customer-counts.after"; then
-  echo "FAIL: customer row counts changed"; exit 7
-fi
+if ! diff -u "$BACKUP_DIR/customer-counts.before" "$BACKUP_DIR/customer-counts.after"; then echo "FAIL: customer row counts changed"; exit 7; fi
 echo "CUSTOMER_DATA_PRESERVED=PASS"
 REMOTE
 
