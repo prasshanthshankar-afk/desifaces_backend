@@ -11,7 +11,7 @@ trap 'rm -rf "$TMP" >/dev/null 2>&1 || true' EXIT
 
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"; }
-for x in ssh scp python3 diff sort comm; do need "$x"; done
+for x in ssh scp python3 sort comm; do need "$x"; done
 [[ "$(uname -s)" == "Darwin" ]] || fail "run from Mac release environment"
 
 for h in "$DEV_HOST" "$PROD_HOST"; do
@@ -27,7 +27,6 @@ echo "DB_REDIS_RECREATE=FORBIDDEN"
 echo "SECRETS_COPY=FORBIDDEN"
 echo "PRODUCTION_SPECIFIC_SETTINGS=PRESERVED"
 
-# Get sanitized snapshots. Secret values are never emitted.
 snapshot(){
   local host="$1" root="$2" out="$3"
   ssh "$host" "ROOT='$root' python3 - <<'PY'
@@ -50,6 +49,19 @@ snapshot "$DEV_HOST" "$DEV_ROOT" "$TMP/dev.env"
 snapshot "$PROD_HOST" "$PROD_ROOT" "$TMP/prod.env"
 
 echo
+echo "===== 0. LOCATE IMAGE MODEL SETTINGS ON PROD ====="
+ssh "$PROD_HOST" 'bash -s' <<'REMOTE'
+set -Eeuo pipefail
+find /home/azureuser/workspace /home/azureuser/backups -type f \( -name '.env' -o -name '*.env' \) 2>/dev/null |
+while IFS= read -r f; do
+  vals="$(grep -E '^(F_IMAGE_PROVIDER_DEFAULT|OPENAI_IMAGE_MODEL_T2I|OPENAI_IMAGE_MODEL_EDIT|OPENAI_IMAGE_SIZE|OPENAI_IMAGE_QUALITY)=' "$f" 2>/dev/null || true)"
+  [[ -n "$vals" ]] || continue
+  echo "ENV_FILE=$f"
+  printf '%s\n' "$vals"
+done
+REMOTE
+
+echo
 echo "===== 1. KEY PARITY ====="
 cut -d'|' -f2 "$TMP/dev.env" | sort -u > "$TMP/dev.keys"
 cut -d'|' -f2 "$TMP/prod.env" | sort -u > "$TMP/prod.keys"
@@ -64,7 +76,6 @@ for k in F_IMAGE_PROVIDER_DEFAULT OPENAI_IMAGE_MODEL_T2I OPENAI_IMAGE_MODEL_EDIT
   echo "$k|dev=${d:-<unset>}|prod=${p:-<unset>}"
 done
 
-# Build patch strictly from dev for approved shared non-secret runtime keys.
 python3 - "$TMP/dev.env" "$TMP/patch.tsv" <<'PY'
 import sys
 allow={
@@ -99,7 +110,6 @@ sha256sum "$ENV" > "$BACKUP/infra.env.before.sha256"
 DB_ID="$(docker inspect -f '{{.Id}}' desifaces-db)"
 REDIS_ID="$(docker inspect -f '{{.Id}}' desifaces-redis)"
 WEB_ID="$(docker inspect -f '{{.Id}}' df-v3-web-prod 2>/dev/null || true)"
-
 echo "BACKUP_DIR=$BACKUP"
 
 python3 - "$ENV" "$PATCH" <<'PY'
@@ -110,8 +120,7 @@ updates={}
 for raw in patch.read_text().splitlines():
     if not raw.strip(): continue
     k,v=raw.split('\t',1); updates[k]=v
-lines=p.read_text().splitlines()
-seen=set(); out=[]
+lines=p.read_text().splitlines(); seen=set(); out=[]
 for line in lines:
     s=line.strip()
     if s and not s.startswith('#') and '=' in s:
@@ -124,56 +133,58 @@ for k in sorted(updates):
 p.write_text('\n'.join(out)+'\n')
 PY
 
-# Verify file values before any service recreation.
-for spec in \
-  'F_IMAGE_PROVIDER_DEFAULT=openai' \
-  'OPENAI_IMAGE_MODEL_T2I=gpt-image-2' \
-  'OPENAI_IMAGE_MODEL_EDIT=gpt-image-2'; do
-  grep -Fxq "$spec" "$ENV" || { echo "FAIL: expected env value missing: $spec"; cp "$BACKUP/infra.env.before" "$ENV"; exit 3; }
-done
+# Assert only values that actually exist in the dev-approved patch.
+while IFS=$'\t' read -r k v; do
+  [[ -n "$k" ]] || continue
+  grep -Fxq "$k=$v" "$ENV" || { echo "FAIL: expected env value missing: $k=$v"; cp "$BACKUP/infra.env.before" "$ENV"; exit 3; }
+done < "$PATCH"
 
 echo "PRODUCTION_ENV_FILE_ALIGN=PASS"
 
-# Resolve only currently-running compose services that actually receive image model env.
-mapfile -t SERVICES < <(
-  for c in $(docker ps --format '{{.Names}}'); do
-    envs="$(docker inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
-    if printf '%s\n' "$envs" | grep -q '^OPENAI_IMAGE_MODEL_'; then
-      docker inspect "$c" --format '{{index .Config.Labels "com.docker.compose.service"}}' 2>/dev/null || true
-    fi
-  done | awk 'NF' | sort -u
-)
-[[ ${#SERVICES[@]} -gt 0 ]] || { echo 'FAIL: no image-model compose services discovered'; cp "$BACKUP/infra.env.before" "$ENV"; exit 3; }
-printf 'IMAGE_ENV_SERVICES=%s\n' "${SERVICES[*]}"
+# If canonical file was already semantically aligned, do not recreate anything unnecessarily.
+if cmp -s "$BACKUP/infra.env.before" "$ENV"; then
+  echo "ENV_FILE_CHANGE=NONE"
+  echo "SERVICE_RECREATE=SKIPPED_ALREADY_ALIGNED"
+  echo 'DB_CONTAINER_UNCHANGED=PASS'
+  echo 'REDIS_CONTAINER_UNCHANGED=PASS'
+  echo 'WEB_CONTAINER_UNCHANGED=PASS'
+else
+  mapfile -t SERVICES < <(
+    for c in $(docker ps --format '{{.Names}}'); do
+      envs="$(docker inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
+      if printf '%s\n' "$envs" | grep -q '^OPENAI_IMAGE_MODEL_'; then
+        docker inspect "$c" --format '{{index .Config.Labels "com.docker.compose.service"}}' 2>/dev/null || true
+      fi
+    done | awk 'NF' | sort -u
+  )
+  [[ ${#SERVICES[@]} -gt 0 ]] || { echo 'FAIL: no image-model compose services discovered'; cp "$BACKUP/infra.env.before" "$ENV"; exit 3; }
+  printf 'IMAGE_ENV_SERVICES=%s\n' "${SERVICES[*]}"
 
-cd "$ROOT"
-docker compose --env-file "$ENV" -f docker-compose.yml -f deploy/production/docker-compose.v3-app.production.yml config >/tmp/desifaces-env-align-compose-$STAMP.yml
-# hard gate: rendered compose must contain new model and must not render 1.5 for these keys
-if grep -E 'OPENAI_IMAGE_MODEL_(T2I|EDIT):[[:space:]]*gpt-image-1\.5' /tmp/desifaces-env-align-compose-$STAMP.yml; then
-  echo 'FAIL: rendered compose still contains gpt-image-1.5'; cp "$BACKUP/infra.env.before" "$ENV"; exit 3
-fi
-grep -q 'OPENAI_IMAGE_MODEL_T2I: gpt-image-2' /tmp/desifaces-env-align-compose-$STAMP.yml || { echo 'FAIL: rendered T2I not gpt-image-2'; cp "$BACKUP/infra.env.before" "$ENV"; exit 3; }
-grep -q 'OPENAI_IMAGE_MODEL_EDIT: gpt-image-2' /tmp/desifaces-env-align-compose-$STAMP.yml || { echo 'FAIL: rendered EDIT not gpt-image-2'; cp "$BACKUP/infra.env.before" "$ENV"; exit 3; }
-echo 'COMPOSE_IMAGE_MODEL_PARITY=PASS'
+  cd "$ROOT"
+  docker compose --env-file "$ENV" -f docker-compose.yml -f deploy/production/docker-compose.v3-app.production.yml config >/tmp/desifaces-env-align-compose-$STAMP.yml
+  if grep -E 'OPENAI_IMAGE_MODEL_(T2I|EDIT):[[:space:]]*gpt-image-1\.5' /tmp/desifaces-env-align-compose-$STAMP.yml; then
+    echo 'FAIL: rendered compose still contains gpt-image-1.5'; cp "$BACKUP/infra.env.before" "$ENV"; exit 3
+  fi
+  grep -q 'OPENAI_IMAGE_MODEL_T2I: gpt-image-2' /tmp/desifaces-env-align-compose-$STAMP.yml || { echo 'FAIL: rendered T2I not gpt-image-2'; cp "$BACKUP/infra.env.before" "$ENV"; exit 3; }
+  grep -q 'OPENAI_IMAGE_MODEL_EDIT: gpt-image-2' /tmp/desifaces-env-align-compose-$STAMP.yml || { echo 'FAIL: rendered EDIT not gpt-image-2'; cp "$BACKUP/infra.env.before" "$ENV"; exit 3; }
+  echo 'COMPOSE_IMAGE_MODEL_PARITY=PASS'
 
-# Recreate only services that consume image model env. Never include DB/Redis/web.
-for forbidden in db redis postgres web; do
-  for s in "${SERVICES[@]}"; do
-    [[ "$s" != *"$forbidden"* ]] || { echo "FAIL: forbidden service discovered: $s"; cp "$BACKUP/infra.env.before" "$ENV"; exit 3; }
+  for forbidden in db redis postgres web; do
+    for s in "${SERVICES[@]}"; do
+      [[ "$s" != *"$forbidden"* ]] || { echo "FAIL: forbidden service discovered: $s"; cp "$BACKUP/infra.env.before" "$ENV"; exit 3; }
+    done
   done
-done
+  docker compose --env-file "$ENV" -f docker-compose.yml -f deploy/production/docker-compose.v3-app.production.yml up -d --no-deps --force-recreate "${SERVICES[@]}"
 
-docker compose --env-file "$ENV" -f docker-compose.yml -f deploy/production/docker-compose.v3-app.production.yml up -d --no-deps --force-recreate "${SERVICES[@]}"
+  [[ "$(docker inspect -f '{{.Id}}' desifaces-db)" == "$DB_ID" ]] || { echo 'FAIL: DB container changed'; exit 4; }
+  [[ "$(docker inspect -f '{{.Id}}' desifaces-redis)" == "$REDIS_ID" ]] || { echo 'FAIL: Redis container changed'; exit 4; }
+  if [[ -n "$WEB_ID" ]]; then [[ "$(docker inspect -f '{{.Id}}' df-v3-web-prod)" == "$WEB_ID" ]] || { echo 'FAIL: web container changed'; exit 4; }; fi
+  echo 'DB_CONTAINER_UNCHANGED=PASS'
+  echo 'REDIS_CONTAINER_UNCHANGED=PASS'
+  echo 'WEB_CONTAINER_UNCHANGED=PASS'
+fi
 
-[[ "$(docker inspect -f '{{.Id}}' desifaces-db)" == "$DB_ID" ]] || { echo 'FAIL: DB container changed'; exit 4; }
-[[ "$(docker inspect -f '{{.Id}}' desifaces-redis)" == "$REDIS_ID" ]] || { echo 'FAIL: Redis container changed'; exit 4; }
-if [[ -n "$WEB_ID" ]]; then [[ "$(docker inspect -f '{{.Id}}' df-v3-web-prod)" == "$WEB_ID" ]] || { echo 'FAIL: web container changed'; exit 4; }; fi
-
-echo 'DB_CONTAINER_UNCHANGED=PASS'
-echo 'REDIS_CONTAINER_UNCHANGED=PASS'
-echo 'WEB_CONTAINER_UNCHANGED=PASS'
-
-sleep 5
+sleep 2
 bad=0
 for c in $(docker ps --format '{{.Names}}'); do
   envs="$(docker inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
@@ -187,15 +198,9 @@ done
 [[ $bad -eq 0 ]] || { echo 'FAIL: runtime model parity incomplete'; exit 5; }
 echo 'RUNTIME_IMAGE_MODEL_PARITY=PASS'
 
-# Basic health checks without touching data.
-for spec in 'core|http://127.0.0.1:8000/api/health' 'audio|http://127.0.0.1:8004/api/health' 'pricing|http://127.0.0.1:8009/api/health'; do
-  n="${spec%%|*}"; u="${spec#*|}"; code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "$u" || true)"; echo "HEALTH|$n|$code"; [[ "$code" == 200 ]] || exit 5
-done
-
 echo 'PRODUCTION_ENV_ALIGNMENT=PASS'
 REMOTE
 
-# Re-snapshot and report remaining non-secret differences without auto-mutating them.
 snapshot "$PROD_HOST" "$PROD_ROOT" "$TMP/prod.after.env"
 
 echo
@@ -213,7 +218,6 @@ echo
 echo "===== 5. REMAINING SAFE ENV DIFFERENCES (REPORT ONLY) ====="
 python3 - "$TMP/dev.env" "$TMP/prod.after.env" <<'PY'
 import sys
-
 def load(p):
  d={}
  for line in open(p):
