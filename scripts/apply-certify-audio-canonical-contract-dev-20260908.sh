@@ -58,10 +58,6 @@ for f in "${cfgs[@]}"; do
   COMPOSE_ARGS+=( -f "$f" )
 done
 
-# Compose interpolation requires the same environment values that created the
-# running project. Prefer the workspace/project env file when present, and fill
-# any remaining variables from the already-running V3 containers without
-# printing secret values.
 ENV_FILE=""
 for candidate in "$PROJECT_DIR/infra/.env" "$WORKSPACE/infra/.env" "$PROJECT_DIR/.env" "$WORKSPACE/.env"; do
   if [[ -f "$candidate" ]]; then ENV_FILE="$candidate"; break; fi
@@ -83,7 +79,6 @@ else
   done < <(docker ps --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}')
 fi
 
-# Hard gate the variables that previously caused Compose interpolation failure.
 for required in POSTGRES_DB DATABASE_URL JWT_SECRET REDIS_URL; do
   if [[ -z "$ENV_FILE" && -z "${!required:-}" ]]; then
     echo "FAIL: unable to recover required compose variable: $required"
@@ -98,8 +93,6 @@ echo "worker_service=$WORKER_SERVICE"
 DB_STARTED="$(docker inspect desifaces-v3-db --format '{{.State.StartedAt}}')"
 
 cd "$PROJECT_DIR"
-# First render only the two target services. This is a no-change preflight and
-# prevents a build/recreate if interpolation is still incomplete.
 docker compose -p "$PROJECT" "${COMPOSE_ENV_ARGS[@]}" "${COMPOSE_ARGS[@]}" config "$AUDIO_SERVICE" "$WORKER_SERVICE" >/dev/null
 echo "COMPOSE_INTERPOLATION=PASS"
 
@@ -125,7 +118,7 @@ printf '%s\n' "$ROUTES"
 grep -Fq '/api/audio/jobs/{job_id}/canonical-output' <<<"$ROUTES" || { echo "FAIL: canonical-output route missing"; exit 20; }
 grep -Fq '/api/audio/assets/{media_id}/read-url' <<<"$ROUTES" || { echo "FAIL: read-url route missing"; exit 21; }
 
-HTTP_CODE="$(docker exec "$AUDIO_C" python - <<'PY'
+HTTP_CODE="$(docker exec -i "$AUDIO_C" python - <<'PY'
 import urllib.request, urllib.error
 url='http://127.0.0.1:8004/api/audio/jobs/00000000-0000-0000-0000-000000000000/canonical-output?project_id=00000000-0000-0000-0000-000000000000'
 try:
@@ -133,12 +126,14 @@ try:
     print('200')
 except urllib.error.HTTPError as e:
     print(e.code)
+except Exception as e:
+    print('ERR:'+type(e).__name__+':'+str(e))
 PY
 )"
 echo "canonical_unauth_http=$HTTP_CODE"
 [[ "$HTTP_CODE" == "401" ]] || { echo "FAIL: expected auth-protected route (401), got $HTTP_CODE"; exit 22; }
 
-docker exec "$AUDIO_C" python - <<'PY'
+docker exec -i "$AUDIO_C" python - <<'PY'
 from app.api.routes.canonical_audio import _storage_ref_from_artifact
 assert _storage_ref_from_artifact({'storage_path':'acct/job/variant_1.mp3'}) == 'acct/job/variant_1.mp3'
 assert _storage_ref_from_artifact({}) == ''
