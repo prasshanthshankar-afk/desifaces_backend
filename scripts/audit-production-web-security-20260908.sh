@@ -7,7 +7,7 @@ API="https://api.desifaces.ai"
 HTTP_WEB="http://web.desifaces.ai"
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "FAIL: missing required command: $1" >&2; exit 2; }; }
-for x in ssh curl openssl; do need "$x"; done
+for x in ssh curl openssl nc; do need "$x"; done
 
 echo "============================================================"
 echo " desifaces.ai — PRODUCTION WEB SECURITY AUDIT"
@@ -21,7 +21,7 @@ HTTP_HEADERS="$(curl -sS -I --max-time 15 "$HTTP_WEB" || true)"
 printf '%s\n' "$HTTP_HEADERS"
 HTTP_STATUS="$(printf '%s\n' "$HTTP_HEADERS" | awk 'toupper($0) ~ /^HTTP\// {code=$2} END{print code}')"
 HTTP_LOC="$(printf '%s\n' "$HTTP_HEADERS" | awk 'BEGIN{IGNORECASE=1} /^Location:/ {gsub("\r",""); sub(/^[^:]+:[[:space:]]*/,""); print; exit}')"
-if [[ "$HTTP_STATUS" =~ ^30[12378]$ ]] && [[ "$HTTP_LOC" == https://web.desifaces.ai* ]]; then
+if printf '%s' "$HTTP_STATUS" | grep -Eq '^30[12378]$' && printf '%s' "$HTTP_LOC" | grep -q '^https://web\.desifaces\.ai'; then
   echo "HTTP_TO_HTTPS_REDIRECT=PASS"
 else
   echo "HTTP_TO_HTTPS_REDIRECT=FAIL"
@@ -32,12 +32,18 @@ echo "===== 2. HTTPS + SECURITY HEADERS ====="
 HTTPS_HEADERS="$(curl -sS -I --max-time 15 "$WEB" || true)"
 printf '%s\n' "$HTTPS_HEADERS"
 for h in strict-transport-security content-security-policy x-content-type-options x-frame-options referrer-policy permissions-policy; do
+  label="$(printf '%s' "$h" | tr '[:lower:]-' '[:upper:]_')"
   if printf '%s\n' "$HTTPS_HEADERS" | grep -qi "^${h}:"; then
-    echo "HEADER_${h^^}=PASS"
+    echo "HEADER_${label}=PASS"
   else
-    echo "HEADER_${h^^}=MISSING"
+    echo "HEADER_${label}=MISSING"
   fi
 done
+if printf '%s\n' "$HTTPS_HEADERS" | grep -qi '^x-powered-by:'; then
+  echo "X_POWERED_BY_EXPOSED=YES"
+else
+  echo "X_POWERED_BY_EXPOSED=NO"
+fi
 
 echo
 echo "===== 3. TLS CERTIFICATE / PROTOCOL ====="
@@ -51,7 +57,7 @@ for proto in tls1 tls1_1 tls1_2 tls1_3; do
     tls1_3) flag=-tls1_3 ;;
   esac
   if echo | openssl s_client "$flag" -connect web.desifaces.ai:443 -servername web.desifaces.ai >/tmp/df-tls.out 2>&1; then
-    if grep -q 'Protocol.*TLS' /tmp/df-tls.out; then
+    if grep -Eq 'Protocol[[:space:]]*:[[:space:]]*TLS|New, TLSv' /tmp/df-tls.out; then
       echo "TLS_${proto}=ACCEPTED"
     else
       echo "TLS_${proto}=REJECTED"
