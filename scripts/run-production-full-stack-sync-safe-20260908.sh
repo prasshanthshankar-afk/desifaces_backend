@@ -21,13 +21,11 @@ import sys
 p=Path(sys.argv[1])
 s=p.read_text()
 
-# Fix nounset declaration defect if present.
 old_decl='  local table="$1" where="$2" file="$RUN/md/${table}.csv"\n'
 new_decl='  local table="$1"\n  local where="$2"\n  local file="$RUN/md/${table}.csv"\n'
 if old_decl in s:
     s=s.replace(old_decl,new_decl,1)
 
-# Replace unsafe nested-SSH filter transport with base64-safe transport.
 old='''  ssh "$DEV_HOST" "DBC='$DB_C' DBU='$DB_USER' DBN='$DB_NAME' T='$table' W='$where' bash -s" > "$file" <<'REMOTE'\nset -Eeuo pipefail\nSQL="COPY (SELECT * FROM public.\\\"$T\\\""\n[[ -n "$W" ]] && SQL+=" WHERE $W"\nSQL+=") TO STDOUT WITH CSV HEADER"\ndocker exec "$DBC" psql -X -q -v ON_ERROR_STOP=1 -U "$DBU" -d "$DBN" -c "$SQL"\nREMOTE\n'''
 new='''  local dbc64 dbu64 dbn64 t64 w64\n  dbc64="$(printf '%s' "$DB_C" | base64 | tr -d '\\n')"\n  dbu64="$(printf '%s' "$DB_USER" | base64 | tr -d '\\n')"\n  dbn64="$(printf '%s' "$DB_NAME" | base64 | tr -d '\\n')"\n  t64="$(printf '%s' "$table" | base64 | tr -d '\\n')"\n  w64="$(printf '%s' "$where" | base64 | tr -d '\\n')"\n  ssh "$DEV_HOST" "DBC64='$dbc64' DBU64='$dbu64' DBN64='$dbn64' T64='$t64' W64='$w64' bash -s" > "$file" <<'REMOTE'\nset -Eeuo pipefail\nDBC="$(printf '%s' "$DBC64" | base64 -d)"\nDBU="$(printf '%s' "$DBU64" | base64 -d)"\nDBN="$(printf '%s' "$DBN64" | base64 -d)"\nT="$(printf '%s' "$T64" | base64 -d)"\nW="$(printf '%s' "$W64" | base64 -d)"\nSQL="COPY (SELECT * FROM public.\\\"$T\\\""\n[[ -n "$W" ]] && SQL+=" WHERE $W"\nSQL+=") TO STDOUT WITH CSV HEADER"\ndocker exec "$DBC" psql -X -q -v ON_ERROR_STOP=1 -U "$DBU" -d "$DBN" -c "$SQL"\nREMOTE\n'''
 if s.count(old) != 1:
@@ -37,13 +35,11 @@ p.write_text(s)
 PY
 
 bash -n "$TMP"
-! grep -Fq "W='$where'" "$TMP" 2>/dev/null || { echo "FAIL: unsafe where transport remains" >&2; exit 3; }
+! grep -Fq "W='\$where'" "$TMP" || { echo "FAIL: unsafe where transport remains" >&2; exit 3; }
 grep -Fq 'W64=' "$TMP"
 grep -Fq 'base64 -d' "$TMP"
 echo "SYNC_LAUNCHER_EXPORT_TRANSPORT_FIX=PASS"
 
-# Read-only preflight: execute every filtered export predicate on dev before any
-# production snapshot or mutation can occur.
 echo "===== PREFLIGHT: DEV FILTERED EXPORT QUERIES ====="
 ssh "$DEV_HOST" "DEV_ROOT='$DEV_ROOT' bash -s" <<'REMOTE'
 set -Eeuo pipefail
