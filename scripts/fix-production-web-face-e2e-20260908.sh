@@ -34,11 +34,24 @@ docker inspect df-svc-face >/dev/null
 docker inspect df-svc-face-worker >/dev/null
 docker inspect df-v3-web-prod >/dev/null
 
+COMPOSE=(docker compose --env-file "$BACKEND_ROOT/infra/.env" -f "$BACKEND_ROOT/docker-compose.yml" -f "$BACKEND_ROOT/deploy/production/docker-compose.v3-app.production.yml")
+
 DB_ID_BEFORE="$(docker inspect -f '{{.Id}}' desifaces-db)"
 REDIS_ID_BEFORE="$(docker inspect -f '{{.Id}}' desifaces-redis)"
 DB_VOL_BEFORE="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' desifaces-db)"
 cp -a services/svc-face/app/app/services/providers/openai_image_client.py "$BACKUP/openai_image_client.py.before"
 docker inspect df-v3-web-prod > "$BACKUP/df-v3-web-prod.before.json"
+
+echo
+echo "===== 0. PRODUCTION COMPOSE ENV PREFLIGHT ====="
+"${COMPOSE[@]}" config >/tmp/desifaces-web-face-hotfix.compose.yml
+for key in DATABASE_URL REDIS_URL JWT_SECRET AZURE_STORAGE_CONNECTION_STRING OPENAI_API_KEY; do
+  if ! grep -q "${key}:" /tmp/desifaces-web-face-hotfix.compose.yml; then
+    echo "FAIL: resolved production compose missing $key" >&2
+    exit 12
+  fi
+done
+echo "PRODUCTION_COMPOSE_ENV_PREFLIGHT=PASS"
 
 echo
 echo "===== 1. FACE PROVIDER TRANSIENT RETRY PATCH ====="
@@ -68,7 +81,7 @@ grep -q 'OPENAI_IMAGE_TRANSIENT_RETRY_V1' services/svc-face/app/app/services/pro
 
 echo
 echo "===== 2. REBUILD ONLY FACE API + WORKER ====="
-docker compose -f docker-compose.yml -f deploy/production/docker-compose.v3-app.production.yml up -d --no-deps --build svc-face svc-face-worker
+"${COMPOSE[@]}" up -d --no-deps --build svc-face svc-face-worker
 for _ in $(seq 1 60); do
   h="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' df-svc-face 2>/dev/null || true)"
   [[ "$h" == "healthy" ]] && break
@@ -123,12 +136,10 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 [[ "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:13001/auth/login)" == "200" ]] || { docker logs --tail 160 df-v3-web-prod; exit 42; }
-# Route exists and rejects malformed target rather than falling through to 404.
 DL_CODE="$(curl -sS -o /tmp/df-media-route.json -w '%{http_code}' 'http://127.0.0.1:13001/api/media/download?url=bad')"
 [[ "$DL_CODE" == "400" ]] || { cat /tmp/df-media-route.json; echo "FAIL: media download route missing code=$DL_CODE" >&2; exit 43; }
 PUBLIC_CODE="$(curl -sS -o /dev/null -w '%{http_code}' https://web.desifaces.ai/auth/login)"
 [[ "$PUBLIC_CODE" == "200" ]] || { echo "FAIL: public web code=$PUBLIC_CODE" >&2; exit 44; }
-# New web is certified; retain prior container stopped for immediate rollback until user E2E passes.
 trap 'rm -rf "$TMP"' EXIT
 echo "WEB_RUNTIME=PASS new_image=$NEW_IMAGE rollback_container=$OLD_NAME"
 
