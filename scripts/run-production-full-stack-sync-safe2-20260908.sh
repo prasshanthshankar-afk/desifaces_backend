@@ -134,7 +134,8 @@ SQL
 scp -q "$RUN/merge.sql"'''
 if merge_re.search(s) is None:
     raise SystemExit('FAIL: merge.sql block not found')
-s=merge_re.sub(merge,s,count=1)
+# Use a callable replacement so backslashes in SQL (e.g. \set) are treated literally.
+s=merge_re.sub(lambda _m: merge,s,count=1)
 p.write_text(s)
 PY
 
