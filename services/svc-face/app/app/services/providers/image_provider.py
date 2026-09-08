@@ -17,40 +17,20 @@ ProviderName = Literal["fal", "openai"]
 
 @dataclass(frozen=True)
 class ImageBytesResult:
-    """
-    Normalized result for svc-face pipeline.
-
-    We return BYTES (not provider URLs) so the worker can always upload to
-    DesiFaces storage (Azure blob) the same way for all providers.
-    """
+    """Normalized provider result returned as bytes for canonical blob persistence."""
     bytes: bytes
-    content_type: str  # "image/png", "image/jpeg", etc.
-    provider: str      # "fal" or "openai"
+    content_type: str
+    provider: str
     meta: Dict[str, Any]
 
 
 class ImageProviderRouter:
-    """
-    One switchpoint for providers.
-
-    settings/env:
-      - DF_IMAGE_PROVIDER_DEFAULT = "fal" | "openai"
-      - OPENAI_API_KEY (required if openai)
-      - OPENAI_IMAGE_QUALITY (optional, default "high")
-      - OPENAI_IMAGE_SIZE (optional, default "1024x1024")
-      - OPENAI_IMAGE_MODEL_T2I / OPENAI_IMAGE_MODEL_EDIT (optional)
-
-    Fal semantics (LOCKED in your FalClient):
-      preservation_strength in [0..1] where 1.0 = preserve identity more (minimal change).
-    """
+    """Single provider switchpoint for Face T2I and I2I generation."""
 
     def __init__(self):
         self._fal = FalClient()
-        self._openai = None  # lazy init
+        self._openai = None
 
-    # -----------------------------
-    # internal helpers
-    # -----------------------------
     @staticmethod
     def _pick_provider(explicit: Optional[str] = None) -> ProviderName:
         p = (explicit or getattr(settings, "DF_IMAGE_PROVIDER_DEFAULT", "fal") or "fal").lower()
@@ -79,9 +59,34 @@ class ImageProviderRouter:
         self._openai = OpenAIImageClient()
         return self._openai
 
-    # -----------------------------
-    # Public API
-    # -----------------------------
+    @staticmethod
+    def _transient_openai_error(exc: Exception) -> bool:
+        # OPENAI_IMAGE_TRANSIENT_RETRY_V1_DEV_SYNC: production retries the same
+        # provider statuses in OpenAIImageClient. Keep the dev baseline protected
+        # as well so a future rebuild cannot regress to single-attempt behavior.
+        text = str(exc or "").lower()
+        return any(token in text for token in ("status=429", "status=500", "status=502", "status=503", "status=504"))
+
+    async def _openai_call_with_retry(self, fn, /, **kwargs):
+        attempts = 3
+        delay = 1.5
+        last: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await asyncio.to_thread(fn, **kwargs)
+            except Exception as exc:
+                last = exc
+                if attempt >= attempts or not self._transient_openai_error(exc):
+                    raise
+                logger.warning(
+                    "Transient OpenAI image provider failure; retrying",
+                    extra={"attempt": attempt, "max_attempts": attempts, "error": str(exc)},
+                )
+                await asyncio.sleep(min(delay * (2 ** (attempt - 1)), 15.0))
+        if last:
+            raise last
+        raise RuntimeError("openai_image_retry_exhausted")
+
     async def generate_t2i_bytes(
         self,
         *,
@@ -98,8 +103,7 @@ class ImageProviderRouter:
 
         if p == "openai":
             oa = self._get_openai()
-            # OpenAI client is sync (requests); run in a thread to avoid blocking event loop.
-            img_bytes = await asyncio.to_thread(
+            img_bytes = await self._openai_call_with_retry(
                 oa.generate_image,
                 prompt=prompt,
                 size=f"{width}x{height}",
@@ -112,7 +116,6 @@ class ImageProviderRouter:
                 meta={"mode": "t2i"},
             )
 
-        # Fal path (returns URL -> download bytes)
         result = await self._fal.generate_image(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -143,16 +146,10 @@ class ImageProviderRouter:
         num_inference_steps: int = 40,
         guidance_scale: float = 0.0,
         preservation_strength: float = 0.75,
-        # OpenAI edits need local files:
         src_local_path: Optional[str] = None,
         mask_local_path: Optional[str] = None,
         provider: Optional[ProviderName] = None,
     ) -> ImageBytesResult:
-        """
-        I2I/Edit:
-          - Fal: uses image_url directly and your LOCKED preservation semantics.
-          - OpenAI: requires src_local_path (download image_url to /tmp first). Optional mask_local_path.
-        """
         p = self._pick_provider(provider)
 
         if p == "openai":
@@ -162,7 +159,7 @@ class ImageProviderRouter:
                     "openai_edit_requires_src_local_path: download image_url to /tmp and pass src_local_path"
                 )
 
-            img_bytes = await asyncio.to_thread(
+            img_bytes = await self._openai_call_with_retry(
                 oa.edit_image,
                 prompt=prompt,
                 image_path=src_local_path,
@@ -182,7 +179,6 @@ class ImageProviderRouter:
                 },
             )
 
-        # Fal I2I (CRITICAL: pass your LOCKED preservation semantics through as `strength`)
         result = await self._fal.generate_image_to_image(
             prompt=prompt,
             negative_prompt=negative_prompt,
