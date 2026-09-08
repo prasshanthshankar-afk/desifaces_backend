@@ -58,6 +58,39 @@ for f in "${cfgs[@]}"; do
   COMPOSE_ARGS+=( -f "$f" )
 done
 
+# Compose interpolation requires the same environment values that created the
+# running project. Prefer the workspace/project env file when present, and fill
+# any remaining variables from the already-running V3 containers without
+# printing secret values.
+ENV_FILE=""
+for candidate in "$PROJECT_DIR/infra/.env" "$WORKSPACE/infra/.env" "$PROJECT_DIR/.env" "$WORKSPACE/.env"; do
+  if [[ -f "$candidate" ]]; then ENV_FILE="$candidate"; break; fi
+done
+
+if [[ -n "$ENV_FILE" ]]; then
+  echo "compose_env_file=$ENV_FILE"
+  COMPOSE_ENV_ARGS=(--env-file "$ENV_FILE")
+else
+  echo "compose_env_file=NONE; hydrating interpolation env from running V3 containers"
+  COMPOSE_ENV_ARGS=()
+  while IFS= read -r c; do
+    while IFS= read -r kv; do
+      key="${kv%%=*}"
+      val="${kv#*=}"
+      [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+      if [[ -z "${!key+x}" ]]; then export "$key=$val"; fi
+    done < <(docker inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}')
+  done < <(docker ps --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}')
+fi
+
+# Hard gate the variables that previously caused Compose interpolation failure.
+for required in POSTGRES_DB DATABASE_URL JWT_SECRET REDIS_URL; do
+  if [[ -z "$ENV_FILE" && -z "${!required:-}" ]]; then
+    echo "FAIL: unable to recover required compose variable: $required"
+    exit 11
+  fi
+done
+
 echo "compose_project=$PROJECT"
 echo "audio_service=$AUDIO_SERVICE"
 echo "worker_service=$WORKER_SERVICE"
@@ -65,8 +98,13 @@ echo "worker_service=$WORKER_SERVICE"
 DB_STARTED="$(docker inspect desifaces-v3-db --format '{{.State.StartedAt}}')"
 
 cd "$PROJECT_DIR"
-docker compose -p "$PROJECT" "${COMPOSE_ARGS[@]}" build "$AUDIO_SERVICE" "$WORKER_SERVICE"
-docker compose -p "$PROJECT" "${COMPOSE_ARGS[@]}" up -d --no-deps --force-recreate "$AUDIO_SERVICE" "$WORKER_SERVICE"
+# First render only the two target services. This is a no-change preflight and
+# prevents a build/recreate if interpolation is still incomplete.
+docker compose -p "$PROJECT" "${COMPOSE_ENV_ARGS[@]}" "${COMPOSE_ARGS[@]}" config "$AUDIO_SERVICE" "$WORKER_SERVICE" >/dev/null
+echo "COMPOSE_INTERPOLATION=PASS"
+
+docker compose -p "$PROJECT" "${COMPOSE_ENV_ARGS[@]}" "${COMPOSE_ARGS[@]}" build "$AUDIO_SERVICE" "$WORKER_SERVICE"
+docker compose -p "$PROJECT" "${COMPOSE_ENV_ARGS[@]}" "${COMPOSE_ARGS[@]}" up -d --no-deps --force-recreate "$AUDIO_SERVICE" "$WORKER_SERVICE"
 
 for i in $(seq 1 30); do
   state="$(docker inspect "$AUDIO_C" --format '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}no-health{{end}}' 2>/dev/null || true)"
@@ -87,7 +125,6 @@ printf '%s\n' "$ROUTES"
 grep -Fq '/api/audio/jobs/{job_id}/canonical-output' <<<"$ROUTES" || { echo "FAIL: canonical-output route missing"; exit 20; }
 grep -Fq '/api/audio/assets/{media_id}/read-url' <<<"$ROUTES" || { echo "FAIL: read-url route missing"; exit 21; }
 
-# Route must exist and be auth-protected: without token, 401 is expected (not 404).
 HTTP_CODE="$(docker exec "$AUDIO_C" python - <<'PY'
 import urllib.request, urllib.error
 url='http://127.0.0.1:8004/api/audio/jobs/00000000-0000-0000-0000-000000000000/canonical-output?project_id=00000000-0000-0000-0000-000000000000'
@@ -101,7 +138,6 @@ PY
 echo "canonical_unauth_http=$HTTP_CODE"
 [[ "$HTTP_CODE" == "401" ]] || { echo "FAIL: expected auth-protected route (401), got $HTTP_CODE"; exit 22; }
 
-# Source-level regression tests are intentionally dependency-light.
 docker exec "$AUDIO_C" python - <<'PY'
 from app.api.routes.canonical_audio import _storage_ref_from_artifact
 assert _storage_ref_from_artifact({'storage_path':'acct/job/variant_1.mp3'}) == 'acct/job/variant_1.mp3'
@@ -115,6 +151,7 @@ echo "============================================================"
 echo " AUDIO CANONICAL DEV CERTIFICATION PASS"
 echo "============================================================"
 echo "SOURCE_SYNC=PASS"
+echo "COMPOSE_INTERPOLATION=PASS"
 echo "CANONICAL_ROUTE=PASS"
 echo "READ_URL_ROUTE=PASS"
 echo "AUTH_GUARD=PASS"
