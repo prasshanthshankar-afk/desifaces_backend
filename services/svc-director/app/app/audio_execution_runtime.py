@@ -4,16 +4,25 @@ For Story workflows, the canonical dialogue-turn locale remains the source
 language and ``v3_participants.voice_locale`` is the user-selected target speech
 locale. Direct/single-person Studio behavior remains unchanged unless an explicit
 participant voice profile is already present.
+
+Story/Director plans may contain qualitative delivery direction (for example,
+``volume: \"Softer than the previous line\"``). svc-audio intentionally models
+``style_degree``, ``rate``, ``pitch`` and ``volume`` as numeric controls. This
+runtime boundary therefore normalizes numeric values before pricing/dispatch and
+preserves qualitative direction in the supported free-text ``context`` field
+instead of sending an invalid value into a numeric API field.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from . import audio_execution as _audio_execution
 
 _original_compile_context_audio_input = _audio_execution.compile_context_audio_input
+_NUMERIC_DELIVERY_FIELDS = ("style_degree", "rate", "pitch", "volume")
 
 
 def _base_language(locale: str | None) -> str:
@@ -37,6 +46,46 @@ def _as_dict(value: Any) -> dict[str, Any]:
         return {}
 
 
+def _finite_audio_number(value: Any) -> float | None:
+    """Return a finite numeric Audio control or None for qualitative direction."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _preserve_qualitative_direction(studio_input: dict[str, Any], notes: list[str]) -> None:
+    """Keep qualitative Director intent without violating svc-audio numeric schema."""
+    if not notes:
+        return
+    existing = str(studio_input.get("context") or "").strip()
+    direction = "delivery_direction=" + " | ".join(notes)
+    studio_input["context"] = f"{existing}; {direction}" if existing else direction
+
+
+def _sanitize_numeric_delivery(studio_input: dict[str, Any]) -> list[str]:
+    """Normalize inherited dialogue-turn delivery fields already added by the base compiler."""
+    notes: list[str] = []
+    for key in _NUMERIC_DELIVERY_FIELDS:
+        if key not in studio_input:
+            continue
+        raw = studio_input.get(key)
+        number = _finite_audio_number(raw)
+        if number is None:
+            text = str(raw or "").strip()
+            studio_input.pop(key, None)
+            if text:
+                notes.append(f"{key}: {text}")
+        else:
+            studio_input[key] = number
+    return notes
+
+
 def compile_context_audio_input(context: _audio_execution.AudioStageContext) -> dict:
     is_story_audio = context.story_id is not None
 
@@ -52,6 +101,8 @@ def compile_context_audio_input(context: _audio_execution.AudioStageContext) -> 
         )
 
     studio_input = dict(_original_compile_context_audio_input(context))
+    qualitative_notes = _sanitize_numeric_delivery(studio_input)
+
     source_locale = str(context.target_locale or "").strip()
     if not source_locale:
         raise _audio_execution.ParticipantAudioBridgeError("audio_source_locale_required")
@@ -70,14 +121,31 @@ def compile_context_audio_input(context: _audio_execution.AudioStageContext) -> 
     studio_input["translate"] = _base_language(source_locale) != _base_language(target_locale)
 
     # Explicit participant-level delivery choices override Director-authored
-    # defaults for every dialogue turn. Only fields already supported by
-    # svc-audio are forwarded.
+    # defaults. String controls remain strings; numeric controls are forwarded
+    # only when they can be represented safely as finite numbers.
     delivery = _as_dict(context.participant_metadata.get("audio_delivery"))
-    for key in ("style", "style_degree", "rate", "pitch", "volume", "translation_tone"):
+
+    for key in ("style", "translation_tone"):
         value = delivery.get(key)
         if value is not None and str(value).strip() != "":
             studio_input[key] = value
 
+    for key in _NUMERIC_DELIVERY_FIELDS:
+        if key not in delivery:
+            continue
+        raw = delivery.get(key)
+        if raw is None or str(raw).strip() == "":
+            continue
+        number = _finite_audio_number(raw)
+        if number is None:
+            # A qualitative participant instruction supersedes any inherited
+            # numeric control but remains available to Audio as creative context.
+            studio_input.pop(key, None)
+            qualitative_notes.append(f"{key}: {str(raw).strip()}")
+        else:
+            studio_input[key] = number
+
+    _preserve_qualitative_direction(studio_input, qualitative_notes)
     return studio_input
 
 
