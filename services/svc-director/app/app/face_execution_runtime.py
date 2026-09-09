@@ -4,18 +4,30 @@ from uuid import UUID
 
 from df_contracts.v3.domain import JobState
 
+from . import face_execution as _face_execution
+from . import face_execution_canonical as _face_execution_canonical
 from .face_execution import _latest_attempt
 from .face_execution_canonical import ParticipantFaceExecutionService as CanonicalParticipantFaceExecutionService
 
 
-class ParticipantFaceExecutionService(CanonicalParticipantFaceExecutionService):
-    """Runtime composition for the existing Studio route contract.
+_ALLOWED_ASPECT_RATIOS = frozenset({"9:16", "16:9", "1:1"})
+_original_base_compile_context_face_input = _face_execution.compile_context_face_input
 
-    Existing routes predate explicit actor propagation into Face dispatch/sync.
-    Until collaborative execution is introduced, the workflow owner is the
-    canonical request actor for C5 generation attribution. The authenticated
-    account boundary remains enforced by the route and workflow lookup.
-    """
+
+def compile_context_face_input_with_stage_aspect(context):
+    """Apply the priced stage aspect ratio to both preview and dispatch payloads."""
+    studio_input = dict(_original_base_compile_context_face_input(context))
+    raw = str((context.metadata or {}).get("aspect_ratio") or "9:16").strip()
+    studio_input["aspect_ratio"] = raw if raw in _ALLOWED_ASPECT_RATIOS else "9:16"
+    return studio_input
+
+
+_face_execution.compile_context_face_input = compile_context_face_input_with_stage_aspect
+_face_execution_canonical.compile_context_face_input = compile_context_face_input_with_stage_aspect
+
+
+class ParticipantFaceExecutionService(CanonicalParticipantFaceExecutionService):
+    """Runtime composition for the existing Studio route contract."""
 
     async def _workflow_owner(self, pool, *, workflow_id: UUID, account_id: UUID) -> UUID:
         async with pool.acquire() as conn:
@@ -64,8 +76,6 @@ class ParticipantFaceExecutionService(CanonicalParticipantFaceExecutionService):
         stage_run_id: UUID,
         result: dict,
     ) -> None:
-        # Query the canonical IDs directly. The legacy helper intentionally
-        # returns only compatibility-attempt fields for base sync semantics.
         async with pool.acquire() as conn:
             attempt = await conn.fetchrow(
                 """select attempt_id,attempt_no,attempt_kind,state,provider_job_ref,media_id,
@@ -154,8 +164,6 @@ class ParticipantFaceExecutionService(CanonicalParticipantFaceExecutionService):
             workflow_id=workflow_id,
             account_id=account_id,
         )
-        # Skip CanonicalParticipantFaceExecutionService.sync so we can supply
-        # the corrected C5 attempt lookup exactly once after base Face sync.
         result = await super(CanonicalParticipantFaceExecutionService, self).sync(
             pool,
             account_id=account_id,
@@ -171,3 +179,6 @@ class ParticipantFaceExecutionService(CanonicalParticipantFaceExecutionService):
             result=result,
         )
         return result
+
+
+__all__ = ["ParticipantFaceExecutionService", "compile_context_face_input_with_stage_aspect"]
