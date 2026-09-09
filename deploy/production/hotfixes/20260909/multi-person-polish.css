@@ -1,0 +1,164 @@
+/* desifaces Multi-Person pricing/action polish.
+   Route-scoped via app/app/multi-person/layout.tsx. */
+
+.multi-person-page .audio-command-bar{
+  border:1px solid rgba(244,176,0,.22);
+  background:
+    radial-gradient(520px 180px at 92% -30%,rgba(244,176,0,.10),transparent 70%),
+    linear-gradient(135deg,rgba(24,20,16,.96),rgba(13,12,12,.96));
+  box-shadow:0 18px 46px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.035);
+}
+
+.multi-person-page .audio-command-price{
+  border:1px solid rgba(244,176,0,.20);
+  background:linear-gradient(135deg,rgba(244,176,0,.075),rgba(255,213,107,.025));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.025);
+}
+
+.multi-person-page .audio-command-price span,
+.multi-person-page .audio-command-summary span{
+  color:var(--gold2);
+}
+
+.multi-person-page .audio-command-actions{
+  gap:10px;
+  align-items:stretch;
+}
+
+.multi-person-page .audio-command-actions .btn{
+  min-height:46px;
+  border-radius:13px;
+  padding:11px 17px;
+  letter-spacing:-.01em;
+  box-shadow:none;
+}
+
+.multi-person-page .audio-command-actions .audio-price-all-strong{
+  color:#fff1bd;
+  border:1px solid rgba(244,176,0,.48);
+  background:linear-gradient(135deg,rgba(244,176,0,.17),rgba(244,176,0,.07));
+  box-shadow:inset 0 1px 0 rgba(255,225,145,.08),0 8px 22px rgba(0,0,0,.20);
+}
+
+.multi-person-page .audio-command-actions .audio-price-all-strong:hover:not(:disabled){
+  border-color:rgba(255,213,107,.80);
+  background:linear-gradient(135deg,rgba(244,176,0,.25),rgba(244,176,0,.10));
+  box-shadow:0 10px 28px rgba(244,176,0,.10);
+}
+
+.multi-person-page .audio-command-actions .btn.primary{
+  background:linear-gradient(135deg,#ffe18a,#f4b000);
+  color:#1b1204;
+  border-color:rgba(255,225,138,.70);
+  box-shadow:0 10px 28px rgba(244,176,0,.13);
+}
+
+.multi-person-page .audio-command-actions .approve-all{
+  color:#c9f4df;
+  border:1px solid rgba(95,208,165,.34);
+  background:linear-gradient(135deg,rgba(95,208,165,.14),rgba(95,208,165,.055));
+}
+
+.multi-person-page .audio-command-actions .approve-all:hover:not(:disabled){
+  border-color:rgba(95,208,165,.62);
+  background:linear-gradient(135deg,rgba(95,208,165,.20),rgba(95,208,165,.08));
+}
+
+.multi-person-page .production-stage-card .stage-actions{
+  display:flex;
+  align-items:stretch;
+  gap:8px;
+  margin-top:15px;
+  padding-top:13px;
+  border-top:1px solid rgba(255,255,255,.055);
+}
+
+.multi-person-page .production-stage-card .stage-actions .mini-action{
+  min-height:40px;
+  border-radius:11px;
+  border:1px solid rgba(255,255,255,.10);
+  background:rgba(255,255,255,.035);
+  color:#ddd5c8;
+  padding:9px 13px;
+  font-size:12px;
+  font-weight:760;
+  line-height:1.15;
+  text-decoration:none;
+  transition:transform .18s ease,border-color .18s ease,background .18s ease,box-shadow .18s ease;
+}
+
+.multi-person-page .production-stage-card .stage-actions .mini-action:hover:not(:disabled){
+  transform:translateY(-1px);
+  border-color:rgba(244,176,0,.38);
+  color:#fff3ca;
+}
+
+.multi-person-page .production-stage-card .stage-actions .mini-action.strong{
+  flex:1 1 160px;
+  min-height:44px;
+  border:1px solid rgba(244,176,0,.56);
+  background:linear-gradient(135deg,rgba(244,176,0,.22),rgba(244,176,0,.08));
+  color:#ffe7a2;
+  font-size:12.5px;
+  font-weight:850;
+  letter-spacing:.005em;
+  box-shadow:inset 0 1px 0 rgba(255,226,147,.09),0 9px 24px rgba(0,0,0,.20);
+}
+
+.multi-person-page .production-stage-card .stage-actions .mini-action.strong:hover:not(:disabled){
+  border-color:#ffd56b;
+  background:linear-gradient(135deg,rgba(244,176,0,.31),rgba(244,176,0,.12));
+  box-shadow:0 10px 28px rgba(244,176,0,.11);
+}
+
+.multi-person-page .production-stage-card .stage-actions .mini-action.approve{
+  color:#bff0d8;
+  border-color:rgba(95,208,165,.28);
+  background:rgba(95,208,165,.075);
+}
+
+.multi-person-page .production-stage-card .stage-actions .mini-action:disabled,
+.multi-person-page .audio-command-actions .btn:disabled{
+  opacity:.42;
+  cursor:not-allowed;
+  transform:none;
+  box-shadow:none;
+}
+
+.multi-person-page .production-stage-card{
+  border-color:rgba(255,255,255,.075);
+  background:linear-gradient(155deg,rgba(18,17,15,.96),rgba(10,10,10,.96));
+  box-shadow:0 14px 34px rgba(0,0,0,.20);
+}
+
+.multi-person-page .production-stage-card:hover{
+  border-color:rgba(244,176,0,.16);
+}
+
+.multi-person-page .production-stage-card .stage-price.receipt{
+  border-color:rgba(244,176,0,.22);
+  background:linear-gradient(135deg,rgba(244,176,0,.075),rgba(244,176,0,.025));
+}
+
+.multi-person-page .stage-inline-error,
+.multi-person-page .audio-command-feedback.error{
+  border-color:rgba(255,127,127,.28);
+  background:linear-gradient(135deg,rgba(177,45,45,.12),rgba(255,127,127,.035));
+}
+
+@media(max-width:900px){
+  .multi-person-page .audio-command-actions{
+    width:100%;
+    display:grid;
+    grid-template-columns:1fr;
+  }
+  .multi-person-page .audio-command-actions .btn{
+    width:100%;
+  }
+  .multi-person-page .production-stage-card .stage-actions{
+    flex-wrap:wrap;
+  }
+  .multi-person-page .production-stage-card .stage-actions .mini-action.strong{
+    flex-basis:100%;
+  }
+}
