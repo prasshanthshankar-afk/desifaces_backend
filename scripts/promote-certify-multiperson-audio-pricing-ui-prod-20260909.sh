@@ -16,6 +16,7 @@ DB_C="desifaces-db"
 REDIS_C="desifaces-redis"
 AUDIO_C="df-svc-audio"
 AUDIO_WORKER_C="df-svc-audio-worker"
+DIRECTOR_IMAGE_REF="${DIRECTOR_IMAGE_REF:-desifaces-v3-svc-director-production}"
 
 SOURCE_COMMIT="36bd83ab7a1612814aaba05fa07f7b92ec6bd2d6"
 WEB_COMMIT="27e7bbd54decb3ab26462db56bd5916d653c1b60"
@@ -67,13 +68,13 @@ WORKER_STARTED_BEFORE="$(docker inspect "$DIRECTOR_WORKER_C" --format '{{.State.
 AUDIO_ID_BEFORE="$(docker inspect "$AUDIO_C" --format '{{.Id}}')"
 AUDIO_WORKER_ID_BEFORE="$(docker inspect "$AUDIO_WORKER_C" --format '{{.Id}}')"
 DIRECTOR_IMAGE_BEFORE="$(docker inspect "$DIRECTOR_C" --format '{{.Image}}')"
-DIRECTOR_IMAGE_REF="$(docker inspect "$DIRECTOR_C" --format '{{.Config.Image}}')"
 WEB_IMAGE_BEFORE="$(docker inspect "$WEB_C" --format '{{.Config.Image}}')"
 
 cp -a "$DIRECTOR_SOURCE" "$BACKUP/audio_execution_runtime.py.before"
 [[ -f "$WEB_CSS" ]] && cp -a "$WEB_CSS" "$BACKUP/multi-person-polish.css.before" || true
 [[ -f "$WEB_LAYOUT" ]] && cp -a "$WEB_LAYOUT" "$BACKUP/layout.tsx.before" || true
 
+DIRECTOR_IMAGE_BUILT=0
 DIRECTOR_RECREATED=0
 WEB_SWAPPED=0
 CANDIDATE_STARTED=0
@@ -91,21 +92,31 @@ rollback(){
   if (( rc != 0 )) && (( SUCCESS == 0 )); then
     echo
     echo "===== AUTOMATIC ROLLBACK ====="
+
     if (( WEB_SWAPPED == 1 )); then
       docker rm -f "$WEB_C" >/dev/null 2>&1 || true
       if docker inspect "$ROLLBACK_WEB" >/dev/null 2>&1; then
         docker rename "$ROLLBACK_WEB" "$WEB_C" >/dev/null 2>&1 || true
+        docker update --restart=unless-stopped "$WEB_C" >/dev/null 2>&1 || true
         docker start "$WEB_C" >/dev/null 2>&1 || true
         echo "WEB_ROLLBACK=ATTEMPTED"
       fi
     fi
-    (( CANDIDATE_STARTED == 1 )) && docker rm -f "$CANDIDATE" >/dev/null 2>&1 || true
+
+    if (( CANDIDATE_STARTED == 1 )); then
+      docker rm -f "$CANDIDATE" >/dev/null 2>&1 || true
+    fi
+
     restore_sources
-    if (( DIRECTOR_RECREATED == 1 )); then
+
+    if (( DIRECTOR_IMAGE_BUILT == 1 )); then
       docker tag "$DIRECTOR_IMAGE_BEFORE" "$DIRECTOR_IMAGE_REF" >/dev/null 2>&1 || true
+    fi
+    if (( DIRECTOR_RECREATED == 1 )); then
       "${COMPOSE[@]}" up -d --no-deps --force-recreate svc-director >/dev/null 2>&1 || true
       echo "DIRECTOR_ROLLBACK=ATTEMPTED"
     fi
+
     echo "BACKUP=$BACKUP"
   fi
   exit "$rc"
@@ -171,7 +182,7 @@ echo
 echo "===== 2. STATIC CONTRACT GATES ====="
 python3 - "$DIRECTOR_SOURCE" <<'PY'
 import ast, pathlib, sys
-s=pathlib.Path(sys.argv[1]).read_text()
+s = pathlib.Path(sys.argv[1]).read_text()
 ast.parse(s)
 for marker in (
     '_NUMERIC_DELIVERY_FIELDS = ("style_degree", "rate", "pitch", "volume")',
@@ -197,6 +208,7 @@ echo "COMPOSE_INTERPOLATION=PASS"
 echo
 echo "===== 4. BUILD DIRECTOR HOTFIX IMAGE ====="
 "${COMPOSE[@]}" build svc-director
+DIRECTOR_IMAGE_BUILT=1
 
 echo
 echo "===== 5. RUNTIME AUDIO PAYLOAD PROOF ====="
@@ -233,14 +245,24 @@ echo
 echo "===== 6. BUILD + CERTIFY WEB IMAGE ====="
 docker build -t "$WEB_IMAGE" "$WEB_SRC"
 docker run --rm --entrypoint sh "$WEB_IMAGE" -lc \
-  'grep -R -q "audio-price-all-strong" /app/.next/static/css && grep -R -q "mini-action.strong\|mini-action" /app/.next/static/css'
+  'grep -R -q "audio-price-all-strong" /app/.next/static/css && grep -R -q "mini-action" /app/.next/static/css'
 echo "WEB_BUILD_AND_THEME_BUNDLE=PASS"
 
 echo
 echo "===== 7. START ISOLATED WEB CANDIDATE ====="
-if ss -ltn "( sport = :$CANDIDATE_PORT )" | grep -q ":$CANDIDATE_PORT"; then
-  fail "candidate port $CANDIDATE_PORT is already in use"
-fi
+python3 - "$CANDIDATE_PORT" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", port))
+except OSError as exc:
+    raise SystemExit(f"candidate port {port} unavailable: {exc}")
+finally:
+    s.close()
+print("CANDIDATE_PORT_AVAILABLE=PASS")
+PY
+
 docker rm -f "$CANDIDATE" >/dev/null 2>&1 || true
 run_web "$CANDIDATE" "$CANDIDATE_PORT" "$WEB_IMAGE"
 CANDIDATE_STARTED=1
@@ -259,15 +281,10 @@ wait_http director "http://127.0.0.1:18011/api/health" 30 || {
   docker logs --tail 180 "$DIRECTOR_C" 2>&1 || true
   fail "Director API failed after promotion"
 }
-python3 - <<'PY'
-import json
-p='/tmp/df-hotfix-http.' + str(__import__('os').getppid())
-# Health was already certified by HTTP 200; runtime_ready is checked directly below.
-PY
 curl -fsS http://127.0.0.1:18011/api/health >/tmp/df-director-audio-hotfix-health.json
 python3 - <<'PY'
 import json
-x=json.load(open('/tmp/df-director-audio-hotfix-health.json'))
+x = json.load(open('/tmp/df-director-audio-hotfix-health.json'))
 assert x.get('ok') is True, x
 assert x.get('runtime_ready') is True, x
 print('DIRECTOR_HEALTH=PASS')
@@ -279,10 +296,13 @@ echo "DIRECTOR_ACTIVE_WORKSPACE=PASS"
 echo
 echo "===== 9. CUT OVER WEB WITH ROLLBACK SLOT ====="
 docker stop "$WEB_C" >/dev/null
-docker rename "$WEB_C" "$ROLLBACK_WEB"
+if ! docker rename "$WEB_C" "$ROLLBACK_WEB"; then
+  docker start "$WEB_C" >/dev/null 2>&1 || true
+  fail "failed to create production web rollback slot"
+fi
+WEB_SWAPPED=1
 docker update --restart=no "$ROLLBACK_WEB" >/dev/null 2>&1 || true
 run_web "$WEB_C" "$WEB_PORT" "$WEB_IMAGE"
-WEB_SWAPPED=1
 wait_http production-web "http://127.0.0.1:${WEB_PORT}/auth/login" 45 || {
   docker logs --tail 180 "$WEB_C" 2>&1 || true
   fail "production web failed local certification"
