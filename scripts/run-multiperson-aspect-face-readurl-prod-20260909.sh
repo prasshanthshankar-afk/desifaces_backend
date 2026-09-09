@@ -10,7 +10,7 @@ SCRIPT_PATH="scripts/promote-certify-multiperson-aspect-face-readurl-prod-202609
 
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 command -v git >/dev/null 2>&1 || fail "git is required"
-[[ -d "$ROOT/.git" ]] || fail "backend git repository not found at $ROOT"
+git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || fail "backend git repository not found at $ROOT"
 
 WEB_SRC="${WEB_SRC:-}"
 if [[ -z "$WEB_SRC" ]]; then
@@ -27,6 +27,7 @@ fi
 [[ -n "$WEB_SRC" && -d "$WEB_SRC" ]] || fail "active production web source not found"
 WEB_ROOT="$(git -C "$WEB_SRC" rev-parse --show-toplevel 2>/dev/null)" || fail "web git repository not found for $WEB_SRC"
 
+echo "SOURCE_TRANSPORT=LOCAL_GIT_OBJECTS"
 # Fetch only repository metadata/objects. Working trees are not checked out or reset.
 git -C "$ROOT" fetch --no-tags origin "$RELEASE_REF" >/dev/null
 git -C "$WEB_ROOT" fetch --no-tags origin main >/dev/null
