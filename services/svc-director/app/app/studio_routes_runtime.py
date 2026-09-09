@@ -25,6 +25,7 @@ from .audio_autoconfigure_routes import router as _audio_auto_router  # noqa: E4
 from .face_reuse_routes import router as _face_reuse_router  # noqa: E402
 from .studio_preflight_routes import router as _preflight_router  # noqa: E402
 from .fusion_resilience_routes import router as _fusion_resilience_router  # noqa: E402
+from .studio_aspect_routes import router as _aspect_router  # noqa: E402
 
 router.include_router(_e2e_router)
 router.include_router(_audio_voice_router)
@@ -32,3 +33,4 @@ router.include_router(_audio_auto_router)
 router.include_router(_face_reuse_router)
 router.include_router(_preflight_router)
 router.include_router(_fusion_resilience_router)
+router.include_router(_aspect_router)
