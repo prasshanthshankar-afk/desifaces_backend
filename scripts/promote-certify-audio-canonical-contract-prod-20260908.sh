@@ -12,8 +12,7 @@ REDIS_C="${REDIS_C:-desifaces-redis}"
 host="$(hostname)"
 [[ "$host" == "$EXPECTED_HOST" ]] || { echo "FAIL: run on $EXPECTED_HOST, current=$host"; exit 2; }
 [[ -d "$WORKSPACE" ]] || { echo "FAIL: workspace missing: $WORKSPACE"; exit 3; }
-command -v gh >/dev/null || { echo "FAIL: gh missing"; exit 4; }
-gh auth status >/dev/null 2>&1 || { echo "FAIL: gh not authenticated"; exit 5; }
+command -v curl >/dev/null || { echo "FAIL: curl missing"; exit 4; }
 command -v docker >/dev/null || { echo "FAIL: docker missing"; exit 6; }
 
 echo "============================================================"
@@ -24,6 +23,7 @@ echo "workspace=$WORKSPACE"
 echo "scope=svc-audio+worker only"
 echo "db_change=NONE"
 echo "redis_change=NONE"
+echo "source_fetch=curl/raw.githubusercontent.com"
 
 echo
 DB_ID_BEFORE="$(docker inspect "$DB_C" --format '{{.Id}}')"
@@ -42,9 +42,12 @@ mkdir -p "$BACKUP"
 fetch_file() {
   local path="$1"
   local dest="$WORKSPACE/$path"
+  local tmp="${dest}.promote-${TS}.tmp"
   mkdir -p "$(dirname "$dest")"
   if [[ -f "$dest" ]]; then cp -a "$dest" "$BACKUP/$(echo "$path" | tr '/' '_')"; fi
-  gh api "repos/$REPO/contents/$path?ref=main" --jq .content | base64 -d > "$dest"
+  curl -fsSL "https://raw.githubusercontent.com/$REPO/main/$path" -o "$tmp"
+  [[ -s "$tmp" ]] || { echo "FAIL: fetched source is empty: $path"; rm -f "$tmp"; exit 7; }
+  mv "$tmp" "$dest"
 }
 
 fetch_file services/svc-audio/app/app/api/routes/canonical_audio.py
