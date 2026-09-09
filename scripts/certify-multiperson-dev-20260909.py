@@ -39,9 +39,9 @@ NON_TARGET = (
     "df-v3-svc-fusion-worker",
 )
 TARGET_APIS = (
-    ("svc-face", "df-v3-svc-face"),
-    ("svc-audio", "df-v3-svc-audio"),
-    ("svc-director", "df-v3-svc-director"),
+    ("svc-face", "df-v3-svc-face", "http://127.0.0.1:18003/api/health"),
+    ("svc-audio", "df-v3-svc-audio", "http://127.0.0.1:18004/api/health"),
+    ("svc-director", "df-v3-svc-director", "http://127.0.0.1:18011/api/health"),
 )
 
 
@@ -79,10 +79,28 @@ def snapshot(name: str) -> str | None:
     ])
 
 
-def image_identity(name: str) -> tuple[str, str]:
-    image_id = out(["docker", "inspect", name, "--format", "{{.Image}}"])
-    image_ref = out(["docker", "inspect", name, "--format", "{{.Config.Image}}"])
-    return image_id, image_ref
+def container_image_ref(name: str) -> str:
+    return out(["docker", "inspect", name, "--format", "{{.Config.Image}}"])
+
+
+def assert_dev_target_container(service: str, container: str) -> None:
+    networks = out(["docker", "inspect", container, "--format", "{{json .NetworkSettings.Networks}}"])
+    if '"df-v3-net"' not in networks:
+        raise RuntimeError(f"refusing non-V3 target container: {container}; networks={networks}")
+    labels = out(["docker", "inspect", container, "--format", "{{json .Config.Labels}}"])
+    # Older V3 containers may have been created by a slightly different compose invocation,
+    # which is exactly why a fixed container_name can conflict. Require either the expected
+    # service label or no compose service label; never remove a differently-labelled service.
+    try:
+        parsed = json.loads(labels or "{}") or {}
+    except Exception:
+        parsed = {}
+    label_service = str(parsed.get("com.docker.compose.service") or "").strip()
+    if label_service and label_service != service:
+        raise RuntimeError(
+            f"refusing container owned by different compose service: {container}; "
+            f"expected={service}; actual={label_service}"
+        )
 
 
 def wait_http(url: str, label: str, attempts: int = 45) -> None:
@@ -160,6 +178,7 @@ def prepare_web_source(run_dir: Path) -> tuple[Path, callable]:
 
 def main() -> int:
     host = socket.gethostname().split(".", 1)[0]
+    stamp = str(int(time.time()))
     print("============================================================")
     print(" desifaces DEV — MULTI-PERSON PARITY CERTIFICATION")
     print("============================================================")
@@ -173,6 +192,7 @@ def main() -> int:
     print("provider_generation=FORBIDDEN")
     print("db_schema_change=NONE")
     print("redis_change=NONE")
+    print("replacement_mode=DEV_TARGET_REMOVE_RECREATE_WITH_COMMITTED_ROLLBACK_IMAGES")
 
     if host != EXPECTED_HOST:
         raise SystemExit(f"FAIL: this certification may run only on {EXPECTED_HOST}; current={host}")
@@ -183,11 +203,17 @@ def main() -> int:
     for name in REQUIRED:
         if not container_exists(name):
             raise SystemExit(f"FAIL: required dev container missing: {name}")
+    for service, container, _ in TARGET_APIS:
+        assert_dev_target_container(service, container)
 
     before = {name: snapshot(name) for name in NON_TARGET}
-    target_before = {name: image_identity(name) for _, name in TARGET_APIS}
-    recreated: list[tuple[str, str]] = []
-    candidate_name = f"df-v3-web-cert-{int(time.time())}"
+    target_image_refs = {container: container_image_ref(container) for _, container, _ in TARGET_APIS}
+    rollback_images = {
+        container: f"desifaces-dev-cert-rollback:{service.removeprefix('svc-')}-{stamp}"
+        for service, container, _ in TARGET_APIS
+    }
+    recreated: list[tuple[str, str, str]] = []
+    candidate_name = f"df-v3-web-cert-{stamp}"
     candidate_started = False
 
     run_root = Path(tempfile.mkdtemp(prefix="desifaces-multiperson-dev-cert-"))
@@ -201,18 +227,32 @@ def main() -> int:
             input_text=input_text,
         )
 
+    def create_rollback_images() -> None:
+        print("\n===== DEV ROLLBACK IMAGE CHECKPOINT =====", flush=True)
+        for service, container, _ in TARGET_APIS:
+            tag = rollback_images[container]
+            run(["docker", "commit", container, tag])
+            run(["docker", "image", "inspect", tag], capture=True)
+            print(f"ROLLBACK_IMAGE_{service.upper().replace('-', '_')}=PASS", flush=True)
+
     def rollback_runtime() -> None:
         if not recreated:
             return
         print("===== DEV AUTOMATIC ROLLBACK =====", flush=True)
-        for service, container in TARGET_APIS:
-            if (service, container) not in recreated:
-                continue
-            old_id, old_ref = target_before[container]
-            run(["docker", "tag", old_id, old_ref], check=False)
-        for service, container in reversed(recreated):
-            compose("up", "-d", "--no-deps", "--force-recreate", service)
-            print(f"rollback={service}=ATTEMPTED", flush=True)
+        errors: list[str] = []
+        for service, container, health in reversed(recreated):
+            try:
+                run(["docker", "rm", "-f", container], check=False)
+                rollback_tag = rollback_images[container]
+                original_ref = target_image_refs[container]
+                run(["docker", "tag", rollback_tag, original_ref])
+                compose("up", "-d", "--no-deps", service)
+                wait_http(health, f"rollback-{service}", attempts=30)
+                print(f"rollback={service}=PASS", flush=True)
+            except Exception as exc:
+                errors.append(f"{service}:{exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
     try:
         print("\n===== 1. MATERIALIZE IMMUTABLE DEV SOURCE =====", flush=True)
@@ -255,6 +295,8 @@ def main() -> int:
         print("STATIC_CONTRACT=PASS")
         print("COMPOSE_INTERPOLATION=PASS")
         print("FUSION_NATIVE_ASPECT_CONTRACT=PASS")
+
+        create_rollback_images()
 
         print("\n===== 3. BUILD DEV API IMAGES =====", flush=True)
         compose("build", "svc-face", "svc-audio", "svc-director")
@@ -334,25 +376,21 @@ print('DIRECTOR_ASPECT_ROUTE_IMAGE=PASS')
 '''
         compose("run", "--rm", "--no-deps", "-T", "--entrypoint", "python", "svc-director", input_text=director_probe)
 
-        print("\n===== 5. RECREATE DEV APIS ONLY =====", flush=True)
-        for service, container in TARGET_APIS:
-            compose("up", "-d", "--no-deps", "--force-recreate", service)
-            recreated.append((service, container))
+        print("\n===== 5. REPLACE DEV APIS ONLY =====", flush=True)
+        for service, container, health in TARGET_APIS:
+            assert_dev_target_container(service, container)
+            run(["docker", "rm", "-f", container])
+            recreated.append((service, container, health))
+            compose("up", "-d", "--no-deps", service)
+            wait_http(health, service)
+            print(f"DEV_REPLACE_{service.upper().replace('-', '_')}=PASS", flush=True)
         print("DEV_API_RECREATE_SCOPE=PASS")
 
         print("\n===== 6. DEV API HEALTH + ROUTE CERTIFICATION =====", flush=True)
-        wait_http("http://127.0.0.1:18003/api/health", "face")
-        wait_http("http://127.0.0.1:18004/api/health", "audio")
-        wait_http("http://127.0.0.1:18011/api/health", "director")
+        for service, _, health in TARGET_APIS:
+            wait_http(health, service)
         print("DEV_API_HEALTH=PASS")
 
-        route_probe = r'''
-from app.main import app
-for r in sorted(app.routes,key=lambda x:getattr(x,'path','')):
-    p=getattr(r,'path','')
-    if 'assets' in p or 'canonical-output' in p or 'aspect-ratio' in p:
-        print(','.join(sorted(getattr(r,'methods',[]) or [])),p)
-'''
         face_routes = out(["docker", "exec", "-i", "df-v3-svc-face", "python", "-c",
                            "from app.main import app; print('\\n'.join(sorted(getattr(r,'path','') for r in app.routes if 'face/assets' in getattr(r,'path',''))))"])
         if "/api/face/assets/{media_asset_id}/read-url" not in face_routes:
@@ -435,6 +473,11 @@ for name,url in urls:
         print("DIRECTOR_WORKER_UNCHANGED=PASS")
         print("FUSION_RUNTIME_UNCHANGED=PASS")
 
+        print("\n===== 9. DISCARD DEV ROLLBACK CHECKPOINT IMAGES =====", flush=True)
+        for tag in rollback_images.values():
+            run(["docker", "image", "rm", tag], check=False)
+        print("DEV_ROLLBACK_IMAGES_CLEANED=PASS")
+
         print("\n============================================================")
         print(" DEV MULTI-PERSON PARITY CERTIFICATION PASS")
         print("============================================================")
@@ -442,6 +485,7 @@ for name,url in urls:
         print("STATIC_CONTRACT=PASS")
         print("COMPOSE_INTERPOLATION=PASS")
         print("FUSION_NATIVE_ASPECT_CONTRACT=PASS")
+        print("DEV_ROLLBACK_IMAGE_CHECKPOINT=PASS")
         print("DEV_API_IMAGES_BUILD=PASS")
         print("FACE_READ_URL_ROUTE_IMAGE=PASS")
         print("AUDIO_CANONICAL_ROUTES_IMAGE=PASS")
