@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg import Error as PsycopgError
 from pydantic import BaseModel, Field
 
 from df_contracts.v3.director import (
@@ -25,6 +28,10 @@ from .runtime import create_director_graph
 from .security import DirectorAuthContext, get_director_auth
 from .studio_projection import load_story_studio_projection
 from .studio_routes_runtime import router as studio_router
+
+
+logger = logging.getLogger("svc-director")
+_TRANSIENT_CHECKPOINT_SQLSTATES = frozenset({"57P01", "57P02", "57P03"})
 
 
 class ResumeIn(BaseModel):
@@ -76,6 +83,43 @@ def _queue_view(row) -> DirectorRunView:
         story_id=UUID(str(row["story_id"])) if row["story_id"] else None,
         errors=(str(row["last_error"]),) if row["last_error"] else (),
     )
+
+
+def _is_transient_checkpoint_error(exc: BaseException) -> bool:
+    if not isinstance(exc, PsycopgError):
+        return False
+    sqlstate = str(getattr(exc, "sqlstate", "") or "")
+    return sqlstate.startswith("08") or sqlstate in _TRANSIENT_CHECKPOINT_SQLSTATES
+
+
+async def _aget_state_resilient(graph: Any, config: dict[str, Any]):
+    """Retry one transient checkpoint read after psycopg discards a dead connection."""
+    try:
+        return await graph.aget_state(config)
+    except PsycopgError as exc:
+        if not _is_transient_checkpoint_error(exc):
+            raise
+        logger.warning(
+            "director_checkpoint_read_retry sqlstate=%s error=%s",
+            getattr(exc, "sqlstate", None),
+            type(exc).__name__,
+        )
+        await asyncio.sleep(0.05)
+
+    try:
+        return await graph.aget_state(config)
+    except PsycopgError as exc:
+        if not _is_transient_checkpoint_error(exc):
+            raise
+        logger.error(
+            "director_checkpoint_read_unavailable sqlstate=%s error=%s",
+            getattr(exc, "sqlstate", None),
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="creative_director_state_temporarily_unavailable",
+        ) from exc
 
 
 @asynccontextmanager
@@ -173,7 +217,7 @@ async def get_run(thread_id: str, auth: DirectorAuthContext = Depends(get_direct
         return _queue_view(row)
     graph = _graph()
     config = {"configurable": {"thread_id": thread_id}}
-    snapshot = await graph.aget_state(config)
+    snapshot = await _aget_state_resilient(graph, config)
     values = dict(snapshot.values or {})
     if not values:
         return _queue_view(row)
