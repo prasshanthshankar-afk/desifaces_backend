@@ -7,12 +7,20 @@ from typing import Any
 from .fusion_execution import FusionSceneContext, _clean, _scene_prompt
 
 
+_ALLOWED_ASPECT_RATIOS = frozenset({"9:16", "16:9", "1:1"})
+
+
 def _input_concurrency() -> int:
     raw = str(os.getenv("DF_DIRECTOR_FUSION_INPUT_CONCURRENCY", "32") or "32").strip()
     try:
         return max(1, min(64, int(raw)))
     except Exception:
         return 32
+
+
+def _scene_aspect_ratio(context: FusionSceneContext) -> str:
+    raw = _clean((context.stage_metadata or {}).get("aspect_ratio") or "9:16")
+    return raw if raw in _ALLOWED_ASPECT_RATIOS else "9:16"
 
 
 async def compile_children_performant(
@@ -24,15 +32,7 @@ async def compile_children_performant(
     external_provider_ok: bool,
     request_nonce_by_turn: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Compile canonical child requests with bounded parallel media resolution.
-
-    The canonical payload is unchanged: one approved Face + one approved Audio asset
-    per speech turn, canonical scene prompt, VEED/Fabric child execution and the same
-    Director lineage tags. Repeated Face media is resolved once per compilation and
-    all unique Face/Audio read URLs are resolved concurrently up to the deployment
-    limit. V3 defaults to 32 so a 28-turn scene does not acquire an artificial
-    preparation queue before provider dispatch.
-    """
+    """Compile canonical child requests with bounded parallel media resolution."""
     semaphore = asyncio.Semaphore(_input_concurrency())
     face_urls: dict[str, str] = {}
     audio_urls: dict[str, str] = {}
@@ -55,11 +55,12 @@ async def compile_children_performant(
     )
 
     prompt = _scene_prompt(context)
+    aspect_ratio = _scene_aspect_ratio(context)
     children: list[dict[str, Any]] = []
     for turn in context.turns:
         face_url = face_urls[str(turn.face_media_id)]
         audio_url = audio_urls[str(turn.audio_media_id)]
-        video: dict[str, Any] = {}
+        video: dict[str, Any] = {"aspect_ratio": aspect_ratio}
         if turn.duration_hint_ms and turn.duration_hint_ms > 0:
             video["duration_sec"] = max(1, min(30, int(round(turn.duration_hint_ms / 1000.0))))
         if turn.emotion_code:
@@ -84,6 +85,7 @@ async def compile_children_performant(
                 "dialogue_turn_id": turn_key,
                 "participant_id": str(turn.participant_id),
                 "segment_sequence": turn.sequence_no,
+                "aspect_ratio": aspect_ratio,
             },
         }
         if request_nonce:
@@ -96,10 +98,11 @@ async def compile_children_performant(
             "sequence_no": turn.sequence_no,
             "face_media_id": str(turn.face_media_id),
             "audio_media_id": str(turn.audio_media_id),
+            "aspect_ratio": aspect_ratio,
             "payload": payload,
         })
 
     return children
 
 
-__all__ = ["compile_children_performant", "_input_concurrency"]
+__all__ = ["compile_children_performant", "_input_concurrency", "_scene_aspect_ratio"]
