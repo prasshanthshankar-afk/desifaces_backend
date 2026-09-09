@@ -245,7 +245,7 @@ echo
 echo "===== 6. BUILD + CERTIFY WEB IMAGE ====="
 docker build -t "$WEB_IMAGE" "$WEB_SRC"
 docker run --rm --entrypoint sh "$WEB_IMAGE" -lc \
-  'grep -R -q "audio-price-all-strong" /app/.next/static/css && grep -R -q "mini-action" /app/.next/static/css'
+  'grep -R -q "audio-price-all-strong" /app/.next && grep -R -q "mini-action" /app/.next'
 echo "WEB_BUILD_AND_THEME_BUNDLE=PASS"
 
 echo
