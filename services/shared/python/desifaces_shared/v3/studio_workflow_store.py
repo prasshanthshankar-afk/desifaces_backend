@@ -91,14 +91,43 @@ class CanonicalStudioWorkflowStore:
         )
 
     async def assert_startable(self, conn, *, stage_run_id: UUID) -> None:
-        blockers = await conn.fetchval(
-            """select count(*) from public.v3_studio_stage_dependencies d
+        """Fail closed unless every declared parent has a usable approved output.
+
+        A dependency is production-ready only when the parent stage is approved AND
+        it still owns at least one active output whose review is approved. Checking
+        state alone is insufficient because a stale/corrupt approved flag must never
+        let Audio, Fusion, or Story Final cross a media dependency boundary.
+        """
+        blockers = await conn.fetch(
+            """
+            select p.stage_run_id,p.stage_type,p.state
+            from public.v3_studio_stage_dependencies d
             join public.v3_studio_stage_runs p on p.stage_run_id=d.parent_stage_run_id
-            where d.child_stage_run_id=$1 and p.state<>'approved'""",
+            where d.child_stage_run_id=$1
+              and (
+                p.state<>'approved'
+                or not exists (
+                  select 1
+                  from public.v3_studio_stage_outputs o
+                  join public.v3_studio_review_items r
+                    on r.stage_run_id=o.stage_run_id and r.media_id=o.media_id
+                  where o.stage_run_id=p.stage_run_id
+                    and o.is_active=true
+                    and r.decision='approved'
+                )
+              )
+            order by p.stage_type,p.stage_run_id
+            """,
             stage_run_id,
         )
-        if int(blockers or 0):
-            raise StageDependencyNotApproved(f"stage_dependencies_not_approved:{stage_run_id}")
+        if blockers:
+            summary = ",".join(
+                f"{row['stage_type']}:{row['stage_run_id']}:{row['state']}"
+                for row in blockers
+            )
+            raise StageDependencyNotApproved(
+                f"stage_dependencies_not_approved_or_usable:{stage_run_id}:{summary}"
+            )
 
     async def mark_generating(self, conn, *, stage_run_id: UUID) -> None:
         await self.assert_startable(conn, stage_run_id=stage_run_id)
