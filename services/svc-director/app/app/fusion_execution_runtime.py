@@ -60,6 +60,38 @@ class V3ResilientSceneStitchClient(_fusion_execution.SceneStitchClient):
         )
 
 
+def _is_internal_child_pricing_contract(payload: dict[str, Any]) -> bool:
+    """Accept the two canonical no-charge modes used across V3 Fusion.
+
+    svc-fusion's route-level suppression artifact uses ``billing_mode=internal``.
+    The FusionOrchestrator's persisted child-pricing artifact uses
+    ``billing_mode=internal_child``. Both are intentionally non-billable children
+    of one billable scene parent. Director must validate the semantic contract,
+    not reject the persisted representation merely because the mode label differs.
+    """
+
+    pricing = _parent_pricing._as_dict(payload.get("pricing"))
+    state = _parent_pricing._clean(pricing.get("state")).lower()
+    quote_id = _parent_pricing._clean(payload.get("quote_id") or pricing.get("quote_id"))
+    billing_mode = _parent_pricing._clean(
+        pricing.get("billing_mode") or pricing.get("pricing_mode")
+    ).lower()
+    suppressed = bool(
+        pricing.get("suppressed")
+        or pricing.get("pricing_suppressed")
+        or pricing.get("suppress_pricing")
+    )
+    enabled = pricing.get("enabled")
+
+    return (
+        state == "suppressed"
+        and not quote_id
+        and suppressed
+        and enabled is not True
+        and billing_mode in {"internal", "internal_child"}
+    )
+
+
 async def _verify_suppressed_child_pricing_without_generation_consent(
     self,
     *,
@@ -127,6 +159,14 @@ _parent_pricing._compile_children = compile_children_performant
 _performance._compile_children = compile_children_performant
 _parallel_dispatch._compile_children = compile_children_performant
 
+# One billable scene parent owns pricing. svc-fusion historically emits two
+# semantically equivalent suppressed child representations: route responses use
+# billing_mode=internal while persisted orchestrator jobs use internal_child.
+# Normalize Director validation at the service boundary so neither representation
+# can be mistaken for a billable child. The remaining guards (suppressed state,
+# zero quote, enabled!=True) still fail closed on a genuinely billable response.
+_parent_pricing._pricing_is_suppressed = _is_internal_child_pricing_contract
+
 # Pricing preview of an internal child must be possible before the user grants
 # external-provider generation consent. This patches only the non-generating
 # suppression verification. _create_internal_child and /jobs keep the original
@@ -167,4 +207,5 @@ __all__ = [
     "V3ParallelFusionStudioClient",
     "V3ResilientSceneStitchClient",
     "compile_children_performant",
+    "_is_internal_child_pricing_contract",
 ]
