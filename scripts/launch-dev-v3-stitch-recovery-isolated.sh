@@ -8,7 +8,7 @@ set -Eeuo pipefail
 LIVE_ROOT="${LIVE_ROOT:-/home/azureuser/workspace/desifaces-v3}"
 RECOVERY_ROOT="${RECOVERY_ROOT:-/home/azureuser/workspace/desifaces-v3-stitch-recovery-20260910}"
 CORE_BRANCH="${CORE_BRANCH:-fix/stitch-worker-readiness-gate-20260910}"
-CORE_PIN="${CORE_PIN:-dba1fdf4ad16e022b4fa182953d415718e58b5cc}"
+CORE_PIN="${CORE_PIN:-2b476b1da46b978a7cffe6d5ca838f362cada8fd}"
 WORKFLOW_ID="${1:-16099052-15b5-401f-a447-c5d989b7b8ad}"
 STAGE_RUN_ID="${2:-cbf4b76a-21ec-4b17-951a-e0674a6f247f}"
 STITCH_CONTAINER="${STITCH_WORKER_CONTAINER:-df-v3-svc-fusion-extension-stitch-worker}"
@@ -31,7 +31,6 @@ pass "DEV_HOST_IDENTITY"
 docker inspect "$STITCH_CONTAINER" >/dev/null 2>&1 \
   || fail "existing DEV stitch worker not found: $STITCH_CONTAINER"
 
-# Record the active workspace state for evidence only. Do not mutate it.
 echo "active_workspace=$LIVE_ROOT"
 echo "active_workspace_head=$(git -C "$LIVE_ROOT" rev-parse HEAD)"
 echo "active_workspace_changes_begin"
@@ -39,7 +38,6 @@ git -C "$LIVE_ROOT" status --short --untracked-files=all || true
 echo "active_workspace_changes_end"
 pass "ACTIVE_WORKSPACE_PRESERVED_UNTOUCHED"
 
-# Ensure the certified recovery commit is locally available without changing HEAD.
 if ! git -C "$LIVE_ROOT" cat-file -e "${CORE_PIN}^{commit}" 2>/dev/null; then
   git -C "$LIVE_ROOT" fetch origin "$CORE_BRANCH"
 fi
@@ -47,8 +45,6 @@ git -C "$LIVE_ROOT" cat-file -e "${CORE_PIN}^{commit}" 2>/dev/null \
   || fail "certified recovery commit is unavailable: $CORE_PIN"
 pass "CERTIFIED_RECOVERY_COMMIT_AVAILABLE"
 
-# Build/recovery source lives in a separate clean Git worktree. A worktree created
-# by an earlier failed preflight may be advanced to CORE_PIN only if it is clean.
 if [[ -e "$RECOVERY_ROOT/.git" ]]; then
   [[ -z "$(git -C "$RECOVERY_ROOT" status --porcelain --untracked-files=no)" ]] \
     || fail "existing recovery worktree has tracked modifications"
@@ -68,11 +64,6 @@ fi
   || fail "isolated worktree is not clean"
 pass "ISOLATED_CERTIFIED_WORKTREE"
 
-# docker-compose.yml has an inherited env_file: ./infra/.env contract. Compose
-# requires that path to exist even when --env-file points elsewhere. The runtime
-# env is therefore bridged into the isolated worktree, but the committed
-# .dockerignore MUST exclude it so Docker COPY . can never bake the secret into
-# the stitch-worker image.
 [[ -f "$RECOVERY_ROOT/.dockerignore" ]] || fail "certified .dockerignore missing"
 grep -Fxq 'infra/.env' "$RECOVERY_ROOT/.dockerignore" \
   || fail "infra/.env is not excluded from Docker build context"
@@ -81,8 +72,6 @@ export DF_V3_ENV_FILE="$LIVE_ROOT/infra/.env"
 pass "V3_ENVIRONMENT_COMPOSE_BRIDGE"
 pass "V3_ENVIRONMENT_DOCKER_EXCLUSION"
 
-# Force Compose in the isolated checkout to manage the exact same running DEV
-# project. This avoids creating a second project merely because the path differs.
 COMPOSE_PROJECT_NAME="$(
   docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' \
     "$STITCH_CONTAINER" 2>/dev/null || true
@@ -92,10 +81,6 @@ export COMPOSE_PROJECT_NAME
 echo "compose_project=$COMPOSE_PROJECT_NAME"
 pass "SAME_COMPOSE_PROJECT_TARGET"
 
-# The active workspace has local Compose edits. Do not assume they are irrelevant.
-# Render both definitions with the v3-execution profile enabled so the profiled
-# stitch-worker service is present, then prove its runtime contract is equivalent
-# before the certified worktree is allowed to recreate that one container.
 LIVE_CFG="$(mktemp /tmp/df-v3-live-stitch-compose.XXXXXX.json)"
 CERT_CFG="$(mktemp /tmp/df-v3-cert-stitch-compose.XXXXXX.json)"
 cleanup_all() {
@@ -131,17 +116,11 @@ try:
 except KeyError as exc:
     raise SystemExit(f"FAIL: stitch-worker Compose service missing: {exc}")
 
-# image is intentionally replaced by the recovery override; build path is the
-# isolated certified source. All other runtime-facing fields must be equivalent.
 ignored = {"image", "build"}
 
 def normalize(value, root):
     if isinstance(value, dict):
-        return {
-            k: normalize(v, root)
-            for k, v in value.items()
-            if k not in ignored
-        }
+        return {k: normalize(v, root) for k, v in value.items() if k not in ignored}
     if isinstance(value, list):
         return [normalize(v, root) for v in value]
     if isinstance(value, str):
@@ -166,10 +145,6 @@ PY
 
 pass "ACTIVE_COMPOSE_CHANGES_SAFELY_ACCOUNTED_FOR"
 
-# Run the already-certified recovery logic from the clean worktree. Its own gates
-# still verify failed scene state, released pricing, exactly nine preserved children,
-# immutable worker build, deterministic readiness, canonical Director retry, zero
-# child dispatch/charges, unchanged provider ids, and final canonical media.
 cd "$RECOVERY_ROOT"
 
 echo "isolated_recovery_root=$RECOVERY_ROOT"
