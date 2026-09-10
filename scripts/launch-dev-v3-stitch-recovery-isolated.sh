@@ -93,7 +93,8 @@ echo "compose_project=$COMPOSE_PROJECT_NAME"
 pass "SAME_COMPOSE_PROJECT_TARGET"
 
 # The active workspace has local Compose edits. Do not assume they are irrelevant.
-# Render both definitions and prove the stitch-worker runtime contract is equivalent
+# Render both definitions with the v3-execution profile enabled so the profiled
+# stitch-worker service is present, then prove its runtime contract is equivalent
 # before the certified worktree is allowed to recreate that one container.
 LIVE_CFG="$(mktemp /tmp/df-v3-live-stitch-compose.XXXXXX.json)"
 CERT_CFG="$(mktemp /tmp/df-v3-cert-stitch-compose.XXXXXX.json)"
@@ -104,12 +105,12 @@ trap cleanup_all EXIT
 
 (
   cd "$LIVE_ROOT"
-  bash scripts/v3-compose.sh config --format json
+  bash scripts/v3-compose.sh --profile v3-execution config --format json
 ) >"$LIVE_CFG"
 
 (
   cd "$RECOVERY_ROOT"
-  bash scripts/v3-compose.sh config --format json
+  bash scripts/v3-compose.sh --profile v3-execution config --format json
 ) >"$CERT_CFG"
 
 python3 - "$LIVE_CFG" "$CERT_CFG" "$LIVE_ROOT" "$RECOVERY_ROOT" <<'PY'
