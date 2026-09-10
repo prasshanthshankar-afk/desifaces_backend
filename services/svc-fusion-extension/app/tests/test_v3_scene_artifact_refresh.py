@@ -1,8 +1,23 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
+from app.workers import stitch_worker
 from app.workers import v3_scene_artifact_refresh as target
+
+
+def test_stitch_worker_bootstrap_keeps_artifact_refresh_and_logging_contract():
+    assert stitch_worker.v3_scene_coordinator_loop is target.v3_scene_coordinator_loop
+
+    source = inspect.getsource(stitch_worker)
+    entrypoint = source.split('if __name__ == "__main__":', 1)
+    assert len(entrypoint) == 2
+    bootstrap = entrypoint[1]
+    assert "setup_logging()" in bootstrap
+    assert "asyncio.run(main())" in bootstrap
+    assert bootstrap.index("setup_logging()") < bootstrap.index("asyncio.run(main())")
 
 
 def test_fresh_artifact_video_url_ignores_persisted_top_level_url():
