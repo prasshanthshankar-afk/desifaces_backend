@@ -14,7 +14,7 @@ from app.config import settings
 from app.db import get_db_pool
 from app.services.sas_service import parse_blob_path_from_sas_url
 from app.services.sas_service import AzureBlobService
-from app.workers.v3_scene_coordinator import v3_scene_coordinator_loop
+from app.workers.v3_scene_artifact_refresh import v3_scene_coordinator_loop
 
 
 logger = logging.getLogger(__name__)
