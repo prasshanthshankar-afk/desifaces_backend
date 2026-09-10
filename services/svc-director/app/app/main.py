@@ -41,6 +41,10 @@ class RecentStoryView(BaseModel):
     title: str | None = None
     updated_at: datetime | None = None
     continue_path: str
+    workflow_id: UUID | None = None
+    workflow_state: str | None = None
+    current_stage: str | None = None
+    attention_state: str | None = None
 
 
 def _coerce_interrupt_value(value: Any) -> dict | None:
@@ -209,7 +213,11 @@ async def recent_stories(
             state=str(row["state"]),
             title=str(row["title"])[:160] if row["title"] else None,
             updated_at=row["updated_at"],
-            continue_path=f"/app/multi-person?story={row['story_id']}",
+            continue_path=f"/app/multi-person?story_id={row['story_id']}",
+            workflow_id=UUID(str(row["workflow_id"])) if row["workflow_id"] else None,
+            workflow_state=str(row["workflow_state"]) if row["workflow_state"] else None,
+            current_stage=str(row["current_stage"]) if row["current_stage"] else None,
+            attention_state=str(row["attention_state"]) if row["attention_state"] else None,
         )
         for row in rows
     ]
