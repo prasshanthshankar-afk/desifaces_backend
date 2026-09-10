@@ -103,53 +103,70 @@ echo "latest_state=$RUN_STATE"
 echo "latest_attempt_count=$ATTEMPT_COUNT"
 echo "eligible_queued_count=$QUEUE_COUNT"
 
-if [[ "$RUN_STATE" != "queued" ]]; then
-  echo "QUEUE_RECOVERY_NOT_REQUIRED=latest_run_state_${RUN_STATE}"
-  SUCCESS=1
-  exit 0
-fi
+case "$RUN_STATE" in
+  running|awaiting_review|ready)
+    echo "QUEUE_RECOVERY_NOT_REQUIRED=latest_run_state_${RUN_STATE}"
+    SUCCESS=1
+    ;;
+  failed)
+    echo "director_last_error=${LAST_ERROR:0:800}"
+    fail "latest Director run has already failed"
+    ;;
+  queued)
+    ;;
+  *)
+    fail "unexpected latest Director state: $RUN_STATE"
+    ;;
+esac
 
-if [[ "$QUEUE_COUNT" == "0" ]]; then
+if (( SUCCESS == 0 )) && [[ "$QUEUE_COUNT" == "0" ]]; then
   fail "latest run is queued but not claimable; inspect available_at/max_attempts contract"
 fi
 
-echo
-echo "===== 2. INSPECT DIRECTOR WORKER ====="
-if docker inspect "$WORKER" >/dev/null 2>&1; then
-  WORKER_STATUS="$(docker inspect "$WORKER" --format '{{.State.Status}}')"
-  WORKER_IMAGE="$(docker inspect "$WORKER" --format '{{.Config.Image}}')"
-  WORKER_IMAGE_ID="$(docker inspect "$WORKER" --format '{{.Image}}')"
-  echo "worker_present=YES"
-  echo "worker_status=$WORKER_STATUS"
-  echo "worker_image=$WORKER_IMAGE"
-  echo "worker_image_id=$WORKER_IMAGE_ID"
-  echo "worker_recent_logs_begin"
-  docker logs --tail 40 "$WORKER" 2>&1 | sed -E 's/(sk-[A-Za-z0-9_\-]{8})[A-Za-z0-9_\-]+/\1...[REDACTED]/g' || true
-  echo "worker_recent_logs_end"
-else
-  WORKER_STATUS="missing"
-  echo "worker_present=NO"
-fi
-
-CURRENT_DIRECTOR_IMAGE="$(docker image inspect desifaces-v3-svc-director:latest --format '{{.Id}}' 2>/dev/null || true)"
-[[ -n "$CURRENT_DIRECTOR_IMAGE" ]] || fail "certified dev Director image desifaces-v3-svc-director:latest missing"
-echo "certified_director_image_id=$CURRENT_DIRECTOR_IMAGE"
-
-# Give an already-running worker a short chance to claim the queued job before touching it.
-if [[ "$WORKER_STATUS" == "running" ]]; then
+if (( SUCCESS == 0 )); then
   echo
+echo "===== 2. INSPECT DIRECTOR WORKER ====="
+  if docker inspect "$WORKER" >/dev/null 2>&1; then
+    WORKER_STATUS="$(docker inspect "$WORKER" --format '{{.State.Status}}')"
+    WORKER_IMAGE="$(docker inspect "$WORKER" --format '{{.Config.Image}}')"
+    WORKER_IMAGE_ID="$(docker inspect "$WORKER" --format '{{.Image}}')"
+    echo "worker_present=YES"
+    echo "worker_status=$WORKER_STATUS"
+    echo "worker_image=$WORKER_IMAGE"
+    echo "worker_image_id=$WORKER_IMAGE_ID"
+    echo "worker_recent_logs_begin"
+    docker logs --tail 40 "$WORKER" 2>&1 | sed -E 's/(sk-[A-Za-z0-9_\-]{8})[A-Za-z0-9_\-]+/\1...[REDACTED]/g' || true
+    echo "worker_recent_logs_end"
+  else
+    WORKER_STATUS="missing"
+    echo "worker_present=NO"
+  fi
+
+  CURRENT_DIRECTOR_IMAGE="$(docker image inspect desifaces-v3-svc-director:latest --format '{{.Id}}' 2>/dev/null || true)"
+  [[ -n "$CURRENT_DIRECTOR_IMAGE" ]] || fail "certified dev Director image desifaces-v3-svc-director:latest missing"
+  echo "certified_director_image_id=$CURRENT_DIRECTOR_IMAGE"
+
+  if [[ "$WORKER_STATUS" == "running" ]]; then
+    echo
 echo "===== 3. PASSIVE CLAIM WINDOW ====="
-  for i in $(seq 1 6); do
-    STATE_ROW="$(run_state "$RUN_ID")"
-    IFS='|' read -r STATE NOW_ATTEMPTS NOW_ERROR <<<"$STATE_ROW"
-    echo "passive_check=$i state=$STATE attempts=$NOW_ATTEMPTS"
-    if [[ "$STATE" != "queued" ]]; then
-      echo "DIRECTOR_QUEUE_CLAIMED_WITHOUT_RESTART=PASS"
-      SUCCESS=1
-      break
-    fi
-    sleep 2
-  done
+    for i in $(seq 1 6); do
+      STATE_ROW="$(run_state "$RUN_ID")"
+      IFS='|' read -r STATE NOW_ATTEMPTS NOW_ERROR <<<"$STATE_ROW"
+      echo "passive_check=$i state=$STATE attempts=$NOW_ATTEMPTS"
+      case "$STATE" in
+        running|awaiting_review|ready)
+          echo "DIRECTOR_QUEUE_CLAIMED_WITHOUT_RESTART=PASS"
+          SUCCESS=1
+          break
+          ;;
+        failed)
+          echo "director_last_error=${NOW_ERROR:0:800}"
+          fail "Director worker claimed the run but execution failed"
+          ;;
+      esac
+      sleep 2
+    done
+  fi
 fi
 
 if (( SUCCESS == 0 )); then
@@ -216,6 +233,15 @@ echo "FACE_AUDIO_FUSION_UNCHANGED=PASS"
 
 FINAL="$(run_state "$RUN_ID")"
 IFS='|' read -r FINAL_STATE FINAL_ATTEMPTS FINAL_ERROR <<<"$FINAL"
+case "$FINAL_STATE" in
+  running|awaiting_review|ready) ;;
+  failed)
+    echo "director_last_error=${FINAL_ERROR:0:800}"
+    fail "Director execution failed after queue claim"
+    ;;
+  *) fail "Director run ended certification in unexpected state: $FINAL_STATE" ;;
+esac
+
 echo
 echo "============================================================"
 echo " DEV DIRECTOR QUEUE RECOVERY PASS"
