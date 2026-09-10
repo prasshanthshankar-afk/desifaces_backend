@@ -21,4 +21,4 @@ curl -fsSL \
 
 bash -n "$TMP"
 echo "FINALIZER_REPAIR_SCRIPT_SYNTAX_GATE=PASS"
-exec bash "$TMP"
+bash "$TMP"
