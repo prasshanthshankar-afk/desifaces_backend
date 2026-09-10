@@ -196,13 +196,14 @@ log "FINALIZER_CANDIDATE_SQL=PASS"
 before_child_ids="$(child_ids)"
 before_child_count="$(printf '%s\n' "$before_child_ids" | sed '/^$/d' | wc -l | tr -d ' ')"
 [[ "$before_child_count" -eq "$EXPECTED_CHILDREN" ]] || fail "expected $EXPECTED_CHILDREN durable Fusion children, got $before_child_count"
+child_id_csv="$(printf '%s\n' "$before_child_ids" | sed '/^$/d' | paste -sd, -)"
 child_summary="$(psqlq "
 select count(*)::text,
        count(*) filter(where j.status='succeeded')::text,
        count(*) filter(where j.status in ('queued','processing','running','submitted','pending'))::text,
        count(*) filter(where j.status in ('failed','cancelled','canceled','blocked'))::text
 from public.studio_jobs j
-where j.id=any(string_to_array('$(printf '%s' "$before_child_ids" | paste -sd, -)',',')::uuid[]);")"
+where j.id=any(string_to_array('${child_id_csv}',',')::uuid[]);")"
 IFS='|' read -r total_children succeeded_children active_children failed_children <<<"$child_summary"
 log "fusion_video_children=$total_children"
 log "fusion_video_children_succeeded=$succeeded_children"
@@ -215,11 +216,12 @@ before_non_targets="$(snapshot_non_targets)"
 
 log ""
 log "===== 3. PROVE RUNTIME DRIFT / WIRING ====="
-source_coord_sha="$(sha256sum "$WT/services/svc-fusion-extension/app/app/workers/v3_scene_coordinator.py" | awk '{print $1}')"
-runtime_coord_sha="$(docker exec "$WORKER" sh -lc 'sha256sum /app/app/workers/v3_scene_coordinator.py 2>/dev/null | awk "{print \\$1}"' 2>/dev/null || true)"
+source_coord_sha="$(sha256sum "$WT/services/svc-fusion-extension/app/app/workers/v3_scene_coordinator.py" | cut -d' ' -f1)"
+runtime_coord_sha="$(docker exec "$WORKER" sh -lc 'sha256sum /app/app/workers/v3_scene_coordinator.py 2>/dev/null | cut -d" " -f1' 2>/dev/null || true)"
+runtime_worker_has_coordinator="$(docker exec "$WORKER" sh -lc 'grep -c "v3_scene_coordinator_loop" /app/app/workers/stitch_worker.py 2>/dev/null || true' 2>/dev/null || true)"
 runtime_cmd="$(docker inspect "$WORKER" --format '{{json .Config.Cmd}}')"
 log "worker_command=$runtime_cmd"
-if [[ "$runtime_coord_sha" == "$source_coord_sha" ]]; then
+if [[ "$runtime_coord_sha" == "$source_coord_sha" && "${runtime_worker_has_coordinator:-0}" -gt 0 ]]; then
   log "STITCH_WORKER_COORDINATOR_SOURCE=CURRENT"
 else
   log "STITCH_WORKER_COORDINATOR_SOURCE=STALE_OR_MISSING"
@@ -261,7 +263,7 @@ async def main():
     pool = await get_db_pool()
     rows = await _candidate_rows(pool)
     ids = {str(row['stage_run_id']) for row in rows}
-    assert '$STAGE_ID' in ids, f'target scene not selected; candidate_count={len(rows)}'
+    assert '$STAGE_ID' in ids, f'target scene not selected; candidate_count={len(rows)} ids={sorted(ids)}'
     print('FINALIZER_IMAGE_LIVE_CANDIDATE=PASS')
     print(f'candidate_count={len(rows)}')
     await pool.close()
