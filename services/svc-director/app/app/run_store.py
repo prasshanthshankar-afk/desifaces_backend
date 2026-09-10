@@ -8,6 +8,13 @@ class DirectorRunNotFound(RuntimeError):
     pass
 
 
+def _updated_rows(command_tag: str) -> int:
+    try:
+        return int(str(command_tag).split()[-1])
+    except Exception:
+        return 0
+
+
 class DirectorRunStore:
     async def enqueue(self, conn, *, run_id: UUID, thread_id: str, account_id: UUID,
                       owner_user_id: UUID, brief: dict[str, Any]) -> None:
@@ -65,10 +72,34 @@ class DirectorRunStore:
             where state='running' and lease_expires_at is not null and lease_expires_at<now()
               and attempt_count<max_attempts"""
         )
-        try:
-            return int(result.split()[-1])
-        except Exception:
-            return 0
+        return _updated_rows(result)
+
+    async def requeue_transient(
+        self,
+        conn,
+        *,
+        run_id: UUID,
+        error: str,
+        delay_seconds: int = 2,
+    ) -> bool:
+        """Release a claimed run after transient infrastructure failure.
+
+        The technical attempt count remains monotonic. A run is requeued only while
+        its configured attempt budget still has capacity; otherwise the caller may
+        mark it failed. This prevents a temporary DNS/DB interruption from turning a
+        durable queue item into a permanent user-visible failure after one attempt.
+        """
+        result = await conn.execute(
+            """update public.v3_director_runs
+            set state='queued',claimed_at=null,lease_expires_at=null,
+                available_at=now()+make_interval(secs => $3::integer),
+                last_error=$2,updated_at=now()
+            where run_id=$1 and attempt_count<max_attempts""",
+            run_id,
+            str(error)[:4000],
+            max(1, min(60, int(delay_seconds))),
+        )
+        return _updated_rows(result) == 1
 
     async def mark_awaiting_review(self, conn, *, run_id: UUID) -> None:
         await conn.execute(
