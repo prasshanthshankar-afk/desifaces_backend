@@ -8,7 +8,7 @@ set -Eeuo pipefail
 LIVE_ROOT="${LIVE_ROOT:-/home/azureuser/workspace/desifaces-v3}"
 RECOVERY_ROOT="${RECOVERY_ROOT:-/home/azureuser/workspace/desifaces-v3-stitch-recovery-20260910}"
 CORE_BRANCH="${CORE_BRANCH:-fix/stitch-worker-readiness-gate-20260910}"
-CORE_PIN="${CORE_PIN:-53d1ea99ed6e8e86388035066adb7b5eb5fa4834}"
+CORE_PIN="${CORE_PIN:-dba1fdf4ad16e022b4fa182953d415718e58b5cc}"
 WORKFLOW_ID="${1:-16099052-15b5-401f-a447-c5d989b7b8ad}"
 STAGE_RUN_ID="${2:-cbf4b76a-21ec-4b17-951a-e0674a6f247f}"
 STITCH_CONTAINER="${STITCH_WORKER_CONTAINER:-df-v3-svc-fusion-extension-stitch-worker}"
@@ -47,14 +47,15 @@ git -C "$LIVE_ROOT" cat-file -e "${CORE_PIN}^{commit}" 2>/dev/null \
   || fail "certified recovery commit is unavailable: $CORE_PIN"
 pass "CERTIFIED_RECOVERY_COMMIT_AVAILABLE"
 
-# Build/recovery source lives in a separate clean Git worktree. Never remove an
-# existing directory unless Git already recognizes it as this exact worktree.
+# Build/recovery source lives in a separate clean Git worktree. A worktree created
+# by an earlier failed preflight may be advanced to CORE_PIN only if it is clean.
 if [[ -e "$RECOVERY_ROOT/.git" ]]; then
-  actual="$(git -C "$RECOVERY_ROOT" rev-parse HEAD 2>/dev/null || true)"
-  [[ "$actual" == "$CORE_PIN" ]] \
-    || fail "existing recovery worktree is at unexpected commit: $actual"
   [[ -z "$(git -C "$RECOVERY_ROOT" status --porcelain --untracked-files=no)" ]] \
     || fail "existing recovery worktree has tracked modifications"
+  actual="$(git -C "$RECOVERY_ROOT" rev-parse HEAD 2>/dev/null || true)"
+  if [[ "$actual" != "$CORE_PIN" ]]; then
+    git -C "$RECOVERY_ROOT" checkout --detach "$CORE_PIN"
+  fi
 else
   [[ ! -e "$RECOVERY_ROOT" ]] \
     || fail "recovery path exists but is not a Git worktree: $RECOVERY_ROOT"
@@ -67,12 +68,18 @@ fi
   || fail "isolated worktree is not clean"
 pass "ISOLATED_CERTIFIED_WORKTREE"
 
-# Never copy infra/.env into the isolated Docker build context. The certified
-# v3-compose launcher accepts this external path and still validates V3 identity.
+# docker-compose.yml has an inherited env_file: ./infra/.env contract. Compose
+# requires that path to exist even when --env-file points elsewhere. The runtime
+# env is therefore bridged into the isolated worktree, but the committed
+# .dockerignore MUST exclude it so Docker COPY . can never bake the secret into
+# the stitch-worker image.
+[[ -f "$RECOVERY_ROOT/.dockerignore" ]] || fail "certified .dockerignore missing"
+grep -Fxq 'infra/.env' "$RECOVERY_ROOT/.dockerignore" \
+  || fail "infra/.env is not excluded from Docker build context"
+install -m 600 "$LIVE_ROOT/infra/.env" "$RECOVERY_ROOT/infra/.env"
 export DF_V3_ENV_FILE="$LIVE_ROOT/infra/.env"
-[[ -f "$DF_V3_ENV_FILE" ]] || fail "external V3 env handoff is unavailable"
-echo "v3_env_source=$DF_V3_ENV_FILE"
-pass "V3_ENVIRONMENT_EXTERNAL_HANDOFF"
+pass "V3_ENVIRONMENT_COMPOSE_BRIDGE"
+pass "V3_ENVIRONMENT_DOCKER_EXCLUSION"
 
 # Force Compose in the isolated checkout to manage the exact same running DEV
 # project. This avoids creating a second project merely because the path differs.
@@ -90,10 +97,10 @@ pass "SAME_COMPOSE_PROJECT_TARGET"
 # before the certified worktree is allowed to recreate that one container.
 LIVE_CFG="$(mktemp /tmp/df-v3-live-stitch-compose.XXXXXX.json)"
 CERT_CFG="$(mktemp /tmp/df-v3-cert-stitch-compose.XXXXXX.json)"
-cleanup_cfg() {
-  rm -f "$LIVE_CFG" "$CERT_CFG"
+cleanup_all() {
+  rm -f "$LIVE_CFG" "$CERT_CFG" "$RECOVERY_ROOT/infra/.env"
 }
-trap cleanup_cfg EXIT
+trap cleanup_all EXIT
 
 (
   cd "$LIVE_ROOT"
