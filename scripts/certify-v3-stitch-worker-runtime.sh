@@ -124,8 +124,10 @@ restart_after="$(docker inspect --format '{{.RestartCount}}' "$CONTAINER")"
 pass "STITCH_WORKER_STABILITY"
 
 # Observability only. Never roll back solely because an INFO log marker is absent.
-if docker logs --since 10m "$CONTAINER" 2>&1 \
-  | grep -Fq "V3 scene coordinator started"; then
+# Capture first instead of piping docker logs into grep under pipefail; otherwise a
+# successful early grep exit could cause the producer's SIGPIPE to look like a miss.
+recent_logs="$(docker logs --since 10m "$CONTAINER" 2>&1 || true)"
+if grep -Fq "V3 scene coordinator started" <<<"$recent_logs"; then
   echo "V3_SCENE_COORDINATOR_STARTUP_LOG=OBSERVED"
 else
   echo "V3_SCENE_COORDINATOR_STARTUP_LOG=NOT_OBSERVED_NON_BLOCKING"
