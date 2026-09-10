@@ -8,7 +8,7 @@ set -Eeuo pipefail
 LIVE_ROOT="${LIVE_ROOT:-/home/azureuser/workspace/desifaces-v3}"
 RECOVERY_ROOT="${RECOVERY_ROOT:-/home/azureuser/workspace/desifaces-v3-stitch-recovery-20260910}"
 CORE_BRANCH="${CORE_BRANCH:-fix/stitch-worker-readiness-gate-20260910}"
-CORE_PIN="${CORE_PIN:-08d711fc1c17193a49de477ef77991f006116036}"
+CORE_PIN="${CORE_PIN:-53d1ea99ed6e8e86388035066adb7b5eb5fa4834}"
 WORKFLOW_ID="${1:-16099052-15b5-401f-a447-c5d989b7b8ad}"
 STAGE_RUN_ID="${2:-cbf4b76a-21ec-4b17-951a-e0674a6f247f}"
 STITCH_CONTAINER="${STITCH_WORKER_CONTAINER:-df-v3-svc-fusion-extension-stitch-worker}"
@@ -34,9 +34,9 @@ docker inspect "$STITCH_CONTAINER" >/dev/null 2>&1 \
 # Record the active workspace state for evidence only. Do not mutate it.
 echo "active_workspace=$LIVE_ROOT"
 echo "active_workspace_head=$(git -C "$LIVE_ROOT" rev-parse HEAD)"
-echo "active_workspace_tracked_changes_begin"
+echo "active_workspace_changes_begin"
 git -C "$LIVE_ROOT" status --short --untracked-files=all || true
-echo "active_workspace_tracked_changes_end"
+echo "active_workspace_changes_end"
 pass "ACTIVE_WORKSPACE_PRESERVED_UNTOUCHED"
 
 # Ensure the certified recovery commit is locally available without changing HEAD.
@@ -67,10 +67,12 @@ fi
   || fail "isolated worktree is not clean"
 pass "ISOLATED_CERTIFIED_WORKTREE"
 
-# Copy only the current DEV V3 environment identity into the isolated worktree.
-# This is not tracked and therefore does not alter the certified source tree.
-install -m 600 "$LIVE_ROOT/infra/.env" "$RECOVERY_ROOT/infra/.env"
-pass "V3_ENVIRONMENT_HANDOFF"
+# Never copy infra/.env into the isolated Docker build context. The certified
+# v3-compose launcher accepts this external path and still validates V3 identity.
+export DF_V3_ENV_FILE="$LIVE_ROOT/infra/.env"
+[[ -f "$DF_V3_ENV_FILE" ]] || fail "external V3 env handoff is unavailable"
+echo "v3_env_source=$DF_V3_ENV_FILE"
+pass "V3_ENVIRONMENT_EXTERNAL_HANDOFF"
 
 # Force Compose in the isolated checkout to manage the exact same running DEV
 # project. This avoids creating a second project merely because the path differs.
