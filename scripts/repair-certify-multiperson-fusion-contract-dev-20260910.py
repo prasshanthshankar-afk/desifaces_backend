@@ -93,6 +93,31 @@ def free_port() -> int:
     raise RuntimeError("no free candidate port in 23001-23020")
 
 
+def live_openapi_paths(container: str, port: int) -> set[str]:
+    """Read routes from the already-running FastAPI process without re-importing app.main.
+
+    This matters for long-lived service images whose process entrypoint may prepare import
+    paths before boot. A fresh `docker exec python -c 'from app.main import app'` is not a
+    valid runtime-route probe and can fail on process-only bootstrap details even while the
+    service itself is healthy. The served OpenAPI document is the authoritative live route
+    inventory for this certification.
+    """
+    code = (
+        "import json,urllib.request; "
+        f"d=json.load(urllib.request.urlopen('http://127.0.0.1:{port}/openapi.json',timeout=8)); "
+        "print(json.dumps(sorted((d.get('paths') or {}).keys())))"
+    )
+    cp = run(["docker", "exec", container, "python", "-c", code], capture=True, check=False)
+    if cp.returncode != 0:
+        raise RuntimeError(f"live OpenAPI unavailable: {container}: {cp.stdout.strip()[:600]}")
+    import json
+    try:
+        values = json.loads(cp.stdout.strip())
+    except Exception as exc:
+        raise RuntimeError(f"invalid live OpenAPI route payload: {container}") from exc
+    return {str(value) for value in values}
+
+
 def main() -> int:
     host = socket.gethostname().split(".", 1)[0]
     print("============================================================")
@@ -313,24 +338,26 @@ print('DIRECTOR_TO_EXTENSION_PARENT_PRICING_NETWORK=PASS')
             raise RuntimeError("persistent web revision label mismatch")
         print("DEV_WEB_STAGE_LOCAL_ASPECT_CUTOVER=PASS")
 
-        print("\n===== 9. COMPLETE CROSS-SERVICE ROUTE MATRIX =====", flush=True)
+        print("\n===== 9. COMPLETE LIVE CROSS-SERVICE ROUTE MATRIX =====", flush=True)
         matrix = {
-            "df-v3-svc-face": ["/api/face/assets/{media_asset_id}/read-url"],
-            "df-v3-svc-audio": ["/api/audio/jobs/{job_id}/canonical-output", "/api/audio/assets/{media_id}/read-url"],
-            "df-v3-svc-director": ["/api/director/studio-workflows/{workflow_id}/stage-runs/{stage_run_id}/aspect-ratio"],
-            EXTENSION: [
+            "df-v3-svc-face": (8003, ["/api/face/assets/{media_asset_id}/read-url"]),
+            "df-v3-svc-audio": (8004, ["/api/audio/jobs/{job_id}/canonical-output", "/api/audio/assets/{media_id}/read-url"]),
+            "df-v3-svc-director": (8011, ["/api/director/studio-workflows/{workflow_id}/stage-runs/{stage_run_id}/aspect-ratio"]),
+            EXTENSION: (8006, [
                 "/api/longform/v3/scene-pricing/preview",
                 "/api/longform/v3/scene-pricing/reserve",
                 "/api/longform/v3/scene-pricing/commit",
                 "/api/longform/v3/scene-pricing/release",
-            ],
+            ]),
         }
-        for container, paths in matrix.items():
-            code = "from app.main import app; p={getattr(r,'path','') for r in app.routes}; required=" + repr(paths) + "; assert all(x in p for x in required)"
-            cp = run(["docker", "exec", container, "python", "-c", code], check=False)
-            if cp.returncode != 0:
-                raise RuntimeError(f"route matrix failed: {container}")
+        for container, (port, required) in matrix.items():
+            paths = live_openapi_paths(container, port)
+            missing = [path for path in required if path not in paths]
+            if missing:
+                raise RuntimeError(f"live route matrix failed: {container}: missing={missing}")
+            print(f"LIVE_ROUTE_MATRIX_SERVICE=PASS:{container}")
         print("MULTIPERSON_CROSS_SERVICE_ROUTE_MATRIX=PASS")
+        print("ROUTE_MATRIX_SOURCE=LIVE_OPENAPI")
 
         print("\n===== 10. NON-TARGET RUNTIME INVARIANTS =====", flush=True)
         for name, value in before.items():
@@ -362,6 +389,7 @@ print('DIRECTOR_TO_EXTENSION_PARENT_PRICING_NETWORK=PASS')
         print("WEB_CANDIDATE=PASS")
         print("DEV_WEB_STAGE_LOCAL_ASPECT_CUTOVER=PASS")
         print("MULTIPERSON_CROSS_SERVICE_ROUTE_MATRIX=PASS")
+        print("ROUTE_MATRIX_SOURCE=LIVE_OPENAPI")
         print("NON_TARGET_RUNTIME_UNCHANGED=PASS")
         print("PRODUCTION_TOUCH=NONE")
         print(f"old_web_image={old_web_image}")
