@@ -146,10 +146,13 @@ limit 8;
     child_create_seen = bool(re.search(r"(?i)(POST\s+[^\s]*?/jobs(?:\s|\?|$)|\"POST /jobs)", all_fusion))
 
     latest = stage_rows.splitlines()[0].split("|") if stage_rows else []
+    latest_stage_id = latest[1] if len(latest) > 1 else ""
     latest_state = latest[2] if len(latest) > 2 else "unknown"
     parent_state = latest[4] if len(latest) > 4 else "unknown"
     quote_present = latest[5] if len(latest) > 5 else "unknown"
     fingerprint_present = latest[6] if len(latest) > 6 else "unknown"
+    attempt_lines = [line.split("|") for line in attempts.splitlines() if line.strip()]
+    latest_stage_attempt = next((parts for parts in attempt_lines if parts and parts[0] == latest_stage_id), None)
 
     print("\n===== 6. CLASSIFICATION =====")
     print(f"DIRECTOR_DISPATCH_ACCESS_SEEN={'YES' if dispatch_seen else 'NO'}")
@@ -159,8 +162,9 @@ limit 8;
     print(f"LATEST_PARENT_PRICING_STATE={parent_state}")
     print(f"LATEST_PARENT_QUOTE_PRESENT={quote_present}")
     print(f"LATEST_PARENT_FINGERPRINT_PRESENT={fingerprint_present}")
+    print(f"LATEST_STAGE_HAS_ATTEMPT={'YES' if latest_stage_attempt else 'NO'}")
 
-    if latest_state == "generating" or attempts:
+    if latest_state == "generating" or latest_stage_attempt is not None:
         classification = "DISPATCH_REACHED_DURABLE_EXECUTION"
     elif parent_state == "quoted" and quote_present == "yes" and fingerprint_present == "yes" and not dispatch_seen:
         classification = "CLIENT_SIDE_OR_GATEWAY_BEFORE_DIRECTOR_DISPATCH"
