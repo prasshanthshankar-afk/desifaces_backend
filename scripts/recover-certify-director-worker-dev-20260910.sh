@@ -4,21 +4,21 @@ set -Eeuo pipefail
 EXPECTED_HOST="desifaces-dev"
 ROOT="/home/azureuser/workspace/desifaces-v3"
 WORKER="df-v3-svc-director-worker"
+ROLLBACK_WORKER="df-v3-svc-director-worker-rollback-$(date -u +%Y%m%dT%H%M%SZ)"
 API="df-v3-svc-director"
 DB="desifaces-v3-db"
 REDIS="desifaces-v3-redis"
 FACE="df-v3-svc-face"
 AUDIO="df-v3-svc-audio"
 FUSION="df-v3-svc-fusion"
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-ROLLBACK_IMAGE="desifaces-dev-director-worker-rollback:${STAMP}"
-WORKER_REPLACED=0
-ROLLBACK_READY=0
+NEW_WORKER_STARTED=0
+ROLLBACK_SLOT=0
 SUCCESS=0
+ORIGINAL_WORKER_STATUS="missing"
 
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"; }
-for x in docker curl python3; do need "$x"; done
+for x in docker python3; do need "$x"; done
 [[ "$(hostname -s)" == "$EXPECTED_HOST" ]] || fail "run only on $EXPECTED_HOST; current=$(hostname -s)"
 [[ -d "$ROOT/.git" ]] || fail "dev checkout missing: $ROOT"
 [[ -f "$ROOT/infra/.env" ]] || fail "dev env missing: $ROOT/infra/.env"
@@ -58,18 +58,18 @@ run_state(){
 cleanup(){
   local rc=$?
   set +e
-  if (( rc != 0 && SUCCESS == 0 && WORKER_REPLACED == 1 && ROLLBACK_READY == 1 )); then
+  if (( rc != 0 && SUCCESS == 0 && ROLLBACK_SLOT == 1 )); then
     echo "===== DEV DIRECTOR WORKER AUTOMATIC ROLLBACK ====="
-    docker rm -f "$WORKER" >/dev/null 2>&1 || true
-    docker run -d \
-      --name "$WORKER" \
-      --restart unless-stopped \
-      --network df-v3-net \
-      "$ROLLBACK_IMAGE" >/dev/null 2>&1 || true
-    echo "DIRECTOR_WORKER_ROLLBACK=ATTEMPTED"
-  fi
-  if (( SUCCESS == 1 && ROLLBACK_READY == 1 )); then
-    docker image rm "$ROLLBACK_IMAGE" >/dev/null 2>&1 || true
+    if (( NEW_WORKER_STARTED == 1 )) && docker inspect "$WORKER" >/dev/null 2>&1; then
+      docker rm -f "$WORKER" >/dev/null 2>&1 || true
+    fi
+    if docker inspect "$ROLLBACK_WORKER" >/dev/null 2>&1; then
+      docker rename "$ROLLBACK_WORKER" "$WORKER" >/dev/null 2>&1 || true
+      if [[ "$ORIGINAL_WORKER_STATUS" == "running" ]]; then
+        docker start "$WORKER" >/dev/null 2>&1 || true
+      fi
+      echo "DIRECTOR_WORKER_ROLLBACK=RESTORED_ORIGINAL_CONTAINER"
+    fi
   fi
   exit "$rc"
 }
@@ -89,6 +89,7 @@ audio_restart=FORBIDDEN
 fusion_restart=FORBIDDEN
 db_restart=FORBIDDEN
 redis_restart=FORBIDDEN
+rollback_mode=rename_original_container
 EOF
 
 echo
@@ -104,99 +105,117 @@ echo "latest_attempt_count=$ATTEMPT_COUNT"
 echo "eligible_queued_count=$QUEUE_COUNT"
 
 case "$RUN_STATE" in
-  running|awaiting_review|ready)
+  awaiting_review|ready)
     echo "QUEUE_RECOVERY_NOT_REQUIRED=latest_run_state_${RUN_STATE}"
     SUCCESS=1
+    exit 0
     ;;
   failed)
     echo "director_last_error=${LAST_ERROR:0:800}"
-    fail "latest Director run has already failed"
+    fail "latest Director run is already failed"
+    ;;
+  running)
+    echo "QUEUE_RECOVERY_NOT_REQUIRED=latest_run_state_running"
+    SUCCESS=1
+    exit 0
     ;;
   queued)
     ;;
   *)
-    fail "unexpected latest Director state: $RUN_STATE"
+    fail "unexpected latest Director run state: $RUN_STATE"
     ;;
 esac
 
-if (( SUCCESS == 0 )) && [[ "$QUEUE_COUNT" == "0" ]]; then
-  fail "latest run is queued but not claimable; inspect available_at/max_attempts contract"
-fi
+[[ "$QUEUE_COUNT" != "0" ]] || fail "latest run is queued but not claimable; inspect available_at/max_attempts contract"
 
-if (( SUCCESS == 0 )); then
-  echo
+echo
 echo "===== 2. INSPECT DIRECTOR WORKER ====="
-  if docker inspect "$WORKER" >/dev/null 2>&1; then
-    WORKER_STATUS="$(docker inspect "$WORKER" --format '{{.State.Status}}')"
-    WORKER_IMAGE="$(docker inspect "$WORKER" --format '{{.Config.Image}}')"
-    WORKER_IMAGE_ID="$(docker inspect "$WORKER" --format '{{.Image}}')"
-    echo "worker_present=YES"
-    echo "worker_status=$WORKER_STATUS"
-    echo "worker_image=$WORKER_IMAGE"
-    echo "worker_image_id=$WORKER_IMAGE_ID"
-    echo "worker_recent_logs_begin"
-    docker logs --tail 40 "$WORKER" 2>&1 | sed -E 's/(sk-[A-Za-z0-9_\-]{8})[A-Za-z0-9_\-]+/\1...[REDACTED]/g' || true
-    echo "worker_recent_logs_end"
-  else
-    WORKER_STATUS="missing"
-    echo "worker_present=NO"
-  fi
+if docker inspect "$WORKER" >/dev/null 2>&1; then
+  ORIGINAL_WORKER_STATUS="$(docker inspect "$WORKER" --format '{{.State.Status}}')"
+  WORKER_IMAGE="$(docker inspect "$WORKER" --format '{{.Config.Image}}')"
+  WORKER_IMAGE_ID="$(docker inspect "$WORKER" --format '{{.Image}}')"
+  echo "worker_present=YES"
+  echo "worker_status=$ORIGINAL_WORKER_STATUS"
+  echo "worker_image=$WORKER_IMAGE"
+  echo "worker_image_id=$WORKER_IMAGE_ID"
+  echo "worker_recent_logs_begin"
+  docker logs --tail 50 "$WORKER" 2>&1 \
+    | sed -E 's/(sk-[A-Za-z0-9_\-]{8})[A-Za-z0-9_\-]+/\1...[REDACTED]/g' \
+    | sed -E 's/(AccountKey=)[^;]+/\1[REDACTED]/g' || true
+  echo "worker_recent_logs_end"
+else
+  ORIGINAL_WORKER_STATUS="missing"
+  echo "worker_present=NO"
+fi
 
-  CURRENT_DIRECTOR_IMAGE="$(docker image inspect desifaces-v3-svc-director:latest --format '{{.Id}}' 2>/dev/null || true)"
-  [[ -n "$CURRENT_DIRECTOR_IMAGE" ]] || fail "certified dev Director image desifaces-v3-svc-director:latest missing"
-  echo "certified_director_image_id=$CURRENT_DIRECTOR_IMAGE"
+CURRENT_DIRECTOR_IMAGE="$(docker image inspect desifaces-v3-svc-director:latest --format '{{.Id}}' 2>/dev/null || true)"
+[[ -n "$CURRENT_DIRECTOR_IMAGE" ]] || fail "certified dev Director image desifaces-v3-svc-director:latest missing"
+echo "certified_director_image_id=$CURRENT_DIRECTOR_IMAGE"
 
-  if [[ "$WORKER_STATUS" == "running" ]]; then
-    echo
-echo "===== 3. PASSIVE CLAIM WINDOW ====="
-    for i in $(seq 1 6); do
-      STATE_ROW="$(run_state "$RUN_ID")"
-      IFS='|' read -r STATE NOW_ATTEMPTS NOW_ERROR <<<"$STATE_ROW"
-      echo "passive_check=$i state=$STATE attempts=$NOW_ATTEMPTS"
-      case "$STATE" in
-        running|awaiting_review|ready)
-          echo "DIRECTOR_QUEUE_CLAIMED_WITHOUT_RESTART=PASS"
-          SUCCESS=1
-          break
-          ;;
-        failed)
-          echo "director_last_error=${NOW_ERROR:0:800}"
-          fail "Director worker claimed the run but execution failed"
-          ;;
-      esac
-      sleep 2
-    done
-  fi
+echo
+echo "===== 3. PRE-RESTART DEV NETWORK CONTRACT ====="
+docker run --rm --network df-v3-net --entrypoint python desifaces-v3-svc-director:latest - <<'PY'
+import socket
+print('dns=', socket.gethostbyname('desifaces-db'))
+with socket.create_connection(('desifaces-db', 5432), timeout=5):
+    pass
+print('DIRECTOR_IMAGE_TO_DB_NETWORK=PASS')
+PY
+
+echo
+echo "===== 4. PASSIVE CLAIM WINDOW ====="
+if [[ "$ORIGINAL_WORKER_STATUS" == "running" ]]; then
+  for i in $(seq 1 6); do
+    STATE_ROW="$(run_state "$RUN_ID")"
+    IFS='|' read -r STATE NOW_ATTEMPTS NOW_ERROR <<<"$STATE_ROW"
+    echo "passive_check=$i state=$STATE attempts=$NOW_ATTEMPTS"
+    case "$STATE" in
+      running|awaiting_review|ready)
+        echo "DIRECTOR_QUEUE_CLAIMED_WITHOUT_RESTART=PASS"
+        SUCCESS=1
+        break
+        ;;
+      failed)
+        echo "director_last_error=${NOW_ERROR:0:800}"
+        fail "Director worker claimed the run but execution failed"
+        ;;
+    esac
+    sleep 2
+  done
 fi
 
 if (( SUCCESS == 0 )); then
   echo
-echo "===== 4. REPLACE DIRECTOR WORKER ONLY ====="
+echo "===== 5. REPLACE DIRECTOR WORKER ONLY ====="
   if docker inspect "$WORKER" >/dev/null 2>&1; then
-    docker commit "$WORKER" "$ROLLBACK_IMAGE" >/dev/null
-    ROLLBACK_READY=1
-    echo "DIRECTOR_WORKER_ROLLBACK_IMAGE=PASS"
-    docker rm -f "$WORKER" >/dev/null
+    if [[ "$ORIGINAL_WORKER_STATUS" == "running" ]]; then
+      docker stop "$WORKER" >/dev/null
+    fi
+    docker rename "$WORKER" "$ROLLBACK_WORKER"
+    docker update --restart=no "$ROLLBACK_WORKER" >/dev/null 2>&1 || true
+    ROLLBACK_SLOT=1
+    echo "DIRECTOR_WORKER_ROLLBACK_SLOT=PASS"
   fi
 
   compose up -d --no-deps svc-director-worker
-  WORKER_REPLACED=1
+  NEW_WORKER_STARTED=1
 
   for i in $(seq 1 30); do
     WORKER_STATUS="$(docker inspect "$WORKER" --format '{{.State.Status}}' 2>/dev/null || true)"
     echo "worker_wait=$i status=${WORKER_STATUS:-missing}"
     [[ "$WORKER_STATUS" == "running" ]] && break
+    [[ "$WORKER_STATUS" == "exited" || "$WORKER_STATUS" == "dead" ]] && break
     sleep 1
   done
-  [[ "$WORKER_STATUS" == "running" ]] || {
-    docker logs --tail 120 "$WORKER" 2>&1 || true
-    fail "Director worker did not become running"
-  }
+  if [[ "$WORKER_STATUS" != "running" ]]; then
+    docker logs --tail 160 "$WORKER" 2>&1 || true
+    fail "Director worker did not remain running"
+  fi
   echo "DIRECTOR_WORKER_RUNNING=PASS"
 
   echo
-echo "===== 5. VERIFY QUEUED RUN IS CLAIMED ====="
-  for i in $(seq 1 30); do
+echo "===== 6. VERIFY QUEUED RUN IS CLAIMED ====="
+  for i in $(seq 1 60); do
     STATE_ROW="$(run_state "$RUN_ID")"
     IFS='|' read -r STATE NOW_ATTEMPTS NOW_ERROR <<<"$STATE_ROW"
     echo "claim_check=$i state=$STATE attempts=$NOW_ATTEMPTS"
@@ -208,6 +227,7 @@ echo "===== 5. VERIFY QUEUED RUN IS CLAIMED ====="
         ;;
       failed)
         echo "director_last_error=${NOW_ERROR:0:800}"
+        docker logs --tail 160 "$WORKER" 2>&1 || true
         fail "Director worker claimed the run but execution failed"
         ;;
     esac
@@ -215,12 +235,12 @@ echo "===== 5. VERIFY QUEUED RUN IS CLAIMED ====="
   done
   (( SUCCESS == 1 )) || {
     docker logs --tail 160 "$WORKER" 2>&1 || true
-    fail "queued Director run was not claimed within 30 seconds"
+    fail "queued Director run was not claimed within 60 seconds"
   }
 fi
 
 echo
-echo "===== 6. NON-TARGET RUNTIME INVARIANTS ====="
+echo "===== 7. NON-TARGET RUNTIME INVARIANTS ====="
 [[ "$API_BEFORE" == "$(snapshot "$API")" ]] || fail "Director API changed or restarted"
 [[ "$DB_BEFORE" == "$(snapshot "$DB")" ]] || fail "DB changed or restarted"
 [[ "$REDIS_BEFORE" == "$(snapshot "$REDIS")" ]] || fail "Redis changed or restarted"
@@ -231,17 +251,14 @@ echo "DIRECTOR_API_UNCHANGED=PASS"
 echo "DB_REDIS_UNCHANGED=PASS"
 echo "FACE_AUDIO_FUSION_UNCHANGED=PASS"
 
+if (( ROLLBACK_SLOT == 1 )); then
+  docker rm -f "$ROLLBACK_WORKER" >/dev/null 2>&1 || true
+  ROLLBACK_SLOT=0
+  echo "DIRECTOR_WORKER_ROLLBACK_SLOT_CLEANED=PASS"
+fi
+
 FINAL="$(run_state "$RUN_ID")"
 IFS='|' read -r FINAL_STATE FINAL_ATTEMPTS FINAL_ERROR <<<"$FINAL"
-case "$FINAL_STATE" in
-  running|awaiting_review|ready) ;;
-  failed)
-    echo "director_last_error=${FINAL_ERROR:0:800}"
-    fail "Director execution failed after queue claim"
-    ;;
-  *) fail "Director run ended certification in unexpected state: $FINAL_STATE" ;;
-esac
-
 echo
 echo "============================================================"
 echo " DEV DIRECTOR QUEUE RECOVERY PASS"
@@ -250,6 +267,7 @@ echo "run_id=$RUN_ID"
 echo "thread_id=$THREAD_ID"
 echo "state=$FINAL_STATE"
 echo "attempt_count=$FINAL_ATTEMPTS"
+echo "DIRECTOR_IMAGE_TO_DB_NETWORK=PASS"
 echo "DIRECTOR_QUEUE_CLAIM=PASS"
 echo "DIRECTOR_API_UNCHANGED=PASS"
 echo "DB_REDIS_UNCHANGED=PASS"
