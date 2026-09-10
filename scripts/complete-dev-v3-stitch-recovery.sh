@@ -158,7 +158,8 @@ docker build \
 pass "STITCH_WORKER_IMAGE_BUILD"
 
 # Pre-cutover source/image contract: this does not contact DB or providers.
-docker run --rm --entrypoint python "$NEW_IMAGE" - <<'PY'
+# Keep stdin attached because python '-' reads this exact probe from stdin.
+docker run --rm -i --entrypoint python "$NEW_IMAGE" - <<'PY'
 from app.workers import stitch_worker
 from app.workers import v3_scene_artifact_refresh as artifact_refresh
 from app.workers import v3_scene_coordinator as coordinator
@@ -409,6 +410,8 @@ IFS='|' read -r final_stage final_attempt final_pricing final_dispatch final_pha
   || fail "recovery attempt did not succeed; state=$final_attempt"
 [[ "$final_pricing" == "committed" ]] \
   || fail "parent pricing did not commit; state=$final_pricing"
+[[ "$final_dispatch" == "stitch_only_retry" ]] \
+  || fail "recovery dispatch was not stitch-only; outcome=$final_dispatch"
 [[ "$final_phase" == "ready_for_review" ]] \
   || fail "background coordinator did not reach ready_for_review; phase=$final_phase"
 [[ "$final_children" == "$EXPECTED_PRESERVED_CHILDREN" ]] \
