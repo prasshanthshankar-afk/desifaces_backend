@@ -6,7 +6,10 @@ ROOT="$(
   pwd
 )"
 
-ENV_FILE="$ROOT/infra/.env"
+# Default behavior is unchanged. A DEV recovery worktree may explicitly point at
+# the active V3 env file so secrets never need to be copied into a Docker build
+# context that contains `COPY .`.
+ENV_FILE="${DF_V3_ENV_FILE:-$ROOT/infra/.env}"
 BASE_FILE="$ROOT/docker-compose.yml"
 V3_FILE="$ROOT/docker-compose.v3.yml"
 
