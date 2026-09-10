@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 EXPECTED_HOST="desifaces-dev"
-SCRIPT_COMMIT="b735c5ce305d9ec1a93bf2b792538179dc9460ae"
+SCRIPT_COMMIT="e2412ed835fece2fa830161f9b9251751b1c737c"
 SCRIPT_PATH="scripts/repair-certify-multiperson-fusion-contract-dev-20260910.py"
 RAW_BASE="https://raw.githubusercontent.com/prasshanthshankar-afk/desifaces_backend"
 TMP="$(mktemp /tmp/desifaces-fusion-contract-repair-XXXXXX.py)"
