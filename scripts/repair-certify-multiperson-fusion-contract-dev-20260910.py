@@ -13,7 +13,7 @@ EXPECTED_HOST = "desifaces-dev"
 BACKEND_ROOT = Path("/home/azureuser/workspace/desifaces-v3")
 WEB_ROOT = Path("/home/azureuser/workspace/desifaces-web")
 BACKEND_REF = "56956867dcad4278d63d1f2c8f652c084087e619"
-WEB_REF = "6283fb12bb32034ec25cfeb2da2da222c97b1948"
+WEB_REF = "732a2ce92727be9166c57d81e2c8b28cc98df47c"
 NETWORK = "df-v3-net"
 EXTENSION = "df-v3-svc-fusion-extension"
 WEB = "df-v3-web"
@@ -301,7 +301,6 @@ print('DIRECTOR_TO_EXTENSION_PARENT_PRICING_NETWORK=PASS')
         run(["docker", "rename", WEB, web_rollback])
         run(["docker", "update", "--restart=no", web_rollback], check=False)
         web_swapped = True
-        # Prove the loopback port is released before starting the new runtime.
         s = socket.socket()
         try:
             s.bind(("127.0.0.1", WEB_PORT))
@@ -343,7 +342,6 @@ print('DIRECTOR_TO_EXTENSION_PARENT_PRICING_NETWORK=PASS')
         print("DIRECTOR_FACE_AUDIO_FUSION_UNCHANGED=PASS")
         print("STITCH_WORKER_UNCHANGED=PASS")
 
-        # Finalize only after all gates pass.
         if exists(web_candidate):
             run(["docker", "rm", "-f", web_candidate], check=False)
         candidate_started = False
