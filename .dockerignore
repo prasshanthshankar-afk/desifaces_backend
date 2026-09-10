@@ -1,0 +1,2 @@
+# Never send runtime secrets into Docker build contexts.
+infra/.env
