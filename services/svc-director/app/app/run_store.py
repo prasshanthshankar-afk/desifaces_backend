@@ -29,21 +29,76 @@ class DirectorRunStore:
         return row
 
     async def list_recent(self, conn, *, account_id: UUID, owner_user_id: UUID, limit: int = 10):
-        """Return only the authenticated user's recent Director runs that own a Story.
+        """Return the authenticated user's recent Stories with live Studio status.
 
-        This is intentionally narrower than an account-wide story search.  A browser or
-        Assistant must never discover another user's Story merely because they share an
-        account.  The response is also deliberately small and excludes raw brief prose.
+        Story discovery is intentionally user-scoped rather than account-wide.  The
+        Assistant/browser may discover only Stories owned by the authenticated user,
+        even when multiple users share an account.  Raw brief prose is never returned.
+
+        The Director run state alone becomes stale after a Story enters Face/Audio/
+        Fusion execution, so each result is enriched from the user's canonical V3
+        Studio workflow.  `attention_state` is a compact operational projection for
+        UX/Assistant use; it does not replace durable stage/workflow state.
         """
         return await conn.fetch(
-            """select run_id,thread_id,story_id,state,created_at,updated_at,
-                      coalesce(nullif(brief_json->>'title',''),
-                               nullif(brief_json->>'story_title',''),
-                               nullif(brief_json->>'name','')) as title
-               from public.v3_director_runs
-              where account_id=$1 and owner_user_id=$2 and story_id is not null
-              order by coalesce(updated_at, created_at) desc
-              limit $3""",
+            """
+            with latest_runs as (
+              select distinct on (r.story_id)
+                     r.run_id,r.thread_id,r.story_id,r.state,r.created_at,r.updated_at,
+                     coalesce(nullif(r.brief_json->>'title',''),
+                              nullif(r.brief_json->>'story_title',''),
+                              nullif(r.brief_json->>'name','')) as title
+                from public.v3_director_runs r
+               where r.account_id=$1
+                 and r.owner_user_id=$2
+                 and r.story_id is not null
+               order by r.story_id,coalesce(r.updated_at,r.created_at) desc,r.run_id desc
+            )
+            select r.run_id,r.thread_id,r.story_id,r.state,r.created_at,
+                   greatest(
+                     coalesce(r.updated_at,r.created_at),
+                     coalesce(w.updated_at,r.created_at),
+                     coalesce(w.stage_updated_at,r.created_at)
+                   ) as updated_at,
+                   r.title,
+                   w.workflow_id,w.workflow_state,w.current_stage,
+                   case
+                     when w.workflow_id is null then r.state
+                     when w.awaiting_review then 'awaiting_review'
+                     when w.failed then 'failed'
+                     when w.generating then 'generating'
+                     when w.workflow_state in ('complete','completed') then 'complete'
+                     else coalesce(w.workflow_state,r.state)
+                   end as attention_state
+              from latest_runs r
+              left join lateral (
+                select wf.workflow_id,
+                       wf.state as workflow_state,
+                       wf.current_stage,
+                       wf.updated_at,
+                       coalesce((select max(s.updated_at)
+                                   from public.v3_studio_stage_runs s
+                                  where s.workflow_id=wf.workflow_id),wf.updated_at) as stage_updated_at,
+                       exists(select 1 from public.v3_studio_stage_runs s
+                               where s.workflow_id=wf.workflow_id and s.state='awaiting_review') as awaiting_review,
+                       exists(select 1 from public.v3_studio_stage_runs s
+                               where s.workflow_id=wf.workflow_id and s.state='failed') as failed,
+                       exists(select 1 from public.v3_studio_stage_runs s
+                               where s.workflow_id=wf.workflow_id and s.state='generating') as generating
+                  from public.v3_studio_workflows wf
+                 where wf.story_id=r.story_id
+                   and wf.account_id=$1
+                   and wf.owner_user_id=$2
+                 order by wf.updated_at desc,wf.workflow_id desc
+                 limit 1
+              ) w on true
+             order by greatest(
+                       coalesce(r.updated_at,r.created_at),
+                       coalesce(w.updated_at,r.created_at),
+                       coalesce(w.stage_updated_at,r.created_at)
+                     ) desc
+             limit $3
+            """,
             account_id, owner_user_id, max(1, min(int(limit), 25)),
         )
 
