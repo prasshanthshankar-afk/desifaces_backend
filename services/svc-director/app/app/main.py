@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg import Error as PsycopgError
 from pydantic import BaseModel, Field
@@ -37,6 +38,19 @@ _TRANSIENT_CHECKPOINT_SQLSTATES = frozenset({"57P01", "57P02", "57P03"})
 class ResumeIn(BaseModel):
     approved: bool
     feedback: str | None = Field(default=None, max_length=12000)
+
+
+class RecentStoryView(BaseModel):
+    story_id: UUID
+    thread_id: str
+    state: str
+    title: str | None = None
+    updated_at: datetime | None = None
+    continue_path: str
+    workflow_id: UUID | None = None
+    workflow_state: str | None = None
+    current_stage: str | None = None
+    attention_state: str | None = None
 
 
 def _coerce_interrupt_value(value: Any) -> dict | None:
@@ -222,6 +236,32 @@ async def get_run(thread_id: str, auth: DirectorAuthContext = Depends(get_direct
     if not values:
         return _queue_view(row)
     return _checkpoint_view(thread_id, values, persisted_interrupt=_snapshot_interrupt(snapshot))
+
+
+@app.get("/api/director/stories/recent", response_model=list[RecentStoryView])
+async def recent_stories(
+    limit: int = Query(default=10, ge=1, le=25),
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    async with app.state.business_pool.acquire() as conn:
+        rows = await app.state.run_store.list_recent(
+            conn, account_id=auth.account_id, owner_user_id=auth.user_id, limit=limit,
+        )
+    return [
+        RecentStoryView(
+            story_id=UUID(str(row["story_id"])),
+            thread_id=str(row["thread_id"]),
+            state=str(row["state"]),
+            title=str(row["title"])[:160] if row["title"] else None,
+            updated_at=row["updated_at"],
+            continue_path=f"/app/multi-person?story_id={row['story_id']}",
+            workflow_id=UUID(str(row["workflow_id"])) if row["workflow_id"] else None,
+            workflow_state=str(row["workflow_state"]) if row["workflow_state"] else None,
+            current_stage=str(row["current_stage"]) if row["current_stage"] else None,
+            attention_state=str(row["attention_state"]) if row["attention_state"] else None,
+        )
+        for row in rows
+    ]
 
 
 @app.get("/api/director/stories/{story_id}/workspace", response_model=StoryWorkspaceView)
