@@ -8,7 +8,6 @@ from fastapi import Depends, FastAPI, HTTPException, Response, status
 from redis.asyncio import Redis
 
 from .config import settings
-from .context import ContextResolver
 from .db import close_pool, open_business_pool
 from .llm import AssistantLLM
 from .retrieval import SafeKnowledgeRetriever
@@ -16,6 +15,7 @@ from .schemas import AssistantChatIn, AssistantChatOut
 from .security import AssistantAuthContext, get_assistant_auth
 from .service import AssistantService
 from .session_store import SessionStore
+from .story_context import StoryAwareContextResolver
 
 
 @asynccontextmanager
@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI):
     app.state.llm = llm
     app.state.service = AssistantService(
         sessions=SessionStore(redis),
-        context_resolver=ContextResolver(http, pool),
+        context_resolver=StoryAwareContextResolver(http, pool),
         retriever=retriever,
         llm=llm,
     )
@@ -63,7 +63,7 @@ async def health():
         "llm_configured": app.state.llm.configured,
         "embedding_configured": bool(settings.DF_ASSISTANT_EMBEDDING_MODEL),
         "knowledge_chunks": app.state.retriever.chunk_count,
-        "live_context": "dashboard+user_scoped_generation+director_story",
+        "live_context": "dashboard+user_scoped_generation+director_story+recent_stories",
         "privacy_guard": "deterministic_pre_and_post_llm",
         "support_route": "support@desifaces.ai",
         "runtime_ready": redis_ok and app.state.llm.configured,
