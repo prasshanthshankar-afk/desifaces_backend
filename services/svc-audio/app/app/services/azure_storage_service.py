@@ -63,6 +63,31 @@ class AzureStorageService:
             except Exception:
                 pass
 
+    def generate_read_url(self, storage_path: str, *, hours: int | None = None) -> str:
+        """Generate a fresh owner-service read URL for an existing Audio blob.
+
+        `storage_path` is the durable blob name stored in media_assets.storage_ref.
+        Never persist this SAS URL as the durable identity; callers should ask for
+        a new read URL when rendering/resuming/downloading an existing artifact.
+        """
+        blob_name = str(storage_path or "").strip().lstrip("/")
+        if not blob_name:
+            raise RuntimeError("missing_audio_storage_path")
+
+        ttl_hours = int(hours if hours is not None else self.sas_hours)
+        if ttl_hours <= 0:
+            raise RuntimeError("invalid_audio_sas_hours")
+
+        sas_token = generate_blob_sas(
+            account_name=self.account_name,
+            container_name=self.audio_container,
+            blob_name=blob_name,
+            account_key=self.account_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.now(timezone.utc) + timedelta(hours=ttl_hours),
+        )
+        return f"https://{self.account_name}.blob.core.windows.net/{self.audio_container}/{blob_name}?{sas_token}"
+
     async def upload_bytes(
         self,
         *,
@@ -93,15 +118,7 @@ class AzureStorageService:
 
         await asyncio.to_thread(_sync_upload)
 
-        sas_token = generate_blob_sas(
-            account_name=self.account_name,
-            container_name=self.audio_container,
-            blob_name=blob_name,
-            account_key=self.account_key,
-            permission=BlobSasPermissions(read=True),
-            expiry=datetime.now(timezone.utc) + timedelta(hours=self.sas_hours),
-        )
-        sas_url = f"https://{self.account_name}.blob.core.windows.net/{self.audio_container}/{blob_name}?{sas_token}"
+        sas_url = self.generate_read_url(blob_name)
 
         return UploadBytesResult(
             storage_path=blob_name,
