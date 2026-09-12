@@ -18,6 +18,10 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY services/shared/python/desifaces_shared /app/desifaces_shared
 COPY services/shared/llm /app/desifaces_shared/llm
+# svc-audio's established tts_service import is intentionally top-level.
+# Keep a direct module alias in /app so `from gender_translation import ...`
+# resolves without executing desifaces_shared.llm package-level side effects.
+COPY services/shared/llm/gender_translation.py /app/gender_translation.py
 COPY services/svc-audio/app/app /app/app
 
 EXPOSE 8004
