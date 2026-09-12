@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from app.api.deps import get_current_user_id
 from app.config import settings
 from app.db import get_pool
+from app.services.azure_storage_service import AzureStorageService
 from desifaces_shared.identity import AccountContextNotFound, resolve_account_context
 
 router = APIRouter(prefix="/api/audio", tags=["audio-v3-output"])
@@ -250,7 +251,7 @@ async def get_audio_media_read_url(
         account = await _resolve_account_or_401(conn, canonical_user_id)
         row = await conn.fetchrow(
             """
-            select id,account_id,meta_json
+            select id,account_id,storage_ref,meta_json
             from public.media_assets
             where id=$1 and user_id=$2 and kind='audio' and lifecycle_state='active'
             """,
@@ -259,13 +260,23 @@ async def get_audio_media_read_url(
         )
         if not row or (row["account_id"] and UUID(str(row["account_id"])) != account.account_id):
             raise HTTPException(status_code=404, detail="audio_media_not_found")
-        meta = _as_dict(row["meta_json"])
-        container = str(meta.get("storage_container") or getattr(settings, "AUDIO_OUTPUT_CONTAINER", "") or "").strip()
-        blob_name = str(meta.get("storage_path") or "").strip()
-        if not container or not blob_name:
+
+        storage_ref = str(row["storage_ref"] or "").strip()
+        if not storage_ref:
+            # Compatibility fallback for any transitional row that predates
+            # storage_ref population but still carries durable coordinates.
+            meta = _as_dict(row["meta_json"])
+            container = str(meta.get("storage_container") or getattr(settings, "AUDIO_OUTPUT_CONTAINER", "") or "").strip()
+            blob_name = str(meta.get("storage_path") or "").strip()
+            if container and blob_name:
+                storage_ref = f"azure://{container}/{blob_name.lstrip('/')}"
+
+        if not storage_ref:
             raise HTTPException(status_code=409, detail="audio_media_storage_lineage_missing")
 
-    return AudioReadUrlView(
-        media_id=media_id,
-        read_url=_sign_audio_blob(container=container, blob_name=blob_name),
-    )
+    try:
+        read_url = AzureStorageService().generate_read_url(storage_ref)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="audio_read_url_unavailable") from exc
+
+    return AudioReadUrlView(media_id=media_id, read_url=read_url)
