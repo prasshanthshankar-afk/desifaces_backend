@@ -34,6 +34,20 @@ logger = logging.getLogger("svc-director")
 _TRANSIENT_CHECKPOINT_SQLSTATES = frozenset({"57P01", "57P02", "57P03"})
 
 
+
+class RecentStoryOut(BaseModel):
+    story_id: UUID
+    thread_id: str
+    state: str
+    title: str | None = None
+    updated_at: str | None = None
+    continue_path: str
+    workflow_id: UUID | None = None
+    workflow_state: str | None = None
+    current_stage: str | None = None
+    attention_state: str | None = None
+
+
 class ResumeIn(BaseModel):
     approved: bool
     feedback: str | None = Field(default=None, max_length=12000)
@@ -222,6 +236,195 @@ async def get_run(thread_id: str, auth: DirectorAuthContext = Depends(get_direct
     if not values:
         return _queue_view(row)
     return _checkpoint_view(thread_id, values, persisted_interrupt=_snapshot_interrupt(snapshot))
+
+
+
+@app.get("/api/director/stories/recent", response_model=list[RecentStoryOut])
+async def get_recent_stories(
+    limit: int = 10,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    bounded_limit = max(1, min(int(limit or 10), 25))
+
+    async with app.state.business_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select
+                s.story_id,
+
+                coalesce(dr.thread_id, '') as thread_id,
+
+                coalesce(
+                    dr.state::text,
+                    s.state::text,
+                    'ready'
+                ) as state,
+
+                s.title,
+
+                greatest(
+                    coalesce(s.updated_at, s.created_at),
+                    coalesce(
+                        dr.updated_at,
+                        dr.created_at,
+                        s.updated_at,
+                        s.created_at
+                    ),
+                    coalesce(
+                        sw.updated_at,
+                        sw.created_at,
+                        s.updated_at,
+                        s.created_at
+                    )
+                ) as effective_updated_at,
+
+                sw.workflow_id,
+                sw.state::text as workflow_state,
+                sw.current_stage::text as current_stage,
+
+                case
+                    when coalesce(stage_state.has_review, false)
+                        then 'awaiting_review'
+
+                    when coalesce(stage_state.has_failed, false)
+                        then 'failed'
+
+                    when sw.state::text in ('complete', 'completed')
+                        then 'complete'
+
+                    when sw.state is not null
+                        then sw.state::text
+
+                    when dr.state is not null
+                        then dr.state::text
+
+                    else coalesce(s.state::text, 'ready')
+                end as attention_state
+
+            from public.v3_stories s
+
+            join public.v3_projects p
+              on p.project_id = s.project_id
+             and p.account_id = s.account_id
+
+            left join lateral (
+                select
+                    r.thread_id,
+                    r.state,
+                    r.created_at,
+                    r.updated_at
+
+                from public.v3_director_runs r
+
+                where r.story_id = s.story_id
+                  and r.account_id = $1
+                  and r.owner_user_id = $2
+
+                order by
+                    r.updated_at desc,
+                    r.created_at desc
+
+                limit 1
+            ) dr on true
+
+            left join lateral (
+                select
+                    w.workflow_id,
+                    w.state,
+                    w.current_stage,
+                    w.created_at,
+                    w.updated_at
+
+                from public.v3_studio_workflows w
+
+                where w.story_id = s.story_id
+                  and w.account_id = $1
+                  and w.owner_user_id = $2
+
+                order by
+                    w.updated_at desc,
+                    w.created_at desc
+
+                limit 1
+            ) sw on true
+
+            left join lateral (
+                select
+                    bool_or(sr.state::text = 'awaiting_review') as has_review,
+                    bool_or(sr.state::text = 'failed') as has_failed
+
+                from public.v3_studio_stage_runs sr
+
+                where sr.workflow_id = sw.workflow_id
+            ) stage_state on true
+
+            where s.account_id = $1
+              and p.owner_user_id = $2
+              and p.lifecycle_state::text = 'active'
+
+            order by
+                effective_updated_at desc nulls last,
+                s.story_id
+
+            limit $3
+            """,
+            auth.account_id,
+            auth.user_id,
+            bounded_limit,
+        )
+
+    result: list[RecentStoryOut] = []
+
+    for row in rows:
+        story_id = UUID(str(row["story_id"]))
+        updated_at = row["effective_updated_at"]
+
+        result.append(
+            RecentStoryOut(
+                story_id=story_id,
+                thread_id=str(row["thread_id"] or ""),
+                state=str(row["state"] or "ready"),
+                title=(
+                    str(row["title"])
+                    if row["title"] is not None
+                    else None
+                ),
+                updated_at=(
+                    updated_at.isoformat()
+                    if updated_at is not None
+                    else None
+                ),
+
+                # Compatibility alias consumed by the currently deployed
+                # Assistant. The browser canonicalizes this to story_id.
+                continue_path=(
+                    f"/app/multi-person?story={story_id}"
+                ),
+
+                workflow_id=(
+                    UUID(str(row["workflow_id"]))
+                    if row["workflow_id"] is not None
+                    else None
+                ),
+                workflow_state=(
+                    str(row["workflow_state"])
+                    if row["workflow_state"] is not None
+                    else None
+                ),
+                current_stage=(
+                    str(row["current_stage"])
+                    if row["current_stage"] is not None
+                    else None
+                ),
+                attention_state=(
+                    str(row["attention_state"])
+                    if row["attention_state"] is not None
+                    else None
+                ),
+            )
+        )
+
+    return result
 
 
 @app.get("/api/director/stories/{story_id}/workspace", response_model=StoryWorkspaceView)
