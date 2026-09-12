@@ -6,6 +6,7 @@ import logging
 import os
 from fastapi import FastAPI
 from app.api import build_router
+from app.api.routes.internal_child_pricing_runtime import install_internal_child_pricing_runtime
 from app.config import settings
 from app.db import get_pool
 from app.services.fusion_orchestrator import FusionOrchestrator
@@ -63,6 +64,12 @@ def create_app() -> FastAPI:
         redoc_url=os.getenv("REDOC_URL", "/redoc"),
         openapi_url=os.getenv("OPENAPI_URL", "/openapi.json"),
     )
+
+    # Canonicalize all V3 internal-child pricing responses before routes are served.
+    # This keeps POST /jobs and subsequent status views aligned with the no-charge
+    # parent-billing contract even when a persisted job contains a stale truthy
+    # pricing snapshot from older orchestration code.
+    install_internal_child_pricing_runtime()
 
     app.include_router(build_router())
 

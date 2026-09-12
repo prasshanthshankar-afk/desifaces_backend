@@ -1,0 +1,6 @@
+be3471a7531c4220dc6dcb25a8db54ef88138ab9b9c6c492122322e6196d575e  etc/systemd/system/desifaces-notification-dispatch.service
+96647f47860df84026678c1889548a03f75559f5c6dfc9ebc78408cc006800b2  etc/systemd/system/desifaces-notification-dispatch.timer
+dffd9c6f7f07af0d30115d0dac80daca3db8480346892384cf1dedf691cf5a93  etc/systemd/system/desifaces-safe-docker-cleanup.service
+0da00fb41fa067fc7d93e20c9e55279122225bcd829e789e10820032cff811d8  etc/systemd/system/desifaces-safe-docker-cleanup.timer
+5e8a7ca455bbac5e58c39ce05aec932320836e8e203adc175f7489b208b7bc98  usr/local/bin/desifaces-notification-dispatch.sh
+ddcffdb81aa5cba0afc6b9ef36e1cb92230732fef41523c5c8a686426cbe7a88  usr/local/sbin/desifaces-safe-docker-cleanup.sh

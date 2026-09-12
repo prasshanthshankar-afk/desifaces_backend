@@ -1,0 +1,120 @@
+name: V3 Dashboard Final Media Certification
+
+on:
+  push:
+    branches:
+      - feature/v3-multiperson-core-20260818
+    paths:
+      - 'services/svc-dashboard/app/app/api/routes/dashboard.py'
+      - 'services/svc-dashboard/app/app/services/final_video_visibility.py'
+      - 'scripts/deploy-v3-dashboard-final-media.sh'
+      - '.github/workflows/v3-dashboard-final-media.yml'
+  pull_request:
+    branches:
+      - feature/v3-multiperson-core-20260818
+    paths:
+      - 'services/svc-dashboard/app/app/api/routes/dashboard.py'
+      - 'services/svc-dashboard/app/app/services/final_video_visibility.py'
+      - 'scripts/deploy-v3-dashboard-final-media.sh'
+      - '.github/workflows/v3-dashboard-final-media.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  final-media-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile dashboard final-media code
+        run: |
+          python -m py_compile \
+            services/svc-dashboard/app/app/api/routes/dashboard.py \
+            services/svc-dashboard/app/app/services/final_video_visibility.py
+
+      - name: Validate one-shot deployment bundle
+        run: bash -n scripts/deploy-v3-dashboard-final-media.sh
+
+      - name: Prove canonical final relationship and fail-safe guards
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          helper = Path('services/svc-dashboard/app/app/services/final_video_visibility.py').read_text()
+          route = Path('services/svc-dashboard/app/app/api/routes/dashboard.py').read_text()
+
+          required = [
+              'm.id = w.final_media_id',
+              "lower(coalesce(w.state, '')) = 'completed'",
+              "lower(coalesce(w.current_stage, '')) = 'fusion'",
+              'm.deleted_at is null',
+              "'render_kind', 'final'",
+              "'output_role', 'final'",
+              "'canonical_final', true",
+              "'display_scope', 'final_outputs'",
+              'media_assets.role is deliberately',
+              'AZURE_FINAL_VIDEO_CONTAINER',
+              'signed_video_url',
+              '_is_browser_media_url',
+          ]
+          for marker in required:
+              assert marker in helper, marker
+          assert 'm.role =' not in helper
+          assert 'enrich_dashboard_home_with_v3_finals' in route
+          assert 'enrich_dashboard_library_with_v3_finals' in route
+          print('CANONICAL_FINAL_STATIC_CONTRACT=PASS')
+          PY
+
+      - name: Prove storage-reference normalization
+        env:
+          PYTHONPATH: services/svc-dashboard/app
+        run: |
+          python - <<'PY'
+          from app.services.final_video_visibility import _storage_ref_parts
+
+          expected = ('video-output', 'story/final.mp4')
+          assert _storage_ref_parts('azure://video-output/story/final.mp4', 'video-output') == expected
+          assert _storage_ref_parts('https://acct.blob.core.windows.net/video-output/story/final.mp4?sig=old', 'video-output') == expected
+          assert _storage_ref_parts('video-output/story/final.mp4', 'video-output') == expected
+          assert _storage_ref_parts('story/final.mp4', 'video-output') == expected
+          print('CANONICAL_FINAL_STORAGE_NORMALIZATION=PASS')
+          PY
+
+      - name: Prove final-media deduplication
+        env:
+          PYTHONPATH: services/svc-dashboard/app
+        run: |
+          python - <<'PY'
+          from app.services.final_video_visibility import merge_final_video_items
+
+          canonical = {
+              'library_id': 'v3-final:632685ec-c33b-43c8-94c4-be7bf09d43ac',
+              'media_asset_id': '632685ec-c33b-43c8-94c4-be7bf09d43ac',
+              'created_at': '2026-08-24T19:25:34+00:00',
+              'canonical_final': True,
+          }
+          duplicate = {
+              'library_id': 'legacy-row',
+              'media_asset_id': '632685ec-c33b-43c8-94c4-be7bf09d43ac',
+              'created_at': '2026-08-24T19:25:33+00:00',
+          }
+          other_final = {
+              'library_id': 'video:other-final',
+              'media_asset_id': 'other-final',
+              'created_at': '2026-08-23T00:00:00+00:00',
+          }
+          merged = merge_final_video_items([duplicate, other_final], [canonical])
+          assert len(merged) == 2, merged
+          assert merged[0]['library_id'].startswith('v3-final:'), merged
+          assert sum(1 for x in merged if x.get('media_asset_id') == canonical['media_asset_id']) == 1
+          print('CANONICAL_FINAL_DEDUPE=PASS')
+          PY

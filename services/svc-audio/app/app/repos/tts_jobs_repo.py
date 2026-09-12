@@ -14,6 +14,8 @@ class TTSJobsRepo:
       - create pricing-enabled jobs as pricing_pending
       - move to queued only after reserve succeeds
       - worker only claims queued
+      - stale running leases are re-queued so a worker/container restart cannot
+        strand an Audio job in running forever
     """
 
     def __init__(self, pool: asyncpg.Pool, *, studio_type: str = "audio"):
@@ -54,6 +56,73 @@ class TTSJobsRepo:
                 user_id,
             )
 
+    async def requeue_stale_running_jobs(
+        self,
+        *,
+        stale_after_seconds: int = 90,
+        max_attempts: int = 3,
+        limit: int = 64,
+    ) -> List[str]:
+        """Recover Audio jobs abandoned by a dead/restarted worker.
+
+        `fetch_next_queued_jobs()` changes claimed jobs to running before provider
+        execution. Without a lease recovery, a process/container failure after that
+        claim leaves the job permanently running and Director will poll forever.
+
+        Audio synthesis is normally short-lived, so an unchanged running row older
+        than the bounded lease is treated as abandoned. We keep the same job id and
+        existing pricing reservation; this is a queue recovery, not a new billable
+        request.
+        """
+        stale_after_seconds = max(30, int(stale_after_seconds))
+        max_attempts = max(1, int(max_attempts))
+        limit = max(1, min(256, int(limit)))
+
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """
+                    SELECT id::text
+                    FROM public.studio_jobs
+                    WHERE studio_type = $1
+                      AND status = 'running'
+                      AND updated_at <= now() - ($2::int * interval '1 second')
+                      AND attempt_count < $3::int
+                    ORDER BY updated_at ASC, created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $4
+                    """,
+                    self.studio_type,
+                    stale_after_seconds,
+                    max_attempts,
+                    limit,
+                )
+                if not rows:
+                    return []
+
+                job_ids = [r["id"] for r in rows]
+                await conn.execute(
+                    """
+                    UPDATE public.studio_jobs
+                       SET status='queued',
+                           next_run_at=now(),
+                           error_code=NULL,
+                           error_message=NULL,
+                           meta_json=COALESCE(meta_json, '{}'::jsonb)
+                                     || jsonb_build_object(
+                                          'worker_recovered_at', now()::text,
+                                          'worker_recovery_reason', 'stale_running_lease'
+                                        ),
+                           updated_at=now()
+                     WHERE id = ANY($1::uuid[])
+                       AND studio_type = $2
+                       AND status = 'running'
+                    """,
+                    job_ids,
+                    self.studio_type,
+                )
+                return job_ids
+
     async def fetch_next_queued_jobs(self, *, limit: int = 1) -> List[str]:
         limit = max(1, int(limit))
 
@@ -82,6 +151,8 @@ class TTSJobsRepo:
                     """
                     UPDATE studio_jobs
                        SET status='running',
+                           meta_json=COALESCE(meta_json, '{}'::jsonb)
+                                     || jsonb_build_object('worker_claimed_at', now()::text),
                            updated_at=now()
                      WHERE id = ANY($1::uuid[])
                     """,

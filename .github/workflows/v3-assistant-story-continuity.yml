@@ -1,0 +1,36 @@
+name: V3 Assistant Story Continuity
+
+on:
+  push:
+    branches:
+      - "feature/v3-assistant-operational-*"
+    paths:
+      - "services/svc-director/app/app/main.py"
+      - "services/svc-director/app/app/run_store.py"
+      - "services/svc-director/tests/test_recent_story_contract.py"
+      - ".github/workflows/v3-assistant-story-continuity.yml"
+  pull_request:
+    paths:
+      - "services/svc-director/app/app/main.py"
+      - "services/svc-director/app/app/run_store.py"
+      - "services/svc-director/tests/test_recent_story_contract.py"
+      - ".github/workflows/v3-assistant-story-continuity.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recent-story-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile Director changed boundaries
+        run: python -m py_compile services/svc-director/app/app/main.py services/svc-director/app/app/run_store.py
+      - name: Run user-scoped recent Story contract
+        run: |
+          python -m pip install --disable-pip-version-check pytest
+          python -m pytest -q services/svc-director/tests/test_recent_story_contract.py

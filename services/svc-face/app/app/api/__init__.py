@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from .health import router as health_router
 from .routes.face_jobs import router as face_jobs_router
+from .routes.face_media import router as face_media_router
 
 
 def build_router() -> APIRouter:
@@ -11,5 +12,6 @@ def build_router() -> APIRouter:
 
     router.include_router(health_router, prefix="/api/health", tags=["health"])
     router.include_router(face_jobs_router, prefix="/api/face", tags=["face"])
+    router.include_router(face_media_router, prefix="/api/face", tags=["face-media"])
 
     return router

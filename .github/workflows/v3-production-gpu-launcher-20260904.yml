@@ -1,0 +1,66 @@
+name: V3 Production GPU Launcher 2026-09-04
+
+on:
+  push:
+    branches:
+      - release/v3-production-deploy-20260903
+    paths:
+      - 'scripts/deploy-v3-production-gpu-20260904.sh'
+      - '.github/workflows/v3-production-gpu-launcher-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release/v3-production-deploy-20260903
+      - name: Bash syntax
+        run: bash -n scripts/deploy-v3-production-gpu-20260904.sh
+      - name: Immutable release pins
+        run: |
+          set -euo pipefail
+          f=scripts/deploy-v3-production-gpu-20260904.sh
+          grep -q 'BACKEND_SHA="b81c3e6a2e74528c059d14c0adffab4a67af1816"' "$f"
+          grep -q 'WEB_SHA="e51de0181bc9dd74c4ace4ec5ab8891f26be83d2"' "$f"
+          grep -q 'hostname -s' "$f"
+          grep -q 'desifaces-gpu' "$f"
+      - name: Production topology safety
+        run: |
+          set -euo pipefail
+          f=scripts/deploy-v3-production-gpu-20260904.sh
+          ! grep -q 'dev-app.desifaces.ai' "$f"
+          ! grep -q 'dev-api.desifaces.ai' "$f"
+          ! grep -q 'desifaces-v3-db' "$f"
+          grep -q 'docker inspect desifaces-db' "$f"
+          grep -q 'docker inspect desifaces-redis' "$f"
+          grep -q 'docker network inspect df-net' "$f"
+          grep -q -- '--no-deps --force-recreate' "$f"
+      - name: Database protection gates
+        run: |
+          set -euo pipefail
+          f=scripts/deploy-v3-production-gpu-20260904.sh
+          grep -q 'pg_dump' "$f"
+          grep -q 'pg_restore' "$f"
+          grep -q 'DB_CLONE_MIGRATION_CERTIFICATION=PASS' "$f"
+          grep -q 'ON_ERROR_STOP=1' "$f"
+          grep -q 'migrations-v3-production-20260903.txt' "$f"
+          grep -q 'DB_BACKUP=PASS' "$f"
+      - name: Web and ingress gates
+        run: |
+          set -euo pipefail
+          f=scripts/deploy-v3-production-gpu-20260904.sh
+          grep -q '127.0.0.1:${WEB_PORT}:3000' "$f"
+          grep -q 'launch-home-20260903.webp' "$f"
+          grep -q 'launch-voice-20260903.webp' "$f"
+          grep -q 'DESIFACES_V3_DIRECTOR_ASSISTANT_20260904' "$f"
+          grep -q 'NGINX_ROLLBACK=ATTEMPTED' "$f"
+          grep -q 'PUBLIC_HTTPS_CERTIFICATION=PASS' "$f"
+          grep -q 'V3 PRODUCTION LAUNCH PASS' "$f"
+      - name: Pass
+        run: echo V3_GPU_LAUNCHER_CERTIFICATION=PASS

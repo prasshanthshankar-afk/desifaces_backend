@@ -129,49 +129,24 @@ class SubjectSpec(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     gender: Optional[Gender] = None
-    relationship_role: Optional[str] = None  # e.g., "partner", "friend", "colleague"
+    relationship_role: Optional[str] = None
 
 
 class CreatorPlatformRequest(BaseModel):
-    """
-    Creator platform face generation request.
-
-    Phase-1:
-      - subject_composition_code: "single_person" | "two_people"
-      - gender: optional hint for single_person
-      - subjects: optional list (lets UI specify M+M, M+F, F+F)
-
-    I2I support:
-      - Old path: source_image_url
-      - New path: source_image_asset_id (returned by /api/face/assets/upload)
-        If source_image_asset_id is present and source_image_url is missing,
-        we automatically mirror asset_id into source_image_url so older code paths work.
-
-    Framing support:
-      - Frontend should send aspect_ratio as the canonical framing control
-      - image_size_hint is provider-facing / derived, not something normal users need to pick
-    """
+    """Creator platform face generation request."""
     model_config = ConfigDict(extra="ignore")
 
-    # Core
     mode: FaceGenerationMode = FaceGenerationMode.TEXT_TO_IMAGE
     language: str = "en"
 
-    # Demographics (optional)
     age_range_code: Optional[str] = None
     skin_tone_code: Optional[str] = None
     region_code: Optional[str] = None
 
-    # ✅ Composition (Phase-1)
     subject_composition_code: Literal["single_person", "two_people"] = "single_person"
-
-    # Optional single-person hint (UI can set)
     gender: Optional[Gender] = None
-
-    # Optional explicit subject list (supports M+M, M+F, F+F)
     subjects: Optional[List[SubjectSpec]] = None
 
-    # Creator config codes
     image_format_code: Optional[str] = None
     use_case_code: Optional[str] = None
     style_code: Optional[str] = None
@@ -179,23 +154,21 @@ class CreatorPlatformRequest(BaseModel):
     clothing_style_code: Optional[str] = None
     platform_code: Optional[str] = None
 
-    # Framing / composition controls
     shot_type_code: Optional[str] = None
     aspect_ratio: AspectRatio = AspectRatio.PORTRAIT
-
-    # Internal/provider-facing image size hint.
     image_size_hint: Optional[ImageSizeHint] = None
 
-    # Generation control
     num_variants: int = Field(default=4, ge=1, le=8)
     user_prompt: Optional[str] = Field(default=None, max_length=1500)
 
-    # Seeding
     seed_mode: Literal["auto", "random", "deterministic"] = "auto"
     seed: Optional[int] = None
     request_nonce: Optional[str] = None
 
-    # I2I (old + new)
+    # Internal orchestration-only pricing context. Director creates one identity
+    # portrait per participant even though the owning story is multi-person.
+    pricing_context: Dict[str, Any] = Field(default_factory=dict)
+
     source_image_url: Optional[str] = None
     source_image_asset_id: Optional[str] = None
 
@@ -209,7 +182,6 @@ class CreatorPlatformRequest(BaseModel):
     forbidden_i2i_changes: Optional[list[str]] = None
     identity_lock_instructions: Optional[str] = Field(default=None, max_length=1500)
 
-    # Future-proof knobs
     facial_features: Dict[str, str] = Field(default_factory=dict)
     preferred_variations: List[str] = Field(default_factory=list)
 
@@ -223,13 +195,10 @@ class CreatorPlatformRequest(BaseModel):
 
         if not (str(out.get("use_case_code") or "").strip()) and str(out.get("use_case") or "").strip():
             out["use_case_code"] = out.get("use_case")
-
         if not (str(out.get("shot_type_code") or "").strip()) and str(out.get("shot_type") or "").strip():
             out["shot_type_code"] = out.get("shot_type")
-
         if not (str(out.get("context_code") or "").strip()) and str(out.get("context") or "").strip():
             out["context_code"] = out.get("context")
-
         if not (str(out.get("style_code") or "").strip()) and str(out.get("style") or "").strip():
             out["style_code"] = out.get("style")
 
@@ -286,17 +255,16 @@ class CreatorPlatformRequest(BaseModel):
 
         if self.image_size_hint is None:
             self.image_size_hint = self._default_size_for_aspect_ratio(self.aspect_ratio)
-        else:
-            if not self._is_size_compatible_with_aspect_ratio(self.aspect_ratio, self.image_size_hint):
-                raise ValueError(
-                    f"image_size_hint {self.image_size_hint.value} is incompatible with aspect_ratio {self.aspect_ratio.value}"
-                )
+        elif not self._is_size_compatible_with_aspect_ratio(self.aspect_ratio, self.image_size_hint):
+            raise ValueError(
+                f"image_size_hint {self.image_size_hint.value} is incompatible with aspect_ratio {self.aspect_ratio.value}"
+            )
 
         return self
 
 
 # ============================================================================
-# PRICING MODELS (canonical cross-studio language)
+# PRICING MODELS
 # ============================================================================
 
 
@@ -323,31 +291,25 @@ class PricingStateView(BaseModel):
 
     state: str
     enabled: Optional[bool] = None
-
     quote_id: Optional[str] = None
     quote_expires_at: Optional[str] = None
     preview_fingerprint: Optional[str] = None
     reservation_id: Optional[str] = None
     variant_code: Optional[str] = None
-
     service_name: Optional[str] = None
     service_action: Optional[str] = None
     sku_code: Optional[str] = None
     unit_type: Optional[str] = None
-
     estimated_units: Optional[str] = None
     reserved_units: Optional[str] = None
     actual_units: Optional[str] = None
     billed_units: Optional[str] = None
     released_units: Optional[str] = None
-
     estimated_amount: Optional[str] = None
     final_amount: Optional[str] = None
-
     amount: Optional[str] = None
     currency: Optional[str] = None
     ledger_entry_id: Optional[str] = None
-
     billing_mode: Optional[str] = None
     billing_account_id: Optional[str] = None
     settlement_mode: Optional[str] = None
@@ -355,7 +317,6 @@ class PricingStateView(BaseModel):
     entitlement_source: Optional[str] = None
     entitlement_reason: Optional[str] = None
     tier_code: Optional[str] = None
-
     source: Optional[str] = None
     reason: Optional[str] = None
     summary: Dict[str, Any] = Field(default_factory=dict)
@@ -385,18 +346,16 @@ class PricingPreviewResponseModel(BaseModel):
 
     studio: str = "face"
     action: str = "generate"
-
     quote_id: str
     quote_expires_at: Optional[str] = None
     preview_fingerprint: Optional[str] = None
-
     pricing: PricingStateView
     balance: Dict[str, Any] = Field(default_factory=dict)
     summary: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ============================================================================
-# RESPONSES (creator platform)
+# RESPONSES
 # ============================================================================
 
 
@@ -408,7 +367,6 @@ class JobCreatedResponse(BaseModel):
     message: str
     estimated_completion_time: str
     config: Dict[str, Any]
-
     pricing: Optional[PricingStateView] = None
 
 
@@ -433,10 +391,8 @@ class JobStatusResponse(BaseModel):
     progress: Optional[Dict[str, Any]] = None
     variants: Optional[List[GeneratedVariant]] = None
     error: Optional[str] = None
-
     pricing: Optional[PricingStateView] = None
     pricing_summary: Optional[PricingSummaryView] = None
-
     created_at: datetime
     updated_at: datetime
 
