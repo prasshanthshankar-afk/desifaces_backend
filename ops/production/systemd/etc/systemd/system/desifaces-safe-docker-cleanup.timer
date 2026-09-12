@@ -1,0 +1,11 @@
+[Unit]
+Description=Run desifaces safe Docker cleanup weekly
+
+[Timer]
+OnCalendar=Sun 02:30
+Persistent=true
+RandomizedDelaySec=30m
+Unit=desifaces-safe-docker-cleanup.service
+
+[Install]
+WantedBy=timers.target
