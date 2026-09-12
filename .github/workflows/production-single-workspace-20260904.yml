@@ -1,0 +1,36 @@
+name: Production Single Workspace 2026-09-04
+
+on:
+  push:
+    branches:
+      - release/v3-production-deploy-20260903
+    paths:
+      - 'scripts/converge-production-workspace-and-deploy-20260904.sh'
+      - '.github/workflows/production-single-workspace-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release/v3-production-deploy-20260903
+      - name: Bash syntax
+        run: bash -n scripts/converge-production-workspace-and-deploy-20260904.sh
+      - name: Production workspace invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=scripts/converge-production-workspace-and-deploy-20260904.sh
+          grep -q 'CANONICAL_ROOT="/home/azureuser/workspace/desifaces"' "$f"
+          grep -q 'LEGACY_ROOT="/home/azureuser/workspace/desifaces-v2"' "$f"
+          grep -q 'source_policy=immutable_export_no_git' "$f"
+          grep -q 'PRODUCTION_SINGLE_PACKAGE=PASS' "$f"
+          grep -q 'certified_launcher_sha' "$f"
+          grep -q 'ACTIVE_MOUNT' "$f"
+          ! grep -q '/home/azureuser/workspace/desifaces-v3' "$f"
+          echo PRODUCTION_SINGLE_WORKSPACE_STATIC=PASS

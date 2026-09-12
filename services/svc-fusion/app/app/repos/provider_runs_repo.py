@@ -36,6 +36,12 @@ class ProviderRunsRepo:
         SET provider_job_id=$2,
             provider_status='submitted',
             response_json=$3::jsonb,
+            meta_json=COALESCE(meta_json, '{}'::jsonb)
+                      || CASE
+                           WHEN COALESCE(meta_json, '{}'::jsonb) ? 'provider_submitted_at'
+                             THEN '{}'::jsonb
+                           ELSE jsonb_build_object('provider_submitted_at', now()::text)
+                         END,
             updated_at=now()
         WHERE id=$1::uuid
         """
@@ -44,13 +50,28 @@ class ProviderRunsRepo:
             await conn.execute(q, run_id, provider_job_id, response_json_str)
 
     async def update_status(self, run_id: str, status: str, meta_json: Optional[Dict[str, Any]] = None) -> None:
+        normalized = str(status or '').strip().lower()
         q = """
         UPDATE provider_runs
         SET provider_status=$2,
-            meta_json=COALESCE($3::jsonb, meta_json),
+            meta_json=COALESCE(meta_json, '{}'::jsonb)
+                      || COALESCE($3::jsonb, '{}'::jsonb)
+                      || jsonb_build_object('provider_last_status_at', now()::text)
+                      || CASE
+                           WHEN $4::text = ANY(ARRAY['running','processing','in_progress','started','finalizing'])
+                            AND NOT (COALESCE(meta_json, '{}'::jsonb) ? 'provider_first_processing_at')
+                             THEN jsonb_build_object('provider_first_processing_at', now()::text)
+                           ELSE '{}'::jsonb
+                         END
+                      || CASE
+                           WHEN $4::text = ANY(ARRAY['succeeded','success','completed','complete','ready','failed','cancelled','canceled'])
+                            AND NOT (COALESCE(meta_json, '{}'::jsonb) ? 'provider_terminal_at')
+                             THEN jsonb_build_object('provider_terminal_at', now()::text)
+                           ELSE '{}'::jsonb
+                         END,
             updated_at=now()
         WHERE id=$1::uuid
         """
         meta_json_str = json.dumps(meta_json) if meta_json is not None else None
         async with self.pool.acquire() as conn:
-            await conn.execute(q, run_id, status, meta_json_str)
+            await conn.execute(q, run_id, status, meta_json_str, normalized)

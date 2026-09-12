@@ -1,0 +1,92 @@
+name: V3 Story Backend Static Certification
+
+on:
+  push:
+    branches:
+      - feature/v3-multiperson-core-20260818
+      - release/v3-studio-completion-20260824
+    paths:
+      - 'services/svc-director/app/app/**'
+      - 'migrations/001_pricing.sql'
+      - 'migrations/2026_08_24_v3_multiperson_pricing_packages.sql'
+      - '.github/workflows/v3-story-backend-static.yml'
+  pull_request:
+    branches:
+      - feature/v3-multiperson-core-20260818
+    paths:
+      - 'services/svc-director/app/app/**'
+      - 'migrations/001_pricing.sql'
+      - 'migrations/2026_08_24_v3_multiperson_pricing_packages.sql'
+      - '.github/workflows/v3-story-backend-static.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  director-and-pricing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: desifaces_v3_ci
+          POSTGRES_USER: desifaces_ci
+          POSTGRES_PASSWORD: desifaces_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U desifaces_ci -d desifaces_v3_ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Checkout V3 backend
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile V3 Story production boundaries
+        run: |
+          python -m py_compile \
+            services/svc-director/app/app/experience_compiler.py \
+            services/svc-director/app/app/studio_preflight_routes.py \
+            services/svc-director/app/app/audio_autoconfigure_routes.py \
+            services/svc-director/app/app/audio_voice_routes.py \
+            services/svc-director/app/app/audio_execution_runtime.py \
+            services/svc-director/app/app/studio_e2e_routes.py \
+            services/svc-director/app/app/fusion_execution.py \
+            services/svc-director/app/app/fusion_execution_resilient.py \
+            services/svc-director/app/app/fusion_execution_performance.py \
+            services/svc-director/app/app/fusion_execution_runtime.py \
+            services/svc-director/app/app/fusion_resilience_routes.py \
+            services/svc-director/app/app/studio_routes_runtime.py
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client >/dev/null
+
+      - name: Validate existing pricing schema plus V3 package migration
+        env:
+          PGPASSWORD: desifaces_ci
+        run: |
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -f migrations/001_pricing.sql
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -f migrations/2026_08_24_v3_multiperson_pricing_packages.sql
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select package_code,pricing_strategy,is_default,is_active from pricing_experience_packages order by package_code;"
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select code,is_active from pricing_variants where code='V3_MULTIPERSON_STORY_PREMIUM';"
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select code,status,default_unit_credits from pricing_skus where code='V3_MULTIPERSON_PREMIUM_SURCHARGE';"
+
+      - name: Assert launch pricing stays component passthrough
+        env:
+          PGPASSWORD: desifaces_ci
+        run: |
+          test "$(psql -At -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select pricing_strategy from pricing_experience_packages where package_code='V3_MULTIPERSON_STANDARD' and is_active=true and is_default=true")" = "component_passthrough"
+          test "$(psql -At -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select is_active::text from pricing_experience_packages where package_code='V3_MULTIPERSON_PREMIUM'")" = "false"
+          test "$(psql -At -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select is_active::text from pricing_variants where code='V3_MULTIPERSON_STORY_PREMIUM'")" = "false"
+          test "$(psql -At -h 127.0.0.1 -U desifaces_ci -d desifaces_v3_ci -c "select status from pricing_skus where code='V3_MULTIPERSON_PREMIUM_SURCHARGE'")" = "inactive"

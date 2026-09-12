@@ -1,0 +1,84 @@
+name: Production Backend Final Runtime 2026-09-04
+
+on:
+  push:
+    branches:
+      - release/v3-production-backend-closeout-20260904
+    paths:
+      - deploy/production/docker-compose.v3-app.production.yml
+      - services/svc-assistant/**
+      - scripts/finalize-production-backend-runtime-from-mac-20260904.sh
+      - .github/workflows/production-backend-final-runtime-20260904.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: postgresql://assistant:assistant@127.0.0.1:5432/assistant
+      REDIS_URL: redis://127.0.0.1:6379/0
+      JWT_SECRET: final-runtime-static-secret
+      JWT_ISSUER: desifaces
+      JWT_AUDIENCE: desifaces_clients
+      PYTHONPATH: services/svc-assistant/app:services/shared/python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Launcher syntax
+        run: bash -n scripts/finalize-production-backend-runtime-from-mac-20260904.sh
+
+      - name: Release model configuration
+        run: |
+          set -euo pipefail
+          grep -q 'DF_DIRECTOR_LLM_MODEL: ${DF_DIRECTOR_LLM_MODEL:-gpt-5.6-sol}' deploy/production/docker-compose.v3-app.production.yml
+          grep -q 'DF_ASSISTANT_LLM_MODEL: ${DF_ASSISTANT_LLM_MODEL:-gpt-5.6-terra}' deploy/production/docker-compose.v3-app.production.yml
+          grep -q 'database_migrations=NONE' scripts/finalize-production-backend-runtime-from-mac-20260904.sh
+          grep -q 'live_db_restore=NONE' scripts/finalize-production-backend-runtime-from-mac-20260904.sh
+          grep -q 'web_action=NONE' scripts/finalize-production-backend-runtime-from-mac-20260904.sh
+          grep -q 'mobile_action=NONE' scripts/finalize-production-backend-runtime-from-mac-20260904.sh
+          echo FINAL_RUNTIME_CONFIG=PASS
+
+      - name: Install Assistant dependencies
+        run: python -m pip install --disable-pip-version-check -r services/svc-assistant/app/requirements.txt pytest
+
+      - name: Compile and test Assistant
+        run: |
+          python -m compileall -q services/svc-assistant/app/app services/shared/python/desifaces_shared
+          python -m pytest -q services/svc-assistant/app/tests
+
+      - name: Canonical knowledge files
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          root=Path('services/svc-assistant/knowledge')
+          expected={'pricing.md','privacy_and_support.md','product_basics.md','troubleshooting.md'}
+          found={p.name for p in root.glob('*.md')}
+          assert found == expected, (found, expected)
+          for p in root.glob('*.md'):
+              p.read_text(encoding='utf-8')
+          assert not list(root.glob('._*'))
+          print('CANONICAL_KNOWLEDGE=PASS')
+          PY
+
+      - name: AppleDouble packaging guard
+        run: |
+          grep -q 'COPYFILE_DISABLE=1' scripts/finalize-production-backend-runtime-from-mac-20260904.sh
+          grep -q 'APPLEDOUBLE' scripts/finalize-production-backend-runtime-from-mac-20260904.sh || true
+          echo APPLEDOUBLE_GUARD=PASS
+
+      - name: Production overlay syntax
+        env:
+          DATABASE_URL: postgresql://prod:prod@desifaces-db:5432/desifaces
+          JWT_SECRET: static-production-secret
+        run: |
+          mkdir -p infra
+          : > infra/.env
+          docker compose --env-file /dev/null -f docker-compose.yml -f deploy/production/docker-compose.v3-app.production.yml config >/dev/null
+          echo PRODUCTION_OVERLAY=PASS

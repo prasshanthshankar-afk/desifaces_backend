@@ -83,6 +83,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=256)
     full_name: str = Field(default="", max_length=200)
+    country_code: str | None = Field(default=None, min_length=2, max_length=2)  # LAUNCH_COUNTRY_CURRENCY_V1
 
 
 class VerifyRegisterEmailRequest(BaseModel):
@@ -101,6 +102,7 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=256)
     device_id: str | None = Field(default=None, max_length=200)
     client_type: str | None = Field(default=None)  # 'web'|'ios'|'android'
+    country_code: str | None = Field(default=None, min_length=2, max_length=2)
 
 
 class AuthUser(BaseModel):
@@ -110,6 +112,7 @@ class AuthUser(BaseModel):
     tier: str | None = None
     is_active: bool = True
     roles: list[str] = Field(default_factory=list)
+    country_code: str | None = None
 
 
 class TokenResponse(BaseModel):
@@ -226,6 +229,47 @@ def _normalize_device_id(v: str | None) -> str | None:
     return s if s else None
 
 
+def _normalize_country_code(v: str | None) -> str | None:
+    s = str(v or "").strip().upper()
+    if not s:
+        return None
+    if len(s) != 2 or not s.isalpha():
+        raise HTTPException(status_code=400, detail="invalid_country_code")
+    return s
+
+
+def _currency_for_country(country_code: str | None) -> str:
+    return "INR" if _normalize_country_code(country_code) == "IN" else "USD"
+
+
+async def _sync_user_country_currency(conn, user_id: str, country_code: str | None) -> str | None:
+    cc = _normalize_country_code(country_code)
+    if not cc:
+        return None
+    await conn.execute(
+        "UPDATE core.users SET country_code=$2, updated_at=now() WHERE id=$1::uuid",
+        user_id, cc,
+    )
+    # Billing accounts may not exist until pricing bootstrap. This update is
+    # deliberately repeatable and is called again after bootstrap.
+    try:
+        await conn.execute(
+            """
+            UPDATE public.pricing_billing_accounts ba
+            SET default_currency=$2, updated_at=now()
+            FROM public.pricing_billing_account_members bam
+            WHERE bam.billing_account_id=ba.id
+              AND bam.user_id=$1::uuid
+              AND bam.status='active'
+              AND ba.default_currency IS DISTINCT FROM $2
+            """,
+            user_id, _currency_for_country(cc),
+        )
+    except Exception:
+        logger.exception("auth_country_billing_currency_sync_failed", extra={"user_id": user_id, "country_code": cc})
+    return cc
+
+
 async def _fetch_roles(conn, user_id: str) -> list[str]:
     rows = await conn.fetch(
         """
@@ -243,7 +287,7 @@ async def _fetch_roles(conn, user_id: str) -> list[str]:
 async def _build_auth_user(conn, user_id: str) -> AuthUser:
     row = await conn.fetchrow(
         """
-        SELECT id::text AS id, email, full_name, tier, is_active
+        SELECT id::text AS id, email, full_name, tier, is_active, country_code
         FROM core.users
         WHERE id = $1::uuid
         """,
@@ -260,6 +304,7 @@ async def _build_auth_user(conn, user_id: str) -> AuthUser:
         tier=row["tier"],
         is_active=bool(row["is_active"]),
         roles=roles,
+        country_code=_normalize_country_code(row["country_code"]),
     )
 
 
@@ -870,6 +915,7 @@ async def _issue_login_tokens(
     ua: str | None,
     device_id: str | None,
     client_type: str | None,
+    country_code: str | None = None,
 ) -> TokenResponse:
     roles = await _fetch_roles(conn, user_id)
 
@@ -878,6 +924,7 @@ async def _issue_login_tokens(
         email=email,
         tier=tier,
         roles=roles,
+        country_code=_normalize_country_code(country_code),
     )
     refresh = mint_refresh_token()
     refresh_hash = hash_refresh_token(refresh)
@@ -928,6 +975,7 @@ async def _issue_login_tokens(
             tier=tier,
             is_active=bool(is_active),
             roles=roles,
+            country_code=_normalize_country_code(country_code),
         ),
     )
 
@@ -977,13 +1025,14 @@ async def register(req: RegisterRequest, request: Request):
 
         row = await conn.fetchrow(
             """
-            INSERT INTO core.users(email, password_hash, full_name, is_active)
-            VALUES ($1, $2, $3, false)
-            RETURNING id::text AS id, email, full_name, tier, is_active
+            INSERT INTO core.users(email, password_hash, full_name, is_active, country_code)
+            VALUES ($1, $2, $3, false, $4)
+            RETURNING id::text AS id, email, full_name, tier, is_active, country_code
             """,
             email,
             pw_hash,
             req.full_name.strip(),
+            _normalize_country_code(req.country_code),
         )
         if not row:
             raise HTTPException(status_code=500, detail="register_failed")
@@ -1061,7 +1110,7 @@ async def verify_register_email(req: VerifyRegisterEmailRequest, request: Reques
 
         user = await conn.fetchrow(
             """
-            SELECT id::text AS id, email, full_name, tier, is_active
+            SELECT id::text AS id, email, full_name, tier, is_active, country_code
             FROM core.users
             WHERE id = $1::uuid
             """,
@@ -1099,6 +1148,7 @@ async def verify_register_email(req: VerifyRegisterEmailRequest, request: Reques
             ua=ua,
             device_id=req.device_id,
             client_type=req.client_type,
+            country_code=user["country_code"],
         )
 
         bootstrap_user_id = user_id
@@ -1227,7 +1277,7 @@ async def login(req: LoginRequest, request: Request):
 
         user = await conn.fetchrow(
             """
-            SELECT id::text AS id, email, full_name, password_hash, tier, is_active
+            SELECT id::text AS id, email, full_name, password_hash, tier, is_active, country_code
             FROM core.users
             WHERE lower(email)=lower($1)
             """,
@@ -1320,6 +1370,10 @@ async def login(req: LoginRequest, request: Request):
             )
             raise HTTPException(status_code=403, detail="email_verification_required")
 
+        login_country = _normalize_country_code(req.country_code) or _normalize_country_code(user["country_code"])
+        if login_country:
+            await _sync_user_country_currency(conn, user["id"], login_country)
+
         response = await _issue_login_tokens(
             conn,
             user_id=user["id"],
@@ -1332,6 +1386,7 @@ async def login(req: LoginRequest, request: Request):
             ua=ua,
             device_id=req.device_id,
             client_type=req.client_type,
+            country_code=login_country,
         )
 
         bootstrap_user_id = user["id"]
@@ -1344,6 +1399,9 @@ async def login(req: LoginRequest, request: Request):
         tier=bootstrap_tier,
         source="svc_core_login",
     )
+    if login_country:
+        async with (await get_pool()).acquire() as conn:
+            await _sync_user_country_currency(conn, bootstrap_user_id, login_country)
 
     return response
 
@@ -1396,7 +1454,8 @@ async def refresh(req: RefreshRequest, request: Request):
                    u.email,
                    u.full_name,
                    u.tier,
-                   u.is_active
+                   u.is_active,
+                   u.country_code
             FROM core.sessions s
             JOIN core.users u ON u.id = s.user_id
             WHERE s.refresh_token_hash = $1
@@ -1455,6 +1514,7 @@ async def refresh(req: RefreshRequest, request: Request):
             email=sess["email"],
             tier=sess["tier"],
             roles=roles,
+            country_code=_normalize_country_code(sess["country_code"]),
         )
 
         await audit_log(
@@ -1480,6 +1540,7 @@ async def refresh(req: RefreshRequest, request: Request):
                 tier=sess["tier"],
                 is_active=bool(sess["is_active"]),
                 roles=roles,
+                country_code=_normalize_country_code(sess["country_code"]),
             ),
         )
 

@@ -1,0 +1,43 @@
+name: Full Stack Sync Fixed Launcher 2026-09-08
+
+on:
+  push:
+    branches:
+      - audit/full-stack-sync-20260908
+    paths:
+      - scripts/run-production-full-stack-sync-fixed-20260908.sh
+      - scripts/apply-production-full-stack-sync-20260908.sh
+      - .github/workflows/full-stack-sync-fixed-launcher-20260908.yml
+  workflow_dispatch:
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: |
+          bash -n scripts/run-production-full-stack-sync-fixed-20260908.sh
+          bash -n scripts/apply-production-full-stack-sync-20260908.sh
+      - name: Certify exact nounset patch contract
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('scripts/apply-production-full-stack-sync-20260908.sh')
+          s=p.read_text()
+          old='  local table="$1" where="$2" file="$RUN/md/${table}.csv"\n'
+          assert s.count(old)==1, s.count(old)
+          new='  local table="$1"\n  local where="$2"\n  local file="$RUN/md/${table}.csv"\n'
+          patched=s.replace(old,new)
+          assert old not in patched
+          assert new in patched
+          Path('/tmp/patched-sync.sh').write_text(patched)
+          PY
+          bash -n /tmp/patched-sync.sh
+      - name: Preservation guards still present
+        run: |
+          grep -Fq 'CUSTOMER_DATA_ACTION=NONE' scripts/apply-production-full-stack-sync-20260908.sh
+          grep -Fq 'PRICING_DATA_ACTION=NONE' scripts/apply-production-full-stack-sync-20260908.sh
+          grep -Fq 'DB_RESTORE_ACTION=NONE' scripts/apply-production-full-stack-sync-20260908.sh
+          grep -Fq 'DB_MASTERDATA_MODE=ADDITIVE_UPSERT_ONLY' scripts/apply-production-full-stack-sync-20260908.sh
+          ! grep -Eq 'docker compose down -v|docker volume prune|DROP DATABASE desifaces|TRUNCATE .*pricing_|pg_restore .* -d desifaces([[:space:]]|$)' scripts/apply-production-full-stack-sync-20260908.sh

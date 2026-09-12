@@ -9,6 +9,7 @@ from app.db import get_db_pool
 from app.repos.longform_jobs_repo import LongformJobsRepo
 from app.repos.longform_segments_repo import LongformSegmentsRepo
 from app.services.longform_orchestrator import stitch_if_ready
+from app.workers.v3_scene_coordinator import v3_scene_coordinator_loop
 
 
 logger = logging.getLogger("svc_fusion_extension.stitch_worker")
@@ -94,5 +95,10 @@ async def stitch_loop() -> None:
         await asyncio.sleep(0.05)
 
 
+async def main() -> None:
+    """Run canonical longform stitching and V3 Story reconciliation together."""
+    await asyncio.gather(stitch_loop(), v3_scene_coordinator_loop())
+
+
 if __name__ == "__main__":
-    asyncio.run(stitch_loop())
+    asyncio.run(main())
