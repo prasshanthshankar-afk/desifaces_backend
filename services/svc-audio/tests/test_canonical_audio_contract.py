@@ -5,6 +5,10 @@ def _source() -> str:
     return Path("app/api/routes/canonical_audio.py").read_text(encoding="utf-8")
 
 
+def _storage_source() -> str:
+    return Path("app/services/azure_storage_service.py").read_text(encoding="utf-8")
+
+
 def test_director_canonical_output_route_is_owned_by_audio_service():
     text = _source()
     assert '@router.get("/jobs/{job_id}/canonical-output"' in text
@@ -32,7 +36,31 @@ def test_canonical_registration_is_idempotent_and_records_lineage():
     assert "on conflict (user_id, sha256) where sha256 is not null" in text.lower()
 
 
-def test_director_resume_read_url_contract_is_present():
+def test_director_resume_read_url_contract_refreshes_sas_from_durable_storage_ref():
     text = _source()
+    storage = _storage_source()
     assert '@router.get("/assets/{media_id}/read-url"' in text
-    assert 'source_audio_url' in text
+    assert "select storage_ref" in text.lower()
+    assert "AzureStorageService().generate_read_url(storage_ref)" in text
+    assert 'meta.get("source_audio_url")' not in text
+    assert "def generate_read_url" in storage
+    assert "generate_blob_sas" in storage
+    assert "BlobSasPermissions(read=True)" in storage
+
+
+def test_read_url_signer_resolves_historical_azure_storage_ref_coordinates():
+    storage = _storage_source()
+    assert "def _resolve_read_coordinates" in storage
+    assert 'raw.startswith("azure://")' in storage
+    assert 'raw.startswith("az://")' in storage
+    assert 'remainder.split("/", 1)' in storage
+    assert 'container_name=container' in storage
+    assert 'blob_name=blob_name' in storage
+    assert '/{container}/{blob_name}?' in storage
+
+
+def test_read_url_signer_preserves_bare_blob_and_container_prefixed_compatibility():
+    storage = _storage_source()
+    assert 'default_prefix = f"{default_container}/"' in storage
+    assert 'normalized.startswith(default_prefix)' in storage
+    assert 'container = default_container' in storage

@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from app.api.deps import get_current_user_id
 from app.db import get_pool
+from app.services.azure_storage_service import AzureStorageService
 
 router = APIRouter(prefix="/api/audio", tags=["audio-canonical-output"])
 
@@ -228,16 +229,16 @@ async def get_audio_asset_read_url(
     user_id: str = Depends(get_current_user_id),
     pool: asyncpg.Pool = Depends(get_pool),
 ) -> AudioReadUrlResponse:
-    """Return the most recent owner-service read URL associated with Audio media.
+    """Return a fresh owner-service read URL for a durable Audio media asset.
 
-    This keeps Director's existing retry/resume contract valid. A later storage
-    adapter can replace source_audio_url with fresh SAS generation without
-    changing the Director API contract.
+    `media_assets.storage_ref` is the durable blob identity. The original
+    `source_audio_url` is intentionally not reused because its SAS token expires.
+    This endpoint re-signs the stored blob on every read/resume/download.
     """
     async with pool.acquire() as conn:
         media = await conn.fetchrow(
             """
-            select meta_json
+            select storage_ref
             from public.media_assets
             where id = $1::uuid
               and user_id = $2::uuid
@@ -250,8 +251,13 @@ async def get_audio_asset_read_url(
         if not media:
             raise HTTPException(status_code=404, detail="audio_media_not_found")
 
-    meta = _jsonb_dict(media["meta_json"])
-    read_url = str(meta.get("source_audio_url") or "").strip()
-    if not read_url:
-        raise HTTPException(status_code=409, detail="audio_read_url_missing")
+    storage_ref = str(media["storage_ref"] or "").strip()
+    if not storage_ref:
+        raise HTTPException(status_code=409, detail="audio_storage_ref_missing")
+
+    try:
+        read_url = AzureStorageService().generate_read_url(storage_ref)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="audio_read_url_unavailable") from exc
+
     return AudioReadUrlResponse(read_url=read_url)
