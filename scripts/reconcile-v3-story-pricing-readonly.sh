@@ -16,15 +16,18 @@ PGUSER="${PGUSER:-postgres}"
 PGDB="${PGDB:-postgres}"
 PSQL=(docker exec -i "$DB" psql -X -v ON_ERROR_STOP=1 -U "$PGUSER" -d "$PGDB")
 
-read -r WORKFLOW_ID STORY_ID OWNER_USER_ID ACCOUNT_ID WF_CREATED WF_UPDATED < <(
+# Preserve timestamps as complete fields. Do not translate the delimiter to spaces:
+# created_at/updated_at contain spaces and were previously split into invalid values.
+IFS='|' read -r WORKFLOW_ID STORY_ID OWNER_USER_ID ACCOUNT_ID WF_CREATED WF_UPDATED < <(
   "${PSQL[@]}" -At -F '|' -c "
     select workflow_id,story_id,owner_user_id,account_id,created_at,updated_at
       from public.v3_studio_workflows
      where story_id is not null and state <> 'canceled'
-     order by updated_at desc,created_at desc limit 1;" | tr '|' ' '
+     order by updated_at desc,created_at desc limit 1;"
 )
 
 [[ -n "${WORKFLOW_ID:-}" ]] || { echo "FAIL: no recent Story workflow"; exit 1; }
+[[ -n "${WF_CREATED:-}" && -n "${WF_UPDATED:-}" ]] || { echo "FAIL: workflow timestamps missing"; exit 1; }
 
 echo "============================================================"
 echo " desifaces V3 — STORY PRICING RECONCILIATION (READ ONLY)"
