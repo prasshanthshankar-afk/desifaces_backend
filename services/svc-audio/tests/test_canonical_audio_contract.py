@@ -46,3 +46,21 @@ def test_director_resume_read_url_contract_refreshes_sas_from_durable_storage_re
     assert "def generate_read_url" in storage
     assert "generate_blob_sas" in storage
     assert "BlobSasPermissions(read=True)" in storage
+
+
+def test_read_url_signer_resolves_historical_azure_storage_ref_coordinates():
+    storage = _storage_source()
+    assert "def _resolve_read_coordinates" in storage
+    assert 'raw.startswith("azure://")' in storage
+    assert 'raw.startswith("az://")' in storage
+    assert 'remainder.split("/", 1)' in storage
+    assert 'container_name=container' in storage
+    assert 'blob_name=blob_name' in storage
+    assert '/{container}/{blob_name}?' in storage
+
+
+def test_read_url_signer_preserves_bare_blob_and_container_prefixed_compatibility():
+    storage = _storage_source()
+    assert 'default_prefix = f"{default_container}/"' in storage
+    assert 'normalized.startswith(default_prefix)' in storage
+    assert 'container = default_container' in storage
