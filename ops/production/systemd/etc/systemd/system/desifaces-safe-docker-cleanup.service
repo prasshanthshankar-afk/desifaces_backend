@@ -1,0 +1,12 @@
+[Unit]
+Description=desifaces safe Docker cleanup - no volume deletion
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/desifaces-safe-docker-cleanup.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
