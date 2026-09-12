@@ -1,0 +1,140 @@
+name: V3 Production Launch Candidate 2026-09-12
+
+on:
+  push:
+    branches:
+      - release/v3-production-launch-20260912
+  pull_request:
+    branches:
+      - release/v3-production-launch-20260912
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v3-production-launch-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Canonical lineage and release evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git fetch origin desifaces-v3 --quiet
+          git merge-base --is-ancestor origin/desifaces-v3 HEAD
+          test -s docs/v3-core/evidence/V3-AUDIO-COGS-PRODUCTION-READINESS-20260912.md
+          test -s docs/v3-core/evidence/V3-PRODUCTION-LAUNCH-INTEGRATION-20260912.md
+          grep -Fq 'Status: `READY`' docs/v3-core/evidence/V3-PRODUCTION-LAUNCH-INTEGRATION-20260912.md
+          echo BACKEND_CANONICAL_LINEAGE=PASS
+          echo BACKEND_EIP_EVIDENCE=PASS
+
+      - name: Story and durable Audio source contracts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python services/svc-director/tests/test_recent_story_contract.py
+          python services/svc-audio/tests/test_v3_audio_durable_read_url_contract.py
+          grep -Fq '@app.get("/api/director/stories/recent"' services/svc-director/app/app/main.py
+          grep -Fq 'p.owner_user_id = $2' services/svc-director/app/app/main.py
+          grep -Fq 'attention_state' services/svc-director/app/app/main.py
+          grep -Fq 'select id,account_id,storage_ref,meta_json' services/svc-audio/app/app/api/routes/v3_audio_output.py
+          grep -Fq 'AzureStorageService().generate_read_url(storage_ref)' services/svc-audio/app/app/api/routes/v3_audio_output.py
+          echo DIRECTOR_RECENT_STORY_CONTRACT=PASS
+          echo AUDIO_DURABLE_READ_URL_CONTRACT=PASS
+
+      - name: Python syntax gate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m compileall -q services/svc-director/app/app
+          python -m compileall -q services/svc-assistant/app/app
+          python -m compileall -q services/svc-audio/app/app
+          echo BACKEND_PYTHON_SYNTAX=PASS
+
+      - name: Production-readiness script syntax and safety markers
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for f in \
+            scripts/apply-v3-audio-cogs-production.sh \
+            scripts/install-v3-production-systemd-bundle.sh \
+            scripts/certify-v3-stripe-live-readiness.sh \
+            scripts/certify-v3-production-economics-costs.sh; do
+            test -s "$f"
+            bash -n "$f"
+          done
+          grep -Fq '2026_09_12_audio_tts_cost_basis.sql' scripts/apply-v3-audio-cogs-production.sh
+          grep -Fq 'AUDIO_TTS_1K_CHARS' migrations/2026_09_12_audio_tts_cost_basis.sql
+          grep -Fq 'desifaces-safe-docker-cleanup.timer' scripts/install-v3-production-systemd-bundle.sh
+          echo PRODUCTION_READINESS_SCRIPT_SYNTAX=PASS
+          echo CUSTOMER_PRICING_CHANGE=NONE
+
+      - name: Build Audio production candidate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker build -f services/svc-audio/app/Dockerfile \
+            -t desifaces-svc-audio:launch-candidate-${GITHUB_SHA:0:12} .
+          echo AUDIO_PRODUCTION_IMAGE_BUILD=PASS
+
+      - name: Build Director production candidate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker build -f services/svc-director/app/Dockerfile.v3 \
+            -t desifaces-svc-director:launch-candidate-${GITHUB_SHA:0:12} .
+          echo DIRECTOR_PRODUCTION_IMAGE_BUILD=PASS
+
+      - name: Build Assistant production candidate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker build -f services/svc-assistant/app/Dockerfile.v3 \
+            -t desifaces-svc-assistant:launch-candidate-${GITHUB_SHA:0:12} .
+          echo ASSISTANT_PRODUCTION_IMAGE_BUILD=PASS
+
+      - name: Candidate image source smoke
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          AUDIO_IMAGE="desifaces-svc-audio:launch-candidate-${GITHUB_SHA:0:12}"
+          DIRECTOR_IMAGE="desifaces-svc-director:launch-candidate-${GITHUB_SHA:0:12}"
+          ASSISTANT_IMAGE="desifaces-svc-assistant:launch-candidate-${GITHUB_SHA:0:12}"
+
+          docker run --rm --entrypoint python "$AUDIO_IMAGE" -m compileall -q /app/app
+          docker run --rm --entrypoint python "$DIRECTOR_IMAGE" -m compileall -q /app/app
+          docker run --rm --entrypoint python "$ASSISTANT_IMAGE" -m compileall -q /app/app
+
+          docker run --rm --entrypoint sh "$AUDIO_IMAGE" -lc \
+            "grep -Fq 'generate_read_url(storage_ref)' /app/app/api/routes/v3_audio_output.py"
+          docker run --rm --entrypoint sh "$DIRECTOR_IMAGE" -lc \
+            "grep -Fq '/api/director/stories/recent' /app/app/main.py"
+          docker run --rm --entrypoint sh "$ASSISTANT_IMAGE" -lc \
+            "test -s /app/app/main.py"
+          echo BACKEND_CANDIDATE_IMAGE_SOURCE_SMOKE=PASS
+
+      - name: Final fail-closed marker
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git diff --check
+          echo BACKEND_PRODUCTION_LAUNCH_CANDIDATE=PASS
+          echo DATABASE_APPLY=NONE
+          echo SYSTEMD_INSTALL=NONE
+          echo STRIPE_LIVE=OFF
+          echo PRODUCTION_TOUCH=NONE
