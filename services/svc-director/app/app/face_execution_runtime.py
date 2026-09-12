@@ -4,8 +4,35 @@ from uuid import UUID
 
 from df_contracts.v3.domain import JobState
 
+from . import face_execution as _face_execution
+from . import face_execution_canonical as _face_execution_canonical
 from .face_execution import _latest_attempt
 from .face_execution_canonical import ParticipantFaceExecutionService as CanonicalParticipantFaceExecutionService
+
+
+_ALLOWED_ASPECT_RATIOS = frozenset({"9:16", "16:9", "1:1"})
+_original_base_compile_context_face_input = _face_execution.compile_context_face_input
+
+
+def compile_context_face_input_with_stage_aspect(context):
+    """Apply the priced stage aspect ratio to both preview and dispatch payloads.
+
+    Multi-Person Face historically inherited a hard-coded 9:16 default from the
+    participant compiler. The stage metadata is the durable generation setting:
+    pricing persists it before preview and dispatch reloads the same stage, so the
+    provider request cannot drift from the user's quoted format.
+    """
+    studio_input = dict(_original_base_compile_context_face_input(context))
+    raw = str((context.metadata or {}).get("aspect_ratio") or "9:16").strip()
+    studio_input["aspect_ratio"] = raw if raw in _ALLOWED_ASPECT_RATIOS else "9:16"
+    return studio_input
+
+
+# Base preview resolves the function from face_execution while canonical dispatch
+# imported the same function into face_execution_canonical. Patch both references
+# once during runtime assembly so dev and production execute the same contract.
+_face_execution.compile_context_face_input = compile_context_face_input_with_stage_aspect
+_face_execution_canonical.compile_context_face_input = compile_context_face_input_with_stage_aspect
 
 
 class ParticipantFaceExecutionService(CanonicalParticipantFaceExecutionService):
@@ -171,3 +198,9 @@ class ParticipantFaceExecutionService(CanonicalParticipantFaceExecutionService):
             result=result,
         )
         return result
+
+
+__all__ = [
+    "ParticipantFaceExecutionService",
+    "compile_context_face_input_with_stage_aspect",
+]
