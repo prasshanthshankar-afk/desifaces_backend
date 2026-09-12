@@ -19,6 +19,17 @@ Branch/PR: `fix/v3-audio-cogs-production-readiness-20260912` / PR #18.
 - Story economics must report `COST_INCOMPLETE` / unavailable margin when any billable leaf SKU has no effective cost row.
 - Production applies the exact migration blob through `scripts/apply-v3-audio-cogs-production.sh` only after DEV certification passes.
 
+## Durable Audio read/download correction
+
+Branch/PR: `fix/v3-audio-read-url-refresh-20260912` / PR #19.
+
+- Audio media identity is `media_assets.storage_ref`; signed generation URLs are not durable identity.
+- `/api/audio/assets/{media_id}/read-url` must generate a fresh read-only Azure SAS on every resume/play/download instead of reusing the original `source_audio_url` token.
+- Web Multi-Person must hydrate approved/awaiting-review Audio stage `media_id` values through the Audio read-url endpoint and prefer that refreshed URL over any persisted stage URL.
+- The shared Web artifact action must preserve the actual Audio format (MP3/WAV/M4A/AAC/OGG/WebM) rather than forcing every Audio result to `audio/mpeg`/`.mp3`.
+- DEV certification must prove: fresh SAS retrieves non-empty Azure bytes; `/api/media/download` returns HTTP 200 for that SAS; DEV Web uses the refreshed stage URL; Director and Piku remain unchanged.
+- Production must carry the exact PR #19 Audio service files and the matching Web production-candidate component before browser acceptance. Do not reintroduce persisted expiring SAS URLs as durable state.
+
 ## Scheduler carry-forward
 
 The existing DEV recurring jobs are systemd timers, not crontab entries:
@@ -53,7 +64,7 @@ Cutover order:
 
 ## Web release
 
-The current DEV Web hotfix branch diverges from Web `main`; do not deploy production by blindly replacing `main` with the hotfix branch. Integrate the certified component deltas (Piku + Multi-Person artifact hydration) onto the current production release baseline, rebuild once, and certify authenticated Story/Piku/browser behavior before cutover.
+The current DEV Web hotfix branch diverges from Web `main`; do not deploy production by blindly replacing `main` with the hotfix branch. Integrate the certified component deltas (Piku + Multi-Person artifact hydration + durable Audio rehydration + canonical download actions) onto the current production release baseline, rebuild once, and certify authenticated Story/Piku/browser behavior before cutover.
 
 ## Mobile parity
 
@@ -64,7 +75,7 @@ Required parity contract:
 
 - Multi-Person Creative Director and recent Story continuation.
 - Story stage progression Face -> Audio -> Fusion -> Story Final.
-- Durable Face artifact rehydration from `media_id` and canonical stage-aware status.
+- Durable Face and Audio artifact rehydration from `media_id` and canonical stage-aware status.
 - Piku context, privacy policy, lightweight bold rendering and `Continue story` navigation action.
 - Saved Work, spending/transactions, plans/credits and account state from shared backend APIs.
 - Native billing rails remain platform-native; product entitlement/credit state remains shared and authoritative.
@@ -75,15 +86,16 @@ PR #11 remains draft until TypeScript/source/build gates and physical-device acc
 ## Production order
 
 1. DEV Audio COGS correction + complete economics certification.
-2. Export/certify exact DEV systemd scheduler bundle.
-3. Complete Web artifact/Piku browser acceptance.
-4. Complete mobile parity build/device acceptance.
-5. Integrate backend/Web/mobile release branches onto canonical production baselines.
-6. Apply production internal COGS migration.
-7. Install production systemd timers.
-8. Deploy backend/Web application release.
-9. Run production health/authenticated Story/Piku/saved-work smoke tests.
-10. Provision and certify Stripe Live, then bounded real-money smoke/refund.
-11. Release native mobile builds after shared backend production acceptance.
+2. DEV durable Audio read/download certification.
+3. Export/certify exact DEV systemd scheduler bundle.
+4. Complete Web artifact/Piku/browser acceptance.
+5. Complete mobile parity build/device acceptance.
+6. Integrate backend/Web/mobile release branches onto canonical production baselines.
+7. Apply production internal COGS migration.
+8. Install production systemd timers.
+9. Deploy backend/Web application release including durable Audio read-url refresh.
+10. Run production health/authenticated Story/Piku/saved-work/audio-download smoke tests.
+11. Provision and certify Stripe Live, then bounded real-money smoke/refund.
+12. Release native mobile builds after shared backend production acceptance.
 
 No production step is considered complete unless its corresponding fail-closed gate reports PASS.
