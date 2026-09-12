@@ -1,0 +1,85 @@
+name: V3 Production Cutover Launcher 2026-09-12
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/launch-v3-production-20260912.sh'
+      - '.github/workflows/v3-production-cutover-launcher-20260912.yml'
+  push:
+    branches:
+      - desifaces-v3
+    paths:
+      - 'scripts/launch-v3-production-20260912.sh'
+      - '.github/workflows/v3-production-cutover-launcher-20260912.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: bash -n scripts/launch-v3-production-20260912.sh
+
+      - name: Immutable release pins
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          S=scripts/launch-v3-production-20260912.sh
+          grep -Fq 'BACKEND_SHA="18dfd6a3a4941307a466960108e4573f3b9ff555"' "$S"
+          grep -Fq 'WEB_SHA="21d1c8d4083c7f9705b957807e12d3d2bdf518d8"' "$S"
+          grep -Fq 'MOBILE_SHA="b92e58a92eca115508804dd68dbc99cab086441f"' "$S"
+          grep -Fq 'source_policy=immutable_export_no_git' "$S"
+          grep -Fq 'PACKAGE_SHA256_GATE=PASS' "$S"
+          echo IMMUTABLE_RELEASE_PINS=PASS
+
+      - name: Production fail-closed guards
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          S=scripts/launch-v3-production-20260912.sh
+          grep -Fq 'DESIFACES_PRODUCTION_CUTOVER_APPROVED:-' "$S"
+          grep -Fq '== "Darwin"' "$S"
+          grep -Fq 'desifaces-gpu' "$S"
+          grep -Fq 'production cutover forbidden on DEV' "$S"
+          grep -Fq 'DF_PRODUCTION_CONFIRM=YES' "$S"
+          grep -Fq 'DF_PRODUCTION_HOSTNAME="$HOST"' "$S"
+          grep -Fq 'run-canonical-production-deploy-20260904.sh' "$S"
+          grep -Fq 'apply-v3-audio-cogs-production.sh' "$S"
+          grep -Fq 'install-v3-production-systemd-bundle.sh' "$S"
+          echo PRODUCTION_FAIL_CLOSED_GUARDS=PASS
+
+      - name: Stripe and mobile separation guards
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          S=scripts/launch-v3-production-20260912.sh
+          grep -Fq 'certify-v3-stripe-live-readiness.sh prepare' "$S"
+          grep -Fq 'STRIPE_LIVE_ACTION=INSPECTION_ONLY' "$S"
+          grep -Fq 'MOBILE_STORE_ACTION=NONE' "$S"
+          ! grep -Eq 'certify-v3-stripe-live-readiness\.sh[[:space:]]+cutover' "$S"
+          ! grep -Eq 'eas-cli|--auto-submit|app-store|play-store' "$S"
+          echo STRIPE_MOBILE_SEPARATION=PASS
+
+      - name: Existing production runner safety syntax
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash -n deploy/production/run-canonical-production-deploy-20260904.sh
+          bash -n scripts/apply-v3-audio-cogs-production.sh
+          bash -n scripts/install-v3-production-systemd-bundle.sh
+          bash -n scripts/certify-v3-stripe-live-readiness.sh
+          grep -Fq 'DB_BACKUP=PASS' deploy/production/run-canonical-production-deploy-20260904.sh
+          grep -Fq 'DB_CLONE_MIGRATION_CERTIFICATION=PASS' deploy/production/run-canonical-production-deploy-20260904.sh
+          grep -Fq 'CUSTOMER_PRICING_IMMUTABILITY=PASS' scripts/apply-v3-audio-cogs-production.sh
+          grep -Fq 'SCHEDULER_BUNDLE_HASH_GATE=PASS' scripts/install-v3-production-systemd-bundle.sh
+          echo EXISTING_PRODUCTION_SAFETY=PASS
+
+      - name: Final marker
+        run: |
+          echo V3_PRODUCTION_CUTOVER_LAUNCHER_CERTIFICATION=PASS
+          echo PRODUCTION_EXECUTION=NONE
