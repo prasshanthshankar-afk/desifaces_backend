@@ -37,12 +37,12 @@ fetch(){
 }
 fetch services/svc-audio/app/app/api/routes/canonical_audio.py "$SRC/canonical_audio.py"
 fetch services/svc-audio/app/app/services/azure_storage_service.py "$SRC/azure_storage_service.py"
-fetch services/svc-audio/app/app/api/__init__.py "$SRC/api_init.py"
+fetch services/svc-audio/app/app/api/__init__.py "$SRC/api_init_reference.py"
 fetch scripts/deploy-certify-v3-audio-download-refresh-dev-v2-20260912.sh "$SRC/v2.sh"
 chmod +x "$SRC/v2.sh"
 bash -n "$SRC/v2.sh" || fail "V2 certification script syntax invalid"
 
-grep -q 'canonical_audio_router' "$SRC/api_init.py" || fail "canonical router registration missing from source"
+grep -q 'canonical_audio_router' "$SRC/api_init_reference.py" || fail "canonical router registration missing from source"
 grep -q 'AzureStorageService().generate_read_url(storage_ref)' "$SRC/canonical_audio.py" || fail "fresh read-url source contract missing"
 grep -q 'def generate_read_url' "$SRC/azure_storage_service.py" || fail "storage signer source contract missing"
 echo "AUDIO_FRESH_SAS_SOURCE_CONTRACT=PASS"
@@ -70,6 +70,34 @@ backup_runtime_file canonical_audio.py "$CANONICAL_PATH"
 backup_runtime_file azure_storage_service.py "$STORAGE_PATH"
 backup_runtime_file api_init.py "$API_INIT_PATH"
 
+grep -Fxq api_init.py "$EXISTED" || fail "existing Audio API router initializer not found"
+grep -Fxq azure_storage_service.py "$EXISTED" || fail "existing Audio storage service not found"
+
+# Patch the *installed* API initializer minimally. Do not replace it wholesale
+# with a newer source-tree initializer because this runtime may predate other
+# routes as well. Only add canonical Audio import/include when absent.
+cp "$BACKUP/api_init.py" "$SRC/api_init_runtime.py"
+python3 - "$SRC/api_init_runtime.py" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); s=p.read_text()
+imp='    from app.api.routes.canonical_audio import router as canonical_audio_router\n'
+inc='    router.include_router(canonical_audio_router)\n'
+if 'canonical_audio_router' not in s:
+    import_anchor='    from app.api.routes.tts_jobs import router as tts_jobs_router\n'
+    include_anchor='    router.include_router(tts_jobs_router)\n'
+    if import_anchor not in s or include_anchor not in s:
+        raise SystemExit('FAIL: installed Audio API initializer shape is not recognized')
+    s=s.replace(import_anchor,import_anchor+imp,1)
+    s=s.replace(include_anchor,include_anchor+inc,1)
+if imp.strip() not in s or inc.strip() not in s:
+    raise SystemExit('FAIL: canonical Audio router could not be registered minimally')
+p.write_text(s)
+PY
+
+grep -q 'canonical_audio_router' "$SRC/api_init_runtime.py" || fail "runtime router patch missing"
+echo "AUDIO_API_INIT_MINIMAL_PATCH=PASS"
+
 SUCCESS=0
 restore_one(){
   local key="$1" path="$2"
@@ -92,11 +120,12 @@ cleanup(){
 }
 trap cleanup EXIT
 
-# The parent package directories are known to exist because app is importable.
+# Install exactly two owner-service implementation files plus the minimal route
+# registration patch into the DEV container writable layer.
 docker exec "$AUDIO_C" mkdir -p "$APP_ROOT/api/routes" "$APP_ROOT/services"
 docker cp "$SRC/canonical_audio.py" "$AUDIO_C:$CANONICAL_PATH"
 docker cp "$SRC/azure_storage_service.py" "$AUDIO_C:$STORAGE_PATH"
-docker cp "$SRC/api_init.py" "$AUDIO_C:$API_INIT_PATH"
+docker cp "$SRC/api_init_runtime.py" "$AUDIO_C:$API_INIT_PATH"
 docker restart "$AUDIO_C" >/dev/null
 
 READY=false
