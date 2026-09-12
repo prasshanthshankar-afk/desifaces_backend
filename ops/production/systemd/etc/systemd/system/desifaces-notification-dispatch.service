@@ -1,0 +1,12 @@
+[Unit]
+Description=desifaces notification dispatch one-shot job
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/desifaces-notification-dispatch.sh
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
