@@ -1,0 +1,11 @@
+[Unit]
+Description=Run desifaces.ai notification dispatch every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=desifaces-notification-dispatch.service
+
+[Install]
+WantedBy=timers.target
