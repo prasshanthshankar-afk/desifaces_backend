@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 REPO="prasshanthshankar-afk/desifaces_backend"
-BRANCH="ops/stripe-live-catalog-20260912"
+SOURCE_REF="2e99a62f645b660ec18aea6f9cee484357444263"
 SCRIPT="/tmp/provision-desifaces-stripe-live.py"
 
 cleanup() {
@@ -18,17 +18,13 @@ echo " PRODUCTION_DB_TOUCH=NONE"
 echo " PRODUCTION_RUNTIME_TOUCH=NONE"
 echo " CUSTOMER_CHARGE=NONE"
 echo "============================================================"
+echo "source_ref=$SOURCE_REF"
 
 command -v gh >/dev/null 2>&1 || { echo "FAIL: gh is required"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "FAIL: python3 is required"; exit 1; }
 
-HEAD_SHA="$(gh api "repos/${REPO}/branches/${BRANCH}" --jq .commit.sha)"
-[[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "FAIL: could not resolve branch SHA"; exit 1; }
-
-echo "source_ref=$HEAD_SHA"
-
 gh api \
-  "repos/${REPO}/contents/scripts/ops/stripe/provision_desifaces_stripe_live_catalog.py?ref=${HEAD_SHA}" \
+  "repos/${REPO}/contents/scripts/ops/stripe/provision_desifaces_stripe_live_catalog.py?ref=${SOURCE_REF}" \
   --jq .content \
 | base64 -d > "$SCRIPT"
 
