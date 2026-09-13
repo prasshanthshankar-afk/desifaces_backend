@@ -20,10 +20,15 @@ need(){ command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"; 
 
 [[ "${DESIFACES_PRODUCTION_CUTOVER_APPROVED:-}" == "YES" ]] || \
   fail "set DESIFACES_PRODUCTION_CUTOVER_APPROVED=YES for this one production cutover"
+[[ -n "${DESIFACES_PRODUCTION_HOSTNAME:-}" ]] || \
+  fail "set DESIFACES_PRODUCTION_HOSTNAME to the exact certified production hostname"
 
 HOST="$(hostname -s 2>/dev/null || hostname)"
-[[ "$HOST" == desifaces-gpu* ]] || fail "run only on production desifaces-gpu; current host=$HOST"
+[[ "$HOST" == "$DESIFACES_PRODUCTION_HOSTNAME" ]] || \
+  fail "production host mismatch actual=$HOST expected=$DESIFACES_PRODUCTION_HOSTNAME"
 [[ "$HOST" != "desifaces-dev" ]] || fail "production cutover forbidden on DEV"
+[[ "$HOST" != *non-prod* && "$HOST" != *nonprod* ]] || \
+  fail "production cutover forbidden on non-production hostname: $HOST"
 
 for x in gh tar docker curl python3 sudo nginx sha256sum; do need "$x"; done
 docker compose version >/dev/null 2>&1 || fail "docker compose v2 is required"
@@ -88,6 +93,7 @@ mobile_parity_sha=$MOBILE_SHA
 created_utc=$STAMP
 source_policy=immutable_github_export_no_git
 production_approval=explicit_one_shot
+production_hostname=$HOST
 EOF
 
 mkdir -p "$STAGE/infra"
