@@ -1,0 +1,122 @@
+name: V3 Production Preserve-Data Cutover 2026-09-12
+
+on:
+  pull_request:
+    branches:
+      - desifaces-v3
+    paths:
+      - scripts/launch-v3-production-preserve-data-20260912.sh
+      - docs/v3-core/evidence/V3-PRODUCTION-DATA-PRESERVATION-20260912.md
+      - .github/workflows/v3-production-preserve-data-cutover-20260912.yml
+  push:
+    branches:
+      - fix/v3-production-preserve-data-cutover-20260912
+      - desifaces-v3
+    paths:
+      - scripts/launch-v3-production-preserve-data-20260912.sh
+      - docs/v3-core/evidence/V3-PRODUCTION-DATA-PRESERVATION-20260912.md
+      - .github/workflows/v3-production-preserve-data-cutover-20260912.yml
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: bash -n scripts/launch-v3-production-preserve-data-20260912.sh
+
+      - name: Exact production and release identity
+        run: |
+          set -euo pipefail
+          S=scripts/launch-v3-production-preserve-data-20260912.sh
+          grep -q 'EXPECTED_GUEST_HOST="desifaces-gpu"' "$S"
+          grep -q 'EXPECTED_AZURE_RESOURCE="desifaces-gpu-non-prod"' "$S"
+          grep -q 'EXPECTED_PUBLIC_IP="52.252.188.211"' "$S"
+          grep -q 'CURRENT_PROD_RUNTIME_SHA="793db700365e6d0fcbf9345b97737afac497afc0"' "$S"
+          grep -q 'BACKEND_SHA="18dfd6a3a4941307a466960108e4573f3b9ff555"' "$S"
+          grep -q 'WEB_SHA="21d1c8d4083c7f9705b957807e12d3d2bdf518d8"' "$S"
+          echo PRODUCTION_IDENTITY_AND_RELEASE_PINS=PASS
+
+      - name: Production data preservation contract
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('scripts/launch-v3-production-preserve-data-20260912.sh').read_text()
+          required = [
+            'PROD_DATA_SOURCE=EXISTING_PRODUCTION_ONLY',
+            'DEV_DATA_IMPORT=NONE',
+            'LIVE_DB_RESTORE=NONE',
+            'LIVE_DB_MIGRATION_COUNT=1',
+            'POSTGRES_CONTAINER_RECREATE=NONE',
+            'REDIS_CONTAINER_RECREATE=NONE',
+            'MIGRATION_REL="migrations/2026_09_12_audio_tts_cost_basis.sql"',
+            'MIGRATION_BLOB="f0c9bc640b183571e8f8ee5eccb6709b0b81fa59"',
+          ]
+          for marker in required:
+              assert marker in s, marker
+          forbidden = [
+            'migrations-v3-production-20260903.txt',
+            'docker compose down -v',
+            'docker volume prune',
+            'DROP DATABASE desifaces',
+            'TRUNCATE ',
+            'align-production-env-to-dev',
+            'apply-production-full-stack-sync',
+          ]
+          for marker in forbidden:
+              assert marker not in s, marker
+          # Exactly one live migration application path: the guarded Audio COGS runner.
+          assert s.count('apply-v3-audio-cogs-production.sh') == 2  # existence gate + execution
+          print('PRODUCTION_DATA_PRESERVATION_CONTRACT=PASS')
+          PY
+
+      - name: Clone restore can never target live DB
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('scripts/launch-v3-production-preserve-data-20260912.sh').read_text()
+          restore='docker exec -i desifaces-db pg_restore -U "$DB_USER" -d "$VALIDATE_DB"'
+          assert s.count('pg_restore') == 1, s.count('pg_restore')
+          assert restore in s
+          assert 'pg_restore -U "$DB_USER" -d "$DB_NAME"' not in s
+          assert 'VALIDATION_DB_RESTORE_TO_LIVE=NONE' in s
+          print('LIVE_DB_RESTORE_FORBIDDEN=PASS')
+          PY
+
+      - name: Changed runtime scope is bounded
+        run: |
+          set -euo pipefail
+          S=scripts/launch-v3-production-preserve-data-20260912.sh
+          grep -q 'build svc-audio svc-audio-worker svc-director svc-director-worker' "$S"
+          grep -q 'up -d --no-deps --force-recreate svc-audio svc-audio-worker svc-director svc-director-worker' "$S"
+          ! grep -q 'force-recreate desifaces-db' "$S"
+          ! grep -q 'force-recreate desifaces-redis' "$S"
+          grep -q 'ASSISTANT_RUNTIME_RECREATE=NONE' "$S"
+          echo BOUNDED_RUNTIME_SCOPE=PASS
+
+      - name: Customer pricing immutability guard exists
+        run: |
+          set -euo pipefail
+          grep -q 'CLONE_PRICE_BEFORE' scripts/launch-v3-production-preserve-data-20260912.sh
+          grep -q 'CLONE_PRICE_AFTER' scripts/launch-v3-production-preserve-data-20260912.sh
+          grep -q 'CUSTOMER_PRICING_IMMUTABILITY=PASS' scripts/apply-v3-audio-cogs-production.sh
+          echo CUSTOMER_PRICING_IMMUTABILITY_GUARD=PASS
+
+      - name: Evidence contract
+        run: |
+          set -euo pipefail
+          E=docs/v3-core/evidence/V3-PRODUCTION-DATA-PRESERVATION-20260912.md
+          grep -q 'DEV -> PROD database restore' "$E"
+          grep -q 'ALLOWLISTED_LIVE_DB_MIGRATIONS=1' "$E"
+          grep -q 'existing production PostgreSQL database' "$E"
+          echo EIP_DATA_PRESERVATION_EVIDENCE=PASS
+
+      - name: Final marker
+        run: echo V3_PRODUCTION_PRESERVE_DATA_CUTOVER_CERTIFICATION=PASS
