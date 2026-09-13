@@ -5,6 +5,7 @@ SOURCE_REF="7ed76b31775f0e81c094b7ba62283e1eb3e78732"
 RAW_BASE="https://raw.githubusercontent.com/prasshanthshankar-afk/desifaces_backend"
 MIGRATION_PATH="migrations/2026_09_13_stripe_live_launch_price_mappings.sql"
 MIG="/tmp/2026_09_13_stripe_live_launch_price_mappings.sql"
+CERT="/tmp/2026_09_13_stripe_live_launch_price_cert.sql"
 BACKUP_DIR="/home/azureuser/backups"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP="${BACKUP_DIR}/desifaces-stripe-live-mapping-pre-${TS}.sql"
@@ -23,6 +24,44 @@ mkdir -p "$BACKUP_DIR"
 
 curl -fsSL "${RAW_BASE}/${SOURCE_REF}/${MIGRATION_PATH}" -o "$MIG"
 [[ -s "$MIG" ]] || fail "mapping migration download failed"
+
+cat > "$CERT" <<'SQL'
+\pset pager off
+select plan_code, interval_code, currency, country_code, price_money,
+       stripe_price_id, metadata_json->>'stripe_env' as stripe_env
+from public.pricing_plan_prices
+where tier_code in ('pro','business')
+  and is_active=true and is_public=true and self_serve=true
+order by tier_code, interval_code, currency;
+
+select code, credits, currency, country_code, price_money,
+       metadata_json->>'stripe_price_id' as stripe_price_id,
+       metadata_json->>'stripe_env' as stripe_env
+from public.pricing_credit_packs
+where code in (
+  'PACK_USD_1000','PACK_USD_5000','PACK_USD_15000',
+  'PACK_INR_1000','PACK_INR_5000','PACK_INR_15000'
+)
+order by code;
+
+select case when
+  (select count(*)
+     from public.pricing_plan_prices
+    where tier_code in ('pro','business')
+      and is_active=true and is_public=true and self_serve=true
+      and metadata_json->>'stripe_env'='live'
+      and stripe_price_id like 'price_%') = 8
+  and
+  (select count(*)
+     from public.pricing_credit_packs
+    where code in (
+      'PACK_USD_1000','PACK_USD_5000','PACK_USD_15000',
+      'PACK_INR_1000','PACK_INR_5000','PACK_INR_15000'
+    )
+      and metadata_json->>'stripe_env'='live'
+      and metadata_json->>'stripe_price_id' like 'price_%') = 6
+then 'PASS' else 'FAIL' end as stripe_live_mapping_gate;
+SQL
 
 echo "============================================================"
 echo " desifaces — STRIPE LIVE PROD DB MAPPING"
@@ -47,25 +86,9 @@ echo "STRIPE_LIVE_DB_MAPPING_APPLY=PASS"
 
 echo
 echo "===== 3. EXACT POST-MAPPING CERTIFICATION ====="
-docker exec desifaces-db sh -lc 'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -P pager=off -c "
-select plan_code, interval_code, currency, country_code, price_money, stripe_price_id, metadata_json->>\x27stripe_env\x27 as stripe_env
-from public.pricing_plan_prices
-where tier_code in (\x27pro\x27,\x27business\x27) and is_active=true and is_public=true and self_serve=true
-order by tier_code, interval_code, currency;
-
-select code, credits, currency, country_code, price_money, metadata_json->>\x27stripe_price_id\x27 as stripe_price_id, metadata_json->>\x27stripe_env\x27 as stripe_env
-from public.pricing_credit_packs
-where code in (\x27PACK_USD_1000\x27,\x27PACK_USD_5000\x27,\x27PACK_USD_15000\x27,\x27PACK_INR_1000\x27,\x27PACK_INR_5000\x27,\x27PACK_INR_15000\x27)
-order by code;
-"'
-
-GATE="$(docker exec desifaces-db sh -lc 'psql -X -At -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
-select case when
-  (select count(*) from public.pricing_plan_prices where tier_code in (\x27pro\x27,\x27business\x27) and is_active=true and is_public=true and self_serve=true and metadata_json->>\x27stripe_env\x27=\x27live\x27 and stripe_price_id like \x27price_%\x27)=8
-  and
-  (select count(*) from public.pricing_credit_packs where code in (\x27PACK_USD_1000\x27,\x27PACK_USD_5000\x27,\x27PACK_USD_15000\x27,\x27PACK_INR_1000\x27,\x27PACK_INR_5000\x27,\x27PACK_INR_15000\x27) and metadata_json->>\x27stripe_env\x27=\x27live\x27 and metadata_json->>\x27stripe_price_id\x27 like \x27price_%\x27)=6
-then \x27PASS\x27 else \x27FAIL\x27 end;
-"')"
+CERT_OUT="$(docker exec -i desifaces-db sh -lc 'psql -X -At -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$CERT")"
+printf '%s\n' "$CERT_OUT"
+GATE="$(printf '%s\n' "$CERT_OUT" | tail -n 1)"
 [[ "$GATE" == "PASS" ]] || fail "post-mapping certification failed"
 
 echo "STRIPE_LIVE_DB_MAPPING_GATE=PASS"
