@@ -1,0 +1,62 @@
+name: V3 Production Uploaded Web Source 2026-09-12
+
+on:
+  pull_request:
+    branches: [desifaces-v3]
+    paths:
+      - scripts/launch-v3-production-preserve-data-uploaded-web-20260912.sh
+      - .github/workflows/v3-production-uploaded-web-source-20260912.yml
+  push:
+    branches:
+      - fix/v3-production-uploaded-web-source-20260912
+      - desifaces-v3
+    paths:
+      - scripts/launch-v3-production-preserve-data-uploaded-web-20260912.sh
+      - .github/workflows/v3-production-uploaded-web-source-20260912.yml
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: bash -n scripts/launch-v3-production-preserve-data-uploaded-web-20260912.sh
+
+      - name: Preserve-data inheritance
+        run: |
+          set -euo pipefail
+          S=scripts/launch-v3-production-preserve-data-uploaded-web-20260912.sh
+          grep -q 'BASE_COMMIT="92d5568b34c1eb808b76f8461d92507409fa11fa"' "$S"
+          grep -q 'BASE_BLOB="f496ef1e3c49953ee4880a3e3e5c81e25b4baea5"' "$S"
+          grep -q 'prod_data_source=EXISTING_PRODUCTION_ONLY' "$S"
+          grep -q 'dev_data_import=FORBIDDEN' "$S"
+          grep -q 'live_db_restore=FORBIDDEN' "$S"
+          echo PRESERVE_DATA_INHERITANCE=PASS
+
+      - name: Uploaded Web source is fail-closed
+        run: |
+          set -euo pipefail
+          S=scripts/launch-v3-production-preserve-data-uploaded-web-20260912.sh
+          grep -q 'DF_WEB_SOURCE_TARBALL_URL is required' "$S"
+          grep -q 'DF_WEB_SOURCE_TARBALL_SHA256 must be a 64-char SHA-256' "$S"
+          grep -q 'uploaded Web tarball SHA-256 mismatch' "$S"
+          grep -q 'uploaded Web tarball missing web/Dockerfile' "$S"
+          grep -q 'SOURCE_ACCESS_PREMUTATION_GATE=PASS' "$S"
+          ! grep -q 'echo.*DF_WEB_SOURCE_TARBALL_URL' "$S"
+          echo UPLOADED_WEB_SOURCE_FAIL_CLOSED=PASS
+
+      - name: Exact release pins
+        run: |
+          set -euo pipefail
+          S=scripts/launch-v3-production-preserve-data-uploaded-web-20260912.sh
+          grep -q 'BACKEND_SHA="18dfd6a3a4941307a466960108e4573f3b9ff555"' "$S"
+          grep -q 'WEB_SHA="21d1c8d4083c7f9705b957807e12d3d2bdf518d8"' "$S"
+          echo EXACT_RELEASE_PINS=PASS
+
+      - name: Final marker
+        run: echo UPLOADED_WEB_SOURCE_ADAPTER_CERTIFICATION=PASS
