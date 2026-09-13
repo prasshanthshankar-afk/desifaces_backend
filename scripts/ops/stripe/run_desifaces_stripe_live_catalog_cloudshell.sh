@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPO="prasshanthshankar-afk/desifaces_backend"
+RAW_BASE="https://raw.githubusercontent.com/prasshanthshankar-afk/desifaces_backend"
 SOURCE_REF="2e99a62f645b660ec18aea6f9cee484357444263"
 SCRIPT="/tmp/provision-desifaces-stripe-live.py"
 
@@ -14,19 +14,19 @@ trap cleanup EXIT
 echo "============================================================"
 echo " desifaces — STRIPE LIVE CATALOG RUNNER"
 echo " CHILD_SHELL_ONLY=YES"
+echo " GITHUB_AUTH_REQUIRED=NO"
 echo " PRODUCTION_DB_TOUCH=NONE"
 echo " PRODUCTION_RUNTIME_TOUCH=NONE"
 echo " CUSTOMER_CHARGE=NONE"
 echo "============================================================"
 echo "source_ref=$SOURCE_REF"
 
-command -v gh >/dev/null 2>&1 || { echo "FAIL: gh is required"; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "FAIL: curl is required"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "FAIL: python3 is required"; exit 1; }
 
-gh api \
-  "repos/${REPO}/contents/scripts/ops/stripe/provision_desifaces_stripe_live_catalog.py?ref=${SOURCE_REF}" \
-  --jq .content \
-| base64 -d > "$SCRIPT"
+curl -fsSL \
+  "${RAW_BASE}/${SOURCE_REF}/scripts/ops/stripe/provision_desifaces_stripe_live_catalog.py" \
+  -o "$SCRIPT"
 
 python3 -m py_compile "$SCRIPT"
 echo "PROVISIONER_SOURCE_GATE=PASS"
