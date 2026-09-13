@@ -1,0 +1,1 @@
+V3 note: production Web network is derived from the existing df-v3-web-prod container at runtime. The deployer requires exactly one existing network, preserves that network during candidate smoke and cutover, and refuses multi-network or missing-network shapes.
