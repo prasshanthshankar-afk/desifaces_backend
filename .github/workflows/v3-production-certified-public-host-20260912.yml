@@ -1,0 +1,87 @@
+name: V3 Certified Public Host Cutover 2026-09-12
+
+on:
+  pull_request:
+    branches:
+      - desifaces-v3
+    paths:
+      - scripts/launch-v3-production-certified-public-host-20260912.sh
+      - .github/workflows/v3-production-certified-public-host-20260912.yml
+  push:
+    branches:
+      - fix/v3-production-host-classification-20260912
+      - desifaces-v3
+    paths:
+      - scripts/launch-v3-production-certified-public-host-20260912.sh
+      - .github/workflows/v3-production-certified-public-host-20260912.yml
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: bash -n scripts/launch-v3-production-certified-public-host-20260912.sh
+
+      - name: Exact public production identity pins
+        run: |
+          set -euo pipefail
+          S=scripts/launch-v3-production-certified-public-host-20260912.sh
+          grep -q 'EXPECTED_HOST="desifaces-gpu-non-prod"' "$S"
+          grep -q 'EXPECTED_PUBLIC_IP="52.252.188.211"' "$S"
+          grep -q 'BASE_LAUNCHER_COMMIT="d9948354b69273b26bdbdfda93bc9a03b9a3eba3"' "$S"
+          grep -q 'BASE_LAUNCHER_GIT_BLOB="98a355094222c7bbf2780fb522e0ba611fba4869"' "$S"
+          echo PUBLIC_IDENTITY_PINS=PASS
+
+      - name: Prove classification is fail-closed before mutation
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('scripts/launch-v3-production-certified-public-host-20260912.sh').read_text()
+          execute=s.index('===== 4. EXECUTE CERTIFIED CUTOVER =====')
+          for marker in (
+              'IMDS_PUBLIC_IP_GATE=PASS',
+              'PUBLIC_DNS_GATE=PASS',
+              'EXISTING_PRODUCTION_RELEASE_GATE=PASS',
+              'PRODUCTION_DATA_RUNTIME_GATE=PASS',
+              'PRODUCTION_NGINX_BINDING_GATE=PASS',
+              'PUBLIC_WEB_PRECUTOVER',
+              'PUBLIC_DIRECTOR_PRECUTOVER',
+              'PUBLIC_ASSISTANT_PRECUTOVER',
+              'PUBLIC_PRODUCTION_HOST_CLASSIFICATION=PASS',
+              'BASE_LAUNCHER_PROVENANCE=PASS',
+              'PUBLIC_HOST_CLASSIFICATION_PATCH=PASS',
+          ):
+              assert s.index(marker) < execute, marker
+          assert 'DESIFACES_PRODUCTION_HOSTNAME="$EXPECTED_HOST"' in s
+          print('PRE_MUTATION_PUBLIC_HOST_CLASSIFICATION=PASS')
+          PY
+
+      - name: Patch contract is narrow
+        run: |
+          set -euo pipefail
+          S=scripts/launch-v3-production-certified-public-host-20260912.sh
+          grep -q 'expected exactly one legacy name-only rejection' "$S"
+          grep -q 'expected exactly one legacy public API smoke URL' "$S"
+          grep -q 'https://api.desifaces.ai/director/api/health' "$S"
+          ! grep -q 'launch-mobile-production' "$S"
+          echo NARROW_CLASSIFICATION_PATCH=PASS
+
+      - name: Base launcher remains separately certified
+        run: |
+          set -euo pipefail
+          test -f scripts/launch-v3-production-direct-on-vm-20260912.sh
+          bash -n scripts/launch-v3-production-direct-on-vm-20260912.sh
+          grep -q 'DESIFACES_PRODUCTION_HOSTNAME' scripts/launch-v3-production-direct-on-vm-20260912.sh
+          grep -q 'STRIPE_LIVE_ACTION=INSPECTION_ONLY' scripts/launch-v3-production-direct-on-vm-20260912.sh
+          grep -q 'MOBILE_STORE_ACTION=NONE' scripts/launch-v3-production-direct-on-vm-20260912.sh
+          echo BASE_LAUNCHER_SAFETY=PASS
+
+      - name: Final marker
+        run: echo CERTIFIED_PUBLIC_HOST_CUTOVER_WRAPPER=PASS
