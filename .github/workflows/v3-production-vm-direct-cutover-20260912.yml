@@ -44,12 +44,15 @@ jobs:
           from pathlib import Path
           s=Path('scripts/launch-v3-production-direct-on-vm-20260912.sh').read_text()
           assert 'DESIFACES_PRODUCTION_CUTOVER_APPROVED' in s
-          assert '[[ "$HOST" == desifaces-gpu* ]]' in s
+          assert 'DESIFACES_PRODUCTION_HOSTNAME' in s
+          assert 'production host mismatch actual=' in s
           assert 'production cutover forbidden on DEV' in s
+          assert 'production cutover forbidden on non-production hostname' in s
           assert 'gh auth status -h github.com' in s
           assert 'GITHUB_PRIVATE_WEB_ACCESS=PASS' in s
           mutation=s.index('mv "$CANONICAL_ROOT" "$PREVIOUS"')
           for marker in (
+              'DESIFACES_PRODUCTION_HOSTNAME',
               'gh auth status -h github.com',
               'repos/$WEB_REPO/commits/$WEB_SHA',
               'docker inspect desifaces-db',
@@ -57,6 +60,7 @@ jobs:
               'IMMUTABLE_SOURCE_EXPORT=PASS',
           ):
               assert s.index(marker) < mutation, marker
+          print('EXACT_PRODUCTION_HOST_GATE=PASS')
           print('PRE_MUTATION_GUARDS=PASS')
           PY
 
