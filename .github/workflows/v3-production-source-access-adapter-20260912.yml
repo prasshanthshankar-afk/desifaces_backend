@@ -1,0 +1,50 @@
+name: V3 Production Source Access Adapter 2026-09-12
+
+on:
+  push:
+    branches:
+      - desifaces-v3
+    paths:
+      - scripts/launch-v3-production-preserve-data-source-access-20260912.sh
+      - .github/workflows/v3-production-source-access-adapter-20260912.yml
+  pull_request:
+    branches:
+      - desifaces-v3
+    paths:
+      - scripts/launch-v3-production-preserve-data-source-access-20260912.sh
+      - .github/workflows/v3-production-source-access-adapter-20260912.yml
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: bash -n scripts/launch-v3-production-preserve-data-source-access-20260912.sh
+      - name: Preserve-data contract
+        run: |
+          set -euo pipefail
+          S=scripts/launch-v3-production-preserve-data-source-access-20260912.sh
+          grep -q 'BASE_COMMIT="92d5568b34c1eb808b76f8461d92507409fa11fa"' "$S"
+          grep -q 'BASE_BLOB="f496ef1e3c49953ee4880a3e3e5c81e25b4baea5"' "$S"
+          grep -q 'dev_data_import=FORBIDDEN' "$S"
+          grep -q 'live_db_restore=FORBIDDEN' "$S"
+          grep -q 'SOURCE_ACCESS_PREMUTATION_GATE=PASS' "$S"
+          ! grep -Eq 'pg_restore.*desifaces([^_A-Za-z0-9]|$)|docker compose down -v|docker volume prune' "$S"
+      - name: Source-access fallback contract
+        run: |
+          set -euo pipefail
+          S=scripts/launch-v3-production-preserve-data-source-access-20260912.sh
+          grep -q 'git_ssh' "$S"
+          grep -q 'git_https' "$S"
+          grep -q 'ghcr_exact_commit_tag' "$S"
+          grep -q 'ghcr.io/prasshanthshankar-afk/desifaces-web:${WEB_SHA}' "$S"
+          grep -q 'BACKEND_PUBLIC_RELEASE_ACCESS=PASS' "$S"
+          grep -q 'WEB_RELEASE_ACCESS=PASS' "$S"
+          grep -q 'DATABASE_MUTATION_BEFORE_GATE=NONE' "$S"
+      - name: Final marker
+        run: echo PRODUCTION_SOURCE_ACCESS_ADAPTER_CERTIFICATION=PASS
