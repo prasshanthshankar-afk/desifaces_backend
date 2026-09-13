@@ -30,7 +30,7 @@ BEFORE_OTHERS="$(docker ps -a --format '{{.Names}}|{{.ID}}' | grep -v '^df-svc-p
 OLD_PRICING_ID="$(docker inspect -f '{{.Id}}' df-svc-pricing)"
 
 python3 - "$ENV_FILE" <<'PY'
-import os, sys, tempfile
+import os, sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
@@ -100,7 +100,7 @@ NEW_PRICING_ID="$(docker inspect -f '{{.Id}}' df-svc-pricing)"
 AFTER_OTHERS="$(docker ps -a --format '{{.Names}}|{{.ID}}' | grep -v '^df-svc-pricing|' | sort | sha256sum | awk '{print $1}')"
 [[ "$AFTER_OTHERS" == "$BEFORE_OTHERS" ]] || fail "non-pricing container identity changed"
 
-MODE_GATE="$(docker exec df-svc-pricing python - <<'PY'
+MODE_GATE="$(docker exec -i df-svc-pricing python - <<'PY'
 import os
 ok = (
     os.getenv('STRIPE_SECRET_KEY','').startswith('sk_live_') and
