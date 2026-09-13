@@ -1,0 +1,90 @@
+name: V3 Direct Production VM Cutover 2026-09-12
+
+on:
+  pull_request:
+    branches:
+      - desifaces-v3
+    paths:
+      - scripts/launch-v3-production-direct-on-vm-20260912.sh
+      - .github/workflows/v3-production-vm-direct-cutover-20260912.yml
+  push:
+    branches:
+      - release/v3-production-vm-direct-cutover-20260912
+      - desifaces-v3
+    paths:
+      - scripts/launch-v3-production-direct-on-vm-20260912.sh
+      - .github/workflows/v3-production-vm-direct-cutover-20260912.yml
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: bash -n scripts/launch-v3-production-direct-on-vm-20260912.sh
+
+      - name: Immutable release pins
+        run: |
+          set -euo pipefail
+          S=scripts/launch-v3-production-direct-on-vm-20260912.sh
+          grep -q 'BACKEND_SHA="18dfd6a3a4941307a466960108e4573f3b9ff555"' "$S"
+          grep -q 'WEB_SHA="21d1c8d4083c7f9705b957807e12d3d2bdf518d8"' "$S"
+          grep -q 'MOBILE_SHA="b92e58a92eca115508804dd68dbc99cab086441f"' "$S"
+          echo IMMUTABLE_RELEASE_PINS=PASS
+
+      - name: Fail-closed pre-mutation guards
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('scripts/launch-v3-production-direct-on-vm-20260912.sh').read_text()
+          assert 'DESIFACES_PRODUCTION_CUTOVER_APPROVED' in s
+          assert '[[ "$HOST" == desifaces-gpu* ]]' in s
+          assert 'production cutover forbidden on DEV' in s
+          assert 'gh auth status -h github.com' in s
+          assert 'GITHUB_PRIVATE_WEB_ACCESS=PASS' in s
+          mutation=s.index('mv "$CANONICAL_ROOT" "$PREVIOUS"')
+          for marker in (
+              'gh auth status -h github.com',
+              'repos/$WEB_REPO/commits/$WEB_SHA',
+              'docker inspect desifaces-db',
+              'production infra/.env source not found',
+              'IMMUTABLE_SOURCE_EXPORT=PASS',
+          ):
+              assert s.index(marker) < mutation, marker
+          print('PRE_MUTATION_GUARDS=PASS')
+          PY
+
+      - name: Existing production safety dependencies
+        run: |
+          set -euo pipefail
+          for f in \
+            deploy/production/run-canonical-production-deploy-20260904.sh \
+            scripts/apply-v3-audio-cogs-production.sh \
+            scripts/install-v3-production-systemd-bundle.sh \
+            scripts/certify-v3-stripe-live-readiness.sh; do
+            test -f "$f"
+            bash -n "$f"
+          done
+          grep -q 'DB_BACKUP=PASS' deploy/production/run-canonical-production-deploy-20260904.sh
+          grep -q 'DB_CLONE_MIGRATION_CERTIFICATION=PASS' deploy/production/run-canonical-production-deploy-20260904.sh
+          grep -q 'CUSTOMER_PRICING_IMMUTABILITY=PASS' scripts/apply-v3-audio-cogs-production.sh
+          echo EXISTING_PRODUCTION_SAFETY=PASS
+
+      - name: No automatic Stripe or mobile store activation
+        run: |
+          set -euo pipefail
+          S=scripts/launch-v3-production-direct-on-vm-20260912.sh
+          grep -q 'certify-v3-stripe-live-readiness.sh prepare' "$S"
+          grep -q 'STRIPE_LIVE_ACTION=INSPECTION_ONLY' "$S"
+          grep -q 'MOBILE_STORE_ACTION=NONE' "$S"
+          ! grep -q 'launch-mobile-production' "$S"
+          echo CUTOVER_SCOPE_SEPARATION=PASS
+
+      - name: Final marker
+        run: echo DIRECT_PRODUCTION_VM_CUTOVER_CERTIFICATION=PASS
