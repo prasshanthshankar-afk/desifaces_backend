@@ -6,6 +6,9 @@ from app.db import init_db
 from app.api.health import router as health_router
 from app.api.routes.longform import router as longform_router
 from app.api.routes.pricing_compat import router as pricing_compat_router
+from app.api.routes.v3_scene_pricing import router as v3_scene_pricing_router
+from app.api.routes.v3_scene_stitch import router as v3_scene_stitch_router
+from app.api.routes.v3_story_stitch import router as v3_story_stitch_router
 from app.config import settings
 from app.services.longform_pricing_confirmation_policy import install_longform_pricing_confirmation_policy
 
@@ -19,6 +22,9 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(longform_router)
     app.include_router(pricing_compat_router)
+    app.include_router(v3_scene_pricing_router)
+    app.include_router(v3_scene_stitch_router)
+    app.include_router(v3_story_stitch_router)
     return app
 
 
