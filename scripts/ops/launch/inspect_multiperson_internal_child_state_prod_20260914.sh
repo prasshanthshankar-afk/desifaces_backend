@@ -29,14 +29,12 @@ echo "FUSION_WORKER=$WORKER"
 echo "FUSION_API_STATE=$(docker inspect -f '{{.State.Status}}' "$FUSION")"
 echo "FUSION_WORKER_STATE=$(docker inspect -f '{{.State.Status}}' "$WORKER")"
 echo "FUSION_WORKER_RESTART_COUNT=$(docker inspect -f '{{.RestartCount}}' "$WORKER")"
-
 echo
-echo(){ :; }
 
 for ID in "${IDS[@]}"; do
   echo "===== JOB PROBE $ID ====="
   docker exec "$DIRECTOR" python -c '
-import json,sys,urllib.request,urllib.error
+import sys,urllib.request,urllib.error
 from app.config import settings
 jid=sys.argv[1]
 base=str(settings.DF_FUSION_BASE_URL).rstrip("/")
