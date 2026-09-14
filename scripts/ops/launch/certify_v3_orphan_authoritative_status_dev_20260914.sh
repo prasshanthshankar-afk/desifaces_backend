@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Azure Managed Run Command normally launches as root with HOME unset.  Re-enter as
+# the VM admin user so Git ownership, Docker access, and the DEV workspace match the
+# interactive environment used by the certified baseline.  This is certification
+# harness behavior only; it does not modify application source or production.
+if [[ "$(id -u)" -eq 0 ]]; then
+  command -v runuser >/dev/null 2>&1 || { echo "FAIL: runuser unavailable" >&2; exit 1; }
+  exec runuser -u azureuser -- env HOME=/home/azureuser PATH="$PATH" bash "$0" "$@"
+fi
+
+export HOME="${HOME:-/home/azureuser}"
+
 EXPECTED_HOST="desifaces-dev"
 BASE_SHA="26b1dc59dde47cb79ff9ee08fd43d1dbaf0e73b5"
 SOURCE_SHA="19f0102459618ddcc272433d437817b037ac28bf"
 SOURCE_BRANCH="fix/v3-orphan-authoritative-status-20260914"
 IMAGE="desifaces-svc-director:orphan-cert-${SOURCE_SHA:0:12}"
 CANDIDATE="df-director-orphan-cert"
-REPO="${HOME}/workspace/desifaces-v3"
+REPO="/home/azureuser/workspace/desifaces-v3"
 WT="$(mktemp -d /tmp/desifaces-director-orphan-cert.XXXXXX)"
 ENVFILE="$(mktemp /tmp/desifaces-director-orphan-env.XXXXXX)"
 INSPECT="$(mktemp /tmp/desifaces-director-orphan-inspect.XXXXXX.json)"
@@ -126,7 +137,7 @@ PY
 [[ -n "$NETWORK" ]] || fail "DEV Director Docker network unresolved"
 pass DEV_RUNTIME_DISCOVERY
 
-# Run focused safety tests inside the exact image.  These cover both the current
+# Run focused safety tests inside the exact image. These cover both the current
 # production failure and the no-new-duplicate regression guard.
 docker run --rm -i \
   --env-file "$ENVFILE" \
@@ -190,7 +201,7 @@ asyncio.run(main())
 PY
 pass FOCUSED_SAFETY_TESTS
 
-# Import the full Director application from the candidate image.  No source bind mounts.
+# Import the full Director application from the candidate image. No source bind mounts.
 docker run --rm \
   --env-file "$ENVFILE" \
   -e DF_DIRECTOR_CHECKPOINTER_AUTO_SETUP=false \
