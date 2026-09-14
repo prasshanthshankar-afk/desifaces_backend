@@ -19,6 +19,7 @@ echo "============================================================"
 echo " desifaces — CONTINUE DEV MULTI-PERSON CANDIDATE CERT"
 echo " candidate_image=$IMAGE"
 echo " production_touch=NONE"
+echo " host_port_touch=NONE"
 echo "============================================================"
 echo "CANDIDATE_IMAGE_REUSE=PASS"
 
@@ -28,7 +29,7 @@ DIRECTOR="$(docker ps --format '{{.Names}}' | grep -E '^df-v3-svc-director$|^df-
 [[ -n "$DIRECTOR" ]] || fail "DEV Director container not found"
 echo "DEV_RUNTIME_DISCOVERY=PASS"
 
-# Static Director contract proof comes from the paired release that introduced this Multi-Person contract.
+# Static Director contract proof from the paired release that introduced Multi-Person V3 pricing/stitch.
 mkdir -p "$TMP/director"
 BASE="https://raw.githubusercontent.com/prasshanthshankar-afk/desifaces_backend/${PAIRED_DIRECTOR_SHA}/services/svc-director/app/app"
 for f in fusion_execution_parent_pricing.py fusion_execution.py story_final_execution.py; do
@@ -44,7 +45,7 @@ grep -Fq '/api/longform/v3/assets/{media_id}/read-url' "$TMP/director/fusion_exe
 grep -Fq '/api/longform/v3/story-stitch' "$TMP/director/story_final_execution.py"
 echo "DIRECTOR_FUSION_EXTENSION_CONTRACT_STATIC=PASS"
 
-# Reconfirm candidate image imports and exposes both existing single-person and restored multi-person contracts.
+# Reconfirm immutable image imports and exposes both current single-person and restored multi-person contracts.
 docker run --rm \
   -e DATABASE_URL='postgresql://invalid:invalid@127.0.0.1:1/invalid' \
   -e JWT_SECRET='candidate-certification-only' \
@@ -112,21 +113,24 @@ docker run -d \
   -e PORT=8006 \
   -e WORKER_ENABLED=false \
   -e STITCH_WORKER_ENABLED=false \
-  -p 127.0.0.1:18006:8006 \
   "$IMAGE" >/dev/null
+
+echo "ISOLATED_CANDIDATE_START=PASS"
+echo "HOST_PORT_BINDING=NONE"
 
 READY=0
 for _ in $(seq 1 60); do
-  if curl -fsS --connect-timeout 2 --max-time 3 http://127.0.0.1:18006/api/health >/dev/null 2>&1; then READY=1; break; fi
+  if docker exec "$CANDIDATE" curl -fsS --connect-timeout 2 --max-time 3 http://127.0.0.1:8006/api/health >/dev/null 2>&1; then READY=1; break; fi
   sleep 2
 done
 (( READY == 1 )) || { docker logs --tail 120 "$CANDIDATE" >&2 || true; fail "candidate API failed health"; }
 echo "CANDIDATE_RUNTIME_HEALTH=PASS"
 
-python3 - <<'PY'
+# Probe routes from inside the isolated candidate; no host socket/port involved.
+docker exec "$CANDIDATE" python -c '
 import urllib.request,urllib.error
 for path in ("/api/longform/pricing/preview","/api/longform/v3/scene-pricing/preview"):
-    req=urllib.request.Request("http://127.0.0.1:18006"+path,data=b"{}",method="POST",headers={"Content-Type":"application/json"})
+    req=urllib.request.Request("http://127.0.0.1:8006"+path,data=b"{}",method="POST",headers={"Content-Type":"application/json"})
     try:
         with urllib.request.urlopen(req,timeout=5) as r: code=r.status
     except urllib.error.HTTPError as e: code=e.code
@@ -134,8 +138,9 @@ for path in ("/api/longform/pricing/preview","/api/longform/v3/scene-pricing/pre
     print(f"candidate_route={path} http={code}")
 print("SINGLE_PERSON_RUNTIME_ROUTE=PASS")
 print("MULTI_PERSON_RUNTIME_ROUTE=PASS")
-PY
+'
 
+# Real DEV Director -> isolated candidate over Docker DNS/network.
 docker exec "$DIRECTOR" python -c '
 import urllib.request,urllib.error
 u="http://df-fusion-extension-v3-cert:8006/api/longform/v3/scene-pricing/preview"
@@ -153,6 +158,7 @@ echo "============================================================"
 echo "DEV_SINGLE_PERSON_REGRESSION_GATE=PASS"
 echo "DEV_MULTI_PERSON_CONTRACT_GATE=PASS"
 echo "DEV_DIRECTOR_CONNECTIVITY_GATE=PASS"
+echo "HOST_PORT_TOUCH=NONE"
 echo "PRODUCTION_TOUCH=NONE"
 echo "PRODUCTION_PROMOTION_GATE=PASS"
 echo "============================================================"
