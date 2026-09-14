@@ -132,7 +132,9 @@ assert AccountContext and AccountContextNotFound and resolve_account_context
 print('SHARED_IDENTITY_IMPORT=PASS')
 PY
 
-docker exec -i "$EXT_API" python -m py_compile \
+# IMPORTANT: no -i here. This script is invoked via curl|bash; attaching stdin here
+# would consume the rest of the deployment script before the restart/certification gates.
+docker exec "$EXT_API" python -m py_compile \
   /app/app/main.py \
   /app/app/api/routes/v3_scene_pricing.py \
   /app/app/api/routes/v3_scene_stitch.py \
@@ -223,7 +225,7 @@ trap - ERR
 
 echo "============================================================"
 echo "ROOT_CAUSE=PRODUCTION_FUSION_EXTENSION_IMAGE_MISSING_PAIRED_IDENTITY_DEPENDENCY"
-echo "FALSE_V3_PREFLIGHT_REMOVED=YES"
+echo "PIPE_STDIN_CONSUMPTION_BUG_FIXED=YES"
 echo "PRODUCTION_FUSION_EXTENSION_STATE=$STATE"
 echo "PRODUCTION_FUSION_EXTENSION_HEALTH=$HEALTH"
 echo "SINGLE_PERSON_PRICING_TOUCH=NONE"
