@@ -16,7 +16,8 @@ echo " job_id=$JOB"
 echo " mutation=NONE"
 echo "============================================================"
 
-docker exec "$DIRECTOR" python - "$JOB" <<'PY'
+# -i is required because the Python program is supplied on stdin.
+docker exec -i "$DIRECTOR" python - "$JOB" <<'PY'
 import os, asyncio, asyncpg, json, sys
 
 JOB=sys.argv[1]
@@ -47,13 +48,20 @@ async def main():
         )
 
         print("MATCH_COUNT="+str(len(rows)))
+        if not rows:
+            raise SystemExit("no Director attempt metadata contains target Fusion job")
 
+        exact_matches = 0
+        stale_queued = 0
         for r in rows:
             meta=dict(r["metadata_json"] or {})
             matches=[]
             for child in list(meta.get("children") or []):
                 if str(child.get("fusion_job_id") or "") == JOB:
                     matches.append(child)
+                    exact_matches += 1
+                    if str(child.get("status") or "").strip().lower() == "queued":
+                        stale_queued += 1
 
             print("ATTEMPT_ID="+str(r["attempt_id"]))
             print("STAGE_RUN_ID="+str(r["stage_run_id"]))
@@ -65,6 +73,14 @@ async def main():
             print("ERROR_CODE="+str(r["error_code"]))
             print("CHILD="+json.dumps(matches, default=str)[:6000])
             print("---")
+
+        print("EXACT_CHILD_MATCH_COUNT="+str(exact_matches))
+        print("STALE_QUEUED_CHILD_COUNT="+str(stale_queued))
+        if exact_matches == 0:
+            raise SystemExit("target job appeared only outside children metadata")
+        if stale_queued == 0:
+            raise SystemExit("target child is not queued in Director metadata")
+        print("DIRECTOR_STALE_QUEUED_METADATA=PROVEN")
     finally:
         await conn.close()
 
