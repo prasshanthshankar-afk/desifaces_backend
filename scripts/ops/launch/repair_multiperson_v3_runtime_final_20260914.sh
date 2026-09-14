@@ -57,8 +57,8 @@ docker create --name "$BASE_C" --entrypoint /bin/true "$IMAGE" >/dev/null
 mkdir -p "$TMP/baseline/routes" "$TMP/identity"
 docker cp "$BASE_C:/app/app/main.py" "$TMP/baseline/main.py"
 for f in v3_scene_pricing.py v3_scene_stitch.py v3_story_stitch.py; do
-  if docker exec "$BASE_C" test -f "/app/app/api/routes/$f"; then
-    docker cp "$BASE_C:/app/app/api/routes/$f" "$TMP/baseline/routes/$f"
+  if docker cp "$BASE_C:/app/app/api/routes/$f" "$TMP/baseline/routes/$f" >/dev/null 2>&1; then
+    :
   else
     touch "$TMP/baseline/routes/$f.absent"
   fi
