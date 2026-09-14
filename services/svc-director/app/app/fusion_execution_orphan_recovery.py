@@ -45,6 +45,52 @@ def _payload_parent_stage_id(payload: dict[str, Any]) -> str:
     return ""
 
 
+async def _authoritative_child_status(
+    fusion_client,
+    *,
+    headers: dict[str, str],
+    job_id: str,
+    persisted_state: str,
+) -> tuple[str, str]:
+    """Resolve an internal child's authoritative state without creating a duplicate.
+
+    The compact status endpoint is intentionally optimized for routine polling and can
+    lag the full job view after provider FINALIZE.  The pre-V3 longform path always
+    polled the full Fusion job before deciding a render was still active.  Preserve
+    that proven safety property here: when the light view is non-terminal or lacks a
+    usable video URL, consult the full status before classifying the child as active.
+
+    This is read-only.  A genuinely queued/running child remains blocked, a terminal
+    failure remains replaceable, and only a terminal success with a concrete video URL
+    is eligible for reuse.
+    """
+    status_payload = await fusion_client.status(headers=headers, job_id=job_id)
+    state = _clean(status_payload.get("status") or persisted_state).lower()
+    video_url = _video_url_from_status(status_payload)
+
+    needs_full = (
+        state not in _TERMINAL_FAILURE
+        and (state not in _TERMINAL_SUCCESS or not video_url)
+    )
+    status_full = getattr(fusion_client, "status_full", None)
+    if needs_full and callable(status_full):
+        try:
+            full = await status_full(headers=headers, job_id=job_id)
+        except Exception:
+            # Fail closed.  The caller will continue to treat the light state as
+            # active/finalizing rather than risking a duplicate provider render.
+            return state, video_url
+
+        full_state = _clean(full.get("status")).lower()
+        full_video_url = _video_url_from_status(full)
+        if full_state:
+            state = full_state
+        if full_video_url:
+            video_url = full_video_url
+
+    return state, video_url
+
+
 class OrphanReconciledParentPricedSceneFusionExecutionService(
     ParentPricedSceneFusionExecutionService
 ):
@@ -138,26 +184,16 @@ class OrphanReconciledParentPricedSceneFusionExecutionService(
                 continue
 
             try:
-                status_payload = await self.fusion_client.status(
+                state, video_url = await _authoritative_child_status(
+                    self.fusion_client,
                     headers=headers,
                     job_id=job_id,
+                    persisted_state=persisted_state,
                 )
             except Exception as exc:
                 raise SceneFusionBridgeError(
                     f"fusion_existing_internal_child_status_unknown:{turn_id}:{job_id}:{str(exc)[:500]}"
                 ) from exc
-
-            state = _clean(status_payload.get("status") or persisted_state).lower()
-            video_url = _video_url_from_status(status_payload)
-
-            if state in _TERMINAL_SUCCESS and not video_url:
-                status_full = getattr(self.fusion_client, "status_full", None)
-                if callable(status_full):
-                    try:
-                        full = await status_full(headers=headers, job_id=job_id)
-                        video_url = _video_url_from_status(full)
-                    except Exception:
-                        video_url = ""
 
             if state in _TERMINAL_FAILURE:
                 continue
@@ -268,4 +304,7 @@ class OrphanReconciledParentPricedSceneFusionExecutionService(
         )
 
 
-__all__ = ["OrphanReconciledParentPricedSceneFusionExecutionService"]
+__all__ = [
+    "OrphanReconciledParentPricedSceneFusionExecutionService",
+    "_authoritative_child_status",
+]
