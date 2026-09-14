@@ -47,7 +47,7 @@ for f in "${CFG_ARR[@]}"; do
   [[ -f "$f" ]] || fail "Compose file missing: $f"
   COMPOSE+=( -f "$f" )
 done
-"${COMPOSE[@]}" config -q
+"${COMPOSE[@]}" config -q </dev/null
 
 echo "CANONICAL_PRODUCTION_ENV_FILE=PASS"
 echo "PRODUCTION_COMPOSE_INTERPOLATION=PASS"
@@ -61,11 +61,12 @@ DEPS_HASH="$(docker run --rm --entrypoint sh "$IMAGE" -lc 'python -m pip freeze 
 echo "CERTIFIED_CANDIDATE_FINGERPRINT=PASS"
 
 # Ask Compose to resolve the API environment using the canonical interpolation file.
-# Secrets are captured only in a protected temporary file and never printed.
+# Explicitly detach stdin so this script is safe even if a caller invokes it via a pipe.
 EFFECTIVE_ENV="$TMP/effective.env"
 COMPOSE_STDERR="$TMP/compose-run.err"
-"${COMPOSE[@]}" run --no-deps --rm --entrypoint env "$SERVICE" >"$EFFECTIVE_ENV" 2>"$COMPOSE_STDERR"
+"${COMPOSE[@]}" run -T --no-deps --rm --entrypoint env "$SERVICE" </dev/null >"$EFFECTIVE_ENV" 2>"$COMPOSE_STDERR"
 chmod 600 "$EFFECTIVE_ENV"
+echo "EFFECTIVE_PRODUCTION_ENV_CAPTURE=PASS"
 
 # Compare critical effective production values against the untouched running Fusion Extension worker.
 docker inspect "$WORKER" > "$TMP/worker.inspect.json"
@@ -127,6 +128,7 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 (( READY == 1 )) || { docker logs --tail 120 "$PREFLIGHT" >&2 || true; fail "certified candidate failed exact-env preflight"; }
+echo "EXACT_ENV_CANDIDATE_HEALTH=PASS"
 
 docker exec "$PREFLIGHT" python -c '
 import urllib.request,urllib.error
@@ -171,9 +173,10 @@ rollback(){
   trap - ERR
   echo "ROLLBACK_TRIGGERED=YES"
   docker tag "$ROLLBACK_IMAGE" "$CURRENT_IMAGE_REF" >/dev/null 2>&1 || true
-  "${COMPOSE[@]}" up -d --no-deps --force-recreate "$SERVICE" >/dev/null 2>&1 || true
+  "${COMPOSE[@]}" up -d --no-deps --force-recreate "$SERVICE" </dev/null >/dev/null 2>&1 || true
   REC="$(docker ps -a --format '{{.Names}}' | grep -E '^df-svc-fusion-extension$|^df-v3-svc-fusion-extension$|svc-fusion-extension$' | head -1 || true)"
   if [[ -n "$REC" ]]; then
+    s=""; h=""
     for _ in $(seq 1 60); do
       s="$(docker inspect -f '{{.State.Status}}' "$REC" 2>/dev/null || true)"
       h="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$REC" 2>/dev/null || true)"
@@ -188,10 +191,10 @@ rollback(){
 }
 trap 'rc=$?; (( MUTATED == 1 )) && rollback "$rc" || exit "$rc"' ERR
 
-# First mutation: activate the exact DEV-certified image, now using validated production interpolation env.
+# First mutation: activate the exact DEV-certified image using validated production interpolation env.
 docker tag "$IMAGE" "$CURRENT_IMAGE_REF"
 MUTATED=1
-"${COMPOSE[@]}" up -d --no-deps --force-recreate "$SERVICE"
+"${COMPOSE[@]}" up -d --no-deps --force-recreate "$SERVICE" </dev/null
 echo "PRODUCTION_RECREATE_WITH_CANONICAL_ENV=PASS"
 
 EXT="$(docker ps -a --format '{{.Names}}' | grep -E '^df-svc-fusion-extension$|^df-v3-svc-fusion-extension$|svc-fusion-extension$' | head -1 || true)"
@@ -242,6 +245,7 @@ MUTATED=0
 
 echo "============================================================"
 echo "ROOT_CAUSE=COMPOSE_INTERPOLATION_ENV_NOT_LOADED_DURING_PRIOR_RECREATE"
+echo "PIPE_SAFE_DEPLOYMENT=YES"
 echo "DEV_CERTIFIED_IMAGE_REUSED=YES"
 echo "CANONICAL_PRODUCTION_ENV_VALIDATED=YES"
 echo "SINGLE_PERSON_REGRESSION_GATE=PASS"
