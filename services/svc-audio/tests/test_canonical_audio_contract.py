@@ -43,3 +43,11 @@ def test_canonical_registration_persists_project_lineage():
     assert "$8::uuid" in text
     assert "project_id = coalesce(public.media_assets.project_id, excluded.project_id)" in text
     assert "account_id,\n                    project_id," in text
+
+
+def test_canonical_registration_persists_durable_azure_storage_lineage():
+    text = _source()
+    assert "from app.config import settings" in text
+    assert 'settings.AUDIO_OUTPUT_CONTAINER' in text
+    assert 'return f"azure://{container}/{storage_path}"' in text
+    assert '"storage_container": str(' in text
