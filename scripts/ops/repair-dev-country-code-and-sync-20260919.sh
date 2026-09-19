@@ -33,8 +33,8 @@ async def main():
         format_type(a.atttypid,a.atttypmod) as data_type,
         a.attnotnull as not_null,
         pg_get_expr(ad.adbin,ad.adrelid) as default_expr,
-        a.attidentity as identity_kind,
-        a.attgenerated as generated_kind,
+        a.attidentity::text as identity_kind,
+        a.attgenerated::text as generated_kind,
         coll.collname as collation
       from pg_attribute a
       join pg_class c on c.oid=a.attrelid
@@ -133,8 +133,8 @@ async def main():
           select format_type(a.atttypid,a.atttypmod) as data_type,
                  a.attnotnull as not_null,
                  pg_get_expr(ad.adbin,ad.adrelid) as default_expr,
-                 a.attidentity as identity_kind,
-                 a.attgenerated as generated_kind
+                 a.attidentity::text as identity_kind,
+                 a.attgenerated::text as generated_kind
           from pg_attribute a
           join pg_class c on c.oid=a.attrelid
           join pg_namespace n on n.oid=c.relnamespace
