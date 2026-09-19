@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from app.api.deps import get_current_user_id
+from app.config import settings
 from app.db import get_pool
 
 router = APIRouter(prefix="/api/audio", tags=["audio-canonical-output"])
@@ -41,7 +42,21 @@ def _jsonb_dict(value: Any) -> Dict[str, Any]:
 
 
 def _storage_ref_from_artifact(meta: Dict[str, Any]) -> str:
-    return str(meta.get("storage_path") or "").strip()
+    storage_path = str(meta.get("storage_path") or "").strip().lstrip("/")
+    if not storage_path:
+        return ""
+    if storage_path.startswith("azure://"):
+        return storage_path
+    container = str(
+        meta.get("storage_container")
+        or settings.AUDIO_OUTPUT_CONTAINER
+        or ""
+    ).strip().strip("/")
+    if not container:
+        return ""
+    if storage_path.startswith(f"{container}/"):
+        storage_path = storage_path[len(container) + 1 :]
+    return f"azure://{container}/{storage_path}"
 
 
 async def _authorized_project_account(
@@ -162,6 +177,11 @@ async def get_canonical_audio_output(
             else:
                 canonical_meta = {
                     **artifact_meta,
+                    "storage_container": str(
+                        artifact_meta.get("storage_container")
+                        or settings.AUDIO_OUTPUT_CONTAINER
+                        or ""
+                    ).strip(),
                     "source_audio_artifact_id": artifact_id,
                     "source_audio_job_id": str(job_id),
                     "source_audio_url": audio_url,
@@ -194,7 +214,7 @@ async def get_canonical_audio_output(
                         nullif($5, ''),
                         $6::jsonb,
                         $7::uuid,
-                        null,
+                        $8::uuid,
                         'intermediate',
                         'active',
                         now(),
@@ -203,6 +223,7 @@ async def get_canonical_audio_output(
                     on conflict (user_id, sha256) where sha256 is not null
                     do update set
                         account_id = coalesce(public.media_assets.account_id, excluded.account_id),
+                        project_id = coalesce(public.media_assets.project_id, excluded.project_id),
                         meta_json = public.media_assets.meta_json || excluded.meta_json,
                         updated_at = now()
                     returning id::text
@@ -214,6 +235,7 @@ async def get_canonical_audio_output(
                     artifact_sha,
                     json.dumps(canonical_meta, default=str),
                     account_id,
+                    project_id,
                 )
 
             if not media_id:
