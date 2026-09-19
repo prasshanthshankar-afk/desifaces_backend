@@ -194,7 +194,7 @@ async def get_canonical_audio_output(
                         nullif($5, ''),
                         $6::jsonb,
                         $7::uuid,
-                        null,
+                        $8::uuid,
                         'intermediate',
                         'active',
                         now(),
@@ -203,6 +203,7 @@ async def get_canonical_audio_output(
                     on conflict (user_id, sha256) where sha256 is not null
                     do update set
                         account_id = coalesce(public.media_assets.account_id, excluded.account_id),
+                        project_id = coalesce(public.media_assets.project_id, excluded.project_id),
                         meta_json = public.media_assets.meta_json || excluded.meta_json,
                         updated_at = now()
                     returning id::text
@@ -214,6 +215,7 @@ async def get_canonical_audio_output(
                     artifact_sha,
                     json.dumps(canonical_meta, default=str),
                     account_id,
+                    project_id,
                 )
 
             if not media_id:
