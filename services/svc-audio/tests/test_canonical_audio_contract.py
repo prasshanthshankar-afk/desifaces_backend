@@ -36,3 +36,10 @@ def test_director_resume_read_url_contract_is_present():
     text = _source()
     assert '@router.get("/assets/{media_id}/read-url"' in text
     assert 'source_audio_url' in text
+
+
+def test_canonical_registration_persists_project_lineage():
+    text = _source()
+    assert "$8::uuid" in text
+    assert "project_id = coalesce(public.media_assets.project_id, excluded.project_id)" in text
+    assert "account_id,\n                    project_id," in text
