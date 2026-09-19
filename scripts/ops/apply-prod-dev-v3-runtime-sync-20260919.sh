@@ -45,7 +45,7 @@ pricing|df-svc-pricing|df-v3-svc-pricing
 
 remote_container_exists(){
   local host="$1" c="$2"
-  ssh -o BatchMode=yes -o ConnectTimeout=12 "$host" "docker inspect '$c' >/dev/null 2>&1"
+  ssh -n -o BatchMode=yes -o ConnectTimeout=12 "$host" "docker inspect '$c' >/dev/null 2>&1"
 }
 
 runtime_manifest(){
