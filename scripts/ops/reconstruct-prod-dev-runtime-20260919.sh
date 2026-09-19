@@ -24,12 +24,15 @@ printf '%s\n' \
 
 collect_host(){
   local host="$1" role="$2" text_out="$3" archive_out="$4"
+  local role_lc
+  role_lc="$(printf '%s' "$role" | tr '[:upper:]' '[:lower:]')"
 
   echo "===== ${role} RUNTIME CAPTURE ====="
   ssh -o BatchMode=yes -o ConnectTimeout=12 "$host" "ROLE='$role' bash -s" >"$text_out" <<'REMOTE'
 set -Eeuo pipefail
 ROLE="${ROLE:?ROLE missing}"
-TMP="/tmp/next2-${ROLE,,}-runtime"
+ROLE_LC="$(printf '%s' "$ROLE" | tr '[:upper:]' '[:lower:]')"
+TMP="/tmp/next2-${ROLE_LC}-runtime"
 rm -rf "$TMP"
 mkdir -p "$TMP/manifests"
 
@@ -144,14 +147,14 @@ asyncio.run(main())
 PY
 fi
 
-tar -C "$TMP" -czf "/tmp/next2-${ROLE,,}-runtime.tgz" .
-sha256sum "/tmp/next2-${ROLE,,}-runtime.tgz"
+tar -C "$TMP" -czf "/tmp/next2-${ROLE_LC}-runtime.tgz" .
+sha256sum "/tmp/next2-${ROLE_LC}-runtime.tgz"
 printf 'RUNTIME_CAPTURE_%s=PASS\n' "$ROLE"
 REMOTE
 
   cat "$text_out"
-  ssh -o BatchMode=yes -o ConnectTimeout=12 "$host" "cat /tmp/next2-${role,,}-runtime.tgz" >"$archive_out"
-  tar -xzf "$archive_out" -C "$OUT/${role,,}"
+  ssh -o BatchMode=yes -o ConnectTimeout=12 "$host" "cat /tmp/next2-${role_lc}-runtime.tgz" >"$archive_out"
+  tar -xzf "$archive_out" -C "$OUT/${role_lc}"
 }
 
 collect_host "$PROD_HOST" PROD "$OUT/prod.txt" "$OUT/prod-runtime.tgz"
