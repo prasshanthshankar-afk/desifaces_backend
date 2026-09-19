@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 PROD_HOST="${PROD_HOST:-desifaces-gpu}"
 DEV_HOST="${DEV_HOST:-desifaces-dev}"
-APPLY_SHA="233d1b6fc332a387f7b625285a93e9695ad688eb"
+APPLY_SHA="b0d94e67c8ab763bfb3ad906647fd6e0c14ed6bf"
 WORK="/tmp/desifaces-next2-country-code-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$WORK"
 
