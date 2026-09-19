@@ -50,7 +50,7 @@ remote_container_exists(){
 
 runtime_manifest(){
   local host="$1" c="$2" out="$3"
-  ssh -o BatchMode=yes -o ConnectTimeout=12 "$host" "C='$c' sh -s" >"$out" <<'REMOTE'
+  ssh -o BatchMode=yes -o ConnectTimeout=12 "$host" "C='$c' bash -s" >"$out" <<'REMOTE'
 set -Eeuo pipefail
 docker exec "$C" sh -lc '
   set -e
@@ -72,7 +72,7 @@ REMOTE
 
 runtime_bundle(){
   local host="$1" c="$2" out="$3"
-  ssh -o BatchMode=yes -o ConnectTimeout=12 "$host" "C='$c' sh -s" >"$out" <<'REMOTE'
+  ssh -o BatchMode=yes -o ConnectTimeout=12 "$host" "C='$c' bash -s" >"$out" <<'REMOTE'
 set -Eeuo pipefail
 docker exec "$C" sh -lc '
   set -e
