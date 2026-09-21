@@ -60,18 +60,16 @@ def _shared_context() -> FusionSceneContext:
         "shared_scene_dimensions": {"width": 1920, "height": 1080},
         "speaker_targets": {
             str(base.turns[0].participant_id): {
-                "x": 0.10,
-                "y": 0.20,
-                "width": 0.20,
-                "height": 0.50,
-                "padding_ratio": 0.10,
+                "point": {"x": 0.20, "y": 0.45},
             },
             str(base.turns[1].participant_id): {
-                "x": 0.60,
-                "y": 0.20,
-                "width": 0.20,
-                "height": 0.50,
-                "padding_ratio": 0.10,
+                "box": {
+                    "x": 0.60,
+                    "y": 0.20,
+                    "width": 0.20,
+                    "height": 0.50,
+                    "padding_ratio": 0.10,
+                },
             },
         },
     }
