@@ -179,11 +179,18 @@ def _category_policy_message(category: str, *, source: str = "prompt") -> str:
             suggested_changes="remove self-harm details and use a supportive, non-graphic framing",
             source=source,
         )
+    if normalized == "weapons":
+        return _policy_message(
+            category="weapons",
+            not_permitted="guns, firearms, weapons, ammunition, or armed weapon-focused imagery",
+            suggested_changes="remove guns, firearms, weapons, ammunition, and armed poses",
+            source=source,
+        )
     if normalized == "violence":
         return _policy_message(
             category="violence",
-            not_permitted="graphic violence, gore, mutilation, or instructions to harm people",
-            suggested_changes="use non-graphic dramatic mood or action without blood, gore, weapons-use instructions, or bodily harm",
+            not_permitted="blood, gore, graphic violence, mutilation, or instructions to harm people",
+            suggested_changes="use a safe non-graphic scene without blood, gore, weapons-use instructions, or bodily harm",
             source=source,
         )
     return _policy_message(
@@ -599,5 +606,6 @@ class SafetyService:
     def build_safe_prompt(self, user_prompt: str) -> str:
         safety_additions = """
         elegant, professional photography, high-quality image, well-lit, clear details, flattering angles, tasteful composition,
+        family-friendly scene, do not include guns, firearms, weapons, ammunition, blood, gore, wounds, or graphic injury,
         """
         return f"{user_prompt}, {safety_additions.strip()}"
