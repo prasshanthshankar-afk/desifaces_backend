@@ -1,0 +1,78 @@
+name: Face Safety Certification
+
+on:
+  push:
+    branches:
+      - fix/face-safety-firearms-gore-20260921
+  pull_request:
+    paths:
+      - 'services/svc-face/**'
+      - '.github/workflows/face-safety-certification.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  certify-face-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: services/svc-face
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install svc-face dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r app/app/requirements.txt pytest
+
+      - name: Compile changed safety modules
+        run: |
+          python -m py_compile             app/app/services/safety_service.py             app/app/services/providers/openai_image_client.py             app/app/services/providers/image_provider.py
+
+      - name: Run full svc-face unit suite
+        env:
+          PYTHONPATH: app
+        run: |
+          pytest -q tests
+
+      - name: Explicit launch-blocking policy proof
+        env:
+          PYTHONPATH: app
+        run: |
+          python - <<'PY'
+          from app.services.safety_service import SafetyService
+
+          safety = SafetyService()
+          blocked = [
+              "woman with gun and arms",
+              "portrait holding a pistol",
+              "model carrying a rifle",
+              "bloody woman portrait",
+              "gory battlefield portrait",
+              "person with an open wound",
+          ]
+          allowed = [
+              "woman with arms crossed, professional portrait, realistic lighting",
+              "adult woman in tasteful swimwear, fashion editorial photography",
+          ]
+
+          for prompt in blocked:
+              ok, reason = safety.check_keywords(prompt)
+              assert not ok, (prompt, reason)
+              print("BLOCKED=PASS", prompt)
+
+          for prompt in allowed:
+              ok, reason = safety.check_keywords(prompt)
+              assert ok, (prompt, reason)
+              print("ALLOWED=PASS", prompt)
+
+          print("FACE_SAFETY_LAUNCH_GATE=PASS")
+          PY
