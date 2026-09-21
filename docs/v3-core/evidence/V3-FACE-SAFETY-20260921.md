@@ -125,6 +125,7 @@ For Face Studio:
   - `services/svc-face/app/app/services/creator_orchestrator.py`
   - `services/svc-face/app/app/api/routes/face_jobs.py`
   - `services/svc-face/tests/test_weapons_gore_hard_block_policy.py`
+  - `.github/workflows/v3-contract-tests.yml`
 - Explicitly out of scope:
   - DB schema and migrations
   - pricing rules and plan amounts
@@ -147,6 +148,7 @@ The existing Face Studio request/response shapes remain unchanged. Current clien
   - generated safe prompt reinforces no weapons/blood/gore
 - Contract tests:
   - existing V3 Canonical Contract Tests
+  - Face Studio weapons/blood/gore regression test is wired into the canonical PR gate
   - existing unsafe-prompt API contract remains `DF_UNSAFE_PROMPT`
 - Integration tests:
   - pricing preview rejects prohibited prompt before quote/provider work
