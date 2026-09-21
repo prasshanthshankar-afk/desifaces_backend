@@ -2126,9 +2126,10 @@ class CreatorOrchestrator:
         """
         Prepare only the deterministic fields required to calculate a Face price.
 
-        Pricing does not depend on prompt safety classification or translated
-        prompt text. Full safety validation and translation remain enforced by
-        process_job() in the Face worker before variant generation.
+        Pricing does not depend on remote prompt safety classification or
+        translated prompt text. Deterministic product hard-blocks are enforced
+        here before any pricing operation; full contextual safety validation and
+        translation remain enforced by process_job() before variant generation.
         """
         if hasattr(request, "model_dump"):
             request_dict = request.model_dump(
@@ -2148,6 +2149,14 @@ class CreatorOrchestrator:
             or request_dict.get("prompt")
         )
         if user_prompt:
+            # Product hard-blocks (firearms, blood/gore, explicit sexual/minor
+            # abuse, etc.) are deterministic and must run before pricing preview,
+            # job creation, or reservation. Remote moderation/translation remains
+            # in process_job() for the broader contextual safety pass.
+            allowed, reason = self.safety_service.check_keywords(user_prompt)
+            if not allowed:
+                raise ValueError(f"unsafe_prompt: {reason}")
+
             request_dict["user_prompt"] = user_prompt
             request_dict["prompt"] = user_prompt
 
@@ -2192,11 +2201,10 @@ class CreatorOrchestrator:
         """
         Prepare the deterministic submission payload only.
 
-        This intentionally reuses the proven pricing-preview preparation path so
-        POST /creator/generate can create, reserve, and queue the job without
-        running remote prompt safety or translation work in the API process.
-        Full prompt preparation remains enforced by process_job() before variant
-        generation.
+        This intentionally reuses the pricing-preview preparation path, including
+        deterministic product hard-blocks, so unsafe firearm/blood/gore requests
+        are rejected before job creation or pricing reservation. Remote contextual
+        safety and translation remain enforced by process_job() before generation.
         """
         return await self._prepare_pricing_preview_request_dict(request)
 
