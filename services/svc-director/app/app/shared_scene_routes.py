@@ -117,7 +117,9 @@ async def set_shared_scene_conversation(
                 select id,user_id,account_id,project_id,kind,lifecycle_state
                 from public.media_assets
                 where id=$1 and user_id=$2 and account_id=$3
-                  and project_id=$4 and kind='image' and lifecycle_state='active'
+                  and (project_id is null or project_id=$4)
+                  and kind in ('image','face_image','face_source_image')
+                  and lifecycle_state='active'
                 """,
                 body.shared_scene_media_id,
                 auth.user_id,
@@ -127,7 +129,7 @@ async def set_shared_scene_conversation(
             if not media:
                 raise HTTPException(
                     status_code=422,
-                    detail="shared_scene_media_not_owned_active_project_image",
+                    detail="shared_scene_media_not_owned_active_face_image",
                 )
 
             speech_rows = await conn.fetch(
