@@ -214,6 +214,15 @@ jobs:
       - name: Run Face Studio safety hard-block tests
         env:
           PYTHONPATH: services/svc-face/app
+          DATABASE_URL: postgresql://test:test@127.0.0.1:5432/test
+          AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=https;AccountName=testaccount;AccountKey=dGVzdA==;EndpointSuffix=core.windows.net
+          FAL_API_KEY: test-only
+          AZURE_OPENAI_ENDPOINT: https://example.invalid
+          AZURE_OPENAI_KEY: test-only
+          AZURE_OPENAI_DEPLOYMENT: test-only
+          AZURE_CONTENT_MODERATOR_ENDPOINT: https://example.invalid
+          AZURE_CONTENT_MODERATOR_KEY: test-only
+          JWT_SECRET: test-only-ci-secret
         run: python -m pytest -q services/svc-face/tests/test_weapons_gore_hard_block_policy.py
 
   multi-person-pricing-postgres:
