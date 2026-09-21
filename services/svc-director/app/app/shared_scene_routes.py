@@ -44,6 +44,8 @@ class SharedSceneSpeakerTarget(BaseModel):
 
 class SharedSceneConversationIn(BaseModel):
     shared_scene_media_id: UUID
+    image_width: int = Field(ge=64, le=16384)
+    image_height: int = Field(ge=64, le=16384)
     speaker_targets: Annotated[list[SharedSceneSpeakerTarget], Field(min_length=2, max_length=20)]
 
     @model_validator(mode="after")
@@ -181,6 +183,7 @@ async def set_shared_scene_conversation(
             metadata["conversation_mode"] = "shared_scene"
             metadata["shared_scene_contract_version"] = 1
             metadata["shared_scene_media_id"] = str(body.shared_scene_media_id)
+            metadata["shared_scene_dimensions"] = {"width": body.image_width, "height": body.image_height}
             metadata["speaker_targets"] = {
                 str(item.participant_id): item.box.model_dump(mode="json")
                 for item in body.speaker_targets
@@ -203,6 +206,7 @@ async def set_shared_scene_conversation(
         "scene_id": str(stage["scene_id"]),
         "conversation_mode": "shared_scene",
         "shared_scene_media_id": str(body.shared_scene_media_id),
+        "shared_scene_dimensions": {"width": body.image_width, "height": body.image_height},
         "speaker_count": len(body.speaker_targets),
         "speaker_targets": {
             str(item.participant_id): item.box.model_dump(mode="json")
