@@ -89,6 +89,11 @@ class ImageProviderRouter:
             raise last
         raise RuntimeError("openai_image_retry_exhausted")
 
+    def _enforce_final_prompt_safety(self, prompt: str) -> None:
+        allow, reason = self._safety.check_keywords(prompt)
+        if not allow:
+            raise RuntimeError(f"generation_prompt_policy_blocked: {reason}")
+
     async def _enforce_generated_output_safety(self, result: ImageBytesResult) -> ImageBytesResult:
         allow, reason = await self._safety.validate_image(
             result.bytes,
@@ -112,6 +117,7 @@ class ImageProviderRouter:
         guidance_scale: float = 3.5,
         provider: Optional[ProviderName] = None,
     ) -> ImageBytesResult:
+        self._enforce_final_prompt_safety(prompt)
         p = self._pick_provider(provider)
 
         if p == "openai":
@@ -167,6 +173,7 @@ class ImageProviderRouter:
         mask_local_path: Optional[str] = None,
         provider: Optional[ProviderName] = None,
     ) -> ImageBytesResult:
+        self._enforce_final_prompt_safety(prompt)
         p = self._pick_provider(provider)
 
         if p == "openai":
