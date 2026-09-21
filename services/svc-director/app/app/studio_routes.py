@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -18,7 +19,11 @@ from .config import settings
 from .face_execution import ParticipantFaceExecutionService
 from .participant_face import ParticipantFaceBridgeError, promote_approved_face_candidate
 from .security import DirectorAuthContext, get_director_auth
-from .studio_workflow import build_direct_studio_workflow, build_story_studio_workflow
+from .studio_workflow import (
+    build_direct_studio_workflow,
+    build_shared_scene_studio_workflow,
+    build_story_studio_workflow,
+)
 
 router = APIRouter()
 store = CanonicalStudioWorkflowStore()
@@ -34,6 +39,10 @@ class FaceDispatchIn(BaseModel):
     quote_id: str = Field(min_length=1, max_length=300)
     preview_fingerprint: str | None = Field(default=None, max_length=500)
     user_confirmed: bool = True
+
+
+class StoryWorkflowCreateIn(BaseModel):
+    conversation_mode: Literal["ordered_speaker_shots", "shared_scene"] = "ordered_speaker_shots"
 
 
 def _forward_auth(request: Request) -> dict[str, str]:
@@ -114,8 +123,16 @@ async def create_direct_studio_workflow(
 async def create_story_studio_workflow(
     story_id: UUID,
     request: Request,
+    body: StoryWorkflowCreateIn | None = None,
     auth: DirectorAuthContext = Depends(get_director_auth),
 ):
+    body = body or StoryWorkflowCreateIn()
+    conversation_mode = body.conversation_mode
+    workflow_kind = (
+        "shared_scene_conversation_story"
+        if conversation_mode == "shared_scene"
+        else "face_audio_fusion_story"
+    )
     pool = request.app.state.business_pool
     try:
         async with pool.acquire() as conn:
@@ -123,9 +140,9 @@ async def create_story_studio_workflow(
                 """select workflow_id from public.v3_studio_workflows
                 where account_id=$1 and story_id=$2
                   and state in ('draft','active','awaiting_review')
-                  and metadata_json->>'workflow_kind'='face_audio_fusion_story'
+                  and metadata_json->>'workflow_kind'=$3
                 order by created_at desc limit 1""",
-                auth.account_id, story_id,
+                auth.account_id, story_id, workflow_kind,
             )
             if existing:
                 return await store.get_workflow(
@@ -136,12 +153,19 @@ async def create_story_studio_workflow(
                 graph = await request.app.state.story_store.get_story_graph(
                     conn, story_id=story_id, account_id=auth.account_id,
                 )
-                workflow_id = await build_story_studio_workflow(
-                    conn, graph=graph, owner_user_id=auth.user_id, store=store,
-                )
+                if conversation_mode == "shared_scene":
+                    workflow_id = await build_shared_scene_studio_workflow(
+                        conn, graph=graph, owner_user_id=auth.user_id, store=store,
+                    )
+                else:
+                    workflow_id = await build_story_studio_workflow(
+                        conn, graph=graph, owner_user_id=auth.user_id, store=store,
+                    )
                 return await store.get_workflow(conn, workflow_id=workflow_id, account_id=auth.account_id)
     except StoryGraphNotFound as exc:
         raise HTTPException(status_code=404, detail="story_not_found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except StudioWorkflowError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
