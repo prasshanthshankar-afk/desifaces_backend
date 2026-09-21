@@ -118,7 +118,7 @@ from app.services.azure_storage_service import AzureStorageService
 from app.services.creator_prompt_service import CreatorPromptService
 from app.services.fal_client import FalClient
 from app.services.idempotency_service import provider_idempotency_key
-from app.services.safety_service import SafetyService
+from app.services.safety_service import SAFETY_POLICY_VERSION, SafetyService
 from app.services.translation_service import TranslationService
 from app.services.providers.openai_image_client import OpenAIImageModerationBlockedError
 
@@ -701,6 +701,32 @@ class CreatorOrchestrator:
         rd["height"] = int(height)
 
         return rd
+
+    async def _validate_submission_prompt(self, request_dict: Dict[str, Any]) -> bool:
+        """
+        Validate the user prompt before pricing reservation or provider generation.
+
+        Returns True when a user prompt was present and validated under the
+        current safety policy. Translation is performed before the second
+        safety pass so non-English unsafe intent cannot bypass keyword policy.
+        """
+        user_prompt = self._clean_text(
+            request_dict.get("user_prompt")
+            or request_dict.get("prompt")
+        )
+        if not user_prompt:
+            return False
+
+        translation_meta = await self.prompt_service.translate_and_validate(
+            user_prompt=user_prompt,
+            language=request_dict.get("language") or "en",
+        )
+        request_dict["translated_prompt"] = (
+            translation_meta.get("user_prompt_translated_en")
+            or user_prompt
+        )
+        request_dict.update(translation_meta)
+        return True
 
     @staticmethod
     def _row_get(obj: Any, key: str, default: Any = None) -> Any:
@@ -2309,6 +2335,7 @@ class CreatorOrchestrator:
         client_context: Optional[Dict[str, Any]] = None,
     ) -> PricingPreviewResponseModel:
         request_dict, mode = await self._prepare_pricing_preview_request_dict(request)
+        await self._validate_submission_prompt(request_dict)
 
         pricing = self._build_initial_pricing_block(request_dict)
         if not pricing.get("enabled"):
@@ -2834,6 +2861,7 @@ class CreatorOrchestrator:
         )
 
         request_dict, mode = await self._prepare_creator_submission_request_dict(request)
+        safety_validated = await self._validate_submission_prompt(request_dict)
 
         pre_mode = self._pre_resolve_seed_mode(request_dict)
 
@@ -2934,8 +2962,13 @@ class CreatorOrchestrator:
                 "request_type": "creator_platform",
                 "api_version": "v2",
                 "language": request_dict.get("language") or "en",
-                "safety_validated": False,
-                "translation_success": True if not request_dict.get("user_prompt") else None,
+                "safety_validated": bool(safety_validated),
+                "safety_policy_version": SAFETY_POLICY_VERSION if safety_validated else None,
+                "translation_success": (
+                    True
+                    if not request_dict.get("user_prompt")
+                    else bool(request_dict.get("translation_success", True))
+                ),
                 "config_validated": True,
                 "seed_mode": seed_mode,
                 "job_seed": int(job_seed),
@@ -3114,6 +3147,8 @@ class CreatorOrchestrator:
             prompt_already_prepared = bool(
                 self._clean_text(payload_json.get("user_prompt_translated_en"))
                 and bool(meta_json.get("safety_validated"))
+                and str(meta_json.get("safety_policy_version") or "").strip()
+                == SAFETY_POLICY_VERSION
             )
 
             if user_prompt and not prompt_already_prepared:
@@ -3144,6 +3179,7 @@ class CreatorOrchestrator:
                     job_id,
                     {
                         "safety_validated": True,
+                        "safety_policy_version": SAFETY_POLICY_VERSION,
                         "translation_success": bool(
                             translation_meta.get("translation_success", True)
                         ),
@@ -3705,6 +3741,21 @@ class CreatorOrchestrator:
 
             image_bytes = out.bytes
             content_type = out.content_type or "image/png"
+
+            # Fail closed before storage: generated images must pass the same
+            # image safety service used for source-image preflight. Unsafe
+            # provider output is never persisted or returned to the user.
+            output_allowed, output_reason = await self.safety_service.validate_image(
+                image_bytes,
+                filename=f"face-variant-{variant_num}.png",
+                content_type=content_type,
+                fail_open=False,
+            )
+            if not output_allowed:
+                raise RuntimeError(
+                    f"generated_image_safety_blocked:{output_reason or 'unsafe_output'}"
+                )
+
             file_size = len(image_bytes)
 
             if output_moderation_retry_count:

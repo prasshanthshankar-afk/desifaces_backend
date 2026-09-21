@@ -248,8 +248,9 @@ def _raise_friendly_unsafe_prompt(user_id: str, reason: str) -> None:
             "error": "unsafe_prompt",
             "code": "DF_UNSAFE_PROMPT",
             "message": (
-                "That prompt isn’t allowed. Please remove sexual or explicit content "
-                "and try again."
+                "That prompt isn’t allowed by the desifaces safety policy. "
+                "Remove guns or weapons, blood or gore, sexual or explicit content, "
+                "or other unsafe content and try again."
             ),
             "reason": reason,
             "action": "edit_prompt",
@@ -865,9 +866,14 @@ async def creator_enhance_prompt(
 ) -> PromptEnhanceResponse:
     """
     Face Studio prompt enhancement.
-    Never blocks the studio: if the shared LLM path fails or is unavailable,
-    this route falls back deterministically.
+    Safety policy is authoritative: unsafe prompts are rejected before any
+    enhancement so the helper cannot sanitize-and-forward disallowed intent.
     """
+    safety = SafetyService()
+    allow, reason = await safety.validate_text(req.user_input or "")
+    if not allow:
+        _raise_friendly_unsafe_prompt(user_id=str(user_id), reason=reason)
+
     try:
         return await enhance_prompt(
             PromptEnhanceRequest(
