@@ -9,6 +9,7 @@ import httpx
 
 from app.config import settings
 from app.services.fal_client import FalClient
+from app.services.safety_service import SafetyService
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class ImageProviderRouter:
     def __init__(self):
         self._fal = FalClient()
         self._openai = None
+        self._safety = SafetyService()
 
     @staticmethod
     def _pick_provider(explicit: Optional[str] = None) -> ProviderName:
@@ -87,6 +89,17 @@ class ImageProviderRouter:
             raise last
         raise RuntimeError("openai_image_retry_exhausted")
 
+    async def _enforce_generated_output_safety(self, result: ImageBytesResult) -> ImageBytesResult:
+        allow, reason = await self._safety.validate_image(
+            result.bytes,
+            filename="generated-face.png",
+            content_type=result.content_type,
+            fail_open=False,
+        )
+        if not allow:
+            raise RuntimeError(f"generated_image_policy_blocked: {reason}")
+        return result
+
     async def generate_t2i_bytes(
         self,
         *,
@@ -109,11 +122,13 @@ class ImageProviderRouter:
                 size=f"{width}x{height}",
                 quality=getattr(settings, "OPENAI_IMAGE_QUALITY", None) or "high",
             )
-            return ImageBytesResult(
-                bytes=img_bytes,
-                content_type="image/png",
-                provider="openai",
-                meta={"mode": "t2i"},
+            return await self._enforce_generated_output_safety(
+                ImageBytesResult(
+                    bytes=img_bytes,
+                    content_type="image/png",
+                    provider="openai",
+                    meta={"mode": "t2i"},
+                )
             )
 
         result = await self._fal.generate_image(
@@ -127,11 +142,13 @@ class ImageProviderRouter:
         )
         url = str(result.get("url") or "")
         b, ct = await self._download_url_bytes(url)
-        return ImageBytesResult(
-            bytes=b,
-            content_type=str(result.get("content_type") or ct or "image/jpeg"),
-            provider="fal",
-            meta={"mode": "t2i", "provider_url": url, "raw": result.get("raw")},
+        return await self._enforce_generated_output_safety(
+            ImageBytesResult(
+                bytes=b,
+                content_type=str(result.get("content_type") or ct or "image/jpeg"),
+                provider="fal",
+                meta={"mode": "t2i", "provider_url": url, "raw": result.get("raw")},
+            )
         )
 
     async def generate_i2i_bytes(
@@ -167,16 +184,18 @@ class ImageProviderRouter:
                 size=f"{width}x{height}",
                 quality=getattr(settings, "OPENAI_IMAGE_QUALITY", None) or "high",
             )
-            return ImageBytesResult(
-                bytes=img_bytes,
-                content_type="image/png",
-                provider="openai",
-                meta={
-                    "mode": "i2i_edit",
-                    "seed": seed,
-                    "preservation_strength": float(preservation_strength),
-                    "used_mask": bool(mask_local_path),
-                },
+            return await self._enforce_generated_output_safety(
+                ImageBytesResult(
+                    bytes=img_bytes,
+                    content_type="image/png",
+                    provider="openai",
+                    meta={
+                        "mode": "i2i_edit",
+                        "seed": seed,
+                        "preservation_strength": float(preservation_strength),
+                        "used_mask": bool(mask_local_path),
+                    },
+                )
             )
 
         result = await self._fal.generate_image_to_image(
@@ -192,15 +211,17 @@ class ImageProviderRouter:
         )
         url = str(result.get("url") or "")
         b, ct = await self._download_url_bytes(url)
-        return ImageBytesResult(
-            bytes=b,
-            content_type=str(result.get("content_type") or ct or "image/jpeg"),
-            provider="fal",
-            meta={
-                "mode": "i2i",
-                "seed": seed,
-                "preservation_strength": float(preservation_strength),
-                "provider_url": url,
-                "raw": result.get("raw"),
-            },
+        return await self._enforce_generated_output_safety(
+            ImageBytesResult(
+                bytes=b,
+                content_type=str(result.get("content_type") or ct or "image/jpeg"),
+                provider="fal",
+                meta={
+                    "mode": "i2i",
+                    "seed": seed,
+                    "preservation_strength": float(preservation_strength),
+                    "provider_url": url,
+                    "raw": result.get("raw"),
+                },
+            )
         )
