@@ -272,7 +272,7 @@ def _is_provider_degraded_message(message: Any) -> bool:
 def _classify_error(e: Exception) -> str:
     msg = str(e).lower()
 
-    if isinstance(e, (FusionProviderError, KlingAdapterError, LumaAdapterError, RunwayAdapterError, OmniHumanAdapterError, VeedFabricAdapterError)):
+    if isinstance(e, (FusionProviderError, KlingAdapterError, LumaAdapterError, RunwayAdapterError, OmniHumanAdapterError, VeedFabricAdapterError, Sync3AdapterError)):
         if _is_provider_degraded_message(msg):
             return "PROVIDER_DEGRADED"
         if "insufficient credits" in msg:
