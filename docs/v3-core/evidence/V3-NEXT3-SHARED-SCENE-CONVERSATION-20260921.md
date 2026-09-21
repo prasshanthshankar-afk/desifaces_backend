@@ -222,3 +222,31 @@ Complete before marking `CERTIFIED`.
 ## 16. Freeze statement
 
 After DEV functional certification, the #next3 first-slice contract is frozen as: one user-confirmed shared image, at least two speaking participants, explicit participant mapping, sequential speaker-attributed Audio turns, per-turn active-speaker Sync-3 lip-sync, deterministic final assembly, and no separate Face cohort. Any production rollout, provider replacement/fallback, automatic face detection, overlapping dialogue, pricing-package change, schema change, or change to existing separate-Faces behavior requires a new #v3-core review/evidence update.
+
+
+## Frozen user-facing UX vocabulary
+
+The implementation may retain internal contract names such as `shared_scene` and
+`ordered_speaker_shots`, but those technical names must not be used as the primary
+mode labels presented to creators.
+
+User-facing mode selection is frozen as:
+
+- **Add people one by one** — existing multi-person workflow where each participant is
+  created or added independently before the conversation is assembled.
+- **Create one group photo** — #next3 workflow where the people remain together in one
+  photo and desifaces synchronizes the active speaker turn by turn.
+
+Saved Work must keep conversation outputs discoverable with dedicated tabs beside
+Videos:
+
+- **Group Photo Conversation**
+- **Multi-Person Conversation**
+
+Persistence/classification contract:
+
+- `conversation_mode=shared_scene` → `conversation_kind=group_photo_conversation`
+- `conversation_mode=ordered_speaker_shots` → `conversation_kind=multi_person_conversation`
+
+The generic **Videos** tab remains available and continues to show video output without
+changing existing single-person behavior.
