@@ -47,7 +47,7 @@ def test_invalid_moderation_falls_back_to_auto(monkeypatch):
     assert client.moderation == "auto"
 
 
-def test_t2i_sends_low_moderation(monkeypatch):
+def test_t2i_stale_low_env_is_forced_to_auto(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_IMAGE_MODERATION", "low")
 
@@ -66,10 +66,10 @@ def test_t2i_sends_low_moderation(monkeypatch):
     )
 
     assert result == b"image-bytes"
-    assert captured["json"]["moderation"] == "low"
+    assert captured["json"]["moderation"] == "auto"
 
 
-def test_edit_sends_low_moderation(monkeypatch, tmp_path):
+def test_edit_stale_low_env_is_forced_to_auto(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_IMAGE_MODERATION", "low")
 
@@ -92,4 +92,4 @@ def test_edit_sends_low_moderation(monkeypatch, tmp_path):
     )
 
     assert result == b"image-bytes"
-    assert captured["data"]["moderation"] == "low"
+    assert captured["data"]["moderation"] == "auto"
