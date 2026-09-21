@@ -37,9 +37,21 @@ class NormalizedSpeakerBox(BaseModel):
         return self
 
 
+class NormalizedSpeakerPoint(BaseModel):
+    x: float = Field(ge=0.0, le=1.0)
+    y: float = Field(ge=0.0, le=1.0)
+
+
 class SharedSceneSpeakerTarget(BaseModel):
     participant_id: UUID
-    box: NormalizedSpeakerBox
+    point: NormalizedSpeakerPoint | None = None
+    box: NormalizedSpeakerBox | None = None
+
+    @model_validator(mode="after")
+    def exactly_one_target(self):
+        if (self.point is None) == (self.box is None):
+            raise ValueError("shared_scene_speaker_requires_exactly_one_point_or_box")
+        return self
 
 
 class SharedSceneConversationIn(BaseModel):
@@ -187,7 +199,11 @@ async def set_shared_scene_conversation(
             metadata["shared_scene_media_id"] = str(body.shared_scene_media_id)
             metadata["shared_scene_dimensions"] = {"width": body.image_width, "height": body.image_height}
             metadata["speaker_targets"] = {
-                str(item.participant_id): item.box.model_dump(mode="json")
+                str(item.participant_id): (
+                    {"point": item.point.model_dump(mode="json")}
+                    if item.point is not None
+                    else {"box": item.box.model_dump(mode="json")}
+                )
                 for item in body.speaker_targets
             }
             metadata["shared_scene_target_source"] = "user_confirmed"
@@ -211,7 +227,11 @@ async def set_shared_scene_conversation(
         "shared_scene_dimensions": {"width": body.image_width, "height": body.image_height},
         "speaker_count": len(body.speaker_targets),
         "speaker_targets": {
-            str(item.participant_id): item.box.model_dump(mode="json")
+            str(item.participant_id): (
+                {"point": item.point.model_dump(mode="json")}
+                if item.point is not None
+                else {"box": item.box.model_dump(mode="json")}
+            )
             for item in body.speaker_targets
         },
         "persisted": True,
@@ -223,6 +243,7 @@ async def set_shared_scene_conversation(
 
 __all__ = [
     "NormalizedSpeakerBox",
+    "NormalizedSpeakerPoint",
     "SharedSceneConversationIn",
     "SharedSceneSpeakerTarget",
     "router",
