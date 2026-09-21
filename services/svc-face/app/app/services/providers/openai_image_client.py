@@ -277,10 +277,9 @@ class OpenAIImageClient:
         self.quality = os.getenv("OPENAI_IMAGE_QUALITY", "high")
 
         # GPT Image supports moderation="auto" or "low".
-        # desifaces launch policy is strict for unsafe visual content, so default
-        # to provider moderation="auto". Operators may still override explicitly.
-        moderation = os.getenv("OPENAI_IMAGE_MODERATION", "auto").strip().lower()
-        self.moderation = moderation if moderation in {"auto", "low"} else "auto"
+        # desifaces launch policy requires provider moderation="auto".
+        # Do not allow stale runtime configuration to weaken this product safety gate.
+        self.moderation = "auto"
 
     def _headers(self) -> Dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key}"}
