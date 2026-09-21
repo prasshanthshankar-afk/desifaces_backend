@@ -17,6 +17,8 @@ FusionProvider = Literal[
     "native",
     "veed_fabric",
     "veed",
+    "sync3",
+    "sync_3",
 ]
 DeliverySurface = Literal["instagram_reel", "youtube", "square_social"]
 Resolution = Literal["540p", "720p", "1080p"]
@@ -28,6 +30,8 @@ def _normalize_provider_name(value: Optional[str]) -> str:
         return "veed_fabric"
     if provider in {"omnihuman", "omnihuman_v15"}:
         return "omnihuman_v15"
+    if provider in {"sync3", "sync_3", "sync-3"}:
+        return "sync3"
     return provider or "omnihuman_v15"
 
 
