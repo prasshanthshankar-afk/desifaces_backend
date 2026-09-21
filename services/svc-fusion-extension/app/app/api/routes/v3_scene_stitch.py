@@ -28,6 +28,7 @@ class SceneStitchIn(BaseModel):
     stage_run_id: UUID
     attempt_id: UUID
     segment_urls: list[str] = Field(min_length=1, max_length=200)
+    stitch_mode: str | None = Field(default=None, max_length=32)
 
 
 class SceneStitchOut(BaseModel):
@@ -97,6 +98,9 @@ async def stitch_scene(
         raise HTTPException(status_code=401, detail="invalid_user_identity") from exc
 
     segment_urls = [str(value or "").strip() for value in body.segment_urls if str(value or "").strip()]
+    stitch_mode = str(body.stitch_mode or "").strip().lower() or None
+    if stitch_mode not in {None, "xfade", "fade", "concat", "hard_cut"}:
+        raise HTTPException(status_code=422, detail="scene_stitch_mode_invalid")
     if len(segment_urls) != len(body.segment_urls):
         raise HTTPException(status_code=422, detail="scene_stitch_segment_url_required")
 
@@ -170,7 +174,12 @@ async def stitch_scene(
     with tempfile.TemporaryDirectory(prefix="df_v3_scene_stitch_") as td:
         out_mp4 = os.path.join(td, "scene.mp4")
         try:
-            await asyncio.to_thread(resilient_stitch_video_urls, segment_urls, out_mp4)
+            await asyncio.to_thread(
+                resilient_stitch_video_urls,
+                segment_urls,
+                out_mp4,
+                stitch_mode_override=stitch_mode,
+            )
             sha256, byte_count = await asyncio.to_thread(_file_sha256_and_size, out_mp4)
             uploaded_storage_path, signed_url = await asyncio.to_thread(
                 upload_final_mp4,
@@ -233,6 +242,7 @@ async def stitch_scene(
                     "v3_studio_stage_run_id": str(body.stage_run_id),
                     "v3_studio_attempt_id": str(body.attempt_id),
                     "segment_count": len(segment_urls),
+                    "stitch_mode": stitch_mode or "default",
                     "storage_container": container,
                     "storage_path": uploaded_storage_path,
                     "source_sha256": sha256,
