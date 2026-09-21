@@ -252,6 +252,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://next3_ci:next3_ci@127.0.0.1:5432/desifaces_v3
           JWT_SECRET: next3-ci-only-jwt-secret
+          AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=https;AccountName=next3ci;AccountKey=dGVzdA==;EndpointSuffix=core.windows.net
         run: |
           PYTHONPATH=services/svc-fusion/app python -m pytest -q \
             services/svc-fusion/tests/test_sync3_adapter.py
