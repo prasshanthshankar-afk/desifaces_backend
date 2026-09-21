@@ -234,17 +234,21 @@ class SceneStitchClient:
         stage_run_id: UUID,
         attempt_id: UUID,
         segment_urls: list[str],
+        stitch_mode: str | None = None,
     ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "project_id": str(project_id),
+            "workflow_id": str(workflow_id),
+            "stage_run_id": str(stage_run_id),
+            "attempt_id": str(attempt_id),
+            "segment_urls": segment_urls,
+        }
+        if stitch_mode:
+            body["stitch_mode"] = stitch_mode
         async with httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=self.timeout_seconds) as client:
             response = await client.post(
                 "/api/longform/v3/scene-stitch",
-                json={
-                    "project_id": str(project_id),
-                    "workflow_id": str(workflow_id),
-                    "stage_run_id": str(stage_run_id),
-                    "attempt_id": str(attempt_id),
-                    "segment_urls": segment_urls,
-                },
+                json=body,
             )
         if response.status_code != 200:
             raise SceneFusionBridgeError(
@@ -762,6 +766,11 @@ class SceneFusionExecutionService:
             stage_run_id=context.stage_run_id,
             attempt_id=attempt_id,
             segment_urls=ordered_urls,
+            stitch_mode=(
+                "hard_cut"
+                if _clean((context.stage_metadata or {}).get("conversation_mode")).casefold() == "shared_scene"
+                else None
+            ),
         )
         media_id = UUID(str(stitch.get("media_id")))
         video_url = _clean(stitch.get("video_url"))
