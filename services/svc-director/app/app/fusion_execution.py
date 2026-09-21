@@ -244,6 +244,7 @@ class SceneStitchClient:
         attempt_id: UUID,
         segment_urls: list[str],
         stitch_mode: str | None = None,
+        conversation_mode: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "project_id": str(project_id),
@@ -254,6 +255,8 @@ class SceneStitchClient:
         }
         if stitch_mode:
             body["stitch_mode"] = stitch_mode
+        if conversation_mode:
+            body["conversation_mode"] = conversation_mode
         async with httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=self.timeout_seconds) as client:
             response = await client.post(
                 "/api/longform/v3/scene-stitch",
@@ -772,6 +775,10 @@ class SceneFusionExecutionService:
             _clean(item.get("video_url"))
             for item in sorted(refreshed, key=lambda x: int(x.get("sequence_no") or 0))
         ]
+        scene_conversation_mode = _clean((context.stage_metadata or {}).get("conversation_mode")).casefold()
+        if not scene_conversation_mode and len({str(turn.participant_id) for turn in context.turns}) >= 2:
+            scene_conversation_mode = "ordered_speaker_shots"
+
         stitch = await self.stitch_client.stitch(
             headers=headers,
             project_id=context.project_id,
@@ -784,6 +791,7 @@ class SceneFusionExecutionService:
                 if _clean((context.stage_metadata or {}).get("conversation_mode")).casefold() == "shared_scene"
                 else None
             ),
+            conversation_mode=scene_conversation_mode or None,
         )
         media_id = UUID(str(stitch.get("media_id")))
         video_url = _clean(stitch.get("video_url"))
