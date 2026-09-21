@@ -70,8 +70,8 @@ cd "$WORKTREE"
 V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh config >/tmp/desifaces-next3-compose.yml
 echo "DEV_COMPOSE_PREFLIGHT=PASS"
 
-SERVICES=(svc-director svc-fusion svc-fusion-extension)
-CONTAINERS=(df-v3-svc-director df-v3-svc-fusion df-v3-svc-fusion-extension)
+SERVICES=(svc-director svc-fusion svc-fusion-extension svc-dashboard)
+CONTAINERS=(df-v3-svc-director df-v3-svc-fusion df-v3-svc-fusion-extension df-v3-svc-dashboard)
 WORKER_SERVICES=(svc-director-worker svc-fusion-worker svc-fusion-extension-worker svc-fusion-extension-stitch-worker)
 WORKER_CONTAINERS=(df-v3-svc-director-worker df-v3-svc-fusion-worker df-v3-svc-fusion-extension-worker df-v3-svc-fusion-extension-stitch-worker)
 
@@ -176,6 +176,13 @@ from app.main import app
 paths={getattr(r,"path","") for r in app.routes}
 assert "/api/longform/v3/scene-stitch" in paths
 print("NEXT3_STITCH_RUNTIME_CONTRACT=PASS")
+PY
+
+docker exec df-v3-svc-dashboard python - <<'PY'
+from app.services.dashboard_service import _library_conversation_mode
+assert _library_conversation_mode({"conversation_mode":"shared_scene"}, {}) == "shared_scene"
+assert _library_conversation_mode({"conversation_mode":"ordered_speaker_shots"}, {}) == "ordered_speaker_shots"
+print("NEXT3_SAVED_WORK_CLASSIFICATION=PASS")
 PY
 
 for i in "${!WORKER_CONTAINERS[@]}"; do
