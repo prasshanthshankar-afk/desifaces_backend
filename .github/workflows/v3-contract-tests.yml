@@ -249,6 +249,9 @@ jobs:
             test/test_v3_multi_person_pricing.py
 
       - name: Run #next3 multi-person conversation contract tests
+        env:
+          DATABASE_URL: postgresql://next3_ci:next3_ci@127.0.0.1:5432/desifaces_v3
+          JWT_SECRET: next3-ci-only-jwt-secret
         run: |
           PYTHONPATH=services/svc-fusion/app python -m pytest -q \
             services/svc-fusion/tests/test_sync3_adapter.py
