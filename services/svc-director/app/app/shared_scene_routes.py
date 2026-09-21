@@ -209,7 +209,9 @@ async def set_shared_scene_conversation(
             for item in body.speaker_targets
         },
         "persisted": True,
-        "generation_ready": True,
+        "configuration_ready": True,
+        "generation_ready": False,
+        "generation_blocker": "shared_scene_media_pipeline_required",
     }
 
 
