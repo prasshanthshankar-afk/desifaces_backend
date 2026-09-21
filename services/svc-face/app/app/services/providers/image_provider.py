@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import Optional, Literal, Dict, Any, Tuple
 
@@ -89,8 +90,35 @@ class ImageProviderRouter:
             raise last
         raise RuntimeError("openai_image_retry_exhausted")
 
+    @staticmethod
+    def _policy_text_without_internal_safety_negations(prompt: str) -> str:
+        """
+        Provider prompts include desifaces-owned negative safety instructions such as
+        "no guns" and "no gore". Those phrases must not trigger the same positive
+        keyword hard-block that protects user-authored content.
+        """
+        cleaned = str(prompt or "")
+        internal_negations = (
+            "no firearms",
+            "no guns",
+            "no weapons",
+            "no blood",
+            "no gore",
+            "no graphic injury",
+            "no open wounds",
+        )
+        for phrase in internal_negations:
+            cleaned = re.sub(
+                rf"\b{re.escape(phrase)}\b",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+        return cleaned
+
     def _enforce_final_prompt_safety(self, prompt: str) -> None:
-        allow, reason = self._safety.check_keywords(prompt)
+        policy_text = self._policy_text_without_internal_safety_negations(prompt)
+        allow, reason = self._safety.check_keywords(policy_text)
         if not allow:
             raise RuntimeError(f"generation_prompt_policy_blocked: {reason}")
 

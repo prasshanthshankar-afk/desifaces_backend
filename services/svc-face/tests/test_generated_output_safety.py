@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from app.services.providers.image_provider import ImageBytesResult, ImageProviderRouter
+from app.services.safety_service import SafetyService
 
 
 class _Safety:
@@ -95,3 +96,23 @@ def test_final_provider_prompt_allows_benign_arms_language():
     router._enforce_final_prompt_safety(
         "woman with arms crossed, professional portrait, realistic lighting"
     )
+
+
+def test_final_provider_prompt_allows_desifaces_internal_safety_negations():
+    router = _router_with_safety(SafetyService())
+
+    router._enforce_final_prompt_safety(
+        "woman with bright smile, professional portrait, "
+        "no firearms, no guns, no weapons, no blood, no gore, "
+        "no graphic injury, no open wounds"
+    )
+
+
+def test_final_provider_prompt_still_blocks_explicit_firearm_with_internal_negations():
+    router = _router_with_safety(SafetyService())
+
+    with pytest.raises(RuntimeError, match="generation_prompt_policy_blocked"):
+        router._enforce_final_prompt_safety(
+            "woman with gun and arms, professional portrait, "
+            "no firearms, no guns, no weapons, no blood, no gore"
+        )
