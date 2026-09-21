@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from uuid import uuid4
 
 import pytest
@@ -8,6 +10,7 @@ from app.fusion_execution import FusionSceneContext, SceneTurnInput
 from app.fusion_input_performance import (
     _assert_conversation_mode_supported,
     _speaker_coordinates,
+    compile_children_performant,
 )
 
 
@@ -73,7 +76,17 @@ def _shared_context() -> FusionSceneContext:
             },
         },
     }
-    return FusionSceneContext(**{**base.__dict__, "stage_metadata": metadata})
+    face_free_turns = tuple(
+        SceneTurnInput(**{**turn.__dict__, "face_media_id": None})
+        for turn in base.turns
+    )
+    return FusionSceneContext(
+        **{
+            **base.__dict__,
+            "stage_metadata": metadata,
+            "turns": face_free_turns,
+        }
+    )
 
 
 def test_existing_fusion_path_is_unchanged_without_conversation_mode():
@@ -105,3 +118,41 @@ def test_shared_scene_requires_target_for_every_speaking_participant():
     context = FusionSceneContext(**{**context.__dict__, "stage_metadata": metadata})
     with pytest.raises(RuntimeError, match="shared_scene_speaker_targets_missing"):
         _assert_conversation_mode_supported(context)
+
+
+def test_shared_scene_compiles_without_individual_face_assets():
+    context = _shared_context()
+    shared_media_id = context.stage_metadata["shared_scene_media_id"]
+
+    class FaceClient:
+        def __init__(self):
+            self.media_ids = []
+
+        async def read_url(self, *, headers, media_id):
+            self.media_ids.append(str(media_id))
+            return "https://example.test/shared-scene.png"
+
+    class AudioClient:
+        async def read_url(self, *, headers, media_id):
+            return f"https://example.test/{media_id}.wav"
+
+    face_client = FaceClient()
+    children = asyncio.run(
+        compile_children_performant(
+            context=context,
+            face_client=face_client,
+            audio_client=AudioClient(),
+            headers={"Authorization": "Bearer test"},
+            external_provider_ok=True,
+        )
+    )
+
+    assert face_client.media_ids == [shared_media_id]
+    assert len(children) == len(context.turns)
+    assert all(child["face_media_id"] is None for child in children)
+    assert all(child["shared_scene_media_id"] == shared_media_id for child in children)
+    assert all(child["payload"]["provider"] == "sync3" for child in children)
+    assert all(
+        child["payload"]["provider_options"]["conversation_mode"] == "shared_scene"
+        for child in children
+    )
