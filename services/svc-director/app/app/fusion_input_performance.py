@@ -23,22 +23,33 @@ def _scene_aspect_ratio(context: FusionSceneContext) -> str:
     return raw if raw in _ALLOWED_ASPECT_RATIOS else "9:16"
 
 
-def _assert_conversation_mode_supported(context: FusionSceneContext) -> None:
-    """Prevent shared-scene requests from silently using isolated speaker shots."""
+def _assert_conversation_mode_supported(context: FusionSceneContext) -> dict[str, Any] | None:
+    """Validate and return the optional shared-scene provider contract."""
 
     mode = _clean((context.stage_metadata or {}).get("conversation_mode")).casefold()
     if not mode:
-        return
+        return None
     if mode != "shared_scene":
         raise RuntimeError(f"unsupported_fusion_conversation_mode:{mode}")
 
     metadata = context.stage_metadata or {}
     shared_scene_media_id = _clean(metadata.get("shared_scene_media_id"))
     speaker_targets = metadata.get("speaker_targets")
+    dimensions = metadata.get("shared_scene_dimensions")
     if not shared_scene_media_id:
         raise RuntimeError("shared_scene_media_id_required")
     if not isinstance(speaker_targets, dict):
         raise RuntimeError("shared_scene_speaker_targets_required")
+    if not isinstance(dimensions, dict):
+        raise RuntimeError("shared_scene_dimensions_required")
+
+    try:
+        image_width = int(dimensions.get("width"))
+        image_height = int(dimensions.get("height"))
+    except Exception as exc:
+        raise RuntimeError("shared_scene_dimensions_invalid") from exc
+    if image_width < 64 or image_height < 64:
+        raise RuntimeError("shared_scene_dimensions_invalid")
 
     missing = [
         str(turn.participant_id)
@@ -48,10 +59,33 @@ def _assert_conversation_mode_supported(context: FusionSceneContext) -> None:
     if missing:
         raise RuntimeError("shared_scene_speaker_targets_missing:" + ",".join(sorted(set(missing))))
 
-    # #next3 media preparation/compositing is intentionally a separate bounded
-    # implementation slice. Until that owner-service path is installed, fail closed
-    # rather than falling back to the existing isolated-speaker rendering behavior.
-    raise RuntimeError("shared_scene_media_pipeline_required")
+    return {
+        "shared_scene_media_id": shared_scene_media_id,
+        "image_width": image_width,
+        "image_height": image_height,
+        "speaker_targets": speaker_targets,
+    }
+
+
+def _speaker_coordinates(shared_scene: dict[str, Any], participant_id) -> list[int]:
+    target = shared_scene["speaker_targets"].get(str(participant_id))
+    if not isinstance(target, dict):
+        raise RuntimeError(f"shared_scene_speaker_target_missing:{participant_id}")
+    try:
+        x = float(target.get("x"))
+        y = float(target.get("y"))
+        width = float(target.get("width"))
+        height = float(target.get("height"))
+    except Exception as exc:
+        raise RuntimeError(f"shared_scene_speaker_target_invalid:{participant_id}") from exc
+    if x < 0 or y < 0 or width <= 0 or height <= 0 or x + width > 1.000001 or y + height > 1.000001:
+        raise RuntimeError(f"shared_scene_speaker_target_invalid:{participant_id}")
+
+    image_width = int(shared_scene["image_width"])
+    image_height = int(shared_scene["image_height"])
+    center_x = max(0, min(image_width - 1, int(round((x + width / 2.0) * image_width))))
+    center_y = max(0, min(image_height - 1, int(round((y + height / 2.0) * image_height))))
+    return [center_x, center_y]
 
 
 async def compile_children_performant(
@@ -69,7 +103,7 @@ async def compile_children_performant(
     pricing. Both pricing and dispatch reload the same stage metadata, ensuring
     that 9:16, 16:9 or 1:1 cannot drift between quote and provider execution.
     """
-    _assert_conversation_mode_supported(context)
+    shared_scene = _assert_conversation_mode_supported(context)
 
     semaphore = asyncio.Semaphore(_input_concurrency())
     face_urls: dict[str, str] = {}
@@ -85,18 +119,25 @@ async def compile_children_performant(
         async with semaphore:
             audio_urls[key] = await audio_client.read_url(headers=headers, media_id=media_id)
 
-    unique_faces = {str(turn.face_media_id): turn.face_media_id for turn in context.turns}
-    unique_audio = {str(turn.audio_media_id): turn.audio_media_id for turn in context.turns}
-    await asyncio.gather(
-        *(load_face(media_id) for media_id in unique_faces.values()),
-        *(load_audio(media_id) for media_id in unique_audio.values()),
-    )
+    if shared_scene:
+        shared_media_id = shared_scene["shared_scene_media_id"]
+        await asyncio.gather(
+            load_face(shared_media_id),
+            *(load_audio(media_id) for media_id in {str(turn.audio_media_id): turn.audio_media_id for turn in context.turns}.values()),
+        )
+    else:
+        unique_faces = {str(turn.face_media_id): turn.face_media_id for turn in context.turns}
+        unique_audio = {str(turn.audio_media_id): turn.audio_media_id for turn in context.turns}
+        await asyncio.gather(
+            *(load_face(media_id) for media_id in unique_faces.values()),
+            *(load_audio(media_id) for media_id in unique_audio.values()),
+        )
 
     prompt = _scene_prompt(context)
     aspect_ratio = _scene_aspect_ratio(context)
     children: list[dict[str, Any]] = []
     for turn in context.turns:
-        face_url = face_urls[str(turn.face_media_id)]
+        face_url = face_urls[str(shared_scene["shared_scene_media_id"])] if shared_scene else face_urls[str(turn.face_media_id)]
         audio_url = audio_urls[str(turn.audio_media_id)]
         video: dict[str, Any] = {"aspect_ratio": aspect_ratio}
         if turn.duration_hint_ms and turn.duration_hint_ms > 0:
@@ -108,9 +149,17 @@ async def compile_children_performant(
 
         turn_key = str(turn.dialogue_turn_id)
         request_nonce = _clean((request_nonce_by_turn or {}).get(turn_key))
+        provider_options: dict[str, Any] = {}
+        provider_name = "veed_fabric"
+        if shared_scene:
+            provider_name = "sync3"
+            provider_options["active_speaker_coordinates"] = _speaker_coordinates(shared_scene, turn.participant_id)
+            provider_options["conversation_mode"] = "shared_scene"
+            provider_options["shared_scene_media_id"] = shared_scene["shared_scene_media_id"]
+
         payload: dict[str, Any] = {
             "face_image_url": face_url,
-            "provider": "veed_fabric",
+            "provider": provider_name,
             "voice_mode": "audio",
             "voice_audio": {"type": "audio", "audio_url": audio_url},
             "consent": {"external_provider_ok": bool(external_provider_ok)},
@@ -124,10 +173,13 @@ async def compile_children_performant(
                 "participant_id": str(turn.participant_id),
                 "segment_sequence": turn.sequence_no,
                 "aspect_ratio": aspect_ratio,
+                "conversation_mode": "shared_scene" if shared_scene else "ordered_speaker_shots",
             },
         }
         if request_nonce:
-            payload["provider_options"] = {"v3_request_nonce": request_nonce}
+            provider_options["v3_request_nonce"] = request_nonce
+        if provider_options:
+            payload["provider_options"] = provider_options
 
         children.append({
             "dialogue_turn_id": turn_key,
@@ -135,6 +187,7 @@ async def compile_children_performant(
             "display_name": turn.display_name,
             "sequence_no": turn.sequence_no,
             "face_media_id": str(turn.face_media_id),
+            "shared_scene_media_id": shared_scene["shared_scene_media_id"] if shared_scene else None,
             "audio_media_id": str(turn.audio_media_id),
             "aspect_ratio": aspect_ratio,
             "payload": payload,
@@ -148,4 +201,5 @@ __all__ = [
     "_input_concurrency",
     "_scene_aspect_ratio",
     "_assert_conversation_mode_supported",
+    "_speaker_coordinates",
 ]
