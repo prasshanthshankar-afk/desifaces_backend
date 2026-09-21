@@ -203,7 +203,7 @@ async def compile_children_performant(
             "participant_id": str(turn.participant_id),
             "display_name": turn.display_name,
             "sequence_no": turn.sequence_no,
-            "face_media_id": str(turn.face_media_id),
+            "face_media_id": str(turn.face_media_id) if turn.face_media_id is not None else None,
             "shared_scene_media_id": shared_scene["shared_scene_media_id"] if shared_scene else None,
             "audio_media_id": str(turn.audio_media_id),
             "aspect_ratio": aspect_ratio,
