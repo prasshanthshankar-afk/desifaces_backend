@@ -16,6 +16,16 @@ jobs:
   certify-face-safety:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      DATABASE_URL: postgresql://test:test@127.0.0.1:5432/test
+      AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=https;AccountName=test;AccountKey=dGVzdA==;EndpointSuffix=core.windows.net
+      FAL_API_KEY: test
+      AZURE_OPENAI_ENDPOINT: https://example.invalid/
+      AZURE_OPENAI_KEY: test
+      AZURE_OPENAI_DEPLOYMENT: test
+      AZURE_CONTENT_MODERATOR_ENDPOINT: https://example.invalid/
+      AZURE_CONTENT_MODERATOR_KEY: test
+      JWT_SECRET: test-only-secret
     defaults:
       run:
         working-directory: services/svc-face
