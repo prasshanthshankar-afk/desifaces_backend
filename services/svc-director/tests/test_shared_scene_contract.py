@@ -38,5 +38,7 @@ def test_shared_scene_contract_requires_unique_speakers():
     with pytest.raises(ValidationError):
         SharedSceneConversationIn(
             shared_scene_media_id=uuid4(),
+            image_width=1920,
+            image_height=1080,
             speaker_targets=[target, target],
         )
