@@ -20,13 +20,13 @@ class _Response:
         }
 
 
-def test_moderation_defaults_to_low(monkeypatch):
+def test_moderation_defaults_to_auto(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.delenv("OPENAI_IMAGE_MODERATION", raising=False)
 
     client = OpenAIImageClient()
 
-    assert client.moderation == "low"
+    assert client.moderation == "auto"
 
 
 def test_moderation_auto_can_be_restored_by_environment(monkeypatch):
@@ -38,13 +38,13 @@ def test_moderation_auto_can_be_restored_by_environment(monkeypatch):
     assert client.moderation == "auto"
 
 
-def test_invalid_moderation_falls_back_to_low(monkeypatch):
+def test_invalid_moderation_falls_back_to_auto(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_IMAGE_MODERATION", "invalid")
 
     client = OpenAIImageClient()
 
-    assert client.moderation == "low"
+    assert client.moderation == "auto"
 
 
 def test_t2i_sends_low_moderation(monkeypatch):

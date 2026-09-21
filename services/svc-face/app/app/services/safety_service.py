@@ -20,10 +20,10 @@ from app.config import settings
 
 logger = logging.getLogger("svc-face.safety")
 
-# Prompt safety must not hard-block broad creator terms like "bikini",
-# "political", "kid", "fight", or "weapon" by keyword alone. Those are
-# context signals for the moderation provider, not automatic user-facing
-# rejections. Keep direct keyword blocks only for clearly disallowed content.
+# Prompt safety may allow broad creator terms such as "bikini", "political",
+# "kid", or "fight" to flow to the moderation provider, but desifaces product
+# policy is stricter for firearms and graphic/bloody content: those requests
+# are always rejected before generation.
 #
 # Azure Content Safety severities commonly use 0 / 2 / 4 / 6. Moving the
 # default block threshold from 2 to 3 gives the requested launch leeway:
@@ -71,10 +71,24 @@ HARD_BLOCK_PATTERNS = [
         "suggested_changes": "Remove abuse or exploitation references and rewrite the prompt in a safe, non-sexual context.",
     },
     {
-        "pattern": r"\b(gore|gory|bloodbath|dismember|decapitat(?:e|ed|ion)|mutilat(?:e|ed|ion))\b",
+        "pattern": (
+            r"\b(gun|guns|firearm|firearms|pistol|pistols|revolver|revolvers|"
+            r"rifle|rifles|shotgun|shotguns|machine[ -]?gun|machine[ -]?guns|"
+            r"assault[ -]?rifle|assault[ -]?rifles|handgun|handguns)\b"
+        ),
+        "category": "weapons",
+        "not_permitted": "firearms or gun imagery",
+        "suggested_changes": "Remove firearms, guns, rifles, pistols, and other gun imagery from the request.",
+    },
+    {
+        "pattern": (
+            r"\b(blood|bloody|bleeding|bloodbath|blood[ -]?(?:splatter|spray|pool|covered|soaked|stained)|"
+            r"gore|gory|dismember|dismembered|decapitat(?:e|ed|ion)|mutilat(?:e|ed|ion)|"
+            r"severed|open[ -]?wound|graphic[ -]?injur(?:y|ies))\b"
+        ),
         "category": "violence",
-        "not_permitted": "graphic gore, mutilation, or extreme violence",
-        "suggested_changes": "Use non-graphic action or dramatic mood without blood, gore, or bodily harm.",
+        "not_permitted": "blood, gore, mutilation, or graphic injury",
+        "suggested_changes": "Use a clean, non-graphic scene without blood, gore, open wounds, or bodily harm.",
     },
     {
         "pattern": r"\b(make|manufacture|cook|synthesize|traffic|sell)\b.{0,60}\b(cocaine|heroin|meth|fentanyl|illegal drugs?)\b",
@@ -166,8 +180,15 @@ def _category_policy_message(category: str, *, source: str = "prompt") -> str:
     if normalized == "violence":
         return _policy_message(
             category="violence",
-            not_permitted="graphic violence, gore, mutilation, or instructions to harm people",
-            suggested_changes="use non-graphic dramatic mood or action without blood, gore, weapons-use instructions, or bodily harm",
+            not_permitted="blood, gore, graphic violence, mutilation, or graphic bodily harm",
+            suggested_changes="use a clean, non-graphic dramatic mood or action without blood, gore, open wounds, or bodily harm",
+            source=source,
+        )
+    if normalized == "weapons":
+        return _policy_message(
+            category="weapons",
+            not_permitted="firearms or gun imagery",
+            suggested_changes="remove firearms, guns, rifles, pistols, and other gun imagery",
             source=source,
         )
     return _policy_message(
@@ -583,5 +604,6 @@ class SafetyService:
     def build_safe_prompt(self, user_prompt: str) -> str:
         safety_additions = """
         elegant, professional photography, high-quality image, well-lit, clear details, flattering angles, tasteful composition,
+        no firearms, no guns, no weapons, no blood, no gore, no graphic injury, no open wounds,
         """
         return f"{user_prompt}, {safety_additions.strip()}"
