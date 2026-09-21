@@ -71,20 +71,37 @@ def _speaker_coordinates(shared_scene: dict[str, Any], participant_id) -> list[i
     target = shared_scene["speaker_targets"].get(str(participant_id))
     if not isinstance(target, dict):
         raise RuntimeError(f"shared_scene_speaker_target_missing:{participant_id}")
-    try:
-        x = float(target.get("x"))
-        y = float(target.get("y"))
-        width = float(target.get("width"))
-        height = float(target.get("height"))
-    except Exception as exc:
-        raise RuntimeError(f"shared_scene_speaker_target_invalid:{participant_id}") from exc
-    if x < 0 or y < 0 or width <= 0 or height <= 0 or x + width > 1.000001 or y + height > 1.000001:
-        raise RuntimeError(f"shared_scene_speaker_target_invalid:{participant_id}")
 
     image_width = int(shared_scene["image_width"])
     image_height = int(shared_scene["image_height"])
-    center_x = max(0, min(image_width - 1, int(round((x + width / 2.0) * image_width))))
-    center_y = max(0, min(image_height - 1, int(round((y + height / 2.0) * image_height))))
+
+    point = target.get("point")
+    if isinstance(point, dict):
+        try:
+            center_x_norm = float(point.get("x"))
+            center_y_norm = float(point.get("y"))
+        except Exception as exc:
+            raise RuntimeError(f"shared_scene_speaker_target_invalid:{participant_id}") from exc
+        if not (0.0 <= center_x_norm <= 1.0 and 0.0 <= center_y_norm <= 1.0):
+            raise RuntimeError(f"shared_scene_speaker_target_invalid:{participant_id}")
+    else:
+        box = target.get("box")
+        if not isinstance(box, dict):
+            raise RuntimeError(f"shared_scene_speaker_target_invalid:{participant_id}")
+        try:
+            x = float(box.get("x"))
+            y = float(box.get("y"))
+            width = float(box.get("width"))
+            height = float(box.get("height"))
+        except Exception as exc:
+            raise RuntimeError(f"shared_scene_speaker_target_invalid:{participant_id}") from exc
+        if x < 0 or y < 0 or width <= 0 or height <= 0 or x + width > 1.000001 or y + height > 1.000001:
+            raise RuntimeError(f"shared_scene_speaker_target_invalid:{participant_id}")
+        center_x_norm = x + width / 2.0
+        center_y_norm = y + height / 2.0
+
+    center_x = max(0, min(image_width - 1, int(round(center_x_norm * image_width))))
+    center_y = max(0, min(image_height - 1, int(round(center_y_norm * image_height))))
     return [center_x, center_y]
 
 
