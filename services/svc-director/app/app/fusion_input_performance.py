@@ -23,6 +23,37 @@ def _scene_aspect_ratio(context: FusionSceneContext) -> str:
     return raw if raw in _ALLOWED_ASPECT_RATIOS else "9:16"
 
 
+def _assert_conversation_mode_supported(context: FusionSceneContext) -> None:
+    """Prevent shared-scene requests from silently using isolated speaker shots."""
+
+    mode = _clean((context.stage_metadata or {}).get("conversation_mode")).casefold()
+    if not mode:
+        return
+    if mode != "shared_scene":
+        raise RuntimeError(f"unsupported_fusion_conversation_mode:{mode}")
+
+    metadata = context.stage_metadata or {}
+    shared_scene_media_id = _clean(metadata.get("shared_scene_media_id"))
+    speaker_targets = metadata.get("speaker_targets")
+    if not shared_scene_media_id:
+        raise RuntimeError("shared_scene_media_id_required")
+    if not isinstance(speaker_targets, dict):
+        raise RuntimeError("shared_scene_speaker_targets_required")
+
+    missing = [
+        str(turn.participant_id)
+        for turn in context.turns
+        if not isinstance(speaker_targets.get(str(turn.participant_id)), dict)
+    ]
+    if missing:
+        raise RuntimeError("shared_scene_speaker_targets_missing:" + ",".join(sorted(set(missing))))
+
+    # #next3 media preparation/compositing is intentionally a separate bounded
+    # implementation slice. Until that owner-service path is installed, fail closed
+    # rather than falling back to the existing isolated-speaker rendering behavior.
+    raise RuntimeError("shared_scene_media_pipeline_required")
+
+
 async def compile_children_performant(
     *,
     context: FusionSceneContext,
@@ -38,6 +69,8 @@ async def compile_children_performant(
     pricing. Both pricing and dispatch reload the same stage metadata, ensuring
     that 9:16, 16:9 or 1:1 cannot drift between quote and provider execution.
     """
+    _assert_conversation_mode_supported(context)
+
     semaphore = asyncio.Semaphore(_input_concurrency())
     face_urls: dict[str, str] = {}
     audio_urls: dict[str, str] = {}
@@ -114,4 +147,5 @@ __all__ = [
     "compile_children_performant",
     "_input_concurrency",
     "_scene_aspect_ratio",
+    "_assert_conversation_mode_supported",
 ]
