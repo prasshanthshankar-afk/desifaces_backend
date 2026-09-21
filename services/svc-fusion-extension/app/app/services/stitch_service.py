@@ -347,12 +347,21 @@ def stitch_video_urls(
 # Normalization helpers
 # ---------------------------------------------------------------------------
 
-def normalize_segment_mp4(input_path: str, output_path: str) -> None:
+def normalize_segment_mp4(
+    input_path: str,
+    output_path: str,
+    *,
+    edge_fade_override: Optional[float] = None,
+) -> None:
     _require_nonempty_file(input_path)
     _ensure_parent_dir(output_path)
 
     has_audio = _probe_has_audio(input_path)
-    edge_fade = _segment_edge_fade_seconds()
+    edge_fade = (
+        _segment_edge_fade_seconds()
+        if edge_fade_override is None
+        else max(0.0, float(edge_fade_override))
+    )
     duration = _probe_duration_seconds(input_path) or 0.0
     vf_parts = ["fps=30", "format=yuv420p"]
     af_parts: List[str] = []
@@ -945,7 +954,11 @@ def stitch_videos(segment_files: List[str], out_mp4: str, *, stitch_mode_overrid
 
         def _norm_one(item):
             _, src, norm = item
-            normalize_segment_mp4(src, norm)
+            normalize_segment_mp4(
+                src,
+                norm,
+                edge_fade_override=0.0 if effective_mode in {"concat", "hard_cut"} else None,
+            )
 
         with ThreadPoolExecutor(max_workers=_stitch_concurrency()) as ex:
             list(ex.map(_norm_one, [(i, src, normalized_files[i]) for i, src in enumerate(segment_files)]))
