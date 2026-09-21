@@ -20,14 +20,15 @@ from app.config import settings
 
 logger = logging.getLogger("svc-face.safety")
 
-# Prompt safety must not hard-block broad creator terms like "bikini",
-# "political", "kid", "fight", or "weapon" by keyword alone. Those are
-# context signals for the moderation provider, not automatic user-facing
-# rejections. Keep direct keyword blocks only for clearly disallowed content.
+# desifaces product safety contract:
+# - firearms / weapons are not permitted in generated Face Studio imagery;
+# - blood / gore / graphic injury are not permitted;
+# - sexual/minor, abuse, hate and self-harm controls remain in force.
 #
-# Azure Content Safety severities commonly use 0 / 2 / 4 / 6. Moving the
-# default block threshold from 2 to 3 gives the requested launch leeway:
-# borderline severity 2 is allowed, while severity 4+ remains blocked.
+# These product-level prohibitions are deterministic hard blocks and do not
+# depend on a provider moderation severity. Provider moderation remains an
+# additional safety layer for contextual categories.
+SAFETY_POLICY_VERSION = "2026-09-21-no-weapons-blood-gore-v1"
 DEFAULT_TEXT_SAFETY_BLOCK_SEVERITY = 3
 DEFAULT_IMAGE_SAFETY_BLOCK_SEVERITY = 3
 
@@ -71,10 +72,25 @@ HARD_BLOCK_PATTERNS = [
         "suggested_changes": "Remove abuse or exploitation references and rewrite the prompt in a safe, non-sexual context.",
     },
     {
-        "pattern": r"\b(gore|gory|bloodbath|dismember|decapitat(?:e|ed|ion)|mutilat(?:e|ed|ion))\b",
+        "pattern": (
+            r"\b(?:gun|guns|firearm|firearms|rifle|rifles|pistol|pistols|"
+            r"handgun|handguns|shotgun|shotguns|revolver|revolvers|"
+            r"machine[- ]?gun|machine[- ]?guns|assault[- ]?rifle|assault[- ]?rifles|"
+            r"sniper[- ]?rifle|sniper[- ]?rifles|weapon|weapons|ammunition|ammo)\b"
+        ),
+        "category": "weapons",
+        "not_permitted": "guns, firearms, weapons, ammunition, or armed weapon-focused imagery",
+        "suggested_changes": "Remove guns, firearms, weapons, ammunition, and armed poses. Use a safe non-weapon prop or pose instead.",
+    },
+    {
+        "pattern": (
+            r"\b(?:gore|gory|blood|bloody|bloodbath|bleeding|blood[- ]?splatter|"
+            r"blood[- ]?stain(?:ed|s)?|open wounds?|dismember|"
+            r"decapitat(?:e|ed|ion)|mutilat(?:e|ed|ion))\b"
+        ),
         "category": "violence",
-        "not_permitted": "graphic gore, mutilation, or extreme violence",
-        "suggested_changes": "Use non-graphic action or dramatic mood without blood, gore, or bodily harm.",
+        "not_permitted": "blood, gore, graphic injury, mutilation, or extreme violence",
+        "suggested_changes": "Remove blood, gore, wounds, graphic injury, or bodily harm and use a safe non-graphic scene.",
     },
     {
         "pattern": r"\b(make|manufacture|cook|synthesize|traffic|sell)\b.{0,60}\b(cocaine|heroin|meth|fentanyl|illegal drugs?)\b",
@@ -88,7 +104,7 @@ SAFETY_NEGATIVE_PROMPT = """
 nude, nudity, naked, nsfw, explicit, sexual, pornographic, obscene,
 inappropriate, explicit sexual content, pornographic presentation,
 exposed intimate body parts, sexual acts, explicitly sexual poses,
-violence, blood, gore, weapons, fighting, abuse,
+violence, blood, bloody, gore, guns, firearms, rifles, pistols, weapons, ammunition, armed poses, fighting, abuse,
 child in inappropriate context, underage,
 political symbols, political figures, controversial symbols,
 hate symbols, offensive gestures, drugs, smoking, alcohol abuse,
