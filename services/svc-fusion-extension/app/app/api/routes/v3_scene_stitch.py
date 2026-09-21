@@ -29,6 +29,7 @@ class SceneStitchIn(BaseModel):
     attempt_id: UUID
     segment_urls: list[str] = Field(min_length=1, max_length=200)
     stitch_mode: str | None = Field(default=None, max_length=32)
+    conversation_mode: str | None = Field(default=None, max_length=32)
 
 
 class SceneStitchOut(BaseModel):
@@ -101,6 +102,9 @@ async def stitch_scene(
     stitch_mode = str(body.stitch_mode or "").strip().lower() or None
     if stitch_mode not in {None, "xfade", "fade", "concat", "hard_cut"}:
         raise HTTPException(status_code=422, detail="scene_stitch_mode_invalid")
+    conversation_mode = str(body.conversation_mode or "").strip().lower() or None
+    if conversation_mode not in {None, "shared_scene", "ordered_speaker_shots"}:
+        raise HTTPException(status_code=422, detail="scene_stitch_conversation_mode_invalid")
     if len(segment_urls) != len(body.segment_urls):
         raise HTTPException(status_code=422, detail="scene_stitch_segment_url_required")
 
@@ -243,6 +247,14 @@ async def stitch_scene(
                     "v3_studio_attempt_id": str(body.attempt_id),
                     "segment_count": len(segment_urls),
                     "stitch_mode": stitch_mode or "default",
+                    "conversation_mode": conversation_mode,
+                    "conversation_kind": (
+                        "group_photo_conversation"
+                        if conversation_mode == "shared_scene"
+                        else "multi_person_conversation"
+                        if conversation_mode == "ordered_speaker_shots"
+                        else None
+                    ),
                     "storage_container": container,
                     "storage_path": uploaded_storage_path,
                     "source_sha256": sha256,
