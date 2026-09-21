@@ -3,7 +3,10 @@ name: Face Safety Certification
 on:
   push:
     branches:
-      - fix/face-safety-firearms-gore-20260921
+      - main
+    paths:
+      - 'services/svc-face/**'
+      - '.github/workflows/face-safety-certification.yml'
   pull_request:
     paths:
       - 'services/svc-face/**'
