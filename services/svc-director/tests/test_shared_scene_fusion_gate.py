@@ -5,7 +5,10 @@ from uuid import uuid4
 import pytest
 
 from app.fusion_execution import FusionSceneContext, SceneTurnInput
-from app.fusion_input_performance import _assert_conversation_mode_supported
+from app.fusion_input_performance import (
+    _assert_conversation_mode_supported,
+    _speaker_coordinates,
+)
 
 
 def _context(metadata: dict) -> FusionSceneContext:
@@ -49,56 +52,58 @@ def _context(metadata: dict) -> FusionSceneContext:
     )
 
 
+def _shared_context() -> FusionSceneContext:
+    base = _context({})
+    metadata = {
+        "conversation_mode": "shared_scene",
+        "shared_scene_media_id": str(uuid4()),
+        "shared_scene_dimensions": {"width": 1920, "height": 1080},
+        "speaker_targets": {
+            str(base.turns[0].participant_id): {
+                "x": 0.10,
+                "y": 0.20,
+                "width": 0.20,
+                "height": 0.50,
+                "padding_ratio": 0.10,
+            },
+            str(base.turns[1].participant_id): {
+                "x": 0.60,
+                "y": 0.20,
+                "width": 0.20,
+                "height": 0.50,
+                "padding_ratio": 0.10,
+            },
+        },
+    }
+    return FusionSceneContext(**{**base.__dict__, "stage_metadata": metadata})
+
+
 def test_existing_fusion_path_is_unchanged_without_conversation_mode():
-    _assert_conversation_mode_supported(_context({}))
+    assert _assert_conversation_mode_supported(_context({})) is None
 
 
-def test_shared_scene_fails_closed_before_media_pipeline_is_installed():
-    context = _context({})
-    targets = {
-        str(turn.participant_id): {
-            "x": 0.1,
-            "y": 0.1,
-            "width": 0.3,
-            "height": 0.5,
-            "padding_ratio": 0.1,
-        }
-        for turn in context.turns
-    }
-    context = _context(
-        {
-            "conversation_mode": "shared_scene",
-            "shared_scene_media_id": str(uuid4()),
-            "speaker_targets": targets,
-        }
-    )
-    # Rebuild targets for the participant ids in the final immutable context.
-    metadata = dict(context.stage_metadata)
-    metadata["speaker_targets"] = {
-        str(turn.participant_id): {
-            "x": 0.1,
-            "y": 0.1,
-            "width": 0.3,
-            "height": 0.5,
-            "padding_ratio": 0.1,
-        }
-        for turn in context.turns
-    }
-    context = FusionSceneContext(
-        **{**context.__dict__, "stage_metadata": metadata}
-    )
+def test_shared_scene_contract_resolves_for_sync3():
+    context = _shared_context()
+    shared = _assert_conversation_mode_supported(context)
+    assert shared is not None
+    assert shared["image_width"] == 1920
+    assert shared["image_height"] == 1080
 
-    with pytest.raises(RuntimeError, match="shared_scene_media_pipeline_required"):
-        _assert_conversation_mode_supported(context)
+
+def test_shared_scene_derives_native_pixel_speaker_center():
+    context = _shared_context()
+    shared = _assert_conversation_mode_supported(context)
+    assert shared is not None
+    assert _speaker_coordinates(shared, context.turns[0].participant_id) == [384, 486]
+    assert _speaker_coordinates(shared, context.turns[1].participant_id) == [1344, 486]
 
 
 def test_shared_scene_requires_target_for_every_speaking_participant():
-    context = _context(
-        {
-            "conversation_mode": "shared_scene",
-            "shared_scene_media_id": str(uuid4()),
-            "speaker_targets": {},
-        }
-    )
+    context = _shared_context()
+    metadata = dict(context.stage_metadata)
+    metadata["speaker_targets"] = {
+        str(context.turns[0].participant_id): metadata["speaker_targets"][str(context.turns[0].participant_id)]
+    }
+    context = FusionSceneContext(**{**context.__dict__, "stage_metadata": metadata})
     with pytest.raises(RuntimeError, match="shared_scene_speaker_targets_missing"):
         _assert_conversation_mode_supported(context)
