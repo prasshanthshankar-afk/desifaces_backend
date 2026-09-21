@@ -214,8 +214,8 @@ async def set_shared_scene_conversation(
         },
         "persisted": True,
         "configuration_ready": True,
-        "generation_ready": False,
-        "generation_blocker": "shared_scene_media_pipeline_required",
+        "generation_ready": True,
+        "fusion_provider": "sync3",
     }
 
 
