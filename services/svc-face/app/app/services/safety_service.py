@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
@@ -17,6 +18,7 @@ from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import HttpResponseError
 
 from app.config import settings
+from app.services.product_visual_policy import ProductVisualPolicyUnavailable, evaluate_product_visual_policy
 from desifaces_shared.safety import (
     SafetyDecision,
     SafetyFinding,
@@ -604,6 +606,33 @@ class SafetyService:
                     return decision_from_findings(
                         [category_finding(category, source="image", severity=severity)]
                     )
+
+            try:
+                product_decision = await asyncio.to_thread(
+                    evaluate_product_visual_policy,
+                    normalized,
+                    content_type="image/jpeg",
+                )
+            except ProductVisualPolicyUnavailable as exc:
+                logger.exception("product_visual_policy_unavailable")
+                if fail_open:
+                    return decision_from_findings(
+                        [
+                            SafetyFinding(
+                                code="CONTENT_SAFETY_VISUAL_POLICY_UNAVAILABLE",
+                                status=SafetyStatus.WARN,
+                                title="Additional visual safety check temporarily unavailable",
+                                reason="The product-level visual safety classifier could not complete the image check.",
+                                required_action="No action is required from you right now; retry if the workflow asks you to validate the image again.",
+                                category="content_safety",
+                                metadata={"source": "product_visual_policy"},
+                            )
+                        ]
+                    )
+                raise ImageSafetyUnavailableError("Product visual safety classifier unavailable") from exc
+
+            if not product_decision.allow:
+                return product_decision
 
             return decision_from_findings([pass_finding(source="image")])
         except (UnsupportedImageFormatError, ImageTooLargeError):
