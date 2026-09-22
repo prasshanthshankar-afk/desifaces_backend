@@ -208,13 +208,16 @@ required={
 missing=sorted(required-paths)
 assert not missing, missing
 from app.studio_workflow import build_story_studio_workflow, build_shared_scene_studio_workflow
+from app.audio_execution import evaluate_text_policy as audio_boundary_policy
 assert callable(build_story_studio_workflow)
 assert callable(build_shared_scene_studio_workflow)
 assert callable(evaluate_text_policy)
 assert callable(evaluate_texts_policy)
+assert callable(audio_boundary_policy)
 print("NEXT3_DIRECTOR_RUNTIME_CONTRACT=PASS")
 print("NEXT3_SHARED_SCENE_SPEAKER_PROFILE=PASS")
 print("DIRECTOR_SHARED_CONTENT_SAFETY=PASS")
+print("AUDIO_DIALOGUE_SAFETY_RUNTIME=PASS")
 print("LEGACY_STUDIO_WORKFLOW_PRESENT=PASS")
 PY
 
