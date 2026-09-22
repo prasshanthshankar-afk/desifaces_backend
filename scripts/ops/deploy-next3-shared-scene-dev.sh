@@ -18,9 +18,9 @@ command -v docker >/dev/null || fail "docker missing"
 command -v git >/dev/null || fail "git missing"
 
 # Azure VM Run Command executes this script as root while the checked-out DEV
-# repository is owned by azureuser. Trust only this exact DEV repository path;
-# do not disable Git ownership checks globally.
-git config --global --add safe.directory "$LIVE_ROOT"
+# repository is owned by azureuser. Trust only the two exact DEV worktree paths
+# per Git invocation; do not change global/system Git ownership policy.
+git_dev(){ git -c safe.directory="$LIVE_ROOT" -c safe.directory="$WORKTREE" "$@"; }
 
 echo "============================================================"
 echo " desifaces #next3 — DEV BACKEND DEPLOY"
@@ -52,21 +52,21 @@ print("DEV_RUNTIME_CONFIG=PASS")
 print("SYNC_API_KEY_PRESENT=PASS")
 PY
 
-if git -C "$LIVE_ROOT" worktree list --porcelain | grep -Fxq "worktree $WORKTREE"; then
-  git -C "$LIVE_ROOT" worktree remove --force "$WORKTREE"
+if git_dev -C "$LIVE_ROOT" worktree list --porcelain | grep -Fxq "worktree $WORKTREE"; then
+  git_dev -C "$LIVE_ROOT" worktree remove --force "$WORKTREE"
 elif [[ -e "$WORKTREE" ]]; then
   fail "refusing unrecognized existing path: $WORKTREE"
 fi
 
-git -C "$LIVE_ROOT" fetch --no-tags "$REPO_URL" "$BACKEND_SHA"
-git -C "$LIVE_ROOT" cat-file -e "$BACKEND_SHA^{commit}"
-git -C "$LIVE_ROOT" worktree add --detach "$WORKTREE" "$BACKEND_SHA"
-[[ "$(git -C "$WORKTREE" rev-parse HEAD)" == "$BACKEND_SHA" ]] || fail "worktree SHA mismatch"
+git_dev -C "$LIVE_ROOT" fetch --no-tags "$REPO_URL" "$BACKEND_SHA"
+git_dev -C "$LIVE_ROOT" cat-file -e "$BACKEND_SHA^{commit}"
+git_dev -C "$LIVE_ROOT" worktree add --detach "$WORKTREE" "$BACKEND_SHA"
+[[ "$(git_dev -C "$WORKTREE" rev-parse HEAD)" == "$BACKEND_SHA" ]] || fail "worktree SHA mismatch"
 
 cleanup(){
   set +e
-  if git -C "$LIVE_ROOT" worktree list --porcelain 2>/dev/null | grep -Fxq "worktree $WORKTREE"; then
-    git -C "$LIVE_ROOT" worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true
+  if git_dev -C "$LIVE_ROOT" worktree list --porcelain 2>/dev/null | grep -Fxq "worktree $WORKTREE"; then
+    git_dev -C "$LIVE_ROOT" worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
