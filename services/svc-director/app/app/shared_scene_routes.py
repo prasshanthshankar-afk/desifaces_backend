@@ -126,7 +126,7 @@ async def set_shared_scene_conversation(
 
             media = await conn.fetchrow(
                 """
-                select id,user_id,account_id,project_id,kind,lifecycle_state
+                select id,user_id,account_id,project_id,kind,lifecycle_state,meta_json
                 from public.media_assets
                 where id=$1 and user_id=$2 and account_id=$3
                   and (project_id is null or project_id=$4)
@@ -163,6 +163,39 @@ async def set_shared_scene_conversation(
                 raise HTTPException(
                     status_code=422,
                     detail="shared_scene_requires_at_least_two_speakers",
+                )
+
+            media_meta = _metadata(media["meta_json"])
+            validation = _metadata(media_meta.get("shared_scene_validation"))
+            if not validation:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "shared_scene_media_validation_required",
+                        "message": "This group photo must pass content-safety and quality checks before it can be used.",
+                        "recoverable": True,
+                        "action": "validate_group_photo",
+                    },
+                )
+            if not bool(validation.get("allow")) or str(validation.get("status") or "").upper() == "FAIL":
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "shared_scene_media_validation_failed",
+                        "message": str(validation.get("summary") or "This group photo did not pass the required safety and quality checks."),
+                        "recoverable": True,
+                        "action": "choose_or_create_another_group_photo",
+                    },
+                )
+            if int(validation.get("expected_speakers") or 0) != len(speaking_ids):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "shared_scene_media_speaker_count_validation_mismatch",
+                        "message": "The photo validation no longer matches the number of speakers in this conversation. Validate the photo again.",
+                        "recoverable": True,
+                        "action": "validate_group_photo",
+                    },
                 )
 
             member_rows = await conn.fetch(
@@ -207,6 +240,12 @@ async def set_shared_scene_conversation(
                 for item in body.speaker_targets
             }
             metadata["shared_scene_target_source"] = "user_confirmed"
+            metadata["shared_scene_validation"] = {
+                "status": str(validation.get("status") or "PASS").upper(),
+                "expected_speakers": int(validation.get("expected_speakers") or len(speaking_ids)),
+                "validated_at": validation.get("validated_at"),
+                "contract_version": int(validation.get("contract_version") or 1),
+            }
 
             await conn.execute(
                 """
