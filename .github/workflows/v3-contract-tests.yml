@@ -281,7 +281,9 @@ jobs:
             services/svc-face/tests/test_weapons_gore_hard_block_policy.py \
             services/svc-face/tests/test_shared_safety_contract.py \
             services/svc-face/tests/test_common_safety_extremism.py \
-            services/svc-face/tests/test_group_photo_quality.py
+            services/svc-face/tests/test_group_photo_quality.py \
+            services/svc-face/tests/test_shared_text_policy.py \
+            services/svc-face/tests/test_product_visual_policy.py
 
   multi-person-pricing-postgres:
     runs-on: ubuntu-latest
