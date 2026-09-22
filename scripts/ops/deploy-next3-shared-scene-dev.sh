@@ -260,7 +260,7 @@ from app.services.group_photo_quality import (
     USABLE_FACE_MIN_WIDTH_RATIO,
     USABLE_FACE_MIN_AREA_RATIO,
 )
-from app.services.product_visual_policy import evaluate_product_visual_policy
+from app.services.product_visual_policy import evaluate_product_visual_policy, _SCHEMA
 assert SafetyDecision and SafetyFinding and SafetyStatus
 assert callable(analyze_group_photo)
 assert 0 < USABLE_FACE_MIN_HEIGHT_RATIO < 1
@@ -268,11 +268,13 @@ assert 0 < USABLE_FACE_MIN_WIDTH_RATIO < 1
 assert 0 < USABLE_FACE_MIN_AREA_RATIO < 1
 assert callable(evaluate_text_policy)
 assert callable(evaluate_product_visual_policy)
+assert "child_abuse_or_exploitation" in _SCHEMA["properties"]
 assert bool(os.getenv("OPENAI_API_KEY"))
 print("NEXT3_GROUP_PHOTO_VALIDATION_RUNTIME=PASS")
 print("GROUP_PHOTO_USABLE_FACE_FILTER=PASS")
 print("SHARED_CONTENT_SAFETY_RUNTIME=PASS")
 print("PRODUCT_VISUAL_POLICY_RUNTIME=PASS")
+print("PRODUCT_VISUAL_CHILD_ABUSE_POLICY=PASS")
 PY
 
 for i in "${!WORKER_CONTAINERS[@]}"; do
