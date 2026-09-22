@@ -86,7 +86,14 @@ def evaluate_product_visual_policy(
     base_url = str(os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
     model = str(os.getenv("OPENAI_SAFETY_VISION_MODEL") or "gpt-5.6-luna").strip()
     encoded = base64.b64encode(image_bytes).decode("ascii")
-    mime = content_type if str(content_type or "").startswith("image/") else "image/jpeg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif image_bytes.startswith(b"\xff\xd8\xff"):
+        mime = "image/jpeg"
+    elif image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        mime = "image/webp"
+    else:
+        mime = content_type if str(content_type or "").startswith("image/") else "image/jpeg"
     data_url = f"data:{mime};base64,{encoded}"
 
     body = {
