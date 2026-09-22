@@ -216,32 +216,52 @@ def analyze_group_photo(image_bytes: bytes, *, expected_speakers: int) -> GroupP
     if detector.empty():
         raise RuntimeError("group_photo_face_detector_unavailable")
 
-    min_side = max(40, int(min(width, height) * 0.06))
+    # Haar is used only as a lightweight locator. Be deliberately strict:
+    # background signage/patterns can otherwise be returned as tiny false faces.
+    # Count only speaker-sized detections as usable faces.
+    min_side = max(48, int(min(width, height) * 0.08))
     detections = detector.detectMultiScale(
         gray,
         scaleFactor=1.08,
-        minNeighbors=5,
+        minNeighbors=8,
         minSize=(min_side, min_side),
     )
 
-    faces: List[Dict[str, Any]] = []
+    raw_faces: List[Dict[str, Any]] = []
     for index, (x, y, w, h) in enumerate(sorted(detections, key=lambda box: box[0]), start=1):
-        faces.append(
+        height_ratio = float(h) / float(height)
+        width_ratio = float(w) / float(width)
+        area_ratio = float(w * h) / float(width * height)
+        raw_faces.append(
             {
                 "face_id": f"face_{index}",
                 "box": {
                     "x": round(float(x) / float(width), 6),
                     "y": round(float(y) / float(height), 6),
-                    "width": round(float(w) / float(width), 6),
-                    "height": round(float(h) / float(height), 6),
+                    "width": round(width_ratio, 6),
+                    "height": round(height_ratio, 6),
                 },
                 "pixel_box": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)},
-                "height_ratio": round(float(h) / float(height), 6),
-                "area_ratio": round(float(w * h) / float(width * height), 6),
+                "height_ratio": round(height_ratio, 6),
+                "width_ratio": round(width_ratio, 6),
+                "area_ratio": round(area_ratio, 6),
             }
         )
 
+    # A speaking face must be materially large enough for mouth animation.
+    # This also removes most false positives from signs, decor and text.
+    faces = [
+        face
+        for face in raw_faces
+        if float(face["height_ratio"]) >= 0.10
+        and float(face["width_ratio"]) >= 0.055
+        and float(face["area_ratio"]) >= 0.006
+    ]
+    for index, face in enumerate(sorted(faces, key=lambda item: float(item["box"]["x"])), start=1):
+        face["face_id"] = f"face_{index}"
+
     detected = len(faces)
+    ignored_small_detections = max(0, len(raw_faces) - detected)
     if detected < expected_speakers:
         checks.append(
             GroupPhotoQualityCheck(
@@ -250,7 +270,11 @@ def analyze_group_photo(image_bytes: bytes, *, expected_speakers: int) -> GroupP
                 title="Not all speakers have a clearly detectable face",
                 reason=f"The conversation has {expected_speakers} speakers, but only {detected} clear frontal face{' was' if detected == 1 else 's were'} detected.",
                 required_action="Use a photo where every speaker's face is clearly visible, separated from other faces, and oriented toward the camera.",
-                metadata={"expected_speakers": expected_speakers, "detected_faces": detected},
+                metadata={
+                    "expected_speakers": expected_speakers,
+                    "detected_faces": detected,
+                    "ignored_small_detections": ignored_small_detections,
+                },
             )
         )
     elif detected > expected_speakers:
@@ -270,8 +294,20 @@ def analyze_group_photo(image_bytes: bytes, *, expected_speakers: int) -> GroupP
                 code="FACE_COUNT",
                 status=SafetyStatus.PASS,
                 title="Speaker count matches the photo",
-                reason=f"{detected} clearly detectable faces were found for {expected_speakers} speakers.",
-                metadata={"expected_speakers": expected_speakers, "detected_faces": detected},
+                reason=(
+                    f"{detected} clearly usable speaker faces were found for {expected_speakers} speakers."
+                    + (
+                        f" {ignored_small_detections} small background-like detection"
+                        f"{' was' if ignored_small_detections == 1 else 's were'} ignored."
+                        if ignored_small_detections
+                        else ""
+                    )
+                ),
+                metadata={
+                    "expected_speakers": expected_speakers,
+                    "detected_faces": detected,
+                    "ignored_small_detections": ignored_small_detections,
+                },
             )
         )
 
