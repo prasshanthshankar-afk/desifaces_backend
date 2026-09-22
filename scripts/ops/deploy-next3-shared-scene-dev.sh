@@ -17,6 +17,11 @@ fail(){ echo "FAIL: $*" >&2; exit 1; }
 command -v docker >/dev/null || fail "docker missing"
 command -v git >/dev/null || fail "git missing"
 
+# Azure VM Run Command executes this script as root while the checked-out DEV
+# repository is owned by azureuser. Trust only this exact DEV repository path;
+# do not disable Git ownership checks globally.
+git config --global --add safe.directory "$LIVE_ROOT"
+
 echo "============================================================"
 echo " desifaces #next3 — DEV BACKEND DEPLOY"
 echo " host=$(hostname -s)"
