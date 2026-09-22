@@ -41,6 +41,13 @@ class FaceProfileIn(BaseModel):
     country_code: str | None = Field(default=None, max_length=8)  # desifaces native parity v4.1
 
 
+class SharedSceneParticipantProfileIn(BaseModel):
+    gender_presentation: str = Field(min_length=1, max_length=40)
+    age_presentation: str | None = Field(default=None, max_length=80)
+    region_code: str | None = Field(default=None, max_length=120)
+    country_code: str | None = Field(default=None, max_length=8)
+
+
 async def _load_preflight(conn, *, workflow_id: UUID, account_id: UUID) -> dict[str, Any]:
     workflow = await conn.fetchrow(
         """
@@ -112,7 +119,7 @@ async def _load_preflight(conn, *, workflow_id: UUID, account_id: UUID) -> dict[
     audio_rows = await conn.fetch(
         """
         select s.stage_run_id,s.state,s.dialogue_turn_id,dt.speaker_participant_id,
-               p.display_name,p.voice_profile_ref,p.voice_locale
+               p.display_name,p.voice_profile_ref,p.voice_locale,p.persona_json,p.metadata_json
         from public.v3_studio_stage_runs s
         join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
         join public.v3_participants p on p.participant_id=dt.speaker_participant_id
@@ -127,17 +134,34 @@ async def _load_preflight(conn, *, workflow_id: UUID, account_id: UUID) -> dict[
         state = _clean(row["state"])
         audio_counts[state] = audio_counts.get(state, 0) + 1
         participant_id = str(row["speaker_participant_id"])
+        persona = _as_dict(row["persona_json"])
+        participant_metadata = _as_dict(row["metadata_json"])
+        explicit = _as_dict(participant_metadata.get("explicit_face_constraints"))
+        explicit_gender = _normalize_gender(
+            explicit.get("gender")
+            or explicit.get("gender_presentation")
+            or persona.get("gender")
+            or persona.get("gender_presentation")
+        )
         speaker_map.setdefault(participant_id, {
             "participant_id": participant_id,
             "display_name": _clean(row["display_name"]),
             "voice_profile_ref": _clean(row["voice_profile_ref"]) or None,
             "voice_locale": _clean(row["voice_locale"]) or None,
+            "gender_presentation": explicit_gender,
+            "age_presentation": _clean(explicit.get("age") or persona.get("age_presentation") or persona.get("age")) or None,
+            "region_code": _clean(explicit.get("region_code") or persona.get("region_code")) or None,
+            "country_code": _clean(explicit.get("country_code") or persona.get("country_code")).upper() or None,
         })
     speakers = list(speaker_map.values())
     for speaker in speakers:
-        speaker["ready"] = bool(speaker["voice_profile_ref"] and speaker["voice_locale"])
+        gender_ready = bool(speaker.get("gender_presentation"))
+        speaker["gender_ready"] = gender_ready
+        speaker["ready"] = bool(gender_ready and speaker["voice_profile_ref"] and speaker["voice_locale"])
         speaker["user_message"] = (
             "Voice ready." if speaker["ready"] else
+            "Confirm this speaker's gender presentation before voice preparation."
+            if not gender_ready else
             "desifaces needs a language/voice choice before Audio generation."
         )
 
@@ -290,6 +314,133 @@ async def set_face_profile(
                 participant_id,
                 json.dumps(metadata, ensure_ascii=False),
                 json.dumps(persona, ensure_ascii=False),
+            )
+
+        return await _load_preflight(conn, workflow_id=workflow_id, account_id=auth.account_id)
+
+
+@router.put(
+    "/api/director/studio-workflows/{workflow_id}/participants/{participant_id}/shared-scene-profile"
+)
+async def set_shared_scene_participant_profile(
+    workflow_id: UUID,
+    participant_id: UUID,
+    body: SharedSceneParticipantProfileIn,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    """Persist user-confirmed speaker context for a shared group-photo conversation.
+
+    This contract is intentionally independent of Face generation. Uploaded group
+    photos still need durable gender presentation for compatible voice selection,
+    while age/geography remain optional contextual metadata. Nothing is inferred
+    from facial appearance.
+    """
+    gender = _normalize_gender(body.gender_presentation)
+    if not gender:
+        raise HTTPException(status_code=422, detail={
+            "code": "shared_scene_gender_presentation_unsupported",
+            "message": "Choose how this speaker should be presented for voice compatibility.",
+            "recoverable": True,
+            "allowed_values": ["female", "male"],
+        })
+
+    async with request.app.state.business_pool.acquire() as conn:
+        async with conn.transaction():
+            participant = await conn.fetchrow(
+                """
+                select distinct p.participant_id,p.display_name,p.metadata_json,p.persona_json
+                from public.v3_studio_workflows w
+                join public.v3_studio_stage_runs s on s.workflow_id=w.workflow_id
+                join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
+                join public.v3_participants p on p.participant_id=dt.speaker_participant_id
+                where w.workflow_id=$1 and w.account_id=$2
+                  and p.participant_id=$3
+                  and s.stage_type='audio' and s.scope_type='dialogue_turn'
+                limit 1
+                for update of p
+                """,
+                workflow_id,
+                auth.account_id,
+                participant_id,
+            )
+            if not participant:
+                raise HTTPException(status_code=404, detail={
+                    "code": "shared_scene_participant_not_found",
+                    "message": "This speaker is not part of the current conversation.",
+                    "recoverable": False,
+                })
+
+            locked_count = await conn.fetchval(
+                """
+                select count(*)
+                from public.v3_studio_stage_runs s
+                join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
+                where s.workflow_id=$1 and s.stage_type='audio' and s.scope_type='dialogue_turn'
+                  and dt.speaker_participant_id=$2
+                  and s.state in ('generating','awaiting_review','approved')
+                """,
+                workflow_id,
+                participant_id,
+            )
+            if int(locked_count or 0) > 0:
+                raise HTTPException(status_code=409, detail={
+                    "code": "shared_scene_participant_profile_locked",
+                    "message": "This speaker profile is locked because Audio generation or review has already started.",
+                    "recoverable": False,
+                })
+
+            metadata = _as_dict(participant["metadata_json"])
+            persona = _as_dict(participant["persona_json"])
+            explicit = _as_dict(metadata.get("explicit_face_constraints"))
+            explicit["gender"] = gender
+            persona["gender_presentation"] = gender
+
+            if body.age_presentation:
+                explicit["age"] = _clean(body.age_presentation)
+                persona["age_presentation"] = _clean(body.age_presentation)
+            else:
+                explicit.pop("age", None)
+                persona.pop("age_presentation", None)
+
+            if body.country_code:
+                country = _clean(body.country_code).upper()
+                explicit["country_code"] = country
+                persona["country_code"] = country
+            else:
+                explicit.pop("country_code", None)
+                persona.pop("country_code", None)
+
+            if body.region_code:
+                region = _clean(body.region_code)
+                explicit["region_code"] = region
+                persona["region_code"] = region
+            else:
+                explicit.pop("region_code", None)
+                persona.pop("region_code", None)
+
+            metadata["explicit_face_constraints"] = explicit
+            provenance = _as_dict(metadata.get("production_provenance"))
+            provenance["explicit_face_constraints"] = "user_confirmed_in_shared_scene"
+            metadata["production_provenance"] = provenance
+
+            # Any previously auto-selected voice may have been chosen before
+            # gender confirmation. Clear it so Audio autoconfigure resolves a
+            # fresh compatible voice from the confirmed speaker profile.
+            await conn.execute(
+                """
+                update public.v3_participants
+                set metadata_json=$2::jsonb,
+                    persona_json=$3::jsonb,
+                    voice_profile_ref=null,
+                    voice_locale=null,
+                    updated_at=now()
+                where participant_id=$1 and account_id=$4
+                """,
+                participant_id,
+                json.dumps(metadata, ensure_ascii=False),
+                json.dumps(persona, ensure_ascii=False),
+                auth.account_id,
             )
 
         return await _load_preflight(conn, workflow_id=workflow_id, account_id=auth.account_id)
