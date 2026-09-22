@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import re
 from typing import Dict, Optional
 
-from .contracts import SafetyDecision, SafetyFinding, SafetyStatus, decision_from_findings
+from .contracts import SafetyFinding, SafetyStatus
 
 
 _CATEGORY_RULES: Dict[str, Dict[str, str]] = {
@@ -58,27 +57,6 @@ _CATEGORY_RULES: Dict[str, Dict[str, str]] = {
         "required_action": "Use different content that stays within supported safety requirements.",
     },
 }
-
-_TEXT_HARD_BLOCKS = [
-    {"pattern": r"\b(nude|nudity|porn|pornographic|explicit sex|genitals?|sexual intercourse)\b", "category": "sexual"},
-    {"pattern": r"\b(child|minor|underage|teen|young girl|young boy)\b.{0,80}\b(nude|nudity|sexual|porn|molest|rape|exploit)\b", "category": "minors"},
-    {"pattern": r"\b(rape|molestation|sexual assault|sexual abuse|sexual exploitation)\b", "category": "abuse"},
-    {"pattern": r"\b(gun|guns|firearm|firearms|pistol|rifle|shotgun|machine gun|assault rifle)\b", "category": "weapons"},
-    {"pattern": r"\b(blood|gore|gory|mutilation|dismemberment|open wounds?|graphic violence|torture)\b", "category": "violence"},
-    {"pattern": r"\b(terrorist|terrorism|extremist|extremism|isis|isil|daesh|al[ -]?qaeda)\b.{0,100}\b(propaganda|recruit|recruitment|join|support|praise|glorify|fund|donate|manifesto|attack instructions?)\b", "category": "terrorism"},
-    {"pattern": r"\b(make|manufacture|cook|synthesize|traffic|sell)\b.{0,60}\b(cocaine|heroin|meth|fentanyl|illegal drugs?)\b", "category": "illegal_drugs"},
-]
-
-
-def evaluate_text_policy(text: str, *, source: str = "prompt") -> SafetyDecision:
-    """Reusable deterministic first-line text safety gate."""
-    normalized = str(text or "").strip()
-    if normalized:
-        for rule in _TEXT_HARD_BLOCKS:
-            if re.search(rule["pattern"], normalized, flags=re.IGNORECASE | re.DOTALL):
-                return decision_from_findings([category_finding(rule["category"], source=source)])
-    return decision_from_findings([pass_finding(source=source)])
-
 
 
 def category_finding(
