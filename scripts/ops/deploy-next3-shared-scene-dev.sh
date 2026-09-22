@@ -239,6 +239,7 @@ docker exec df-v3-svc-face python - <<'PY'
 from app.main import app
 paths={getattr(r,"path","") for r in app.routes}
 assert "/api/face/creator/group-photo/validate" in paths
+assert "/api/face/creator/group-photo/validate-asset" in paths
 from desifaces_shared.safety import SafetyDecision, SafetyFinding, SafetyStatus
 from app.services.group_photo_quality import analyze_group_photo
 assert SafetyDecision and SafetyFinding and SafetyStatus and callable(analyze_group_photo)
