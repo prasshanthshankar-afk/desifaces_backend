@@ -104,6 +104,7 @@ jobs:
           python -m pip install --disable-pip-version-check \
             pytest "pydantic>=2,<3" "httpx>=0.27,<1" "PyJWT==2.9.0" "psycopg[binary,pool]>=3.2,<4" \
             azure-ai-contentsafety==1.0.0 azure-core==1.29.6 "azure-storage-blob>=12,<13" pydantic-settings==2.1.0 \
+            Pillow==10.2.0 opencv-python-headless==4.10.0.84 \
             -r services/svc-core/app/app/requirements.txt
 
       - name: Compile V3 contract, Core Admin, pricing and compatibility code
@@ -112,6 +113,7 @@ jobs:
             services/shared/df_contracts \
             services/shared/python/desifaces_shared/identity \
             services/shared/python/desifaces_shared/pricing \
+            services/shared/python/desifaces_shared/safety \
             services/shared/python/desifaces_shared/v3 \
             services/svc-core/app/app \
             services/svc-face/app/app/services/multi_person_pricing_policy.py \
@@ -264,7 +266,7 @@ jobs:
 
       - name: Run Face Studio safety hard-block tests
         env:
-          PYTHONPATH: services/svc-face/app
+          PYTHONPATH: services/svc-face/app:services/shared/python
           DATABASE_URL: postgresql://test:test@127.0.0.1:5432/test
           AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=https;AccountName=testaccount;AccountKey=dGVzdA==;EndpointSuffix=core.windows.net
           FAL_API_KEY: test-only
@@ -274,7 +276,12 @@ jobs:
           AZURE_CONTENT_MODERATOR_ENDPOINT: https://example.invalid
           AZURE_CONTENT_MODERATOR_KEY: test-only
           JWT_SECRET: test-only-ci-secret
-        run: python -m pytest -q services/svc-face/tests/test_weapons_gore_hard_block_policy.py
+        run: |
+          python -m pytest -q \
+            services/svc-face/tests/test_weapons_gore_hard_block_policy.py \
+            services/svc-face/tests/test_shared_safety_contract.py \
+            services/svc-face/tests/test_common_safety_extremism.py \
+            services/svc-face/tests/test_group_photo_quality.py
 
   multi-person-pricing-postgres:
     runs-on: ubuntu-latest
