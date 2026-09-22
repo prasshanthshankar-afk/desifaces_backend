@@ -196,7 +196,7 @@ for _ in $(seq 1 60); do
 done
 (( ready == 1 )) || fail "DEV API containers did not become ready"
 
-docker exec df-v3-svc-director python - <<'PY'
+docker exec -i df-v3-svc-director python - <<'PY'
 from app.main import app
 from desifaces_shared.safety import evaluate_text_policy, evaluate_texts_policy
 paths={getattr(r,"path","") for r in app.routes}
@@ -221,7 +221,7 @@ print("AUDIO_DIALOGUE_SAFETY_RUNTIME=PASS")
 print("LEGACY_STUDIO_WORKFLOW_PRESENT=PASS")
 PY
 
-docker exec df-v3-svc-fusion python - <<'PY'
+docker exec -i df-v3-svc-fusion python - <<'PY'
 from app.services.providers.sync3_adapter import Sync3Adapter
 adapter=Sync3Adapter()
 assert adapter.provider_name=="sync3"
@@ -231,21 +231,21 @@ print("SYNC3_ADAPTER_RUNTIME=PASS")
 print("SYNC_API_KEY_BOUND=PASS")
 PY
 
-docker exec df-v3-svc-fusion-extension python - <<'PY'
+docker exec -i df-v3-svc-fusion-extension python - <<'PY'
 from app.main import app
 paths={getattr(r,"path","") for r in app.routes}
 assert "/api/longform/v3/scene-stitch" in paths
 print("NEXT3_STITCH_RUNTIME_CONTRACT=PASS")
 PY
 
-docker exec df-v3-svc-dashboard python - <<'PY'
+docker exec -i df-v3-svc-dashboard python - <<'PY'
 from app.services.dashboard_service import _library_conversation_mode
 assert _library_conversation_mode({"conversation_mode":"shared_scene"}, {}) == "shared_scene"
 assert _library_conversation_mode({"conversation_mode":"ordered_speaker_shots"}, {}) == "ordered_speaker_shots"
 print("NEXT3_SAVED_WORK_CLASSIFICATION=PASS")
 PY
 
-docker exec df-v3-svc-face python - <<'PY'
+docker exec -i df-v3-svc-face python - <<'PY'
 import os
 from app.main import app
 paths={getattr(r,"path","") for r in app.routes}
