@@ -24,6 +24,7 @@ from desifaces_shared.safety import (
     category_finding,
     decision_from_findings,
     pass_finding,
+    evaluate_text_policy,
 )
 
 logger = logging.getLogger("svc-face.safety")
@@ -219,16 +220,11 @@ def _category_policy_message(category: str, *, source: str = "prompt") -> str:
 
 
 def _hard_keyword_finding(text: str) -> Optional[SafetyFinding]:
-    normalized = (text or "").lower()
-    for rule in HARD_BLOCK_PATTERNS:
-        if re.search(str(rule["pattern"]), normalized, flags=re.IGNORECASE | re.DOTALL):
-            return category_finding(
-                str(rule["category"]),
-                source="prompt",
-                reason=str(rule["not_permitted"]),
-                required_action=str(rule["suggested_changes"]),
-            )
-    return None
+    decision = evaluate_text_policy(text, source="prompt")
+    return next(
+        (item for item in decision.findings if item.status == SafetyStatus.FAIL),
+        None,
+    )
 
 
 def _legacy_policy_message_from_finding(finding: SafetyFinding, *, source: str) -> str:
