@@ -286,6 +286,22 @@ async def autoconfigure_story_audio(
 
     for participant_id, item in grouped.items():
         locale_item, source = prepared[participant_id]
+
+        if not item["explicit_gender"]:
+            results.append({
+                "participant_id": participant_id,
+                "display_name": item["display_name"],
+                "ready": False,
+                "status": "needs_user_choice",
+                "code": "audio_explicit_gender_required",
+                "style": item["style"] or None,
+                "message": (
+                    f"Confirm {item['display_name']}'s gender presentation before voice preparation. "
+                    "desifaces does not infer gender from the group photo."
+                ),
+            })
+            continue
+
         if locale_item is None:
             results.append({
                 "participant_id": participant_id,
