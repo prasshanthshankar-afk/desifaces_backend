@@ -751,6 +751,23 @@ async def upload_source_image(
 
     safety = SafetyService()
     try:
+        safety_decision = await safety.validate_image_decision(
+            data,
+            filename=getattr(file, "filename", None),
+            content_type=content_type,
+            fail_open=False,
+        )
+        if not safety_decision.allow:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "content_safety_blocked",
+                    "code": "DF_CONTENT_SAFETY_BLOCKED",
+                    "message": safety_decision.summary,
+                    "decision": safety_decision.to_dict(),
+                },
+            )
+
         normalized_data, normalized_filename, normalized_content_type, normalized_meta = await safety.normalize_image_for_storage_and_generation(
             data,
             filename=getattr(file, "filename", None),
@@ -771,6 +788,20 @@ async def upload_source_image(
                 "message": str(exc),
             },
         )
+    except ImageSafetyUnavailableError as exc:
+        logger.exception(
+            "upload_source_image content_safety_unavailable user_id=%s filename=%s",
+            user_id,
+            getattr(file, "filename", None),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "content_safety_unavailable",
+                "code": "DF_CONTENT_SAFETY_UNAVAILABLE",
+                "message": "Content-safety validation is temporarily unavailable. The image was not stored; please retry.",
+            },
+        ) from exc
 
     data = normalized_data
     content_type = normalized_content_type
