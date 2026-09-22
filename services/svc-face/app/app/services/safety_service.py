@@ -101,6 +101,15 @@ HARD_BLOCK_PATTERNS = [
         "suggested_changes": "Remove blood, gore, wounds, graphic injury, or bodily harm and use a safe non-graphic scene.",
     },
     {
+        "pattern": (
+            r"\b(terrorist|terrorism|extremist|extremism|isis|isil|daesh|al[ -]?qaeda)\b"
+            r".{0,100}\b(propaganda|recruit|recruitment|join|support|praise|glorify|fund|donate|manifesto|attack instructions?)\b"
+        ),
+        "category": "terrorism",
+        "not_permitted": "terrorist or extremist propaganda, recruitment, praise, material support, or attack facilitation",
+        "suggested_changes": "Remove promotional, recruitment, support, praise, or attack-facilitation content involving terrorist or extremist activity.",
+    },
+    {
         "pattern": r"\b(make|manufacture|cook|synthesize|traffic|sell)\b.{0,60}\b(cocaine|heroin|meth|fentanyl|illegal drugs?)\b",
         "category": "illegal_drugs",
         "not_permitted": "instructions or facilitation for illegal drug activity",
