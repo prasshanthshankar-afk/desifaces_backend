@@ -26,6 +26,7 @@ _SCHEMA = {
         "terrorist_or_extremist_promotion": {"type": "boolean"},
         "nudity_or_explicit_sexual": {"type": "boolean"},
         "sexual_content_involving_minor": {"type": "boolean"},
+        "child_abuse_or_exploitation": {"type": "boolean"},
         "graphic_blood_or_gore": {"type": "boolean"},
         "graphic_violence_or_torture": {"type": "boolean"},
         "reason": {"type": "string"},
@@ -35,6 +36,7 @@ _SCHEMA = {
         "terrorist_or_extremist_promotion",
         "nudity_or_explicit_sexual",
         "sexual_content_involving_minor",
+        "child_abuse_or_exploitation",
         "graphic_blood_or_gore",
         "graphic_violence_or_torture",
         "reason",
@@ -108,7 +110,8 @@ def evaluate_product_visual_policy(
             "or clearly propagandistic extremist/terrorist imagery or symbols; neutral documentary context alone is false. "
             "Mark nudity_or_explicit_sexual for nudity, pornography, exposed intimate parts, or explicit sexual activity. "
             "Mark sexual_content_involving_minor when a person who appears under 18 is depicted in a sexualized, nude, "
-            "or exploitative context. Mark graphic_blood_or_gore for visible blood, gore, mutilation, or open graphic wounds. "
+            "or exploitative context. Mark child_abuse_or_exploitation true for visible abuse, exploitation, torture, or severe harm involving a child, whether sexual or non-sexual. "
+            "Mark graphic_blood_or_gore for visible blood, gore, mutilation, or open graphic wounds. "
             "Mark graphic_violence_or_torture for graphic bodily harm, torture, or severe abuse. "
             "Return the schema only."
         ),
@@ -163,6 +166,7 @@ def evaluate_product_visual_policy(
         ("terrorist_or_extremist_promotion", "terrorism"),
         ("nudity_or_explicit_sexual", "sexual"),
         ("sexual_content_involving_minor", "minors"),
+        ("child_abuse_or_exploitation", "abuse"),
         ("graphic_blood_or_gore", "violence"),
         ("graphic_violence_or_torture", "violence"),
     )
