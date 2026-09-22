@@ -201,6 +201,7 @@ from app.main import app
 paths={getattr(r,"path","") for r in app.routes}
 required={
  "/api/director/studio-workflows/{workflow_id}/stage-runs/{stage_run_id}/shared-scene",
+ "/api/director/studio-workflows/{workflow_id}/participants/{participant_id}/shared-scene-profile",
 }
 missing=sorted(required-paths)
 assert not missing, missing
@@ -208,6 +209,7 @@ from app.studio_workflow import build_story_studio_workflow, build_shared_scene_
 assert callable(build_story_studio_workflow)
 assert callable(build_shared_scene_studio_workflow)
 print("NEXT3_DIRECTOR_RUNTIME_CONTRACT=PASS")
+print("NEXT3_SHARED_SCENE_SPEAKER_PROFILE=PASS")
 print("LEGACY_STUDIO_WORKFLOW_PRESENT=PASS")
 PY
 
