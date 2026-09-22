@@ -155,11 +155,19 @@ V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$LIVE_PROJECT" build "${SERV
 echo "NEXT3_IMAGE_BUILD=PASS"
 
 RUNTIME_CHANGED=1
+# These containers have already passed exact project/service ownership checks.
+# Remove only this bounded #next3 target set so Compose can recreate the
+# fixed-name DEV containers from the newly built images.
+for c in "${CONTAINERS[@]}"; do
+  docker rm -f "$c" >/dev/null
+done
+echo "NEXT3_TARGET_API_CONTAINERS_REMOVED=PASS"
 V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$LIVE_PROJECT" up -d --no-deps --force-recreate "${SERVICES[@]}"
 
 for i in "${!WORKER_SERVICES[@]}"; do
   svc="${WORKER_SERVICES[$i]}"; c="${WORKER_CONTAINERS[$i]}"
   [[ "${ACTIVE_WORKER[$c]:-0}" == "1" ]] || continue
+  docker rm -f "$c" >/dev/null
   if [[ "$svc" == "svc-director-worker" ]]; then
     V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$LIVE_PROJECT" --profile v3-orchestration up -d --no-deps --force-recreate "$svc"
   else
