@@ -98,9 +98,14 @@ done
 # source worktree must not create a second project with the same fixed
 # container names.
 LIVE_PROJECT=""
+EXISTING_API_TARGETS=0
 for i in "${!CONTAINERS[@]}"; do
   c="${CONTAINERS[$i]}"; svc="${SERVICES[$i]}"
-  docker inspect "$c" >/dev/null 2>&1 || fail "expected DEV container missing: $c"
+  if ! docker inspect "$c" >/dev/null 2>&1; then
+    echo "DEV_TARGET_CONTAINER_ABSENT=$c"
+    continue
+  fi
+  EXISTING_API_TARGETS=$((EXISTING_API_TARGETS+1))
   project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$c")"
   owner_service="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$c")"
   [[ -n "$project" ]] || fail "compose project label missing for $c"
@@ -111,6 +116,7 @@ for i in "${!CONTAINERS[@]}"; do
     [[ "$project" == "$LIVE_PROJECT" ]] || fail "target containers span multiple Compose projects"
   fi
 done
+(( EXISTING_API_TARGETS > 0 )) || fail "no existing DEV V3 API container available to establish Compose ownership"
 for i in "${!WORKER_CONTAINERS[@]}"; do
   c="${WORKER_CONTAINERS[$i]}"; svc="${WORKER_SERVICES[$i]}"
   [[ "${ACTIVE_WORKER[$c]:-0}" == "1" ]] || continue
@@ -159,7 +165,9 @@ RUNTIME_CHANGED=1
 # Remove only this bounded #next3 target set so Compose can recreate the
 # fixed-name DEV containers from the newly built images.
 for c in "${CONTAINERS[@]}"; do
-  docker rm -f "$c" >/dev/null
+  if docker inspect "$c" >/dev/null 2>&1; then
+    docker rm -f "$c" >/dev/null
+  fi
 done
 echo "NEXT3_TARGET_API_CONTAINERS_REMOVED=PASS"
 V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$LIVE_PROJECT" up -d --no-deps --force-recreate "${SERVICES[@]}"
