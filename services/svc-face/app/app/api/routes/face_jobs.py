@@ -339,6 +339,7 @@ class UploadImageResponse(BaseModel):
 class ImageSafetyCheckResponse(BaseModel):
     allow: bool
     status: str
+    decision_status: Optional[str] = None
     reason: Optional[str] = None
     summary: Optional[str] = None
     component: Optional[str] = None
@@ -489,7 +490,8 @@ async def creator_i2i_content_safety_check(
 
         return ImageSafetyCheckResponse(
             allow=bool(decision.allow),
-            status=decision.status.value,
+            status="passed" if decision.allow else "blocked",
+            decision_status=decision.status.value,
             reason=(legacy_reason or None),
             summary=decision.summary,
             component=decision.component,
