@@ -776,12 +776,27 @@ async def creator_group_photo_validate_asset(
         bsc, _, _, _ = _azure_clients()
         blob_client = bsc.get_blob_client(container=container, blob=blob_name)
         data = blob_client.download_blob().readall()
-        return await _evaluate_group_photo_bytes(
+        decision = await _evaluate_group_photo_bytes(
             data,
             expected_speakers=req.expected_speakers,
             filename=f"{req.media_asset_id}.jpg",
             content_type=asset.content_type or "image/jpeg",
         )
+
+        await MediaAssetsRepo(pool).merge_meta(
+            req.media_asset_id,
+            {
+                "shared_scene_validation": {
+                    "contract_version": 1,
+                    "status": decision.status,
+                    "allow": bool(decision.allow),
+                    "expected_speakers": int(req.expected_speakers),
+                    "validated_at": datetime.now(timezone.utc).isoformat(),
+                    "summary": decision.summary,
+                }
+            },
+        )
+        return decision
     except (UnsupportedImageFormatError, ImageTooLargeError) as exc:
         raise HTTPException(
             status_code=422,
