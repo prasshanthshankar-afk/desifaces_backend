@@ -198,18 +198,23 @@ done
 
 docker exec df-v3-svc-director python - <<'PY'
 from app.main import app
+from desifaces_shared.safety import evaluate_text_policy, evaluate_texts_policy
 paths={getattr(r,"path","") for r in app.routes}
 required={
  "/api/director/studio-workflows/{workflow_id}/stage-runs/{stage_run_id}/shared-scene",
  "/api/director/studio-workflows/{workflow_id}/participants/{participant_id}/shared-scene-profile",
+ "/api/director/runs",
 }
 missing=sorted(required-paths)
 assert not missing, missing
 from app.studio_workflow import build_story_studio_workflow, build_shared_scene_studio_workflow
 assert callable(build_story_studio_workflow)
 assert callable(build_shared_scene_studio_workflow)
+assert callable(evaluate_text_policy)
+assert callable(evaluate_texts_policy)
 print("NEXT3_DIRECTOR_RUNTIME_CONTRACT=PASS")
 print("NEXT3_SHARED_SCENE_SPEAKER_PROFILE=PASS")
+print("DIRECTOR_SHARED_CONTENT_SAFETY=PASS")
 print("LEGACY_STUDIO_WORKFLOW_PRESENT=PASS")
 PY
 
@@ -238,15 +243,27 @@ print("NEXT3_SAVED_WORK_CLASSIFICATION=PASS")
 PY
 
 docker exec df-v3-svc-face python - <<'PY'
+import os
 from app.main import app
 paths={getattr(r,"path","") for r in app.routes}
 assert "/api/face/creator/group-photo/validate" in paths
 assert "/api/face/creator/group-photo/validate-asset" in paths
-from desifaces_shared.safety import SafetyDecision, SafetyFinding, SafetyStatus
+from desifaces_shared.safety import (
+    SafetyDecision,
+    SafetyFinding,
+    SafetyStatus,
+    evaluate_text_policy,
+)
 from app.services.group_photo_quality import analyze_group_photo
-assert SafetyDecision and SafetyFinding and SafetyStatus and callable(analyze_group_photo)
+from app.services.product_visual_policy import evaluate_product_visual_policy
+assert SafetyDecision and SafetyFinding and SafetyStatus
+assert callable(analyze_group_photo)
+assert callable(evaluate_text_policy)
+assert callable(evaluate_product_visual_policy)
+assert bool(os.getenv("OPENAI_API_KEY"))
 print("NEXT3_GROUP_PHOTO_VALIDATION_RUNTIME=PASS")
 print("SHARED_CONTENT_SAFETY_RUNTIME=PASS")
+print("PRODUCT_VISUAL_POLICY_RUNTIME=PASS")
 PY
 
 for i in "${!WORKER_CONTAINERS[@]}"; do
