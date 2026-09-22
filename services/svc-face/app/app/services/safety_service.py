@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
@@ -17,6 +18,16 @@ from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import HttpResponseError
 
 from app.config import settings
+from app.services.product_visual_policy import ProductVisualPolicyUnavailable, evaluate_product_visual_policy
+from desifaces_shared.safety import (
+    SafetyDecision,
+    SafetyFinding,
+    SafetyStatus,
+    category_finding,
+    decision_from_findings,
+    pass_finding,
+    evaluate_text_policy,
+)
 
 logger = logging.getLogger("svc-face.safety")
 
@@ -91,6 +102,15 @@ HARD_BLOCK_PATTERNS = [
         "category": "violence",
         "not_permitted": "blood, gore, graphic injury, mutilation, or extreme violence",
         "suggested_changes": "Remove blood, gore, wounds, graphic injury, or bodily harm and use a safe non-graphic scene.",
+    },
+    {
+        "pattern": (
+            r"\b(terrorist|terrorism|extremist|extremism|isis|isil|daesh|al[ -]?qaeda)\b"
+            r".{0,100}\b(propaganda|recruit|recruitment|join|support|praise|glorify|fund|donate|manifesto|attack instructions?)\b"
+        ),
+        "category": "terrorism",
+        "not_permitted": "terrorist or extremist propaganda, recruitment, praise, material support, or attack facilitation",
+        "suggested_changes": "Remove promotional, recruitment, support, praise, or attack-facilitation content involving terrorist or extremist activity.",
     },
     {
         "pattern": r"\b(make|manufacture|cook|synthesize|traffic|sell)\b.{0,60}\b(cocaine|heroin|meth|fentanyl|illegal drugs?)\b",
@@ -201,17 +221,30 @@ def _category_policy_message(category: str, *, source: str = "prompt") -> str:
     )
 
 
+def _hard_keyword_finding(text: str) -> Optional[SafetyFinding]:
+    decision = evaluate_text_policy(text, source="prompt")
+    return next(
+        (item for item in decision.findings if item.status == SafetyStatus.FAIL),
+        None,
+    )
+
+
+def _legacy_policy_message_from_finding(finding: SafetyFinding, *, source: str) -> str:
+    target = "Prompt" if source == "prompt" else "Image"
+    return (
+        f"PROMPT_POLICY_BLOCKED: {target} needs changes. "
+        f"Blocked category: {finding.category or 'content_safety'}. "
+        f"Not permitted: {finding.reason}. "
+        f"Please change: {finding.required_action} "
+        "You can retry after updating the prompt or image."
+    )
+
+
 def _hard_keyword_policy_message(text: str) -> Optional[str]:
-    normalized = (text or "").lower()
-    for rule in HARD_BLOCK_PATTERNS:
-        if re.search(str(rule["pattern"]), normalized, flags=re.IGNORECASE | re.DOTALL):
-            return _policy_message(
-                category=str(rule["category"]),
-                not_permitted=str(rule["not_permitted"]),
-                suggested_changes=str(rule["suggested_changes"]),
-                source="prompt",
-            )
-    return None
+    finding = _hard_keyword_finding(text)
+    if finding is None:
+        return None
+    return _legacy_policy_message_from_finding(finding, source="prompt")
 
 
 def _extract_text_severity(response: object, category_name: str) -> int:
@@ -443,18 +476,18 @@ class SafetyService:
             )
 
     def check_keywords(self, text: str) -> Tuple[bool, str]:
-        reason = _hard_keyword_policy_message(text)
-        if reason:
-            return False, reason
+        finding = _hard_keyword_finding(text)
+        if finding is not None:
+            return False, _legacy_policy_message_from_finding(finding, source="prompt")
         return True, ""
 
-    async def validate_text(self, text: str) -> Tuple[bool, str]:
-        is_safe, reason = self.check_keywords(text)
-        if not is_safe:
-            return False, reason
+    async def validate_text_decision(self, text: str) -> SafetyDecision:
+        finding = _hard_keyword_finding(text)
+        if finding is not None:
+            return decision_from_findings([finding])
 
         if self.client is None:
-            return True, ""
+            return decision_from_findings([pass_finding(source="prompt")])
 
         try:
             request = AnalyzeTextOptions(text=text)
@@ -478,27 +511,69 @@ class SafetyService:
                             "threshold": threshold,
                         },
                     )
-                    return False, _category_policy_message(category, source="prompt")
+                    return decision_from_findings(
+                        [category_finding(category, source="prompt", severity=severity)]
+                    )
 
-            return True, ""
+            return decision_from_findings([pass_finding(source="prompt")])
         except Exception:
             logger.exception("azure_text_safety_unavailable_fail_open")
-            return True, ""
+            return decision_from_findings(
+                [
+                    SafetyFinding(
+                        code="CONTENT_SAFETY_PROVIDER_UNAVAILABLE",
+                        status=SafetyStatus.WARN,
+                        title="Content safety provider temporarily unavailable",
+                        reason="The remote text-safety provider could not be reached.",
+                        required_action="No action is required from you right now; downstream generation safety checks still apply.",
+                        category="content_safety",
+                        retryable=True,
+                        metadata={"source": "prompt"},
+                    )
+                ]
+            )
 
-    async def validate_image(
+    async def validate_text(self, text: str) -> Tuple[bool, str]:
+        return (await self.validate_text_decision(text)).legacy_tuple()
+
+    async def validate_image_decision(
         self,
         image_bytes: bytes,
         *,
         filename: Optional[str] = None,
         content_type: Optional[str] = None,
         fail_open: bool = False,
-    ) -> Tuple[bool, str]:
+    ) -> SafetyDecision:
         if not image_bytes:
-            return False, "Empty image"
+            return decision_from_findings(
+                [
+                    SafetyFinding(
+                        code="CONTENT_SAFETY_EMPTY_IMAGE",
+                        status=SafetyStatus.FAIL,
+                        title="The image is empty",
+                        reason="No image data was received.",
+                        required_action="Choose a valid JPG, PNG, WEBP, HEIC, or other supported image and try again.",
+                        category="content_safety",
+                        metadata={"source": "image"},
+                    )
+                ]
+            )
 
         if self.client is None:
             if fail_open:
-                return True, ""
+                return decision_from_findings(
+                    [
+                        SafetyFinding(
+                            code="CONTENT_SAFETY_PROVIDER_UNAVAILABLE",
+                            status=SafetyStatus.WARN,
+                            title="Content safety provider temporarily unavailable",
+                            reason="The remote image-safety provider is not configured.",
+                            required_action="No action is required from you right now; later generation gates may still block unsupported content.",
+                            category="content_safety",
+                            metadata={"source": "image"},
+                        )
+                    ]
+                )
             raise ImageSafetyUnavailableError("Azure Content Safety is not configured")
 
         try:
@@ -511,16 +586,11 @@ class SafetyService:
             request = AnalyzeImageOptions(image=ImageData(content=image_b64))
             response = self.client.analyze_image(request)
 
-            hate_severity = _extract_image_severity(response, "hate")
-            self_harm_severity = _extract_image_severity(response, "self_harm")
-            sexual_severity = _extract_image_severity(response, "sexual")
-            violence_severity = _extract_image_severity(response, "violence")
-
             category_severities = {
-                "hate": hate_severity,
-                "self_harm": self_harm_severity,
-                "sexual": sexual_severity,
-                "violence": violence_severity,
+                "hate": _extract_image_severity(response, "hate"),
+                "self_harm": _extract_image_severity(response, "self_harm"),
+                "sexual": _extract_image_severity(response, "sexual"),
+                "violence": _extract_image_severity(response, "violence"),
             }
             threshold = _image_block_threshold()
             for category, severity in category_severities.items():
@@ -533,21 +603,91 @@ class SafetyService:
                             "threshold": threshold,
                         },
                     )
-                    return False, _category_policy_message(category, source="image")
+                    return decision_from_findings(
+                        [category_finding(category, source="image", severity=severity)]
+                    )
 
-            return True, ""
+            try:
+                product_decision = await asyncio.to_thread(
+                    evaluate_product_visual_policy,
+                    normalized,
+                    content_type="image/jpeg",
+                )
+            except ProductVisualPolicyUnavailable as exc:
+                logger.exception("product_visual_policy_unavailable")
+                if fail_open:
+                    return decision_from_findings(
+                        [
+                            SafetyFinding(
+                                code="CONTENT_SAFETY_VISUAL_POLICY_UNAVAILABLE",
+                                status=SafetyStatus.WARN,
+                                title="Additional visual safety check temporarily unavailable",
+                                reason="The product-level visual safety classifier could not complete the image check.",
+                                required_action="No action is required from you right now; retry if the workflow asks you to validate the image again.",
+                                category="content_safety",
+                                metadata={"source": "product_visual_policy"},
+                            )
+                        ]
+                    )
+                raise ImageSafetyUnavailableError("Product visual safety classifier unavailable") from exc
+
+            if not product_decision.allow:
+                return product_decision
+
+            return decision_from_findings([pass_finding(source="image")])
         except (UnsupportedImageFormatError, ImageTooLargeError):
             raise
         except HttpResponseError as exc:
             logger.exception("azure_image_safety_http_error")
             if fail_open:
-                return True, ""
+                return decision_from_findings(
+                    [
+                        SafetyFinding(
+                            code="CONTENT_SAFETY_PROVIDER_UNAVAILABLE",
+                            status=SafetyStatus.WARN,
+                            title="Content safety provider temporarily unavailable",
+                            reason="The remote image-safety provider returned an error.",
+                            required_action="No action is required from you right now; later generation gates may still block unsupported content.",
+                            category="content_safety",
+                            metadata={"source": "image"},
+                        )
+                    ]
+                )
             raise ImageSafetyUnavailableError("Azure Content Safety analyze_image failed") from exc
         except Exception as exc:
             logger.exception("azure_image_safety_unavailable")
             if fail_open:
-                return True, ""
+                return decision_from_findings(
+                    [
+                        SafetyFinding(
+                            code="CONTENT_SAFETY_PROVIDER_UNAVAILABLE",
+                            status=SafetyStatus.WARN,
+                            title="Content safety provider temporarily unavailable",
+                            reason="The remote image-safety provider could not complete the check.",
+                            required_action="No action is required from you right now; later generation gates may still block unsupported content.",
+                            category="content_safety",
+                            metadata={"source": "image"},
+                        )
+                    ]
+                )
             raise ImageSafetyUnavailableError("Azure Content Safety analyze_image failed") from exc
+
+    async def validate_image(
+        self,
+        image_bytes: bytes,
+        *,
+        filename: Optional[str] = None,
+        content_type: Optional[str] = None,
+        fail_open: bool = False,
+    ) -> Tuple[bool, str]:
+        return (
+            await self.validate_image_decision(
+                image_bytes,
+                filename=filename,
+                content_type=content_type,
+                fail_open=fail_open,
+            )
+        ).legacy_tuple()
 
     async def normalize_image_for_storage_and_generation(
         self,

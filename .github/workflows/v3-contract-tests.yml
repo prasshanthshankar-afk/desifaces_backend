@@ -15,6 +15,19 @@ on:
       - "services/svc-face/app/**"
       - "services/svc-audio/app/**"
       - "services/svc-fusion/app/**"
+      - "services/svc-director/app/app/fusion_execution.py"
+      - "services/svc-director/app/app/fusion_input_performance.py"
+      - "services/svc-director/app/app/shared_scene_routes.py"
+      - "services/svc-director/app/app/studio_workflow.py"
+      - "services/svc-director/app/app/studio_routes.py"
+      - "services/svc-director/app/app/studio_progression.py"
+      - "services/svc-director/app/app/studio_routes_runtime.py"
+      - "services/svc-director/tests/test_shared_scene_*.py"
+      - "services/svc-fusion-extension/app/app/api/routes/v3_scene_stitch.py"
+      - "services/svc-fusion-extension/app/app/services/stitch_service.py"
+      - "services/svc-fusion-extension/app/app/services/v3_stitch_resilience.py"
+      - "services/svc-fusion-extension/tests/test_shared_scene_*.py"
+      - "services/svc-fusion/tests/test_sync3_adapter.py"
       - "services/svc-pricing/app/**"
       - "migrations/010_core_auth.sql"
       - "migrations/2026_08_18_v3_*.sql"
@@ -42,6 +55,19 @@ on:
       - "services/svc-face/app/**"
       - "services/svc-audio/app/**"
       - "services/svc-fusion/app/**"
+      - "services/svc-director/app/app/fusion_execution.py"
+      - "services/svc-director/app/app/fusion_input_performance.py"
+      - "services/svc-director/app/app/shared_scene_routes.py"
+      - "services/svc-director/app/app/studio_workflow.py"
+      - "services/svc-director/app/app/studio_routes.py"
+      - "services/svc-director/app/app/studio_progression.py"
+      - "services/svc-director/app/app/studio_routes_runtime.py"
+      - "services/svc-director/tests/test_shared_scene_*.py"
+      - "services/svc-fusion-extension/app/app/api/routes/v3_scene_stitch.py"
+      - "services/svc-fusion-extension/app/app/services/stitch_service.py"
+      - "services/svc-fusion-extension/app/app/services/v3_stitch_resilience.py"
+      - "services/svc-fusion-extension/tests/test_shared_scene_*.py"
+      - "services/svc-fusion/tests/test_sync3_adapter.py"
       - "services/svc-pricing/app/**"
       - "migrations/010_core_auth.sql"
       - "migrations/2026_08_18_v3_*.sql"
@@ -76,8 +102,9 @@ jobs:
       - name: Install focused test dependencies
         run: |
           python -m pip install --disable-pip-version-check \
-            pytest "pydantic>=2,<3" "httpx>=0.27,<1" \
-            azure-ai-contentsafety==1.0.0 azure-core==1.29.6 pydantic-settings==2.1.0 \
+            pytest "pydantic>=2,<3" "httpx>=0.27,<1" "PyJWT==2.9.0" "psycopg[binary,pool]>=3.2,<4" \
+            azure-ai-contentsafety==1.0.0 azure-core==1.29.6 "azure-storage-blob>=12,<13" pydantic-settings==2.1.0 \
+            Pillow==10.2.0 opencv-python-headless==4.10.0.84 \
             -r services/svc-core/app/app/requirements.txt
 
       - name: Compile V3 contract, Core Admin, pricing and compatibility code
@@ -86,6 +113,7 @@ jobs:
             services/shared/df_contracts \
             services/shared/python/desifaces_shared/identity \
             services/shared/python/desifaces_shared/pricing \
+            services/shared/python/desifaces_shared/safety \
             services/shared/python/desifaces_shared/v3 \
             services/svc-core/app/app \
             services/svc-face/app/app/services/multi_person_pricing_policy.py \
@@ -97,6 +125,17 @@ jobs:
             services/svc-fusion/app/app/services/multi_person_pricing_policy.py \
             services/svc-fusion/app/app/services/v3_fusion_adapter_shadow.py \
             services/svc-fusion/app/app/api/v3_adapter_probe.py \
+            services/svc-director/app/app/fusion_execution.py \
+            services/svc-director/app/app/fusion_input_performance.py \
+            services/svc-director/app/app/shared_scene_routes.py \
+            services/svc-director/app/app/studio_workflow.py \
+            services/svc-director/app/app/studio_routes.py \
+            services/svc-director/app/app/studio_progression.py \
+            services/svc-director/app/app/studio_routes_runtime.py \
+            services/svc-fusion/app/app/services/providers/sync3_adapter.py \
+            services/svc-fusion-extension/app/app/api/routes/v3_scene_stitch.py \
+            services/svc-fusion-extension/app/app/services/stitch_service.py \
+            services/svc-fusion-extension/app/app/services/v3_stitch_resilience.py \
             services/svc-pricing/app/app/services/v3_pricing_adapter_shadow.py \
             services/svc-pricing/app/app/api/v3_adapter_probe.py \
             services/svc-pricing/app/app/services/subscription_credit_integrity_service.py \
@@ -211,9 +250,23 @@ jobs:
             test/test_v3_subscription_cycle.py \
             test/test_v3_multi_person_pricing.py
 
+      - name: Run #next3 multi-person conversation contract tests
+        env:
+          DATABASE_URL: postgresql://next3_ci:next3_ci@127.0.0.1:5432/desifaces_v3
+          JWT_SECRET: next3-ci-only-jwt-secret
+          AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=https;AccountName=next3ci;AccountKey=dGVzdA==;EndpointSuffix=core.windows.net
+        run: |
+          PYTHONPATH=services/svc-fusion/app python -m pytest -q \
+            services/svc-fusion/tests/test_sync3_adapter.py
+          PYTHONPATH=services/svc-director/app:services/shared:services/shared/python python -m pytest -q \
+            services/svc-director/tests/test_shared_scene_contract.py \
+            services/svc-director/tests/test_shared_scene_fusion_gate.py
+          PYTHONPATH=services/svc-fusion-extension/app python -m pytest -q \
+            services/svc-fusion-extension/tests/test_shared_scene_hard_cut.py
+
       - name: Run Face Studio safety hard-block tests
         env:
-          PYTHONPATH: services/svc-face/app
+          PYTHONPATH: services/svc-face/app:services/shared/python
           DATABASE_URL: postgresql://test:test@127.0.0.1:5432/test
           AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=https;AccountName=testaccount;AccountKey=dGVzdA==;EndpointSuffix=core.windows.net
           FAL_API_KEY: test-only
@@ -223,7 +276,14 @@ jobs:
           AZURE_CONTENT_MODERATOR_ENDPOINT: https://example.invalid
           AZURE_CONTENT_MODERATOR_KEY: test-only
           JWT_SECRET: test-only-ci-secret
-        run: python -m pytest -q services/svc-face/tests/test_weapons_gore_hard_block_policy.py
+        run: |
+          python -m pytest -q \
+            services/svc-face/tests/test_weapons_gore_hard_block_policy.py \
+            services/svc-face/tests/test_shared_safety_contract.py \
+            services/svc-face/tests/test_common_safety_extremism.py \
+            services/svc-face/tests/test_group_photo_quality.py \
+            services/svc-face/tests/test_shared_text_policy.py \
+            services/svc-face/tests/test_product_visual_policy.py
 
   multi-person-pricing-postgres:
     runs-on: ubuntu-latest

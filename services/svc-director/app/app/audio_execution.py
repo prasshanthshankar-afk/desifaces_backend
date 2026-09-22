@@ -8,6 +8,7 @@ from uuid import UUID
 import httpx
 
 from desifaces_shared.v3.studio_workflow_store import CanonicalStudioWorkflowStore, StudioWorkflowError
+from desifaces_shared.safety import evaluate_text_policy
 
 
 class ParticipantAudioBridgeError(RuntimeError):
@@ -119,6 +120,19 @@ async def load_audio_stage_context(
     text = _clean(row["text_value"])
     if not text:
         raise ParticipantAudioBridgeError("audio_dialogue_text_required")
+
+    safety = evaluate_text_policy(text, source="audio_dialogue")
+    if not safety.allow:
+        first = next((item for item in safety.findings if item.status.value == "FAIL"), None)
+        payload = {
+            "code": first.code if first else "CONTENT_SAFETY_BLOCKED",
+            "title": first.title if first else "This dialogue cannot be used yet",
+            "reason": first.reason if first else safety.summary,
+            "required_action": first.required_action if first else "Revise the dialogue and try again.",
+        }
+        raise ParticipantAudioBridgeError(
+            "audio_content_safety_blocked:" + json.dumps(payload, ensure_ascii=False)
+        )
     target_locale = _clean(
         row["turn_locale"] or row["voice_locale"] or row["default_locale"] or row["story_locale"]
     )

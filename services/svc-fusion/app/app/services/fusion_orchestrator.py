@@ -209,6 +209,7 @@ from app.services.providers.luma_adapter import LumaAdapter, LumaAdapterError
 from app.services.providers.runway_adapter import RunwayAdapter, RunwayAdapterError
 from app.services.providers.omnihuman_adapter import OmniHumanAdapter, OmniHumanAdapterError
 from app.services.providers.veed_fabric_adapter import VeedFabricAdapter, VeedFabricAdapterError
+from app.services.providers.sync3_adapter import Sync3Adapter, Sync3AdapterError
 try:
     from app.services.heygen_service import HeyGenService
 except Exception as heygen_import_error:
@@ -271,7 +272,7 @@ def _is_provider_degraded_message(message: Any) -> bool:
 def _classify_error(e: Exception) -> str:
     msg = str(e).lower()
 
-    if isinstance(e, (FusionProviderError, KlingAdapterError, LumaAdapterError, RunwayAdapterError, OmniHumanAdapterError, VeedFabricAdapterError)):
+    if isinstance(e, (FusionProviderError, KlingAdapterError, LumaAdapterError, RunwayAdapterError, OmniHumanAdapterError, VeedFabricAdapterError, Sync3AdapterError)):
         if _is_provider_degraded_message(msg):
             return "PROVIDER_DEGRADED"
         if "insufficient credits" in msg:
@@ -496,6 +497,8 @@ class FusionOrchestrator:
             return "omnihuman_v15"
         if raw in {"veed", "veed_fabric", "veed_fabric_1", "fabric", "fabric_1_0", "veed/fabric-1.0"}:
             return "veed_fabric"
+        if raw in {"sync3", "sync_3", "sync-3"}:
+            return "sync3"
         if raw in {"kling", "kling_i2v", "kling_t2v"}:
             return "kling"
         if raw in {"luma", "luma_ray2", "luma_ray_2"}:
@@ -514,6 +517,8 @@ class FusionOrchestrator:
             provider: ProviderClient = OmniHumanAdapter()
         elif name == "veed_fabric":
             provider = VeedFabricAdapter()
+        elif name == "sync3":
+            provider = Sync3Adapter()
         elif name == "kling":
             provider = KlingAdapter()
         elif name == "luma":
@@ -615,6 +620,8 @@ class FusionOrchestrator:
             return "OmniHuman provider is not wired correctly in this deployment."
         if provider_name == "veed_fabric":
             return "VEED Fabric provider is not wired correctly in this deployment."
+        if provider_name == "sync3":
+            return "Sync sync-3 provider is not wired correctly in this deployment."
         return f"Provider {provider_name} is not available."
 
 

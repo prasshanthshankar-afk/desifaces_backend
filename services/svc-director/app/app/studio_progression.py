@@ -64,6 +64,31 @@ async def advance_studio_workflow(
             conn, workflow_id=workflow_id, stage_type="audio"
         )
         if audio_ready:
+            conversation_mode = await conn.fetchval(
+                """
+                select coalesce(metadata_json->>'conversation_mode','')
+                from public.v3_studio_workflows
+                where workflow_id=$1 and account_id=$2
+                """,
+                workflow_id,
+                account_id,
+            )
+            if str(conversation_mode or "").strip().casefold() == "shared_scene":
+                shared_scene_ready = await conn.fetchval(
+                    """
+                    select count(*) > 0
+                       and count(*) filter(
+                         where nullif(metadata_json->>'shared_scene_media_id','') is not null
+                           and metadata_json->'speaker_targets' is not null
+                           and jsonb_typeof(metadata_json->'speaker_targets')='object'
+                       ) = count(*)
+                    from public.v3_studio_stage_runs
+                    where workflow_id=$1 and stage_type='fusion' and scope_type='scene'
+                    """,
+                    workflow_id,
+                )
+                if not bool(shared_scene_ready):
+                    return view
             await store.set_workflow_state(
                 conn,
                 workflow_id=workflow_id,

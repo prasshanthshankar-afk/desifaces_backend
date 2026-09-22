@@ -19,7 +19,9 @@ from df_contracts.v3.director import (
     DirectorRunView,
     StoryWorkspaceView,
 )
+from desifaces_shared.safety import evaluate_text_policy
 from desifaces_shared.v3.creation_context import build_creation_context, build_story_workspace
+from desifaces_shared.safety import evaluate_text_policy
 from desifaces_shared.v3.story_store import CanonicalStoryStore, StoryGraphNotFound
 
 from .config import settings
@@ -197,6 +199,30 @@ def _graph():
 async def create_run(brief: CreativeBrief, auth: DirectorAuthContext = Depends(get_director_auth)):
     if app.state.director_graph is None:
         raise HTTPException(status_code=503, detail="creative_director_llm_not_configured")
+
+    safety = evaluate_text_policy(brief.text, source="director_brief")
+    if not safety.allow:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "content_safety_blocked",
+                "code": "DF_CONTENT_SAFETY_BLOCKED",
+                "message": safety.summary,
+                "decision": safety.to_dict(),
+            },
+        )
+
+    safety = evaluate_text_policy(brief.text, source="director_brief")
+    if not safety.allow:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "content_safety_blocked",
+                "code": "DF_CONTENT_SAFETY_BLOCKED",
+                "message": safety.summary,
+                "decision": safety.to_dict(),
+            },
+        )
     thread_id, run_id = str(uuid4()), uuid4()
     async with app.state.business_pool.acquire() as conn:
         await app.state.run_store.enqueue(

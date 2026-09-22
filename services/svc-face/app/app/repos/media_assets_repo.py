@@ -66,6 +66,16 @@ class MediaAssetsRepo(BaseRepository):
         data = self.convert_db_row(row)
         return MediaAssetDB(**data)
     
+    async def merge_meta(self, asset_id: str, patch: Dict[str, Any]) -> None:
+        """Merge metadata into an existing media asset."""
+        query = """
+        UPDATE media_assets
+        SET meta_json = coalesce(meta_json, '{}'::jsonb) || $2::jsonb,
+            updated_at = now()
+        WHERE id = $1::uuid
+        """
+        await self.execute_command(query, asset_id, self.prepare_jsonb_param(patch or {}))
+
     async def update_storage_ref(self, asset_id: str, storage_ref: str) -> None:
         """Update asset storage reference (URL)"""
         

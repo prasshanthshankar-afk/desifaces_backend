@@ -43,7 +43,7 @@ class SceneTurnInput:
     sequence_no: int
     participant_id: UUID
     display_name: str
-    face_media_id: UUID
+    face_media_id: UUID | None
     audio_media_id: UUID
     emotion_code: str | None
     duration_hint_ms: int | None
@@ -94,6 +94,11 @@ async def load_fusion_scene_context(
     if _clean(stage["current_stage"]) != "fusion":
         raise SceneFusionBridgeError("fusion_stage_not_current")
 
+    stage_metadata = _as_dict(stage["stage_metadata"])
+    shared_scene_mode = (
+        _clean(stage_metadata.get("conversation_mode")).casefold() == "shared_scene"
+    )
+
     turn_rows = await conn.fetch(
         """
         select dt.turn_id,dt.sequence_no,dt.speaker_participant_id,dt.emotion_code,
@@ -119,7 +124,7 @@ async def load_fusion_scene_context(
 
     turns: list[SceneTurnInput] = []
     for row in turn_rows:
-        if not row["primary_face_media_id"]:
+        if not row["primary_face_media_id"] and not shared_scene_mode:
             raise SceneFusionBridgeError(
                 f"fusion_speaker_face_not_approved:{row['speaker_participant_id']}"
             )
@@ -129,7 +134,11 @@ async def load_fusion_scene_context(
                 sequence_no=int(row["sequence_no"]),
                 participant_id=UUID(str(row["speaker_participant_id"])),
                 display_name=_clean(row["display_name"]) or "Character",
-                face_media_id=UUID(str(row["primary_face_media_id"])),
+                face_media_id=(
+                    UUID(str(row["primary_face_media_id"]))
+                    if row["primary_face_media_id"]
+                    else None
+                ),
                 audio_media_id=UUID(str(row["audio_media_id"])),
                 emotion_code=_clean(row["emotion_code"]) or None,
                 duration_hint_ms=(int(row["duration_hint_ms"]) if row["duration_hint_ms"] is not None else None),
@@ -145,7 +154,7 @@ async def load_fusion_scene_context(
         story_id=UUID(str(stage["story_id"])) if stage["story_id"] else None,
         scene_id=UUID(str(stage["scene_id"])),
         stage_state=_clean(stage["state"]),
-        stage_metadata=_as_dict(stage["stage_metadata"]),
+        stage_metadata=stage_metadata,
         scene_title=_clean(stage["title"]) or None,
         scene_summary=_clean(stage["summary"]) or None,
         scene_direction=_as_dict(stage["direction_json"]),
@@ -234,17 +243,24 @@ class SceneStitchClient:
         stage_run_id: UUID,
         attempt_id: UUID,
         segment_urls: list[str],
+        stitch_mode: str | None = None,
+        conversation_mode: str | None = None,
     ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "project_id": str(project_id),
+            "workflow_id": str(workflow_id),
+            "stage_run_id": str(stage_run_id),
+            "attempt_id": str(attempt_id),
+            "segment_urls": segment_urls,
+        }
+        if stitch_mode:
+            body["stitch_mode"] = stitch_mode
+        if conversation_mode:
+            body["conversation_mode"] = conversation_mode
         async with httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=self.timeout_seconds) as client:
             response = await client.post(
                 "/api/longform/v3/scene-stitch",
-                json={
-                    "project_id": str(project_id),
-                    "workflow_id": str(workflow_id),
-                    "stage_run_id": str(stage_run_id),
-                    "attempt_id": str(attempt_id),
-                    "segment_urls": segment_urls,
-                },
+                json=body,
             )
         if response.status_code != 200:
             raise SceneFusionBridgeError(
@@ -289,6 +305,10 @@ async def _compile_children(
     prompt = _scene_prompt(context)
     children: list[dict[str, Any]] = []
     for turn in context.turns:
+        if turn.face_media_id is None:
+            raise SceneFusionBridgeError(
+                f"fusion_speaker_face_not_approved:{turn.participant_id}"
+            )
         face_url = await face_client.read_url(headers=headers, media_id=turn.face_media_id)
         audio_url = await audio_client.read_url(headers=headers, media_id=turn.audio_media_id)
         video: dict[str, Any] = {}
@@ -755,6 +775,10 @@ class SceneFusionExecutionService:
             _clean(item.get("video_url"))
             for item in sorted(refreshed, key=lambda x: int(x.get("sequence_no") or 0))
         ]
+        scene_conversation_mode = _clean((context.stage_metadata or {}).get("conversation_mode")).casefold()
+        if not scene_conversation_mode and len({str(turn.participant_id) for turn in context.turns}) >= 2:
+            scene_conversation_mode = "ordered_speaker_shots"
+
         stitch = await self.stitch_client.stitch(
             headers=headers,
             project_id=context.project_id,
@@ -762,6 +786,12 @@ class SceneFusionExecutionService:
             stage_run_id=context.stage_run_id,
             attempt_id=attempt_id,
             segment_urls=ordered_urls,
+            stitch_mode=(
+                "hard_cut"
+                if _clean((context.stage_metadata or {}).get("conversation_mode")).casefold() == "shared_scene"
+                else None
+            ),
+            conversation_mode=scene_conversation_mode or None,
         )
         media_id = UUID(str(stitch.get("media_id")))
         video_url = _clean(stitch.get("video_url"))

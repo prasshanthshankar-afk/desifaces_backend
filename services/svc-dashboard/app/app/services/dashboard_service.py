@@ -1408,6 +1408,24 @@ def _signed_url_from_parts(
     return existing
 
 
+def _library_conversation_mode(meta: Dict[str, Any], reuse: Dict[str, Any]) -> str:
+    job_meta = _coerce_json(meta.get("job_meta")) or {}
+    job_tags = _coerce_json(job_meta.get("tags")) or {}
+    performance_meta = _coerce_json(meta.get("performance_meta")) or {}
+    candidates = (
+        reuse.get("conversation_mode"),
+        meta.get("conversation_mode"),
+        job_meta.get("conversation_mode"),
+        job_tags.get("conversation_mode"),
+        performance_meta.get("conversation_mode"),
+    )
+    for value in candidates:
+        mode = _clean_text(value).lower()
+        if mode in {"shared_scene", "ordered_speaker_shots"}:
+            return mode
+    return ""
+
+
 def _normalize_library_item(
     item: Dict[str, Any],
     signer: AzureBlobSasSigner,
@@ -1506,12 +1524,22 @@ def _normalize_library_item(
     else:
         resolved_video_url = _clean_text(_pick_first(reuse, "video_url")) or _clean_text(preview_url) or _clean_text(download_url)
         resolved_thumbnail_url = _clean_text(_pick_first(reuse, "thumbnail_url", "poster_url")) or _clean_text(thumbnail_url)
+        conversation_mode = _library_conversation_mode(meta, reuse)
+        conversation_kind = (
+            "group_photo_conversation"
+            if conversation_mode == "shared_scene"
+            else "multi_person_conversation"
+            if conversation_mode == "ordered_speaker_shots"
+            else ""
+        )
         reuse_payload = {
             "video_artifact_id": _clean_text(_pick_first(reuse, "video_artifact_id", "artifact_id")) or artifact_id or None,
             "media_asset_id": _clean_text(_pick_first(reuse, "media_asset_id", "video_media_asset_id")) or media_asset_id or None,
             "video_url": resolved_video_url or None,
             "thumbnail_url": resolved_thumbnail_url or None,
             "poster_url": resolved_thumbnail_url or None,
+            "conversation_mode": conversation_mode or None,
+            "conversation_kind": conversation_kind or None,
         }
         title = _clean_text(_pick_first(item, "title", "name")) or "Video"
         asset_type = _clean_text(_pick_first(item, "asset_type")) or "video"

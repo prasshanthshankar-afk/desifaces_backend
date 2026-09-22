@@ -17,6 +17,7 @@ from df_contracts.v3.director import (
 )
 from df_contracts.v3.story import DialogueTurnKind
 from desifaces_shared.v3.participant_refs import normalize_participant_reference
+from desifaces_shared.safety import evaluate_texts_policy
 
 
 _DIRECTOR_SYSTEM_PROMPT = """You are the desifaces Creative Director.
@@ -183,6 +184,36 @@ def _to_canonical_plan(wire: _WireCreativeStoryPlan) -> CreativeStoryPlan:
     )
 
 
+def _validate_plan_content_safety(plan: CreativeStoryPlan) -> CreativeStoryPlan:
+    texts: list[str] = [plan.title]
+    if plan.logline:
+        texts.append(plan.logline)
+    if plan.summary:
+        texts.append(plan.summary)
+    for scene in plan.scenes:
+        if scene.title:
+            texts.append(scene.title)
+        if scene.purpose:
+            texts.append(scene.purpose)
+        texts.extend(turn.text for turn in scene.dialogue if turn.text)
+
+    decision = evaluate_texts_policy(texts, source="director_plan")
+    if not decision.allow:
+        first = next((item for item in decision.findings if item.status.value == "FAIL"), None)
+        payload = {
+            "code": first.code if first else "CONTENT_SAFETY_BLOCKED",
+            "title": first.title if first else "Generated conversation content is not supported",
+            "reason": first.reason if first else decision.summary,
+            "required_action": first.required_action if first else "Revise the conversation and try again.",
+        }
+        raise RuntimeError(
+            "director_plan_content_safety_blocked:"
+            + json.dumps(payload, ensure_ascii=False)
+        )
+    return plan
+
+
+
 class OpenAICreativePlanner:
     """Initial OpenAI provider adapter; graph/domain remain provider-neutral."""
 
@@ -216,7 +247,7 @@ class OpenAICreativePlanner:
             ]
         )
         wire = result if isinstance(result, _WireCreativeStoryPlan) else _WireCreativeStoryPlan.model_validate(result)
-        return _to_canonical_plan(wire)
+        return _validate_plan_content_safety(_to_canonical_plan(wire))
 
 
 class OpenAICreativeCritic:

@@ -6,7 +6,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 from urllib.parse import urlsplit
 
 from app.services.stitch_service import download_to_local, stitch_videos
@@ -133,7 +133,12 @@ def _download_segment(index: int, url: str, output_path: str) -> str:
     ) from last_error
 
 
-def resilient_stitch_video_urls(segment_urls: Sequence[str], out_mp4: str) -> None:
+def resilient_stitch_video_urls(
+    segment_urls: Sequence[str],
+    out_mp4: str,
+    *,
+    stitch_mode_override: Optional[str] = None,
+) -> None:
     """Download ordered provider segments robustly, then run canonical stitching.
 
     This function is intentionally V3-specific. It preserves the canonical FFmpeg
@@ -187,7 +192,7 @@ def resilient_stitch_video_urls(segment_urls: Sequence[str], out_mp4: str) -> No
         )
 
         stitch_started = time.monotonic()
-        stitch_videos(local_files, out_mp4)
+        stitch_videos(local_files, out_mp4, stitch_mode_override=stitch_mode_override)
         logger.info(
             "v3_stitch_ffmpeg_ok segments=%s stitch_ms=%s total_ms=%s",
             len(local_files),
