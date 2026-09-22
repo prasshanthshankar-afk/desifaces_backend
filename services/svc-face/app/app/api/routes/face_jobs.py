@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 from uuid import uuid4
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field, ValidationError
 
 try:
@@ -213,6 +213,7 @@ from app.services.safety_service import (
     SafetyService,
     UnsupportedImageFormatError,
 )
+from app.services.group_photo_quality import analyze_group_photo
 
 router = APIRouter()
 logger = logging.getLogger("api.face_jobs")
@@ -339,6 +340,19 @@ class ImageSafetyCheckResponse(BaseModel):
     allow: bool
     status: str
     reason: Optional[str] = None
+    summary: Optional[str] = None
+    component: Optional[str] = None
+    contract_version: Optional[int] = None
+    findings: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class GroupPhotoValidationResponse(BaseModel):
+    allow: bool
+    status: str
+    summary: str
+    expected_speakers: int
+    content_safety: Dict[str, Any]
+    quality: Optional[Dict[str, Any]] = None
 
 
 class FacePromptEnhanceRequestModel(BaseModel):
@@ -465,17 +479,22 @@ async def creator_i2i_content_safety_check(
 
     try:
         safety = SafetyService()
-        allow, reason = await safety.validate_image(
+        decision = await safety.validate_image_decision(
             data,
             filename=getattr(file, "filename", None),
             content_type=content_type,
             fail_open=False,
         )
+        _, legacy_reason = decision.legacy_tuple()
 
         return ImageSafetyCheckResponse(
-            allow=bool(allow),
-            status="passed" if allow else "blocked",
-            reason=(reason or None),
+            allow=bool(decision.allow),
+            status=decision.status.value,
+            reason=(legacy_reason or None),
+            summary=decision.summary,
+            component=decision.component,
+            contract_version=decision.contract_version,
+            findings=[item.to_dict() for item in decision.findings],
         )
 
     except UnsupportedImageFormatError as exc:
@@ -538,6 +557,153 @@ async def creator_i2i_content_safety_check(
                 "message": "Failed to validate source image safety.",
             },
         )
+
+
+# ------------------------------------------------------------------------------
+# Group Photo Validation — shared-scene conversation
+# ------------------------------------------------------------------------------
+
+@router.post("/creator/group-photo/validate", response_model=GroupPhotoValidationResponse)
+async def creator_group_photo_validate(
+    file: UploadFile = File(...),
+    expected_speakers: int = Form(...),
+    user_id: str = Depends(get_current_user_id),
+) -> GroupPhotoValidationResponse:
+    """
+    Validate one shared group photo before #next3 speaker mapping.
+
+    Order is deliberate:
+      1) common content-safety decision
+      2) workflow-specific photo quality checks
+
+    A FAIL always returns structured reasons and required_action values so the
+    user knows exactly what must change before retrying.
+    """
+    _ = user_id
+
+    if expected_speakers < 2 or expected_speakers > 20:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_expected_speaker_count",
+                "code": "DF_GROUP_PHOTO_EXPECTED_SPEAKERS_INVALID",
+                "message": "Group-photo conversations require between 2 and 20 expected speakers.",
+            },
+        )
+
+    content_type = (file.content_type or "").strip().lower()
+    if not content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "error": "unsupported_content_type",
+                "code": "DF_GROUP_PHOTO_UNSUPPORTED_CONTENT_TYPE",
+                "message": f"Unsupported content type: {content_type or 'unknown'}. Choose a supported image file.",
+            },
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "empty_file",
+                "code": "DF_GROUP_PHOTO_EMPTY_FILE",
+                "message": "The selected image is empty. Choose another image and try again.",
+            },
+        )
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error": "file_too_large",
+                "code": "DF_GROUP_PHOTO_FILE_TOO_LARGE",
+                "message": f"The image exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.",
+            },
+        )
+
+    try:
+        safety = SafetyService()
+        safety_decision = await safety.validate_image_decision(
+            data,
+            filename=getattr(file, "filename", None),
+            content_type=content_type,
+            fail_open=False,
+        )
+        safety_payload = safety_decision.to_dict()
+
+        if not safety_decision.allow:
+            return GroupPhotoValidationResponse(
+                allow=False,
+                status="FAIL",
+                summary=safety_decision.summary or "This image cannot be used because it failed content-safety checks.",
+                expected_speakers=expected_speakers,
+                content_safety=safety_payload,
+                quality=None,
+            )
+
+        quality = analyze_group_photo(data, expected_speakers=expected_speakers)
+        quality_payload = quality.to_dict()
+        overall = quality.status.value
+        allow = quality.usable and safety_decision.allow
+        if safety_decision.status.value == "WARN" and overall == "PASS":
+            overall = "WARN"
+
+        if not allow:
+            summary = quality.summary
+        elif overall == "WARN":
+            summary = "The photo can continue after you review the warnings below."
+        else:
+            summary = "The photo passed content-safety and group-photo quality checks."
+
+        return GroupPhotoValidationResponse(
+            allow=allow,
+            status=overall,
+            summary=summary,
+            expected_speakers=expected_speakers,
+            content_safety=safety_payload,
+            quality=quality_payload,
+        )
+    except UnsupportedImageFormatError as exc:
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "error": "group_photo_unsupported_format",
+                "code": "DF_GROUP_PHOTO_UNSUPPORTED_FORMAT",
+                "message": str(exc),
+            },
+        )
+    except ImageTooLargeError as exc:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error": "group_photo_image_too_large",
+                "code": "DF_GROUP_PHOTO_IMAGE_TOO_LARGE",
+                "message": str(exc),
+            },
+        )
+    except ImageSafetyUnavailableError as exc:
+        logger.exception("group_photo_content_safety_unavailable user_id=%s", user_id)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "content_safety_unavailable",
+                "code": "DF_CONTENT_SAFETY_UNAVAILABLE",
+                "message": "Content-safety validation is temporarily unavailable. The photo was not accepted; please retry.",
+            },
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("group_photo_validation_failed user_id=%s", user_id)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "group_photo_validation_failed",
+                "code": "DF_GROUP_PHOTO_VALIDATION_FAILED",
+                "message": "The group photo could not be validated. Nothing was accepted or generated; please retry with the same or another image.",
+            },
+        ) from exc
 
 
 # ------------------------------------------------------------------------------
