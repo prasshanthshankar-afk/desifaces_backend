@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Dict, Optional
 
-from .contracts import SafetyFinding, SafetyStatus
+from .contracts import SafetyDecision, SafetyFinding, SafetyStatus, decision_from_findings
 
 
 _CATEGORY_RULES: Dict[str, Dict[str, str]] = {
@@ -70,15 +70,14 @@ _TEXT_HARD_BLOCKS = [
 ]
 
 
-def evaluate_text_policy(text: str, *, source: str = "prompt"):
+def evaluate_text_policy(text: str, *, source: str = "prompt") -> SafetyDecision:
     """Reusable deterministic first-line text safety gate."""
     normalized = str(text or "").strip()
-    if not normalized:
-        return None
-    for rule in _TEXT_HARD_BLOCKS:
-        if re.search(rule["pattern"], normalized, flags=re.IGNORECASE | re.DOTALL):
-            return category_finding(rule["category"], source=source)
-    return None
+    if normalized:
+        for rule in _TEXT_HARD_BLOCKS:
+            if re.search(rule["pattern"], normalized, flags=re.IGNORECASE | re.DOTALL):
+                return decision_from_findings([category_finding(rule["category"], source=source)])
+    return decision_from_findings([pass_finding(source=source)])
 
 
 
