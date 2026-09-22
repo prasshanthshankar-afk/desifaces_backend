@@ -5,6 +5,10 @@ from typing import Any, Dict, List
 
 from desifaces_shared.safety import SafetyStatus
 
+USABLE_FACE_MIN_HEIGHT_RATIO = 0.10
+USABLE_FACE_MIN_WIDTH_RATIO = 0.055
+USABLE_FACE_MIN_AREA_RATIO = 0.006
+
 
 @dataclass(frozen=True)
 class GroupPhotoQualityCheck:
@@ -253,9 +257,9 @@ def analyze_group_photo(image_bytes: bytes, *, expected_speakers: int) -> GroupP
     faces = [
         face
         for face in raw_faces
-        if float(face["height_ratio"]) >= 0.10
-        and float(face["width_ratio"]) >= 0.055
-        and float(face["area_ratio"]) >= 0.006
+        if float(face["height_ratio"]) >= USABLE_FACE_MIN_HEIGHT_RATIO
+        and float(face["width_ratio"]) >= USABLE_FACE_MIN_WIDTH_RATIO
+        and float(face["area_ratio"]) >= USABLE_FACE_MIN_AREA_RATIO
     ]
     for index, face in enumerate(sorted(faces, key=lambda item: float(item["box"]["x"])), start=1):
         face["face_id"] = f"face_{index}"
