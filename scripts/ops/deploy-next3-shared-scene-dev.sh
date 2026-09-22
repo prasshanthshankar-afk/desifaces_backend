@@ -94,6 +94,35 @@ for i in "${!WORKER_CONTAINERS[@]}"; do
   if docker inspect "$c" >/dev/null 2>&1; then ACTIVE_WORKER["$c"]=1; else ACTIVE_WORKER["$c"]=0; fi
 done
 
+# Reuse the Compose project that already owns the DEV V3 containers. The
+# source worktree must not create a second project with the same fixed
+# container names.
+LIVE_PROJECT=""
+for i in "${!CONTAINERS[@]}"; do
+  c="${CONTAINERS[$i]}"; svc="${SERVICES[$i]}"
+  docker inspect "$c" >/dev/null 2>&1 || fail "expected DEV container missing: $c"
+  project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$c")"
+  owner_service="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$c")"
+  [[ -n "$project" ]] || fail "compose project label missing for $c"
+  [[ "$owner_service" == "$svc" ]] || fail "compose service ownership mismatch for $c: $owner_service != $svc"
+  if [[ -z "$LIVE_PROJECT" ]]; then
+    LIVE_PROJECT="$project"
+  else
+    [[ "$project" == "$LIVE_PROJECT" ]] || fail "target containers span multiple Compose projects"
+  fi
+done
+for i in "${!WORKER_CONTAINERS[@]}"; do
+  c="${WORKER_CONTAINERS[$i]}"; svc="${WORKER_SERVICES[$i]}"
+  [[ "${ACTIVE_WORKER[$c]:-0}" == "1" ]] || continue
+  project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$c")"
+  owner_service="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$c")"
+  [[ "$project" == "$LIVE_PROJECT" ]] || fail "worker Compose project mismatch for $c"
+  [[ "$owner_service" == "$svc" ]] || fail "worker Compose service mismatch for $c: $owner_service != $svc"
+done
+[[ -n "$LIVE_PROJECT" ]] || fail "unable to resolve live DEV Compose project"
+echo "DEV_COMPOSE_PROJECT=$LIVE_PROJECT"
+echo "DEV_COMPOSE_OWNERSHIP=PASS"
+
 RUNTIME_CHANGED=0
 rollback(){
   local rc=$?
@@ -106,14 +135,14 @@ rollback(){
     [[ -n "$ref" && -n "$id" ]] && docker tag "$id" "$ref" >/dev/null 2>&1 || true
   done
   if (( RUNTIME_CHANGED == 1 )); then
-    V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh up -d --no-deps --force-recreate "${SERVICES[@]}" >/dev/null 2>&1 || true
+    V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$LIVE_PROJECT" up -d --no-deps --force-recreate "${SERVICES[@]}" >/dev/null 2>&1 || true
     for i in "${!WORKER_SERVICES[@]}"; do
       svc="${WORKER_SERVICES[$i]}"; c="${WORKER_CONTAINERS[$i]}"
       [[ "${ACTIVE_WORKER[$c]:-0}" == "1" ]] || continue
       if [[ "$svc" == "svc-director-worker" ]]; then
-        V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh --profile v3-orchestration up -d --no-deps --force-recreate "$svc" >/dev/null 2>&1 || true
+        V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$LIVE_PROJECT" --profile v3-orchestration up -d --no-deps --force-recreate "$svc" >/dev/null 2>&1 || true
       else
-        V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh --profile v3-execution up -d --no-deps --force-recreate "$svc" >/dev/null 2>&1 || true
+        V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$LIVE_PROJECT" --profile v3-execution up -d --no-deps --force-recreate "$svc" >/dev/null 2>&1 || true
       fi
     done
   fi
@@ -122,19 +151,19 @@ rollback(){
 }
 trap 'rollback' ERR
 
-V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh build "${SERVICES[@]}"
+V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$LIVE_PROJECT" build "${SERVICES[@]}"
 echo "NEXT3_IMAGE_BUILD=PASS"
 
 RUNTIME_CHANGED=1
-V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh up -d --no-deps --force-recreate "${SERVICES[@]}"
+V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$LIVE_PROJECT" up -d --no-deps --force-recreate "${SERVICES[@]}"
 
 for i in "${!WORKER_SERVICES[@]}"; do
   svc="${WORKER_SERVICES[$i]}"; c="${WORKER_CONTAINERS[$i]}"
   [[ "${ACTIVE_WORKER[$c]:-0}" == "1" ]] || continue
   if [[ "$svc" == "svc-director-worker" ]]; then
-    V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh --profile v3-orchestration up -d --no-deps --force-recreate "$svc"
+    V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$LIVE_PROJECT" --profile v3-orchestration up -d --no-deps --force-recreate "$svc"
   else
-    V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh --profile v3-execution up -d --no-deps --force-recreate "$svc"
+    V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$LIVE_PROJECT" --profile v3-execution up -d --no-deps --force-recreate "$svc"
   fi
 done
 
