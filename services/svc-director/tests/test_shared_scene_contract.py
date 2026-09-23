@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from uuid import uuid4
+import inspect
 
 import pytest
 from pydantic import ValidationError
@@ -42,3 +43,11 @@ def test_shared_scene_contract_requires_unique_speakers():
             image_height=1080,
             speaker_targets=[target, target],
         )
+
+
+def test_shared_scene_profile_lock_query_avoids_distinct_for_update():
+    from app.studio_preflight_routes import set_shared_scene_participant_profile
+
+    source = inspect.getsource(set_shared_scene_participant_profile).lower()
+    assert "for update of p" in source
+    assert "select distinct p.participant_id" not in source
