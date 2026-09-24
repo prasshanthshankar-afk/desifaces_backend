@@ -162,6 +162,23 @@ class OmniHumanAdapter(ProviderClient):
             "resolution": resolution,
             "turbo_mode": turbo_mode,
         }
+
+        provider_options = request_payload.get("provider_options") if isinstance(request_payload.get("provider_options"), dict) else {}
+        source_mask_url = self._safe_optional_url(
+            provider_options.get("mask_url")
+            or request_payload.get("mask_url")
+        )
+        fal_mask_url = ""
+        if source_mask_url:
+            if self.upload_inputs_to_fal:
+                fal_mask_url = await self._upload_remote_file_to_fal(
+                    source_mask_url,
+                    suffix_hint=self._suffix_from_url(source_mask_url, ".png"),
+                )
+            else:
+                fal_mask_url = await self._refresh_azure_blob_input_url(source_mask_url)
+            request_json["mask_url"] = fal_mask_url
+
         if prompt:
             request_json["prompt"] = prompt
 
@@ -194,6 +211,9 @@ class OmniHumanAdapter(ProviderClient):
                 "source_audio_url": source_audio_url,
                 "fal_face_url": face_url,
                 "fal_audio_url": audio_url,
+                "source_mask_url": source_mask_url or None,
+                "fal_mask_url": fal_mask_url or None,
+                "mask_enabled": bool(fal_mask_url),
             },
         )
 
@@ -426,6 +446,16 @@ class OmniHumanAdapter(ProviderClient):
                     tmp_path = None
 
         raise OmniHumanAdapterError(f"fal upload failed for input asset: {last_error}") from last_error
+
+    @staticmethod
+    def _safe_optional_url(value: Any) -> str:
+        s = str(value or "").strip()
+        if not s:
+            return ""
+        parsed = urlparse(s)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise OmniHumanAdapterError("omnihuman_v15_invalid_mask_url")
+        return s
 
     def _is_fal_hosted_url(self, url: str) -> bool:
         try:
