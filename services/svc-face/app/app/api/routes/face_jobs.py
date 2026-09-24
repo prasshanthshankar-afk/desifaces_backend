@@ -786,6 +786,12 @@ async def creator_group_photo_validate_asset(
         await MediaAssetsRepo(pool).merge_meta(
             req.media_asset_id,
             {
+                # Canonical semantic lineage. A group photo may be produced by
+                # svc-face, but it is not a reusable single-Face identity asset.
+                "asset_class": "group_photo",
+                "conversation_mode": "shared_scene",
+                "intended_reuse": "group_photo_conversation",
+                "participant_count": int(req.expected_speakers),
                 "shared_scene_validation": {
                     "contract_version": 1,
                     "status": decision.status,
@@ -793,7 +799,7 @@ async def creator_group_photo_validate_asset(
                     "expected_speakers": int(req.expected_speakers),
                     "validated_at": datetime.now(timezone.utc).isoformat(),
                     "summary": decision.summary,
-                }
+                },
             },
         )
         return decision
