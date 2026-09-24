@@ -515,7 +515,21 @@ async def reconcile_one(pool, row: dict[str, Any]) -> None:
                 children=refreshed,
                 phase="video_generation",
             )
-            if any(_clean(item.get("status")).lower() in _FAILED for item in refreshed):
+            has_failed = any(
+                _clean(item.get("status")).lower() in _FAILED
+                for item in refreshed
+            )
+            all_terminal = bool(refreshed) and all(
+                _clean(item.get("status")).lower() in (_SUCCESS | _FAILED)
+                for item in refreshed
+            )
+
+            # Do not fail the parent scene while sibling provider jobs are still
+            # rendering. Keep reconciling until every child is terminal so any
+            # successful clips are captured and reusable on retry. Previously the
+            # first failed child stopped the coordinator immediately, leaving
+            # still-running siblings orphaned from the durable parent attempt.
+            if has_failed and all_terminal:
                 await _release_failed_scene(
                     pool,
                     row,
@@ -523,6 +537,7 @@ async def reconcile_one(pool, row: dict[str, Any]) -> None:
                     reason="one_or_more_child_fusion_jobs_failed",
                 )
                 return
+
             all_succeeded = bool(refreshed) and all(
                 _clean(item.get("status")).lower() in _SUCCESS and _clean(item.get("video_url"))
                 for item in refreshed
