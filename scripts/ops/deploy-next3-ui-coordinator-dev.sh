@@ -3,8 +3,37 @@ set -Eeuo pipefail
 
 EXPECTED_HOST="desifaces-dev"
 BACKEND_ROOT="/home/azureuser/workspace/desifaces-v3"
-WEB_ROOT="/home/azureuser/workspace/desifaces_web"
 ENV_FILE="$BACKEND_ROOT/infra/.env"
+
+resolve_web_root() {
+  local candidate remote gitdir
+  for candidate in \
+    /home/azureuser/workspace/desifaces_web \
+    /home/azureuser/workspace/desifaces-web \
+    /home/azureuser/workspace/desifaces_frontend \
+    /home/azureuser/workspace/desifaces-web-review
+  do
+    [[ -d "$candidate/.git" || -f "$candidate/.git" ]] || continue
+    remote="$(git -C "$candidate" remote get-url origin 2>/dev/null || true)"
+    if [[ "$remote" == *"prasshanthshankar-afk/desifaces_web"* ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+
+  while IFS= read -r gitdir; do
+    candidate="${gitdir%/.git}"
+    remote="$(git -C "$candidate" remote get-url origin 2>/dev/null || true)"
+    if [[ "$remote" == *"prasshanthshankar-afk/desifaces_web"* ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done < <(find /home/azureuser/workspace -maxdepth 3 -type d -name .git 2>/dev/null | sort)
+
+  return 1
+}
+
+WEB_ROOT="$(resolve_web_root || true)"
 
 BACKEND_RUNTIME_SHA="6dfb2b8ff47fd4e81a6e4bc70ca3857b5b3ba756"
 WEB_RUNTIME_SHA="dbd2a1f9215742a560243401fa641bf3ddb4bba2"
@@ -31,7 +60,9 @@ trap cleanup EXIT
 [[ "$(hostname -s)" == "$EXPECTED_HOST" ]] || fail "DEV host guard failed"
 [[ -f "$ENV_FILE" ]] || fail "canonical DEV env missing"
 [[ -d "$BACKEND_ROOT/.git" || -f "$BACKEND_ROOT/.git" ]] || fail "backend repo missing"
-[[ -d "$WEB_ROOT/.git" || -f "$WEB_ROOT/.git" ]] || fail "web repo missing"
+[[ -n "$WEB_ROOT" ]] || fail "desifaces_web repository not found under /home/azureuser/workspace"
+[[ -d "$WEB_ROOT/.git" || -f "$WEB_ROOT/.git" ]] || fail "web repo missing: $WEB_ROOT"
+echo "WEB_ROOT=$WEB_ROOT"
 docker inspect "$STITCH" >/dev/null 2>&1 || fail "$STITCH missing"
 docker inspect "$WEB" >/dev/null 2>&1 || fail "$WEB missing"
 
