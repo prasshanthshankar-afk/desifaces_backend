@@ -70,14 +70,7 @@ for raw in Path(sys.argv[1]).read_text().splitlines():
 PY
 )"
 
-write_key() {
-  local key="$1"
-  printf '%s' "$key" | python3 - "$ENV_FILE" <<'PY'
-PY
-}
-
-# Use a temporary helper file descriptor so the secret is consumed from stdin
-# rather than placed on the Python command line or echoed to terminal.
+# Keep the secret out of command arguments and terminal output.
 write_env_key() {
   local key="$1"
   SYNC_KEY_STDIN="$key" python3 - "$ENV_FILE" <<'PY'
