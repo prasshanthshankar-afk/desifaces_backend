@@ -92,23 +92,44 @@ python3 -m py_compile \
   "$WT/services/svc-fusion/app/app/services/providers/omnihuman_adapter.py"
 echo "SHARED_SCENE_MOTION_SOURCE_CONTRACT=PASS"
 
-PROJECT="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$FUSION")"
-[[ -n "$PROJECT" ]] || fail "Compose project missing"
+DIRECTOR_PROJECT="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$DIRECTOR")"
+DIRECTOR_WORKER_PROJECT="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$DIRECTOR_WORKER")"
+FUSION_PROJECT="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$FUSION")"
+FUSION_WORKER_PROJECT="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$FUSION_WORKER")"
+
+[[ -n "$DIRECTOR_PROJECT" ]] || fail "Director Compose project missing"
+[[ -n "$DIRECTOR_WORKER_PROJECT" ]] || fail "Director worker Compose project missing"
+[[ -n "$FUSION_PROJECT" ]] || fail "Fusion Compose project missing"
+[[ -n "$FUSION_WORKER_PROJECT" ]] || fail "Fusion worker Compose project missing"
+
+echo "DIRECTOR_PROJECT=$DIRECTOR_PROJECT"
+echo "DIRECTOR_WORKER_PROJECT=$DIRECTOR_WORKER_PROJECT"
+echo "FUSION_PROJECT=$FUSION_PROJECT"
+echo "FUSION_WORKER_PROJECT=$FUSION_WORKER_PROJECT"
 
 echo
 echo "=== 2. BUILD DIRECTOR + FUSION API/WORKERS ==="
 cd "$WT"
-V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$PROJECT" --profile v3-orchestration --profile v3-execution \
+
+# Build the four target images. Project selection affects Compose ownership, not
+# the explicit V3 Director image name; Fusion uses its existing project image.
+V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$FUSION_PROJECT" --profile v3-orchestration --profile v3-execution \
   build svc-director svc-director-worker svc-fusion svc-fusion-worker
 echo "SHARED_SCENE_MOTION_IMAGES=PASS"
 
-V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$PROJECT" \
-  up -d --no-deps --force-recreate svc-director svc-fusion
+# Recreate every service through the Compose project that already owns its live
+# container. This prevents an unrelated Compose project from trying to allocate
+# the same explicit container_name.
+V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$DIRECTOR_PROJECT" \
+  up -d --no-deps --force-recreate svc-director
 
-V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$PROJECT" --profile v3-orchestration \
+V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$DIRECTOR_WORKER_PROJECT" --profile v3-orchestration \
   up -d --no-deps --force-recreate svc-director-worker
 
-V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$PROJECT" --profile v3-execution \
+V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$FUSION_PROJECT" \
+  up -d --no-deps --force-recreate svc-fusion
+
+V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$FUSION_WORKER_PROJECT" --profile v3-execution \
   up -d --no-deps --force-recreate svc-fusion-worker
 
 for c in "$DIRECTOR" "$DIRECTOR_WORKER" "$FUSION" "$FUSION_WORKER"; do
