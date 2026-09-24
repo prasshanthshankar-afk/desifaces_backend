@@ -995,6 +995,19 @@ class CreatorOrchestrator:
                     meta_json = self._coerce_dict(row.get("meta_json"))
 
             if storage_ref:
+                asset_class = self._clean_text(meta_json.get("asset_class")).lower()
+                intended_reuse = self._clean_text(meta_json.get("intended_reuse")).lower()
+                conversation_mode = self._clean_text(meta_json.get("conversation_mode")).lower()
+                if (
+                    asset_class == "group_photo"
+                    or intended_reuse == "group_photo_conversation"
+                    or conversation_mode == "shared_scene"
+                    or isinstance(meta_json.get("shared_scene_validation"), dict)
+                ):
+                    raise RuntimeError(
+                        "group_photo_not_valid_face_source:"
+                        "reuse_this_asset_in_multi_person_group_photo_conversation"
+                    )
                 storage_ref = await self._refresh_read_sas_best_effort(str(storage_ref), meta_json)
                 return await self._resolve_source_image_ref(str(storage_ref))
 
