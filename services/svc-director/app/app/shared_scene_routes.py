@@ -128,7 +128,8 @@ async def set_shared_scene_conversation(
                 """
                 select id,user_id,account_id,project_id,kind,lifecycle_state,meta_json
                 from public.media_assets
-                where id=$1 and user_id=$2 and account_id=$3
+                where id=$1 and user_id=$2
+                  and (account_id=$3 or account_id is null)
                   and (project_id is null or project_id=$4)
                   and kind in ('image','face_image','face_source_image')
                   and lifecycle_state='active'
@@ -142,6 +143,27 @@ async def set_shared_scene_conversation(
                 raise HTTPException(
                     status_code=422,
                     detail="shared_scene_media_not_owned_active_face_image",
+                )
+
+            # Face Studio's legacy MediaAssetsRepo writes canonical user ownership
+            # but does not populate the V3 account/project lineage columns. When a
+            # same-user active Face asset is explicitly selected for this workflow,
+            # adopt the missing lineage here before persisting the shared-scene
+            # contract. Assets already scoped to another account/project remain
+            # rejected by the query above.
+            if media["account_id"] is None:
+                await conn.execute(
+                    """
+                    update public.media_assets
+                    set account_id=$2,
+                        project_id=coalesce(project_id,$3),
+                        updated_at=now()
+                    where id=$1 and user_id=$4 and account_id is null
+                    """,
+                    body.shared_scene_media_id,
+                    auth.account_id,
+                    stage["project_id"],
+                    auth.user_id,
                 )
 
             speech_rows = await conn.fetch(
