@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 EXPECTED_HOST="desifaces-dev"
 ROOT="/home/azureuser/workspace/desifaces-v3"
-TARGET_SHA="01cceff80703d30574a37b032fb6ad577fdad609"
+TARGET_SHA="b82233c3559e15dcb31f7e72fb1f25f8d06a4cb0"
 WT="/tmp/desifaces-motion-bakeoff-$TARGET_SHA"
 LIVE="df-v3-svc-fusion"
 IMAGE="desifaces-motion-bakeoff:$TARGET_SHA"
@@ -28,7 +28,7 @@ NETWORK="$(docker inspect "$LIVE" -f '{{range $k,$v := .NetworkSettings.Networks
 [[ "$NETWORK" == "df-v3-net" ]] || fail "unexpected DEV network=$NETWORK"
 
 echo "============================================================"
-echo " desifaces DEV — SYNC3 vs OMNIHUMAN MOTION BAKEOFF"
+echo " desifaces DEV — FINAL SYNC3 vs OMNIHUMAN MOTION BAKEOFF"
 echo " target_sha=$TARGET_SHA"
 echo " live_runtime_mutation=NONE"
 echo " production_touch=NONE"
@@ -91,7 +91,7 @@ grep -Fq "PRODUCTION_TOUCH=NONE" "$LOG" || fail "production guard marker missing
 
 echo
 echo "============================================================"
-echo " MOTION BAKEOFF COMPLETE"
+echo " FINAL MOTION BAKEOFF COMPLETE"
 echo " log=$LOG"
 echo " LIVE_RUNTIME_MUTATION=NONE"
 echo " PRODUCTION_TOUCH=NONE"
