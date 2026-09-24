@@ -197,13 +197,6 @@ if (( RC_DIRECTOR != 0 || RC_DIRECTOR_WORKER != 0 || RC_FUSION != 0 || RC_FUSION
   fail "one or more DEV service recreations failed"
 fi
 
-# New canonical containers are healthy enough to own their stable names; remove
-# temporary adoption backups only after all four services were recreated.
-docker rm -f "$DIRECTOR_ROLLBACK" >/dev/null 2>&1 || true
-docker rm -f "$DIRECTOR_WORKER_ROLLBACK" >/dev/null 2>&1 || true
-docker rm -f "$FUSION_ROLLBACK" >/dev/null 2>&1 || true
-docker rm -f "$FUSION_WORKER_ROLLBACK" >/dev/null 2>&1 || true
-
 for c in "$DIRECTOR" "$DIRECTOR_WORKER" "$FUSION" "$FUSION_WORKER"; do
   [[ "$(docker inspect -f '{{.State.Status}}' "$c")" == "running" ]] || fail "$c not running"
 done
@@ -241,6 +234,14 @@ import os
 assert bool(os.getenv("SYNC_API_KEY"))
 print("SYNC3_FALLBACK_KEY_BOUND=PASS")
 PY
+
+# All runtime contracts passed. It is now safe to remove temporary adoption
+# backups from pre-Compose DEV containers.
+docker rm -f "$DIRECTOR_ROLLBACK" >/dev/null 2>&1 || true
+docker rm -f "$DIRECTOR_WORKER_ROLLBACK" >/dev/null 2>&1 || true
+docker rm -f "$FUSION_ROLLBACK" >/dev/null 2>&1 || true
+docker rm -f "$FUSION_WORKER_ROLLBACK" >/dev/null 2>&1 || true
+echo "DEV_COMPOSE_OWNERSHIP_ADOPTION=PASS"
 
 echo
 echo "=== 4. DEPLOY VALIDATED WEB UI ==="
