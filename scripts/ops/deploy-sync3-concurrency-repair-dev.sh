@@ -55,8 +55,8 @@ cd "$WT"
 python3 -m py_compile "$WT/services/svc-fusion/app/app/services/providers/sync3_adapter.py"
 echo "SYNC3_CONCURRENCY_SYNTAX=PASS"
 
-V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$PROJECT" build svc-fusion
-echo "FUSION_IMAGE_BUILD=PASS"
+V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$PROJECT" build --no-deps svc-fusion svc-fusion-worker
+echo "FUSION_API_WORKER_IMAGE_BUILD=PASS"
 
 V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$PROJECT"   up -d --no-deps --force-recreate svc-fusion
 
@@ -82,5 +82,6 @@ PY
 
 echo "============================================================"
 echo " SYNC3 CONCURRENCY REPAIR DEPLOYED"
+echo " FUSION_API_WORKER_RUNTIME_ALIGNED=PASS"
 echo " PRODUCTION_TOUCH=NONE"
 echo "============================================================"
