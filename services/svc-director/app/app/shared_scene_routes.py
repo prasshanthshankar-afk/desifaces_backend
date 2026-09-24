@@ -64,7 +64,7 @@ _DEFAULT_NATURAL_MOTION_PROMPT = (
 
 
 class SharedSceneVideoSettingsIn(BaseModel):
-    motion_mode: Literal["natural_motion", "precise_lipsync"] = "natural_motion"
+    motion_mode: Literal["natural_motion", "precise_lipsync"] = "precise_lipsync"
     video_prompt: str | None = Field(default=None, max_length=2400)
 
 
