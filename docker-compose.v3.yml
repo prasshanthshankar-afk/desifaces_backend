@@ -175,6 +175,7 @@ services:
     container_name: df-v3-svc-fusion-worker
     profiles: !override ["v3-execution"]
     environment:
+      DF_FUSION_WORKER_CONCURRENCY: ${DF_FUSION_WORKER_CONCURRENCY:-8}
       AZURE_VIDEO_OUTPUT_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
       AZURE_FINAL_VIDEO_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
 
