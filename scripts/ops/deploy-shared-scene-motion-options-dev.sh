@@ -92,28 +92,28 @@ python3 -m py_compile \
   "$WT/services/svc-fusion/app/app/services/providers/omnihuman_adapter.py"
 echo "SHARED_SCENE_MOTION_SOURCE_CONTRACT=PASS"
 
-compose_project_or_default() {
+compose_project_label() {
   local container="$1"
-  local project
-  project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$container" 2>/dev/null || true)"
-  if [[ -n "$project" && "$project" != "<no value>" ]]; then
-    printf '%s' "$project"
-  else
-    printf '%s' "desifaces"
-  fi
+  docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$container" 2>/dev/null || true
 }
 
 compose_managed() {
-  local container="$1"
   local project
-  project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$container" 2>/dev/null || true)"
+  project="$(compose_project_label "$1")"
   [[ -n "$project" && "$project" != "<no value>" ]]
 }
 
-DIRECTOR_PROJECT="$(compose_project_or_default "$DIRECTOR")"
-DIRECTOR_WORKER_PROJECT="$(compose_project_or_default "$DIRECTOR_WORKER")"
-FUSION_PROJECT="$(compose_project_or_default "$FUSION")"
-FUSION_WORKER_PROJECT="$(compose_project_or_default "$FUSION_WORKER")"
+# Fusion is already a Compose-owned member of the active V3 stack. Use that
+# exact project as the adoption target for older unlabeled Director containers.
+FUSION_PROJECT="$(compose_project_label "$FUSION")"
+[[ -n "$FUSION_PROJECT" && "$FUSION_PROJECT" != "<no value>" ]] || fail "Fusion Compose project missing"
+FUSION_WORKER_PROJECT="$(compose_project_label "$FUSION_WORKER")"
+[[ -n "$FUSION_WORKER_PROJECT" && "$FUSION_WORKER_PROJECT" != "<no value>" ]] || FUSION_WORKER_PROJECT="$FUSION_PROJECT"
+
+DIRECTOR_PROJECT="$(compose_project_label "$DIRECTOR")"
+[[ -n "$DIRECTOR_PROJECT" && "$DIRECTOR_PROJECT" != "<no value>" ]] || DIRECTOR_PROJECT="$FUSION_PROJECT"
+DIRECTOR_WORKER_PROJECT="$(compose_project_label "$DIRECTOR_WORKER")"
+[[ -n "$DIRECTOR_WORKER_PROJECT" && "$DIRECTOR_WORKER_PROJECT" != "<no value>" ]] || DIRECTOR_WORKER_PROJECT="$FUSION_PROJECT"
 
 echo "DIRECTOR_PROJECT=$DIRECTOR_PROJECT managed=$(compose_managed "$DIRECTOR" && echo yes || echo no)"
 echo "DIRECTOR_WORKER_PROJECT=$DIRECTOR_WORKER_PROJECT managed=$(compose_managed "$DIRECTOR_WORKER" && echo yes || echo no)"
@@ -133,24 +133,61 @@ echo "SHARED_SCENE_MOTION_IMAGES=PASS"
 # Recreate every service through its owning Compose project. Older DEV Director
 # containers may predate Compose labels; adopt those once into the canonical
 # V3 Compose project by temporarily renaming the exact running container.
+recover_stranded_adoption() {
+  local canonical="$1"
+  local rollback_name="$2"
+  if ! docker inspect "$rollback_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local canonical_state=""
+  if docker inspect "$canonical" >/dev/null 2>&1; then
+    canonical_state="$(docker inspect -f '{{.State.Status}}' "$canonical" 2>/dev/null || true)"
+  fi
+
+  if [[ "$canonical_state" == "running" ]]; then
+    docker rm -f "$rollback_name" >/dev/null 2>&1 || true
+    echo "STRANDED_ADOPTION_CLEANUP=$canonical canonical_running"
+    return 0
+  fi
+
+  docker rm -f "$canonical" >/dev/null 2>&1 || true
+  docker stop "$rollback_name" >/dev/null 2>&1 || true
+  docker rename "$rollback_name" "$canonical"
+  docker start "$canonical" >/dev/null
+  echo "STRANDED_ADOPTION_RECOVERED=$canonical"
+}
+
 adopt_if_unmanaged() {
   local container="$1"
   local rollback_name="$2"
   if compose_managed "$container"; then
     return 0
   fi
+
+  # Renaming a running container does not release its published host ports.
+  # Stop first, then rename, so the canonical replacement can bind 18011/etc.
   docker rm -f "$rollback_name" >/dev/null 2>&1 || true
+  docker stop "$container" >/dev/null
   docker rename "$container" "$rollback_name"
-  echo "ADOPT_UNMANAGED_CONTAINER=$container rollback=$rollback_name"
+  echo "ADOPT_UNMANAGED_CONTAINER=$container rollback=$rollback_name stopped_before_rename=YES"
 }
 
 restore_if_needed() {
   local canonical="$1"
   local rollback_name="$2"
+  local canonical_state=""
+
   if docker inspect "$canonical" >/dev/null 2>&1; then
-    return 0
+    canonical_state="$(docker inspect -f '{{.State.Status}}' "$canonical" 2>/dev/null || true)"
+    if [[ "$canonical_state" == "running" ]]; then
+      return 0
+    fi
+    docker rm -f "$canonical" >/dev/null 2>&1 || true
   fi
+
   if docker inspect "$rollback_name" >/dev/null 2>&1; then
+    docker stop "$rollback_name" >/dev/null 2>&1 || true
     docker rename "$rollback_name" "$canonical" >/dev/null 2>&1 || true
     docker start "$canonical" >/dev/null 2>&1 || true
   fi
@@ -160,6 +197,12 @@ DIRECTOR_ROLLBACK="df-v3-svc-director-pre-motion"
 DIRECTOR_WORKER_ROLLBACK="df-v3-svc-director-worker-pre-motion"
 FUSION_ROLLBACK="df-v3-svc-fusion-pre-motion"
 FUSION_WORKER_ROLLBACK="df-v3-svc-fusion-worker-pre-motion"
+
+# Self-heal any partial adoption left by an interrupted/failed earlier run.
+recover_stranded_adoption "$DIRECTOR" "$DIRECTOR_ROLLBACK"
+recover_stranded_adoption "$DIRECTOR_WORKER" "$DIRECTOR_WORKER_ROLLBACK"
+recover_stranded_adoption "$FUSION" "$FUSION_ROLLBACK"
+recover_stranded_adoption "$FUSION_WORKER" "$FUSION_WORKER_ROLLBACK"
 
 DIRECTOR_ADOPTED=0
 DIRECTOR_WORKER_ADOPTED=0
