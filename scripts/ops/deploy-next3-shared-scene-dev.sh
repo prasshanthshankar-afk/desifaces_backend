@@ -52,6 +52,64 @@ print("DEV_RUNTIME_CONFIG=PASS")
 print("SYNC_API_KEY_PRESENT=PASS")
 PY
 
+###############################################################################
+# Provider credential preflight.
+#
+# Presence is not enough: a stale/revoked Sync key previously survived container
+# recreation and allowed the workflow to reach video generation before failing.
+# Validate the exact key stored in the canonical DEV env before changing runtime.
+###############################################################################
+SYNC_KEY="$(
+python3 - "$ENV_FILE" <<'PY'
+from pathlib import Path
+import sys
+for raw in Path(sys.argv[1]).read_text().splitlines():
+    if raw.startswith("SYNC_API_KEY="):
+        print(raw.split("=",1)[1].strip(), end="")
+        break
+PY
+)"
+[[ -n "$SYNC_KEY" ]] || fail "SYNC_API_KEY empty in canonical DEV env"
+
+SYNC_VALIDATOR_CONTAINER=""
+for candidate in df-v3-svc-fusion-worker df-v3-svc-fusion; do
+  if docker inspect "$candidate" >/dev/null 2>&1 && [[ "$(docker inspect -f '{{.State.Status}}' "$candidate")" == "running" ]]; then
+    SYNC_VALIDATOR_CONTAINER="$candidate"
+    break
+  fi
+done
+[[ -n "$SYNC_VALIDATOR_CONTAINER" ]] || fail "running DEV Fusion runtime required for Sync credential preflight"
+
+set +e
+SYNC_AUTH_OUTPUT="$(
+  printf '%s' "$SYNC_KEY" | docker exec -i "$SYNC_VALIDATOR_CONTAINER" python -c '
+import sys, httpx
+key=sys.stdin.read().strip()
+try:
+    r=httpx.get(
+        "https://api.sync.so/v2/generations",
+        headers={"x-api-key": key, "Accept": "application/json"},
+        timeout=20,
+    )
+except Exception as exc:
+    print("SYNC_PROVIDER_AUTH=ERROR")
+    print(type(exc).__name__)
+    raise SystemExit(3)
+print("SYNC_PROVIDER_HTTP="+str(r.status_code))
+if r.status_code == 200:
+    print("SYNC_PROVIDER_AUTH=PASS")
+    raise SystemExit(0)
+print("SYNC_PROVIDER_AUTH=FAIL")
+raise SystemExit(2)
+' 2>&1
+)"
+SYNC_AUTH_RC=$?
+set -e
+unset SYNC_KEY
+printf '%s\n' "$SYNC_AUTH_OUTPUT"
+(( SYNC_AUTH_RC == 0 )) || fail "Sync provider authentication failed; refusing DEV deployment"
+echo "SYNC_PROVIDER_PREFLIGHT=PASS"
+
 if git_dev -C "$LIVE_ROOT" worktree list --porcelain | grep -Fxq "worktree $WORKTREE"; then
   git_dev -C "$LIVE_ROOT" worktree remove --force "$WORKTREE"
 elif [[ -e "$WORKTREE" ]]; then
@@ -222,13 +280,28 @@ print("LEGACY_STUDIO_WORKFLOW_PRESENT=PASS")
 PY
 
 docker exec -i df-v3-svc-fusion python - <<'PY'
+import asyncio
+import httpx
 from app.services.providers.sync3_adapter import Sync3Adapter
-adapter=Sync3Adapter()
-assert adapter.provider_name=="sync3"
-assert adapter.model=="sync-3" or bool(adapter.model)
-assert bool(adapter.api_key)
-print("SYNC3_ADAPTER_RUNTIME=PASS")
-print("SYNC_API_KEY_BOUND=PASS")
+
+async def main():
+    adapter=Sync3Adapter()
+    assert adapter.provider_name=="sync3"
+    assert adapter.model=="sync-3" or bool(adapter.model)
+    assert bool(adapter.api_key)
+    print("SYNC3_ADAPTER_RUNTIME=PASS")
+    print("SYNC_API_KEY_BOUND=PASS")
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response=await client.get(
+            f"{adapter.base_url}/v2/generations",
+            headers={"x-api-key": adapter.api_key, "Accept": "application/json"},
+        )
+    print(f"SYNC_PROVIDER_HTTP={response.status_code}")
+    assert response.status_code == 200, "Sync provider authentication failed after deployment"
+    print("SYNC_PROVIDER_AUTH=PASS")
+
+asyncio.run(main())
 PY
 
 docker exec -i df-v3-svc-fusion-extension python - <<'PY'
