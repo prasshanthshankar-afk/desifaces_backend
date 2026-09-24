@@ -126,23 +126,51 @@ async def main() -> None:
         if not siblings:
             raise RuntimeError("shared_scene_children_not_found")
 
-        candidates = []
+        succeeded = []
+        turn_ids: list[str] = []
         for row in siblings:
             payload = _dict(row["payload_json"])
             if str(row["status"] or "") != "succeeded":
                 continue
-            duration = 0.0
-            try:
-                duration = float(_dict(payload.get("video")).get("duration_sec") or 0.0)
-            except Exception:
-                duration = 0.0
-            candidates.append((duration, row, payload))
-        if not candidates:
+            turn_id = str((_dict(payload.get("tags"))).get("dialogue_turn_id") or "").strip()
+            if turn_id:
+                turn_ids.append(turn_id)
+            succeeded.append((row, payload, turn_id))
+        if not succeeded:
             raise RuntimeError("no_succeeded_sync3_child_available_for_bakeoff")
 
-        # Prefer the longest successful turn: it exposes more facial/body motion
-        # while keeping the provider spend bounded to a single representative clip.
-        _, selected_row, payload = max(candidates, key=lambda item: item[0])
+        duration_by_turn: dict[str, float] = {}
+        if turn_ids:
+            duration_rows = await conn.fetch(
+                """
+                select turn_id::text as turn_id, duration_hint_ms
+                from public.v3_dialogue_turns
+                where turn_id::text = any($1::text[])
+                """,
+                sorted(set(turn_ids)),
+            )
+            for duration_row in duration_rows:
+                try:
+                    duration_by_turn[str(duration_row["turn_id"])] = max(
+                        0.0,
+                        float(duration_row["duration_hint_ms"] or 0) / 1000.0,
+                    )
+                except Exception:
+                    pass
+
+        candidates = []
+        for row, payload, turn_id in succeeded:
+            duration = duration_by_turn.get(turn_id, 0.0)
+            if duration <= 0:
+                try:
+                    duration = float(_dict(payload.get("video")).get("duration_sec") or 0.0)
+                except Exception:
+                    duration = 0.0
+            candidates.append((duration, row, payload, turn_id))
+
+        # Prefer the longest successful turn so the final bakeoff gives the motion
+        # model enough time to execute a visible sequence of body/hand actions.
+        _, selected_row, payload, selected_turn_id = max(candidates, key=lambda item: item[0])
         job_id = str(selected_row["job_id"])
         user_id = str(selected_row["user_id"])
 
@@ -222,19 +250,27 @@ async def main() -> None:
             except Exception:
                 pass
 
-        motion_prompt = (
-            "Natural two-person seated conversation. Animate only the active speaker selected by the mask. "
-            "Use believable conversational body language: subtle torso shifts, realistic breathing, small natural hand "
-            "gestures when appropriate, gentle head movement, expressive eyes and micro-expressions. Preserve the other "
-            "person's identity, pose and position, preserve the room/background, avoid camera cuts, avoid reframing, "
-            "avoid exaggerated gestures, and keep photorealistic continuity with the source image."
-        )
+        duration_sec = duration_by_turn.get(selected_turn_id, 0.0)
+        if duration_sec <= 0:
+            try:
+                duration_sec = float(_dict(payload.get("video")).get("duration_sec") or 0.0)
+            except Exception:
+                duration_sec = 0.0
 
-        duration_sec = 0.0
-        try:
-            duration_sec = float(_dict(payload.get("video")).get("duration_sec") or 0.0)
-        except Exception:
-            duration_sec = 0.0
+        motion_prompt = (
+            "Static medium-wide camera. Natural two-person seated conversation. Animate only the active speaker "
+            "selected by the mask; the listener stays stable except for tiny natural breathing and attentive eye focus. "
+            "Use a clear sequential performance rather than only facial animation. Start from the source pose. "
+            "During the opening phrase, the active speaker makes one visible conversational gesture with the nearest "
+            "visible hand: lift it naturally from its resting position, open the palm slightly toward the listener, "
+            "then lower it partway. During the middle phrase, lean the torso forward slightly, shift the shoulders, "
+            "and nod once while continuing realistic lip-sync. During the next phrase, make a second smaller hand "
+            "gesture near the body and then relax the arm. During the closing phrase, ease the torso back toward the "
+            "original seated posture. Maintain realistic breathing, small posture adjustments, expressive eyes and "
+            "micro-expressions throughout. Preserve face identity, clothing, hand anatomy, the listener, furniture, "
+            "lighting and room background. No camera movement, no cuts, no reframing, no exaggerated waving, no extra "
+            "fingers, no body warping, and no background deformation. End close to the original pose."
+        )
 
         adapter = OmniHumanAdapter()
         prepared = await adapter.prepare(
@@ -294,7 +330,9 @@ async def main() -> None:
         print(f"SOURCE_SYNC_JOB_ID={job_id}")
         print(f"SPEAKER_COORDINATES={target_x},{target_y}")
         print(f"IMAGE_DIMENSIONS={width}x{height}")
+        print(f"DIALOGUE_TURN_ID={selected_turn_id}")
         print(f"DURATION_SEC={duration_sec}")
+        print("MOTION_PROMPT_PROFILE=explicit_sequential_hand_torso_v2")
         print("SYNC3_BASELINE_VIDEO_URL=" + baseline_url)
         print("OMNIHUMAN_MASK_VIDEO_URL=" + candidate_url)
         print("MASK_URL=" + str(mask_url))
