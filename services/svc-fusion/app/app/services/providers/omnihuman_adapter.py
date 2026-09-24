@@ -4,7 +4,9 @@ import asyncio
 import logging
 import math
 import os
+import struct
 import tempfile
+import zlib
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -169,6 +171,7 @@ class OmniHumanAdapter(ProviderClient):
             or request_payload.get("mask_url")
         )
         fal_mask_url = ""
+        generated_mask = False
         if source_mask_url:
             if self.upload_inputs_to_fal:
                 fal_mask_url = await self._upload_remote_file_to_fal(
@@ -177,6 +180,11 @@ class OmniHumanAdapter(ProviderClient):
                 )
             else:
                 fal_mask_url = await self._refresh_azure_blob_input_url(source_mask_url)
+        elif str(provider_options.get("conversation_mode") or "").strip().lower() == "shared_scene":
+            fal_mask_url = await self._build_shared_scene_mask_url(provider_options)
+            generated_mask = bool(fal_mask_url)
+
+        if fal_mask_url:
             request_json["mask_url"] = fal_mask_url
 
         if prompt:
@@ -214,6 +222,7 @@ class OmniHumanAdapter(ProviderClient):
                 "source_mask_url": source_mask_url or None,
                 "fal_mask_url": fal_mask_url or None,
                 "mask_enabled": bool(fal_mask_url),
+                "generated_shared_scene_mask": generated_mask,
             },
         )
 
@@ -446,6 +455,98 @@ class OmniHumanAdapter(ProviderClient):
                     tmp_path = None
 
         raise OmniHumanAdapterError(f"fal upload failed for input asset: {last_error}") from last_error
+
+    @staticmethod
+    def _png_chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    @classmethod
+    def _shared_scene_mask_png(
+        cls,
+        *,
+        width: int,
+        height: int,
+        target_x: int,
+        all_x: List[int],
+    ) -> bytes:
+        if width < 64 or height < 64:
+            raise OmniHumanAdapterError("omnihuman_v15_invalid_shared_scene_dimensions")
+        xs = sorted({max(0, min(width - 1, int(x))) for x in all_x})
+        target = max(0, min(width - 1, int(target_x)))
+        if not xs:
+            xs = [target]
+        target = min(xs, key=lambda x: abs(x - target))
+        idx = xs.index(target)
+        left = 0 if idx == 0 else int(round((xs[idx - 1] + target) / 2.0))
+        right = width if idx == len(xs) - 1 else int(round((target + xs[idx + 1]) / 2.0))
+        margin = max(2, int(round(width * 0.01)))
+        if left > 0:
+            left += margin
+        if right < width:
+            right -= margin
+        left = max(0, min(width - 1, left))
+        right = max(left + 1, min(width, right))
+
+        row = bytes([0]) + bytes([255 if left <= x < right else 0 for x in range(width)])
+        raw = row * height
+        header = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + cls._png_chunk(b"IHDR", header)
+            + cls._png_chunk(b"IDAT", zlib.compress(raw, level=9))
+            + cls._png_chunk(b"IEND", b"")
+        )
+
+    async def _build_shared_scene_mask_url(self, provider_options: Dict[str, Any]) -> str:
+        coords = provider_options.get("active_speaker_coordinates")
+        dims = provider_options.get("shared_scene_dimensions")
+        all_coords = provider_options.get("all_speaker_coordinates")
+        if not isinstance(coords, (list, tuple)) or len(coords) != 2:
+            raise OmniHumanAdapterError("omnihuman_v15_shared_scene_coordinates_required")
+        if not isinstance(dims, dict):
+            raise OmniHumanAdapterError("omnihuman_v15_shared_scene_dimensions_required")
+        try:
+            width = int(dims.get("width"))
+            height = int(dims.get("height"))
+            target_x = int(coords[0])
+        except Exception as exc:
+            raise OmniHumanAdapterError("omnihuman_v15_shared_scene_mask_contract_invalid") from exc
+
+        xs: List[int] = []
+        if isinstance(all_coords, list):
+            for item in all_coords:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    try:
+                        xs.append(int(item[0]))
+                    except Exception:
+                        pass
+
+        mask_bytes = self._shared_scene_mask_png(
+            width=width,
+            height=height,
+            target_x=target_x,
+            all_x=xs,
+        )
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                tmp.write(mask_bytes)
+                tmp_path = tmp.name
+            uploaded = await asyncio.to_thread(fal_client.upload_file, tmp_path)
+            if not uploaded:
+                raise OmniHumanAdapterError("omnihuman_v15_shared_scene_mask_upload_empty")
+            return str(uploaded)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     @staticmethod
     def _safe_optional_url(value: Any) -> str:
