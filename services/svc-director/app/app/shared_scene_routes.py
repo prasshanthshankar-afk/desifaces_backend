@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -54,6 +54,20 @@ class SharedSceneSpeakerTarget(BaseModel):
         return self
 
 
+_DEFAULT_NATURAL_MOTION_PROMPT = (
+    "Static medium-wide camera. Natural multi-person conversation. Animate only the active speaker. "
+    "Use believable conversational body language with visible but controlled hand gestures, subtle torso shifts, "
+    "realistic breathing, gentle head movement, expressive eyes and micro-expressions. Preserve the listener, "
+    "identity, clothing, furniture, lighting and background. No camera cuts, no reframing, no exaggerated gestures, "
+    "no extra fingers, no body warping, and no background deformation."
+)
+
+
+class SharedSceneVideoSettingsIn(BaseModel):
+    motion_mode: Literal["natural_motion", "precise_lipsync"] = "natural_motion"
+    video_prompt: str | None = Field(default=None, max_length=2400)
+
+
 class SharedSceneConversationIn(BaseModel):
     shared_scene_media_id: UUID
     image_width: int = Field(ge=64, le=16384)
@@ -75,6 +89,83 @@ def _metadata(value) -> dict:
         return dict(value or {})
     except Exception:
         return {}
+
+
+@router.put(
+    "/api/director/studio-workflows/{workflow_id}/stage-runs/{stage_run_id}/shared-scene-video-settings"
+)
+async def set_shared_scene_video_settings(
+    workflow_id: UUID,
+    stage_run_id: UUID,
+    body: SharedSceneVideoSettingsIn,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    pool = request.app.state.business_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            stage = await conn.fetchrow(
+                """
+                select s.stage_run_id,s.state,s.metadata_json
+                from public.v3_studio_stage_runs s
+                join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+                where s.stage_run_id=$1 and s.workflow_id=$2 and w.account_id=$3
+                  and s.stage_type='fusion' and s.scope_type='scene'
+                for update of s
+                """,
+                stage_run_id,
+                workflow_id,
+                auth.account_id,
+            )
+            if not stage:
+                raise HTTPException(status_code=404, detail="fusion_scene_stage_not_found")
+            state = str(stage["state"] or "").strip().lower()
+            if state not in _PREVIEWABLE_STATES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"shared_scene_video_settings_locked_for_stage:{state}",
+                )
+
+            metadata = _metadata(stage["metadata_json"])
+            if str(metadata.get("conversation_mode") or "").strip().lower() != "shared_scene":
+                raise HTTPException(status_code=409, detail="shared_scene_video_settings_require_shared_scene")
+            if not str(metadata.get("shared_scene_media_id") or "").strip():
+                raise HTTPException(status_code=409, detail="shared_scene_video_settings_require_group_photo")
+            if not isinstance(metadata.get("speaker_targets"), dict) or len(metadata["speaker_targets"]) < 2:
+                raise HTTPException(status_code=409, detail="shared_scene_video_settings_require_speaker_mapping")
+
+            motion_mode = body.motion_mode
+            provider = "omnihuman_v15" if motion_mode == "natural_motion" else "sync3"
+            prompt = str(body.video_prompt or "").strip()
+            if motion_mode == "natural_motion" and not prompt:
+                prompt = _DEFAULT_NATURAL_MOTION_PROMPT
+            if motion_mode == "precise_lipsync":
+                prompt = ""
+
+            metadata["shared_scene_video_settings_version"] = 1
+            metadata["shared_scene_motion_mode"] = motion_mode
+            metadata["shared_scene_video_provider"] = provider
+            metadata["shared_scene_video_prompt"] = prompt
+
+            await conn.execute(
+                """
+                update public.v3_studio_stage_runs
+                set metadata_json=$2::jsonb,updated_at=now()
+                where stage_run_id=$1
+                """,
+                stage_run_id,
+                json.dumps(metadata, ensure_ascii=False),
+            )
+
+    return {
+        "workflow_id": str(workflow_id),
+        "stage_run_id": str(stage_run_id),
+        "motion_mode": motion_mode,
+        "provider": provider,
+        "video_prompt": prompt,
+        "persisted": True,
+        "pricing_must_refresh": True,
+    }
 
 
 @router.put(
@@ -306,6 +397,7 @@ __all__ = [
     "NormalizedSpeakerBox",
     "NormalizedSpeakerPoint",
     "SharedSceneConversationIn",
+    "SharedSceneVideoSettingsIn",
     "SharedSceneSpeakerTarget",
     "router",
 ]
