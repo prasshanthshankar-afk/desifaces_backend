@@ -69,27 +69,71 @@ echo " production_touch=NONE"
 echo "============================================================"
 
 echo
-echo "=== 0. ACTIVE JOB GUARD ==="
-ACTIVE_FUSION_JOBS="$(docker exec -i "$FUSION" python - <<'PY'
+echo "=== 0. ACTIVE GENERATION GUARD ==="
+ACTIVE_REPORT="$(docker exec -i "$FUSION" python - <<'PY'
 import asyncio, os, asyncpg
+
+# pricing_pending is deliberately excluded. FusionJobsRepo documents that workers
+# claim only queued jobs, so pricing_pending can never be provider generation.
+ACTIVE_STATES = ("queued", "running", "processing")
+
 async def main():
     conn=await asyncpg.connect(os.environ["DATABASE_URL"])
     try:
-        n=await conn.fetchval("""
-          select count(*)
+        rows=await conn.fetch("""
+          select
+            id::text as job_id,
+            lower(coalesce(status,'')) as status,
+            coalesce(payload_json->>'provider','') as provider,
+            coalesce(payload_json #>> '{tags,conversation_mode}','') as conversation_mode,
+            updated_at
           from public.studio_jobs
           where studio_type='fusion'
-            and lower(coalesce(status,'')) not in ('succeeded','failed','blocked','canceled','cancelled')
+            and lower(coalesce(status,'')) = any($1::text[])
+          order by updated_at
+        """, list(ACTIVE_STATES))
+
+        stale_pricing=await conn.fetch("""
+          select id::text as job_id,updated_at
+          from public.studio_jobs
+          where studio_type='fusion'
+            and lower(coalesce(status,''))='pricing_pending'
+            and updated_at < now() - interval '1 hour'
+          order by updated_at
+          limit 10
         """)
-        print(int(n or 0))
+
+        print(f"ACTIVE_COUNT={len(rows)}")
+        for row in rows:
+            print(
+                "ACTIVE_JOB="
+                + str(row["job_id"])
+                + " status=" + str(row["status"])
+                + " provider=" + str(row["provider"])
+                + " mode=" + str(row["conversation_mode"])
+                + " updated_at=" + str(row["updated_at"])
+            )
+
+        print(f"STALE_PRICING_PENDING_COUNT={len(stale_pricing)}")
+        for row in stale_pricing:
+            print(
+                "STALE_PRICING_PENDING="
+                + str(row["job_id"])
+                + " updated_at=" + str(row["updated_at"])
+            )
     finally:
         await conn.close()
+
 asyncio.run(main())
 PY
 )"
-echo "ACTIVE_FUSION_JOBS=$ACTIVE_FUSION_JOBS"
-[[ "$ACTIVE_FUSION_JOBS" =~ ^[0-9]+$ ]] || fail "could not determine active Fusion jobs"
-(( ACTIVE_FUSION_JOBS == 0 )) || fail "active Fusion jobs exist; wait for them to finish before runtime replacement"
+echo "$ACTIVE_REPORT"
+
+ACTIVE_FUSION_JOBS="$(printf '%s\n' "$ACTIVE_REPORT" | sed -n 's/^ACTIVE_COUNT=//p' | tail -1)"
+[[ "$ACTIVE_FUSION_JOBS" =~ ^[0-9]+$ ]] || fail "could not determine active Fusion generation jobs"
+(( ACTIVE_FUSION_JOBS == 0 )) || fail "active Fusion generation jobs exist; wait for them to finish before runtime replacement"
+echo "ACTIVE_FUSION_GENERATION_JOBS=0"
+echo "PRICING_PENDING_EXCLUDED_FROM_GENERATION_GUARD=PASS"
 echo "ACTIVE_FUSION_JOB_GUARD=PASS"
 
 echo
