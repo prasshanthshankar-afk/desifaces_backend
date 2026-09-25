@@ -181,6 +181,33 @@ def probe_duration_seconds(input_path: str) -> Optional[float]:
     return _probe_duration_seconds(input_path)
 
 
+def _probe_video_dimensions(input_path: str) -> Optional[Tuple[int, int]]:
+    p = subprocess.run(
+        [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0:s=x",
+            input_path,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if p.returncode != 0:
+        return None
+    raw = str(p.stdout or "").strip()
+    try:
+        width, height = raw.split("x", 1)
+        w, h = int(width), int(height)
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+    return None
+
+
 def _ensure_parent_dir(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -720,6 +747,7 @@ def _xfade_pair(
     out_mp4: str,
     *,
     transition_duration_sec: float,
+    transition_style_override: Optional[str] = None,
 ) -> None:
     _require_nonempty_file(left_mp4)
     _require_nonempty_file(right_mp4)
@@ -738,8 +766,29 @@ def _xfade_pair(
         right_duration,
     )
     offset = max(0.0, float(left_duration) - xfade_duration)
-    transition_style = _transition_style()
+    transition_style = str(transition_style_override or "").strip().lower() or _transition_style()
     audio_curve = _transition_audio_curve()
+
+    left_dims = _probe_video_dimensions(left_mp4)
+    if left_dims is None:
+        raise RuntimeError(f"Unable to probe video dimensions for {left_mp4}")
+    width, height = left_dims
+
+    # Normalize geometry/timebases inside the filter graph as well as in the
+    # pre-normalization pass. Provider clips can otherwise differ slightly in
+    # SAR/timebase and FFmpeg xfade falls back to a visible hard cut.
+    filter_complex = (
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,"
+        f"settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v0];"
+        f"[1:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,"
+        f"settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v1];"
+        f"[v0][v1]xfade=transition={transition_style}:duration={xfade_duration:.3f}:offset={offset:.3f}[v];"
+        f"[0:a]aresample=48000,asetpts=PTS-STARTPTS[a0];"
+        f"[1:a]aresample=48000,asetpts=PTS-STARTPTS[a1];"
+        f"[a0][a1]acrossfade=d={xfade_duration:.3f}:c1={audio_curve}:c2={audio_curve}[a]"
+    )
 
     _run([
         "ffmpeg",
@@ -747,11 +796,7 @@ def _xfade_pair(
         "-threads", _ffmpeg_threads(),
         "-i", left_mp4,
         "-i", right_mp4,
-        "-filter_complex",
-        (
-            f"[0:v][1:v]xfade=transition={transition_style}:duration={xfade_duration:.3f}:offset={offset:.3f}[v];"
-            f"[0:a][1:a]acrossfade=d={xfade_duration:.3f}:c1={audio_curve}:c2={audio_curve}[a]"
-        ),
+        "-filter_complex", filter_complex,
         "-map", "[v]",
         "-map", "[a]",
         "-c:v", "libx264",
@@ -766,7 +811,6 @@ def _xfade_pair(
         out_mp4,
     ])
     _require_nonempty_file(out_mp4)
-
 
 def render_montage_segment(
     image_urls: List[str],
@@ -944,10 +988,22 @@ def stitch_videos(segment_files: List[str], out_mp4: str, *, stitch_mode_overrid
 
     _ensure_parent_dir(out_mp4)
 
-    transition_duration = float(
-        getattr(settings, "LONGFORM_SEGMENT_TRANSITION_SECONDS", None)
-        or os.getenv("LONGFORM_SEGMENT_TRANSITION_SECONDS", "0.70")
-    )
+    if effective_mode == "conversation_handoff":
+        try:
+            transition_duration = max(
+                0.12,
+                min(
+                    0.35,
+                    float(os.getenv("V3_SHARED_SCENE_HANDOFF_SECONDS", "0.20")),
+                ),
+            )
+        except Exception:
+            transition_duration = 0.20
+    else:
+        transition_duration = float(
+            getattr(settings, "LONGFORM_SEGMENT_TRANSITION_SECONDS", None)
+            or os.getenv("LONGFORM_SEGMENT_TRANSITION_SECONDS", "0.70")
+        )
 
     with tempfile.TemporaryDirectory(prefix="df_fusionext_stitch_") as td:
         normalized_files: List[str] = [os.path.join(td, f"norm_{i:04d}.mp4") for i in range(len(segment_files))]
@@ -957,7 +1013,7 @@ def stitch_videos(segment_files: List[str], out_mp4: str, *, stitch_mode_overrid
             normalize_segment_mp4(
                 src,
                 norm,
-                edge_fade_override=0.0 if effective_mode in {"concat", "hard_cut"} else None,
+                edge_fade_override=0.0 if effective_mode in {"concat", "hard_cut", "conversation_handoff"} else None,
             )
 
         with ThreadPoolExecutor(max_workers=_stitch_concurrency()) as ex:
@@ -979,7 +1035,7 @@ def stitch_videos(segment_files: List[str], out_mp4: str, *, stitch_mode_overrid
             return
 
         mode = effective_mode
-        if mode in {"xfade", "fade"}:
+        if mode in {"xfade", "fade", "conversation_handoff"}:
             try:
                 running = normalized_files[0]
                 for idx in range(1, len(normalized_files)):
@@ -990,6 +1046,7 @@ def stitch_videos(segment_files: List[str], out_mp4: str, *, stitch_mode_overrid
                         next_input,
                         xfade_out,
                         transition_duration_sec=transition_duration,
+                        transition_style_override="fade" if mode == "conversation_handoff" else None,
                     )
                     running = xfade_out
 
@@ -1003,10 +1060,21 @@ def stitch_videos(segment_files: List[str], out_mp4: str, *, stitch_mode_overrid
                     out_mp4,
                 ])
                 _require_nonempty_file(out_mp4)
-                logger.info("stitch_videos xfade ok out_mp4=%s bytes=%s", out_mp4, Path(out_mp4).stat().st_size)
+                logger.info(
+                    "stitch_videos xfade ok out_mp4=%s bytes=%s mode=%s transition_seconds=%.3f",
+                    out_mp4,
+                    Path(out_mp4).stat().st_size,
+                    mode,
+                    transition_duration,
+                )
                 return
             except Exception:
-                logger.exception("stitch_videos xfade failed out_mp4=%s", out_mp4)
+                logger.exception("stitch_videos xfade failed out_mp4=%s mode=%s", out_mp4, mode)
+                # For a shared-scene conversation, an abrupt fallback is a visible
+                # quality defect. Preserve completed child clips and fail only the
+                # stitch so retry can rebuild the final video without rerendering.
+                if mode == "conversation_handoff":
+                    raise
 
         concat_list = os.path.join(td, "concat.txt")
         _write_concat_list(normalized_files, concat_list)
