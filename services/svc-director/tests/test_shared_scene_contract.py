@@ -60,3 +60,11 @@ def test_shared_scene_binding_accepts_same_user_legacy_face_asset_and_adopts_lin
     assert "(account_id=$3 or account_id is null)" in source
     assert "project_id=coalesce(project_id,$3)" in source
     assert "where id=$1 and user_id=$4 and account_id is null" in source
+
+
+def test_shared_scene_binding_accepts_uploaded_source_image_assets():
+    from app.shared_scene_routes import set_shared_scene_conversation
+
+    source = inspect.getsource(set_shared_scene_conversation).lower()
+    assert "'source_image'" in source
+    assert "shared_scene_media_not_owned_active_image" in source
