@@ -244,7 +244,7 @@ async def set_shared_scene_conversation(
                 where id=$1 and user_id=$2
                   and (account_id=$3 or account_id is null)
                   and (project_id is null or project_id=$4)
-                  and kind in ('image','face_image','face_source_image')
+                  and kind in ('image','face_image','face_source_image','source_image')
                   and lifecycle_state='active'
                 """,
                 body.shared_scene_media_id,
@@ -255,7 +255,7 @@ async def set_shared_scene_conversation(
             if not media:
                 raise HTTPException(
                     status_code=422,
-                    detail="shared_scene_media_not_owned_active_face_image",
+                    detail="shared_scene_media_not_owned_active_image",
                 )
 
             # Face Studio's legacy MediaAssetsRepo writes canonical user ownership
