@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -12,6 +13,17 @@ from .security import DirectorAuthContext, get_director_auth
 
 router = APIRouter()
 _PREVIEWABLE_STATES = frozenset({"pending", "ready", "failed", "rejected"})
+
+
+def _omnihuman_shared_scene_enabled() -> bool:
+    """Launch guard for the enhanced-motion provider.
+
+    Natural motion remains available to controlled DEV/beta runs only. The normal
+    shared-scene path must not inherit OmniHuman latency unless explicitly enabled.
+    """
+    return str(os.getenv("DF_OMNIHUMAN_SHARED_SCENE_ENABLED", "0") or "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 class NormalizedSpeakerBox(BaseModel):
@@ -135,6 +147,16 @@ async def set_shared_scene_video_settings(
                 raise HTTPException(status_code=409, detail="shared_scene_video_settings_require_speaker_mapping")
 
             motion_mode = body.motion_mode
+            if motion_mode == "natural_motion" and not _omnihuman_shared_scene_enabled():
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "natural_motion_temporarily_unavailable",
+                        "message": "Natural motion is temporarily unavailable while desifaces improves render performance. Use Precise lip-sync.",
+                        "recoverable": True,
+                        "action": "choose_precise_lipsync",
+                    },
+                )
             provider = "omnihuman_v15" if motion_mode == "natural_motion" else "sync3"
             prompt = str(body.video_prompt or "").strip()
             if motion_mode == "natural_motion" and not prompt:
