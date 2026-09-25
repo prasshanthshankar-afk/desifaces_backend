@@ -202,21 +202,24 @@ class OmniHumanAdapter(ProviderClient):
 
         if self.upload_inputs_to_fal:
             if shared_scene_mode:
-                face_url = await self._upload_shared_scene_remote_file_to_fal(
+                face_upload = self._upload_shared_scene_remote_file_to_fal(
                     source_face_url,
                     suffix_hint=self._suffix_from_url(source_face_url, ".png"),
                     cache_namespace="group_photo",
                 )
             else:
-                face_url = await self._upload_remote_file_to_fal(
+                face_upload = self._upload_remote_file_to_fal(
                     source_face_url,
                     suffix_hint=self._suffix_from_url(source_face_url, ".png"),
                 )
-            # Dialogue audio is turn-specific and intentionally not shared.
-            audio_url = await self._upload_remote_file_to_fal(
+            # Image and turn-specific audio are independent provider inputs. Upload
+            # them concurrently; the shared-image single-flight cache ensures that
+            # parallel children still perform only one group-photo upload.
+            audio_upload = self._upload_remote_file_to_fal(
                 source_audio_url,
                 suffix_hint=self._suffix_from_url(source_audio_url, ".mp3"),
             )
+            face_url, audio_url = await asyncio.gather(face_upload, audio_upload)
         else:
             face_url = await self._refresh_azure_blob_input_url(source_face_url)
             audio_url = await self._refresh_azure_blob_input_url(source_audio_url)
