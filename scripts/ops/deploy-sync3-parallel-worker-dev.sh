@@ -79,7 +79,10 @@ git -C "$ROOT" worktree add --detach "$WT" "$BACKEND_SHA"
 
 grep -Fq 'DF_FUSION_WORKER_CONCURRENCY: ${DF_FUSION_WORKER_CONCURRENCY:-8}' "$WT/docker-compose.v3.yml"
 grep -Fq 'DF_SYNC3_PROVIDER_CONCURRENCY: ${DF_SYNC3_PROVIDER_CONCURRENCY:-6}' "$WT/docker-compose.v3.yml"
-grep -Fq 'raw = os.getenv("DF_SYNC3_PROVIDER_CONCURRENCY") or "1"' "$WT/services/svc-fusion/app/app/services/providers/sync3_adapter.py"
+grep -Fq 'os.getenv("DF_SYNC3_PROVIDER_CONCURRENCY") or "1"' "$WT/services/svc-fusion/app/app/services/providers/sync3_adapter.py"
+python3 -m py_compile \
+  "$WT/services/svc-fusion/app/app/workers/fusion_worker.py" \
+  "$WT/services/svc-fusion/app/app/services/providers/sync3_adapter.py"
 echo "SYNC3_PARALLEL_SOURCE_CONTRACT=PASS"
 
 PROJECT="$(project_of)" || fail "Fusion worker Compose project missing"
