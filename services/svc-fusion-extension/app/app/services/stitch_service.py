@@ -720,6 +720,7 @@ def _xfade_pair(
     out_mp4: str,
     *,
     transition_duration_sec: float,
+    transition_style_override: Optional[str] = None,
 ) -> None:
     _require_nonempty_file(left_mp4)
     _require_nonempty_file(right_mp4)
@@ -738,7 +739,7 @@ def _xfade_pair(
         right_duration,
     )
     offset = max(0.0, float(left_duration) - xfade_duration)
-    transition_style = _transition_style()
+    transition_style = str(transition_style_override or _transition_style()).strip() or _transition_style()
     audio_curve = _transition_audio_curve()
 
     _run([
@@ -749,8 +750,17 @@ def _xfade_pair(
         "-i", right_mp4,
         "-filter_complex",
         (
-            f"[0:v][1:v]xfade=transition={transition_style}:duration={xfade_duration:.3f}:offset={offset:.3f}[v];"
-            f"[0:a][1:a]acrossfade=d={xfade_duration:.3f}:c1={audio_curve}:c2={audio_curve}[a]"
+            # xfade requires constant-frame-rate inputs. Provider clips may report
+            # nominal 30 fps while still carrying VFR/undefined filter timebase
+            # metadata, which can surface as an invalid 1/0 rate inside xfade.
+            # Normalize only the transition inputs; the outer stitch fallback remains
+            # unchanged and continues to use concat if xfade itself fails.
+            f"[0:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v0];"
+            f"[1:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v1];"
+            f"[v0][v1]xfade=transition={transition_style}:duration={xfade_duration:.3f}:offset={offset:.3f}[v];"
+            f"[0:a]aresample=48000,asetpts=PTS-STARTPTS[a0];"
+            f"[1:a]aresample=48000,asetpts=PTS-STARTPTS[a1];"
+            f"[a0][a1]acrossfade=d={xfade_duration:.3f}:c1={audio_curve}:c2={audio_curve}[a]"
         ),
         "-map", "[v]",
         "-map", "[a]",

@@ -101,6 +101,7 @@ services:
   svc-director:
     container_name: df-v3-svc-director
     image: desifaces-v3-svc-director
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/svc-director/app/Dockerfile.v3
@@ -131,6 +132,7 @@ services:
   svc-director-worker:
     container_name: df-v3-svc-director-worker
     image: desifaces-v3-svc-director
+    restart: unless-stopped
     build:
       context: .
       dockerfile: services/svc-director/app/Dockerfile.v3
@@ -175,6 +177,11 @@ services:
     container_name: df-v3-svc-fusion-worker
     profiles: !override ["v3-execution"]
     environment:
+      # Sync3 currently advertises one provider generation slot for this account.
+      # Keep platform/worker concurrency independent; serialize only provider submissions
+      # to avoid 429 wait storms and preserve overall application throughput.
+      DF_SYNC3_PROVIDER_CONCURRENCY: ${DF_SYNC3_PROVIDER_CONCURRENCY:-1}
+      DF_SYNC3_CONCURRENCY_WAIT_SECONDS: ${DF_SYNC3_CONCURRENCY_WAIT_SECONDS:-900}
       AZURE_VIDEO_OUTPUT_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
       AZURE_FINAL_VIDEO_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
 
