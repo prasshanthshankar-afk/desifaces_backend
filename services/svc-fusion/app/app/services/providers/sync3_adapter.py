@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import time
 from typing import Any, Dict, Optional
 
 import httpx
@@ -18,6 +20,50 @@ class Sync3AdapterError(RuntimeError):
     pass
 
 
+_SYNC3_SUBMISSION_GATE: asyncio.Semaphore | None = None
+_SYNC3_SUBMISSION_GATE_LIMIT: int | None = None
+
+
+def _provider_concurrency_limit() -> int:
+    raw = str(os.getenv("DF_SYNC3_PROVIDER_CONCURRENCY") or "1").strip()
+    try:
+        return max(1, min(16, int(raw)))
+    except Exception:
+        return 1
+
+
+def _provider_wait_seconds() -> float:
+    raw = str(os.getenv("DF_SYNC3_CONCURRENCY_WAIT_SECONDS") or "900").strip()
+    try:
+        return max(5.0, min(3600.0, float(raw)))
+    except Exception:
+        return 900.0
+
+
+def _submission_gate() -> asyncio.Semaphore:
+    global _SYNC3_SUBMISSION_GATE, _SYNC3_SUBMISSION_GATE_LIMIT
+    limit = _provider_concurrency_limit()
+    if _SYNC3_SUBMISSION_GATE is None or _SYNC3_SUBMISSION_GATE_LIMIT != limit:
+        _SYNC3_SUBMISSION_GATE = asyncio.Semaphore(limit)
+        _SYNC3_SUBMISSION_GATE_LIMIT = limit
+    return _SYNC3_SUBMISSION_GATE
+
+
+def _active_count(payload: Any) -> int:
+    if isinstance(payload, list):
+        return len(payload)
+    if isinstance(payload, dict):
+        for key in ("activeGenerations", "active_generations", "count", "total"):
+            value = payload.get(key)
+            if isinstance(value, (int, float)):
+                return max(0, int(value))
+        for key in ("data", "items", "results", "generations"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return len(value)
+    raise Sync3AdapterError("SYNC3_ACTIVE_GENERATIONS_RESPONSE_INVALID")
+
+
 class Sync3Adapter(ProviderClient):
     """Sync Labs sync-3 adapter for deterministic multi-face still-image lipsync."""
 
@@ -29,6 +75,8 @@ class Sync3Adapter(ProviderClient):
         self.api_key = str(os.getenv("SYNC_API_KEY") or "").strip()
         self.model = str(os.getenv("DF_SYNC3_MODEL_ID") or "sync-3").strip() or "sync-3"
         self.timeout_seconds = max(10.0, float(os.getenv("DF_SYNC3_HTTP_TIMEOUT_SECONDS") or "45"))
+        self.provider_concurrency = _provider_concurrency_limit()
+        self.concurrency_wait_seconds = _provider_wait_seconds()
 
     @staticmethod
     def _safe_str(value: Any) -> str:
@@ -97,6 +145,63 @@ class Sync3Adapter(ProviderClient):
             },
         )
 
+    async def _wait_for_submission_capacity(self, client: httpx.AsyncClient, headers: Dict[str, str]) -> None:
+        """Wait until Sync reports capacity before a new generation is submitted.
+
+        The module-level semaphore serializes capacity-check + submit so two local
+        Fusion jobs cannot both observe the same free provider slot and race.
+        Provider-side active generation count remains authoritative, which also
+        protects us after worker restarts or generations started elsewhere.
+        """
+        deadline = time.monotonic() + float(self.concurrency_wait_seconds)
+        last_active: int | None = None
+        last_status = 0
+        last_text = ""
+
+        while True:
+            try:
+                response = await client.get(
+                    f"{self.base_url}/v2/generations?status=PROCESSING",
+                    headers=headers,
+                )
+                last_status = int(response.status_code)
+                last_text = response.text[:1200]
+                if response.status_code != 200:
+                    raise Sync3AdapterError(
+                        f"SYNC3_ACTIVE_GENERATIONS_FAILED:{response.status_code}:{last_text}"
+                    )
+                payload = response.json()
+                last_active = _active_count(payload)
+            except Sync3AdapterError:
+                if time.monotonic() >= deadline:
+                    raise
+                await asyncio.sleep(5.0)
+                continue
+            except Exception as exc:
+                if time.monotonic() >= deadline:
+                    raise Sync3AdapterError(
+                        f"SYNC3_CONCURRENCY_WAIT_TIMEOUT:{last_status}:{last_text or str(exc)[:1200]}"
+                    ) from exc
+                await asyncio.sleep(5.0)
+                continue
+
+            if last_active < int(self.provider_concurrency):
+                return
+
+            if time.monotonic() >= deadline:
+                raise Sync3AdapterError(
+                    "SYNC3_CONCURRENCY_WAIT_TIMEOUT:"
+                    f"active={last_active}:limit={self.provider_concurrency}"
+                )
+
+            retry_after = 5.0
+            if isinstance(payload, dict):
+                try:
+                    retry_after = float(payload.get("retryAfterSeconds") or payload.get("retry_after_seconds") or 5.0)
+                except Exception:
+                    retry_after = 5.0
+            await asyncio.sleep(max(1.0, min(20.0, retry_after)))
+
     async def submit(self, request_json: Dict[str, Any], idempotency_key: str) -> ProviderSubmitResult:
         headers = self._headers()
         body = dict(request_json or {})
@@ -104,11 +209,22 @@ class Sync3Adapter(ProviderClient):
             safe_name = "".join(ch for ch in str(idempotency_key) if ch.isalnum() or ch in {"_", "-"})[:120]
             if safe_name:
                 body.setdefault("outputFileName", safe_name)
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await client.post(f"{self.base_url}/v2/generate", headers=headers, json=body)
-        except Exception as exc:
-            raise Sync3AdapterError(f"SYNC3_SUBMIT_FAILED:{exc}") from exc
+
+        gate = _submission_gate()
+        async with gate:
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                    await self._wait_for_submission_capacity(client, headers)
+                    response = await client.post(
+                        f"{self.base_url}/v2/generate",
+                        headers=headers,
+                        json=body,
+                    )
+            except Sync3AdapterError:
+                raise
+            except Exception as exc:
+                raise Sync3AdapterError(f"SYNC3_SUBMIT_FAILED:{exc}") from exc
+
         if response.status_code not in {200, 201, 202}:
             raise Sync3AdapterError(
                 f"SYNC3_SUBMIT_FAILED:{response.status_code}:{response.text[:1200]}"
