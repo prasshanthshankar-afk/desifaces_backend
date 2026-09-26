@@ -324,14 +324,24 @@ class ParentPricedSceneFusionExecutionService(PerformantResilientSceneFusionExec
         request_nonce_by_turn = {
             turn_id: uuid4().hex for turn_id in required_turn_ids
         }
-        children = await _compile_children(
-            context=context,
-            face_client=self.face_client,
-            audio_client=self.audio_client,
-            headers=headers,
-            external_provider_ok=external_provider_ok,
-            request_nonce_by_turn=request_nonce_by_turn,
-        )
+
+        # Stitch-only recovery already has a concrete video artifact for every
+        # dialogue turn. Do not resolve Face/Audio inputs again in that case:
+        # those services are generation prerequisites, not stitch prerequisites.
+        # This keeps technical finalization independent from upstream service
+        # availability and guarantees zero child provider work on a 0-required
+        # retry.
+        children: list[dict[str, Any]] = []
+        if required_turn_ids:
+            children = await _compile_children(
+                context=context,
+                face_client=self.face_client,
+                audio_client=self.audio_client,
+                headers=headers,
+                external_provider_ok=external_provider_ok,
+                request_nonce_by_turn=request_nonce_by_turn,
+            )
+
         required_children = [
             {
                 **child,
