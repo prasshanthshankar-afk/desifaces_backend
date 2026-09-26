@@ -1,5 +1,4 @@
-name: desifaces-v3
-
+name: desifaces
 services:
 
   # -------------------------------------------------------------------
@@ -7,7 +6,7 @@ services:
   # -------------------------------------------------------------------
 
   desifaces-db:
-    container_name: desifaces-v3-db
+    container_name: desifaces-db
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?V3 POSTGRES_DB is required}
       POSTGRES_USER: ${POSTGRES_USER:?V3 POSTGRES_USER is required}
@@ -17,19 +16,19 @@ services:
       - "127.0.0.1:25432:5432"
 
   desifaces-redis:
-    container_name: desifaces-v3-redis
+    container_name: desifaces-redis
 
   # -------------------------------------------------------------------
   # APIs
   # -------------------------------------------------------------------
 
   svc-core:
-    container_name: df-v3-svc-core
+    container_name: df-svc-core
     ports: !override
       - "127.0.0.1:18000:8000"
 
   svc-fusion:
-    container_name: df-v3-svc-fusion
+    container_name: df-svc-fusion
     environment:
       FUSION_RECOVERY_ENABLED: "false"
       DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED: "true"
@@ -39,14 +38,14 @@ services:
       - "127.0.0.1:18002:8002"
 
   svc-face:
-    container_name: df-v3-svc-face
+    container_name: df-svc-face
     environment:
       DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED: "true"
     ports: !override
       - "127.0.0.1:18003:8003"
 
   svc-audio:
-    container_name: df-v3-svc-audio
+    container_name: df-svc-audio
     image: desifaces-v3-svc-audio
     environment:
       DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED: "true"
@@ -54,12 +53,12 @@ services:
       - "127.0.0.1:18004:8004"
 
   svc-dashboard:
-    container_name: df-v3-svc-dashboard
+    container_name: df-svc-dashboard
     ports: !override
       - "127.0.0.1:18005:8005"
 
   svc-fusion-extension:
-    container_name: df-v3-svc-fusion-extension
+    container_name: df-svc-fusion-extension
     environment:
       WORKER_ENABLED: "false"
       STITCH_WORKER_ENABLED: "false"
@@ -69,17 +68,17 @@ services:
       - "127.0.0.1:18006:8006"
 
   svc-music:
-    container_name: df-v3-svc-music
+    container_name: df-svc-music
     ports: !override
       - "127.0.0.1:18007:8000"
 
   svc-commerce:
-    container_name: df-v3-svc-commerce
+    container_name: df-svc-commerce
     ports: !override
       - "127.0.0.1:18008:8008"
 
   svc-pricing:
-    container_name: df-v3-svc-pricing
+    container_name: df-svc-pricing
     image: desifaces-v3-svc-pricing
     build:
       context: .
@@ -91,7 +90,7 @@ services:
       - "127.0.0.1:18009:8009"
 
   svc-marketing:
-    container_name: df-v3-svc-marketing
+    container_name: df-svc-marketing
     ports: !override
       - "127.0.0.1:18010:8010"
 
@@ -99,7 +98,7 @@ services:
   # inspect and resume durable Director runs; LLM execution occurs in the
   # orchestration runner below.
   svc-director:
-    container_name: df-v3-svc-director
+    container_name: df-svc-director
     image: desifaces-v3-svc-director
     restart: unless-stopped
     build:
@@ -130,7 +129,7 @@ services:
   # process. This is an orchestration runner, not a Face/Audio/Fusion provider
   # worker, and therefore has its own explicit profile.
   svc-director-worker:
-    container_name: df-v3-svc-director-worker
+    container_name: df-svc-director-worker
     image: desifaces-v3-svc-director
     restart: unless-stopped
     build:
@@ -161,20 +160,20 @@ services:
   # -------------------------------------------------------------------
 
   svc-core-notification-worker:
-    container_name: df-v3-svc-core-notification-worker
+    container_name: df-svc-core-notification-worker
     profiles: !override ["v3-execution"]
 
   svc-face-worker:
-    container_name: df-v3-svc-face-worker
+    container_name: df-svc-face-worker
     profiles: !override ["v3-execution"]
 
   svc-audio-worker:
-    container_name: df-v3-svc-audio-worker
+    container_name: df-svc-audio-worker
     image: desifaces-v3-svc-audio-worker
     profiles: !override ["v3-execution"]
 
   svc-fusion-worker:
-    container_name: df-v3-svc-fusion-worker
+    container_name: df-svc-fusion-worker
     profiles: !override ["v3-execution"]
     environment:
       # Sync3 currently advertises one provider generation slot for this account.
@@ -186,22 +185,22 @@ services:
       AZURE_FINAL_VIDEO_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
 
   svc-commerce-worker:
-    container_name: df-v3-svc-commerce-worker
+    container_name: df-svc-commerce-worker
     profiles: !override ["v3-execution"]
 
   svc-dashboard-worker:
-    container_name: df-v3-svc-dashboard-worker
+    container_name: df-svc-dashboard-worker
     profiles: !override ["v3-execution"]
 
   svc-fusion-extension-worker:
-    container_name: df-v3-svc-fusion-extension-worker
+    container_name: df-svc-fusion-extension-worker
     profiles: !override ["v3-execution"]
     environment:
       AZURE_VIDEO_OUTPUT_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
       AZURE_FINAL_VIDEO_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
 
   svc-fusion-extension-stitch-worker:
-    container_name: df-v3-svc-fusion-extension-stitch-worker
+    container_name: df-svc-fusion-extension-stitch-worker
     profiles: !override ["v3-execution"]
     environment:
       PYTHONPATH: "/app:/repo:/repo/services/shared:/repo/services/shared/python"
@@ -214,19 +213,19 @@ services:
       AZURE_FINAL_VIDEO_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
 
   svc-music-worker:
-    container_name: df-v3-svc-music-worker
+    container_name: df-svc-music-worker
     profiles: !override ["v3-execution"]
 
   svc-marketing-worker:
-    container_name: df-v3-svc-marketing-worker
+    container_name: df-svc-marketing-worker
     profiles: !override ["v3-execution"]
 
   svc-marketing-scheduler:
-    container_name: df-v3-svc-marketing-scheduler
+    container_name: df-svc-marketing-scheduler
     profiles: !override ["v3-execution"]
 
   svc-studio-coach-refresh-worker:
-    container_name: df-v3-svc-studio-coach-refresh-worker
+    container_name: df-svc-studio-coach-refresh-worker
     profiles: !override ["v3-execution"]
 
 networks:
