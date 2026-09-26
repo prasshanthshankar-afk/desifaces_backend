@@ -11,7 +11,10 @@ from desifaces_shared.v3.studio_workflow_store import StudioWorkflowError
 
 from .audio_execution import ParticipantAudioBridgeError, ParticipantAudioExecutionService
 from .config import settings
-from .fusion_execution import SceneFusionBridgeError, SceneFusionExecutionService
+from .fusion_execution import SceneFusionBridgeError
+from .fusion_execution_parallel_dispatch import (
+    ParallelOrphanReconciledParentPricedSceneFusionExecutionService,
+)
 from .story_final_execution import (
     StoryFinalBridgeError,
     StoryFinalExecutionService,
@@ -26,7 +29,7 @@ audio_execution = ParticipantAudioExecutionService(
     audio_base_url=settings.DF_AUDIO_BASE_URL,
     store=store,
 )
-fusion_execution = SceneFusionExecutionService(
+fusion_execution = ParallelOrphanReconciledParentPricedSceneFusionExecutionService(
     face_base_url=settings.DF_FACE_BASE_URL,
     audio_base_url=settings.DF_AUDIO_BASE_URL,
     fusion_base_url=settings.DF_FUSION_BASE_URL,
