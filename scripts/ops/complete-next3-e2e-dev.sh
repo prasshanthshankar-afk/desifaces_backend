@@ -19,6 +19,7 @@ fail(){ echo "FAIL: $*" >&2; return 1; }
 [[ "$BACKEND_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "exact backend SHA required"
 [[ "$WEB_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "exact web SHA required"
 [[ -f "$LIVE_ENV" ]] || fail "missing live DEV env: $LIVE_ENV"
+export DESIFACES_RUNTIME_ENV_FILE="$LIVE_ENV"
 [[ -d "$BACKEND_REPO/.git" || -f "$BACKEND_REPO/.git" ]] || fail "backend repo missing"
 [[ -d "$WEB_REPO/.git" || -f "$WEB_REPO/.git" ]] || fail "web repo missing"
 
@@ -338,44 +339,33 @@ grep -qx 'FUSION_EXTENSION_BASE_URL=http://svc-fusion-extension:8006' <<<"$WEB_E
 echo "WEB_STABLE_SERVICE_ROUTING=PASS"
 
 # ---------------------------------------------------------------------------
-# 8. Relabel runtime names only. Docker rename does not restart containers.
-#    This removes remaining V3 identifiers from desifaces container/process names.
+# 8. Runtime-name certification only.
+#    Do not rename unrelated or rollback containers during a feature deployment.
+#    The Compose source itself owns canonical runtime names.
 # ---------------------------------------------------------------------------
-mapfile -t VERSIONED < <(
-  docker ps -a --format '{{.Names}}'   | grep -Ei '(^|_)df-v3-|(^|_)desifaces-v3-' || true
-)
-
-for old in "${VERSIONED[@]}"; do
-  service="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$old" 2>/dev/null || true)"
-  [[ -n "$service" ]] || continue
-
-  case "$service" in
-    desifaces-db) canonical="desifaces-db" ;;
-    desifaces-redis) canonical="desifaces-redis" ;;
-    *) canonical="df-$service" ;;
-  esac
-
-  if docker inspect "$canonical" >/dev/null 2>&1; then
-    canonical="${canonical}-legacy-${STAMP}"
-    n=0
-    while docker inspect "$canonical" >/dev/null 2>&1; do
-      n=$((n+1))
-      canonical="${canonical}-legacy-${STAMP}-${n}"
-    done
-  fi
-
-  before="$(docker inspect -f '{{.State.Status}}|{{.State.StartedAt}}' "$old")"
-  docker rename "$old" "$canonical"
-  after="$(docker inspect -f '{{.State.Status}}|{{.State.StartedAt}}' "$canonical")"
-  [[ "$before" == "$after" ]] || fail "rename changed runtime state for $old"
-  echo "CANONICALIZED_NAME $old -> $canonical"
+for service in "${SERVICES[@]}"; do
+  target="${TARGET[$service]}"
+  [[ "$(docker inspect -f '{{.State.Status}}' "$target" 2>/dev/null || true)" == "running" ]]     || fail "canonical runtime is not running: $target"
 done
 
-remaining="$(
-  docker ps -a --format '{{.Names}}'   | grep -Ei '(^|_)df-v3-|(^|_)desifaces-v3-' || true
+for target in desifaces-db desifaces-redis; do
+  if docker inspect "$target" >/dev/null 2>&1; then
+    [[ "$(docker inspect -f '{{.State.Status}}' "$target")" == "running" ]]       || fail "canonical infrastructure runtime is not running: $target"
+  fi
+done
+
+duplicate_running="$(
+  for service in "${SERVICES[@]}"; do
+    count="$(docker ps --filter "label=com.docker.compose.service=$service" --format '{{.Names}}' | wc -l)"
+    if [[ "$count" -ne 1 ]]; then
+      echo "$service=$count"
+    fi
+  done
 )"
-[[ -z "$remaining" ]] || fail "version-specific container names remain: $remaining"
-echo "VERSIONED_CONTAINER_NAMES=0"
+[[ -z "$duplicate_running" ]] || fail "duplicate/missing running service ownership: $duplicate_running"
+
+echo "CANONICAL_RUNTIME_NAMES=PASS"
+echo "RUNTIME_RENAME_DURING_DEPLOY=NONE"
 
 # ---------------------------------------------------------------------------
 # 9. Database/data-lineage read-only certification.
