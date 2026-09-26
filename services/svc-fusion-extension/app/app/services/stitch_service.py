@@ -720,6 +720,7 @@ def _xfade_pair(
     out_mp4: str,
     *,
     transition_duration_sec: float,
+    transition_style_override: Optional[str] = None,
 ) -> None:
     _require_nonempty_file(left_mp4)
     _require_nonempty_file(right_mp4)
@@ -738,7 +739,7 @@ def _xfade_pair(
         right_duration,
     )
     offset = max(0.0, float(left_duration) - xfade_duration)
-    transition_style = _transition_style()
+    transition_style = str(transition_style_override or _transition_style()).strip() or _transition_style()
     audio_curve = _transition_audio_curve()
 
     _run([
