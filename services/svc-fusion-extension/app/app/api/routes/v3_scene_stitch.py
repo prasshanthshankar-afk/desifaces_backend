@@ -105,6 +105,14 @@ async def stitch_scene(
     conversation_mode = str(body.conversation_mode or "").strip().lower() or None
     if conversation_mode not in {None, "shared_scene", "ordered_speaker_shots"}:
         raise HTTPException(status_code=422, detail="scene_stitch_conversation_mode_invalid")
+
+    # Shared-scene conversations keep the same authoritative group photo in every
+    # dialogue child. Cross-fading those independently lip-synced clips creates
+    # unnecessary frame blending and has proven fragile across provider encodes.
+    # The product contract is a deterministic speaker-by-speaker conversation, so
+    # shared_scene always uses a hard cut between turns. Existing ordered-speaker
+    # and non-shared longform behavior remains unchanged.
+    effective_stitch_mode = "hard_cut" if conversation_mode == "shared_scene" else stitch_mode
     if len(segment_urls) != len(body.segment_urls):
         raise HTTPException(status_code=422, detail="scene_stitch_segment_url_required")
 
@@ -182,7 +190,7 @@ async def stitch_scene(
                 resilient_stitch_video_urls,
                 segment_urls,
                 out_mp4,
-                stitch_mode_override=stitch_mode,
+                stitch_mode_override=effective_stitch_mode,
             )
             sha256, byte_count = await asyncio.to_thread(_file_sha256_and_size, out_mp4)
             uploaded_storage_path, signed_url = await asyncio.to_thread(
@@ -246,7 +254,7 @@ async def stitch_scene(
                     "v3_studio_stage_run_id": str(body.stage_run_id),
                     "v3_studio_attempt_id": str(body.attempt_id),
                     "segment_count": len(segment_urls),
-                    "stitch_mode": stitch_mode or "default",
+                    "stitch_mode": effective_stitch_mode or "default",
                     "conversation_mode": conversation_mode,
                     "conversation_kind": (
                         "group_photo_conversation"
