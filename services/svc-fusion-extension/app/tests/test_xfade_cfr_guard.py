@@ -27,3 +27,23 @@ def test_xfade_normalizes_provider_inputs_to_cfr(monkeypatch):
     assert "[v0][v1]xfade=" in filter_complex
     assert "[0:a]aresample=48000,asetpts=PTS-STARTPTS[a0]" in filter_complex
     assert "[1:a]aresample=48000,asetpts=PTS-STARTPTS[a1]" in filter_complex
+
+
+def test_xfade_accepts_conversation_handoff_transition_override(monkeypatch):
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(target, "_require_nonempty_file", lambda _path: None)
+    monkeypatch.setattr(target, "_ensure_parent_dir", lambda _path: None)
+    monkeypatch.setattr(target, "_probe_duration_seconds", lambda _path: 2.0)
+    monkeypatch.setattr(target, "_run", lambda cmd, **_kwargs: commands.append(list(cmd)))
+
+    target._xfade_pair(
+        "left.mp4",
+        "right.mp4",
+        "out.mp4",
+        transition_duration_sec=0.2,
+        transition_style_override="fade",
+    )
+
+    filter_complex = commands[0][commands[0].index("-filter_complex") + 1]
+    assert "xfade=transition=fade:" in filter_complex
