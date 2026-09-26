@@ -13,7 +13,7 @@ BWT="${STATE}/backend"
 WWT="${STATE}/web"
 LOG="${STATE}/certification.log"
 
-fail(){ echo "FAIL: $*" >&2; exit 1; }
+fail(){ echo "FAIL: $*" >&2; return 1; }
 
 [[ "$(hostname -s)" == "$EXPECTED_HOST" ]] || fail "DEV host guard failed"
 [[ "$BACKEND_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "exact backend SHA required"
