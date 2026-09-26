@@ -44,6 +44,21 @@ class VideoReadUrlOut(BaseModel):
     read_url: str
 
 
+def _effective_scene_stitch_mode(
+    stitch_mode: str | None,
+    conversation_mode: str | None,
+) -> str | None:
+    """Return the deterministic assembly mode for one canonical scene.
+
+    Shared-scene conversations must never cross-fade independently generated
+    active-speaker clips. They all originate from the same group photo, so a
+    hard cut preserves identity/geometry and avoids provider-frame blending.
+    """
+    if str(conversation_mode or "").strip().lower() == "shared_scene":
+        return "hard_cut"
+    return str(stitch_mode or "").strip().lower() or None
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
@@ -112,7 +127,7 @@ async def stitch_scene(
     # The product contract is a deterministic speaker-by-speaker conversation, so
     # shared_scene always uses a hard cut between turns. Existing ordered-speaker
     # and non-shared longform behavior remains unchanged.
-    effective_stitch_mode = "hard_cut" if conversation_mode == "shared_scene" else stitch_mode
+    effective_stitch_mode = _effective_scene_stitch_mode(stitch_mode, conversation_mode)
     if len(segment_urls) != len(body.segment_urls):
         raise HTTPException(status_code=422, detail="scene_stitch_segment_url_required")
 
