@@ -106,3 +106,28 @@ def test_shared_scene_approval_clears_draft_metadata():
     source = inspect.getsource(set_shared_scene_conversation)
     assert "shared_scene_draft_media_id" in source
     assert "metadata.pop(draft_key, None)" in source
+
+
+def test_shared_scene_binding_allows_same_account_cross_project_group_photo_reuse():
+    from app.shared_scene_routes import set_shared_scene_conversation
+
+    source = inspect.getsource(set_shared_scene_conversation).lower()
+    assert "(account_id=$3 or account_id is null)" in source
+    assert "(project_id is null or project_id=$4)" not in source
+    assert "group photos are reusable saved media" in source
+
+
+def test_shared_scene_draft_allows_same_account_cross_project_group_photo_reuse():
+    from app.shared_scene_routes import set_shared_scene_draft
+
+    source = inspect.getsource(set_shared_scene_draft).lower()
+    assert "(account_id=$3 or account_id is null)" in source
+    assert "(project_id is null or project_id=$4)" not in source
+
+
+def test_shared_scene_people_approval_is_durable_workflow_metadata():
+    from app.shared_scene_routes import approve_shared_scene_people
+
+    source = inspect.getsource(approve_shared_scene_people)
+    assert 'metadata["shared_scene_people_approved"] = True' in source
+    assert '"shared_scene_people_approved_participant_ids"' in source
