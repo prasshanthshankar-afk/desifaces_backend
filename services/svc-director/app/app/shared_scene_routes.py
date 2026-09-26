@@ -121,6 +121,101 @@ def _metadata(value) -> dict:
         return {}
 
 
+@router.post(
+    "/api/director/studio-workflows/{workflow_id}/shared-scene-people-approval"
+)
+async def approve_shared_scene_people(
+    workflow_id: UUID,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    """Persist the explicit people-phase HITL decision for shared-scene workflows."""
+
+    pool = request.app.state.business_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            workflow = await conn.fetchrow(
+                """
+                select workflow_id,metadata_json
+                from public.v3_studio_workflows
+                where workflow_id=$1 and account_id=$2
+                for update
+                """,
+                workflow_id,
+                auth.account_id,
+            )
+            if not workflow:
+                raise HTTPException(status_code=404, detail="shared_scene_workflow_not_found")
+
+            metadata = _metadata(workflow["metadata_json"])
+            if str(metadata.get("conversation_mode") or "").strip().lower() != "shared_scene":
+                raise HTTPException(status_code=409, detail="shared_scene_people_approval_requires_shared_scene")
+
+            rows = await conn.fetch(
+                """
+                select distinct p.participant_id,p.persona_json,p.metadata_json
+                from public.v3_studio_stage_runs s
+                join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
+                join public.v3_participants p on p.participant_id=dt.speaker_participant_id
+                where s.workflow_id=$1
+                  and s.stage_type='audio'
+                  and s.scope_type='dialogue_turn'
+                  and dt.speaker_participant_id is not null
+                order by p.participant_id
+                """,
+                workflow_id,
+            )
+            if len(rows) < 2:
+                raise HTTPException(status_code=422, detail="shared_scene_requires_at_least_two_speakers")
+
+            approved_ids: list[str] = []
+            missing_ids: list[str] = []
+            for row in rows:
+                participant_metadata = _metadata(row["metadata_json"])
+                persona = _metadata(row["persona_json"])
+                explicit = _metadata(participant_metadata.get("explicit_face_constraints"))
+                gender = str(
+                    explicit.get("gender")
+                    or explicit.get("gender_presentation")
+                    or persona.get("gender_presentation")
+                    or persona.get("gender")
+                    or ""
+                ).strip().lower()
+                if gender not in {"female", "male"}:
+                    missing_ids.append(str(row["participant_id"]))
+                else:
+                    approved_ids.append(str(row["participant_id"]))
+
+            if missing_ids:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "shared_scene_people_profiles_incomplete",
+                        "message": "Confirm gender presentation for every conversation speaker before approving the people phase.",
+                        "missing_participant_ids": missing_ids,
+                    },
+                )
+
+            metadata["shared_scene_people_approved"] = True
+            metadata["shared_scene_people_approved_participant_ids"] = approved_ids
+            await conn.execute(
+                """
+                update public.v3_studio_workflows
+                set metadata_json=$2::jsonb,updated_at=now()
+                where workflow_id=$1
+                """,
+                workflow_id,
+                json.dumps(metadata, ensure_ascii=False),
+            )
+
+    return {
+        "workflow_id": str(workflow_id),
+        "shared_scene_people_approved": True,
+        "participant_ids": approved_ids,
+        "persisted": True,
+    }
+
+
 @router.put(
     "/api/director/studio-workflows/{workflow_id}/stage-runs/{stage_run_id}/shared-scene-draft"
 )
@@ -170,14 +265,12 @@ async def set_shared_scene_draft(
                 from public.media_assets
                 where id=$1 and user_id=$2
                   and (account_id=$3 or account_id is null)
-                  and (project_id is null or project_id=$4)
                   and kind in ('image','face_image','face_source_image','source_image')
                   and lifecycle_state='active'
                 """,
                 body.shared_scene_media_id,
                 auth.user_id,
                 auth.account_id,
-                stage["project_id"],
             )
             if not media:
                 raise HTTPException(status_code=422, detail="shared_scene_media_not_owned_active_image")
@@ -402,14 +495,12 @@ async def set_shared_scene_conversation(
                 from public.media_assets
                 where id=$1 and user_id=$2
                   and (account_id=$3 or account_id is null)
-                  and (project_id is null or project_id=$4)
                   and kind in ('image','face_image','face_source_image','source_image')
                   and lifecycle_state='active'
                 """,
                 body.shared_scene_media_id,
                 auth.user_id,
                 auth.account_id,
-                stage["project_id"],
             )
             if not media:
                 raise HTTPException(
@@ -417,6 +508,9 @@ async def set_shared_scene_conversation(
                     detail="shared_scene_media_not_owned_active_image",
                 )
 
+            # Group photos are reusable saved media within the same authenticated account,
+            # so project_id is provenance, not an authorization boundary. Same-user,
+            # same-account (or legacy account-null) ownership plus active lifecycle is the gate.
             # Face Studio's legacy MediaAssetsRepo writes canonical user ownership
             # but does not populate the V3 account/project lineage columns. When a
             # same-user active Face asset is explicitly selected for this workflow,
