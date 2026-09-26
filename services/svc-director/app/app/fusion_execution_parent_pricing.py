@@ -316,10 +316,15 @@ class ParentPricedSceneFusionExecutionService(PerformantResilientSceneFusionExec
             if latest:
                 preserved = _completed_children(_as_dict(latest["metadata_json"]))
 
+        all_turn_ids = {str(turn.dialogue_turn_id) for turn in context.turns}
+        unexpected_preserved = set(preserved) - all_turn_ids
+        if unexpected_preserved:
+            raise SceneFusionBridgeError("fusion_preserved_child_lineage_mismatch")
+
         required_turn_ids = {
-            str(turn.dialogue_turn_id)
-            for turn in context.turns
-            if str(turn.dialogue_turn_id) not in preserved
+            turn_id
+            for turn_id in all_turn_ids
+            if turn_id not in preserved
         }
         request_nonce_by_turn = {
             turn_id: uuid4().hex for turn_id in required_turn_ids
@@ -442,6 +447,9 @@ class ParentPricedSceneFusionExecutionService(PerformantResilientSceneFusionExec
                     preserved = _completed_children(_as_dict(prior_attempt["metadata_json"]))
 
             all_turn_ids = {str(turn.dialogue_turn_id) for turn in context.turns}
+            unexpected_preserved = set(preserved) - all_turn_ids
+            if unexpected_preserved:
+                raise SceneFusionBridgeError("fusion_preserved_child_lineage_mismatch")
             expected_turns = all_turn_ids - set(preserved)
             if set(child_confirmation_by_turn) != expected_turns:
                 raise SceneFusionBridgeError("fusion_child_confirmation_bundle_mismatch")
