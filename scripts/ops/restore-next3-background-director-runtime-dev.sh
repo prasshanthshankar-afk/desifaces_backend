@@ -93,7 +93,11 @@ if required not in runtime_text:
     raise SystemExit("background-finalized Fusion runtime alias missing")
 
 assembly_text=assembly.read_text()
-if assembly_text.index("fusion_execution_runtime") > assembly_text.index("studio_e2e_routes"):
+runtime_import = "from . import fusion_execution_runtime as _fusion_execution_runtime"
+e2e_import = "from .studio_e2e_routes import router as _e2e_router"
+if runtime_import not in assembly_text or e2e_import not in assembly_text:
+    raise SystemExit("Director runtime assembly imports missing")
+if assembly_text.index(runtime_import) > assembly_text.index(e2e_import):
     raise SystemExit("Fusion runtime must install before studio_e2e_routes import")
 
 print("DIRECTOR_BACKGROUND_ALIAS_SOURCE=PASS")
