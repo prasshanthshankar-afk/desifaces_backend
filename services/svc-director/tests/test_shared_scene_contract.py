@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from app.shared_scene_routes import (
     NormalizedSpeakerBox,
     SharedSceneConversationIn,
+    SharedSceneDraftIn,
     SharedSceneSpeakerTarget,
 )
 
@@ -68,3 +69,40 @@ def test_shared_scene_binding_accepts_uploaded_source_image_assets():
     source = inspect.getsource(set_shared_scene_conversation).lower()
     assert "'source_image'" in source
     assert "shared_scene_media_not_owned_active_image" in source
+
+
+def test_shared_scene_draft_allows_partial_mapping():
+    p1 = uuid4()
+    p2 = uuid4()
+    draft = SharedSceneDraftIn(
+        shared_scene_media_id=uuid4(),
+        image_width=1536,
+        image_height=1024,
+        speaker_targets=[
+            SharedSceneSpeakerTarget(
+                participant_id=p1,
+                point={"x": 0.25, "y": 0.30},
+            )
+        ],
+    )
+    assert len(draft.speaker_targets) == 1
+    assert draft.speaker_targets[0].participant_id == p1
+    assert p2 != p1
+
+
+def test_shared_scene_draft_requires_dimension_pair():
+    with pytest.raises(ValidationError):
+        SharedSceneDraftIn(
+            shared_scene_media_id=uuid4(),
+            image_width=1536,
+            image_height=None,
+            speaker_targets=[],
+        )
+
+
+def test_shared_scene_approval_clears_draft_metadata():
+    from app.shared_scene_routes import set_shared_scene_conversation
+
+    source = inspect.getsource(set_shared_scene_conversation)
+    assert "shared_scene_draft_media_id" in source
+    assert "metadata.pop(draft_key, None)" in source
