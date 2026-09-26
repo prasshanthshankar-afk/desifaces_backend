@@ -355,6 +355,7 @@ class PerformantResilientSceneFusionExecutionService(ResilientSceneFusionExecuti
 
         ordered_urls = [_clean(item.get("video_url")) for item in refreshed]
         try:
+            scene_conversation_mode = _clean(context.stage_metadata.get("conversation_mode")).lower()
             stitch = await self.stitch_client.stitch(
                 headers=headers,
                 project_id=context.project_id,
@@ -362,6 +363,8 @@ class PerformantResilientSceneFusionExecutionService(ResilientSceneFusionExecuti
                 stage_run_id=context.stage_run_id,
                 attempt_id=attempt_id,
                 segment_urls=ordered_urls,
+                stitch_mode="hard_cut" if scene_conversation_mode == "shared_scene" else None,
+                conversation_mode=scene_conversation_mode or None,
             )
             media_id = UUID(str(stitch.get("media_id")))
             video_url = _clean(stitch.get("video_url"))
