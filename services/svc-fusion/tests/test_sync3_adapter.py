@@ -6,7 +6,7 @@ import pytest
 
 from app.domain.models import FusionJobCreate, VoiceAudio
 from app.services.providers.base import ProviderPrepareInput
-from app.services.providers.sync3_adapter import Sync3Adapter, Sync3AdapterError
+from app.services.providers.sync3_adapter import Sync3Adapter, Sync3AdapterError, _active_count, _provider_concurrency_limit, _provider_wait_seconds
 
 
 def test_sync3_provider_is_accepted_by_fusion_contract():
@@ -68,3 +68,24 @@ def test_sync3_prepare_requires_explicit_speaker_coordinates():
                 )
             )
         )
+
+
+def test_sync3_active_generation_count_accepts_provider_shapes():
+    assert _active_count([]) == 0
+    assert _active_count([{"id": "a"}]) == 1
+    assert _active_count({"activeGenerations": 2}) == 2
+    assert _active_count({"generations": [{"id": "a"}, {"id": "b"}]}) == 2
+
+
+def test_sync3_concurrency_env_defaults_to_one(monkeypatch):
+    monkeypatch.delenv("DF_SYNC3_PROVIDER_CONCURRENCY", raising=False)
+    monkeypatch.delenv("DF_SYNC3_CONCURRENCY_WAIT_SECONDS", raising=False)
+    assert _provider_concurrency_limit() == 1
+    assert _provider_wait_seconds() == 900.0
+
+
+def test_sync3_concurrency_env_is_bounded(monkeypatch):
+    monkeypatch.setenv("DF_SYNC3_PROVIDER_CONCURRENCY", "99")
+    monkeypatch.setenv("DF_SYNC3_CONCURRENCY_WAIT_SECONDS", "99999")
+    assert _provider_concurrency_limit() == 16
+    assert _provider_wait_seconds() == 3600.0
