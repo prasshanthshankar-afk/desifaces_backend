@@ -3,19 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def test_studio_route_uses_runtime_installed_scene_fusion_alias():
+def test_studio_route_uses_explicit_background_finalized_executor():
     app_root = Path(__file__).resolve().parents[1] / "app" / "app"
     route_source = (app_root / "studio_e2e_routes.py").read_text(encoding="utf-8")
-    runtime_source = (app_root / "fusion_execution_runtime.py").read_text(encoding="utf-8")
-    assembly_source = (app_root / "studio_routes_runtime.py").read_text(encoding="utf-8")
 
-    assert "fusion_execution = SceneFusionExecutionService(" in route_source
-    assert (
-        "_fusion_execution.SceneFusionExecutionService = (\n"
-        "    BackgroundFinalizedParallelSceneFusionExecutionService\n"
-        ")"
-    ) in runtime_source
-    assert assembly_source.index("fusion_execution_runtime") < assembly_source.index("studio_e2e_routes")
+    assert "fusion_execution_runtime as _fusion_execution_runtime" in route_source
+    assert "BackgroundFinalizedParallelSceneFusionExecutionService" in route_source
+    assert "fusion_execution = BackgroundFinalizedParallelSceneFusionExecutionService(" in route_source
 
 
 def test_v3_runtime_serializes_only_sync3_provider_submission():
