@@ -4,7 +4,10 @@ import asyncio
 import logging
 import math
 import os
+import struct
 import tempfile
+import time
+import zlib
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -28,6 +31,58 @@ class OmniHumanAdapterError(RuntimeError):
 
 
 logger = logging.getLogger("fusion.providers.omnihuman")
+
+# Shared-scene child jobs are intentionally fan-out/parallel. Without a process-local
+# single-flight cache every child re-downloads and re-uploads the exact same group
+# photo to fal, and repeated turns by one speaker upload the same generated mask.
+# Cache only provider input URLs for the lifetime of this worker process; durable
+# source lineage remains the Azure media asset and speaker mapping.
+_FAL_SHARED_INPUT_CACHE: Dict[str, tuple[float, str]] = {}
+_FAL_SHARED_INPUT_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def _shared_input_cache_ttl_seconds() -> float:
+    try:
+        return max(
+            60.0,
+            min(
+                21600.0,
+                float(os.getenv("DF_OMNIHUMAN_SHARED_INPUT_CACHE_TTL_SECONDS", "3600")),
+            ),
+        )
+    except Exception:
+        return 3600.0
+
+
+def _shared_input_cache_get(key: str) -> str:
+    item = _FAL_SHARED_INPUT_CACHE.get(key)
+    if not item:
+        return ""
+    created_at, url = item
+    if (time.monotonic() - created_at) > _shared_input_cache_ttl_seconds():
+        _FAL_SHARED_INPUT_CACHE.pop(key, None)
+        return ""
+    return str(url or "").strip()
+
+
+def _shared_input_cache_put(key: str, url: str) -> str:
+    value = str(url or "").strip()
+    if value:
+        _FAL_SHARED_INPUT_CACHE[key] = (time.monotonic(), value)
+        # Bound process memory. This cache normally contains only a handful of
+        # group photos/masks for concurrently active scenes.
+        if len(_FAL_SHARED_INPUT_CACHE) > 256:
+            oldest = min(_FAL_SHARED_INPUT_CACHE, key=lambda k: _FAL_SHARED_INPUT_CACHE[k][0])
+            _FAL_SHARED_INPUT_CACHE.pop(oldest, None)
+    return value
+
+
+def _shared_input_lock(key: str) -> asyncio.Lock:
+    lock = _FAL_SHARED_INPUT_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _FAL_SHARED_INPUT_LOCKS[key] = lock
+    return lock
 
 
 def _is_downstream_degraded_error(message: Optional[str]) -> bool:
@@ -142,16 +197,29 @@ class OmniHumanAdapter(ProviderClient):
 
         source_face_url = spec.resolved_face_url
         source_audio_url = spec.resolved_audio_url
+        provider_options = request_payload.get("provider_options") if isinstance(request_payload.get("provider_options"), dict) else {}
+        shared_scene_mode = str(provider_options.get("conversation_mode") or "").strip().lower() == "shared_scene"
 
         if self.upload_inputs_to_fal:
-            face_url = await self._upload_remote_file_to_fal(
-                source_face_url,
-                suffix_hint=self._suffix_from_url(source_face_url, ".png"),
-            )
-            audio_url = await self._upload_remote_file_to_fal(
+            if shared_scene_mode:
+                face_upload = self._upload_shared_scene_remote_file_to_fal(
+                    source_face_url,
+                    suffix_hint=self._suffix_from_url(source_face_url, ".png"),
+                    cache_namespace="group_photo",
+                )
+            else:
+                face_upload = self._upload_remote_file_to_fal(
+                    source_face_url,
+                    suffix_hint=self._suffix_from_url(source_face_url, ".png"),
+                )
+            # Image and turn-specific audio are independent provider inputs. Upload
+            # them concurrently; the shared-image single-flight cache ensures that
+            # parallel children still perform only one group-photo upload.
+            audio_upload = self._upload_remote_file_to_fal(
                 source_audio_url,
                 suffix_hint=self._suffix_from_url(source_audio_url, ".mp3"),
             )
+            face_url, audio_url = await asyncio.gather(face_upload, audio_upload)
         else:
             face_url = await self._refresh_azure_blob_input_url(source_face_url)
             audio_url = await self._refresh_azure_blob_input_url(source_audio_url)
@@ -162,6 +230,28 @@ class OmniHumanAdapter(ProviderClient):
             "resolution": resolution,
             "turbo_mode": turbo_mode,
         }
+
+        source_mask_url = self._safe_optional_url(
+            provider_options.get("mask_url")
+            or request_payload.get("mask_url")
+        )
+        fal_mask_url = ""
+        generated_mask = False
+        if source_mask_url:
+            if self.upload_inputs_to_fal:
+                fal_mask_url = await self._upload_remote_file_to_fal(
+                    source_mask_url,
+                    suffix_hint=self._suffix_from_url(source_mask_url, ".png"),
+                )
+            else:
+                fal_mask_url = await self._refresh_azure_blob_input_url(source_mask_url)
+        elif str(provider_options.get("conversation_mode") or "").strip().lower() == "shared_scene":
+            fal_mask_url = await self._build_shared_scene_mask_url(provider_options)
+            generated_mask = bool(fal_mask_url)
+
+        if fal_mask_url:
+            request_json["mask_url"] = fal_mask_url
+
         if prompt:
             request_json["prompt"] = prompt
 
@@ -194,6 +284,11 @@ class OmniHumanAdapter(ProviderClient):
                 "source_audio_url": source_audio_url,
                 "fal_face_url": face_url,
                 "fal_audio_url": audio_url,
+                "source_mask_url": source_mask_url or None,
+                "fal_mask_url": fal_mask_url or None,
+                "mask_enabled": bool(fal_mask_url),
+                "generated_shared_scene_mask": generated_mask,
+                "shared_scene_input_cache_enabled": shared_scene_mode,
             },
         )
 
@@ -354,6 +449,48 @@ class OmniHumanAdapter(ProviderClient):
             )
             return source_url
 
+    async def _upload_shared_scene_remote_file_to_fal(
+        self,
+        url: str,
+        *,
+        suffix_hint: str,
+        cache_namespace: str,
+    ) -> str:
+        source_url = str(url or "").strip()
+        cache_key = f"{cache_namespace}:{source_url}"
+        cached = _shared_input_cache_get(cache_key)
+        if cached:
+            logger.info(
+                "omnihuman.shared_input_cache_hit namespace=%s source_url=%s fal_url=%s",
+                cache_namespace,
+                _preview_url(source_url),
+                _preview_url(cached),
+            )
+            return cached
+
+        lock = _shared_input_lock(cache_key)
+        async with lock:
+            cached = _shared_input_cache_get(cache_key)
+            if cached:
+                logger.info(
+                    "omnihuman.shared_input_cache_hit_after_wait namespace=%s source_url=%s",
+                    cache_namespace,
+                    _preview_url(source_url),
+                )
+                return cached
+            uploaded = await self._upload_remote_file_to_fal(
+                source_url,
+                suffix_hint=suffix_hint,
+            )
+            _shared_input_cache_put(cache_key, uploaded)
+            logger.info(
+                "omnihuman.shared_input_cache_fill namespace=%s source_url=%s fal_url=%s",
+                cache_namespace,
+                _preview_url(source_url),
+                _preview_url(uploaded),
+            )
+            return uploaded
+
     async def _upload_remote_file_to_fal(self, url: str, *, suffix_hint: str) -> str:
         logger.info(
             "omnihuman.upload_input start source_url=%s suffix_hint=%s",
@@ -426,6 +563,127 @@ class OmniHumanAdapter(ProviderClient):
                     tmp_path = None
 
         raise OmniHumanAdapterError(f"fal upload failed for input asset: {last_error}") from last_error
+
+    @staticmethod
+    def _png_chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    @classmethod
+    def _shared_scene_mask_png(
+        cls,
+        *,
+        width: int,
+        height: int,
+        target_x: int,
+        all_x: List[int],
+    ) -> bytes:
+        if width < 64 or height < 64:
+            raise OmniHumanAdapterError("omnihuman_v15_invalid_shared_scene_dimensions")
+        xs = sorted({max(0, min(width - 1, int(x))) for x in all_x})
+        target = max(0, min(width - 1, int(target_x)))
+        if not xs:
+            xs = [target]
+        target = min(xs, key=lambda x: abs(x - target))
+        idx = xs.index(target)
+        left = 0 if idx == 0 else int(round((xs[idx - 1] + target) / 2.0))
+        right = width if idx == len(xs) - 1 else int(round((target + xs[idx + 1]) / 2.0))
+        margin = max(2, int(round(width * 0.01)))
+        if left > 0:
+            left += margin
+        if right < width:
+            right -= margin
+        left = max(0, min(width - 1, left))
+        right = max(left + 1, min(width, right))
+
+        row = bytes([0]) + bytes([255 if left <= x < right else 0 for x in range(width)])
+        raw = row * height
+        header = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + cls._png_chunk(b"IHDR", header)
+            + cls._png_chunk(b"IDAT", zlib.compress(raw, level=9))
+            + cls._png_chunk(b"IEND", b"")
+        )
+
+    async def _build_shared_scene_mask_url(self, provider_options: Dict[str, Any]) -> str:
+        coords = provider_options.get("active_speaker_coordinates")
+        dims = provider_options.get("shared_scene_dimensions")
+        all_coords = provider_options.get("all_speaker_coordinates")
+        if not isinstance(coords, (list, tuple)) or len(coords) != 2:
+            raise OmniHumanAdapterError("omnihuman_v15_shared_scene_coordinates_required")
+        if not isinstance(dims, dict):
+            raise OmniHumanAdapterError("omnihuman_v15_shared_scene_dimensions_required")
+        try:
+            width = int(dims.get("width"))
+            height = int(dims.get("height"))
+            target_x = int(coords[0])
+        except Exception as exc:
+            raise OmniHumanAdapterError("omnihuman_v15_shared_scene_mask_contract_invalid") from exc
+
+        xs: List[int] = []
+        if isinstance(all_coords, list):
+            for item in all_coords:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    try:
+                        xs.append(int(item[0]))
+                    except Exception:
+                        pass
+
+        mask_key = (
+            f"speaker_mask:{width}x{height}:target={target_x}:"
+            + ",".join(str(value) for value in sorted(xs))
+        )
+        cached = _shared_input_cache_get(mask_key)
+        if cached:
+            logger.info(
+                "omnihuman.shared_input_cache_hit namespace=speaker_mask target_x=%s fal_url=%s",
+                target_x,
+                _preview_url(cached),
+            )
+            return cached
+
+        lock = _shared_input_lock(mask_key)
+        async with lock:
+            cached = _shared_input_cache_get(mask_key)
+            if cached:
+                return cached
+
+            mask_bytes = self._shared_scene_mask_png(
+                width=width,
+                height=height,
+                target_x=target_x,
+                all_x=xs,
+            )
+            tmp_path: Optional[str] = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                    tmp.write(mask_bytes)
+                    tmp_path = tmp.name
+                uploaded = await asyncio.to_thread(fal_client.upload_file, tmp_path)
+                if not uploaded:
+                    raise OmniHumanAdapterError("omnihuman_v15_shared_scene_mask_upload_empty")
+                return _shared_input_cache_put(mask_key, str(uploaded))
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+
+    @staticmethod
+    def _safe_optional_url(value: Any) -> str:
+        s = str(value or "").strip()
+        if not s:
+            return ""
+        parsed = urlparse(s)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise OmniHumanAdapterError("omnihuman_v15_invalid_mask_url")
+        return s
 
     def _is_fal_hosted_url(self, url: str) -> bool:
         try:

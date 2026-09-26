@@ -100,7 +100,7 @@ async def stitch_scene(
 
     segment_urls = [str(value or "").strip() for value in body.segment_urls if str(value or "").strip()]
     stitch_mode = str(body.stitch_mode or "").strip().lower() or None
-    if stitch_mode not in {None, "xfade", "fade", "concat", "hard_cut"}:
+    if stitch_mode not in {None, "xfade", "fade", "concat", "hard_cut", "conversation_handoff"}:
         raise HTTPException(status_code=422, detail="scene_stitch_mode_invalid")
     conversation_mode = str(body.conversation_mode or "").strip().lower() or None
     if conversation_mode not in {None, "shared_scene", "ordered_speaker_shots"}:

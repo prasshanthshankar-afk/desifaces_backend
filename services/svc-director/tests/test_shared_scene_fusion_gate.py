@@ -156,3 +156,48 @@ def test_shared_scene_compiles_without_individual_face_assets():
         child["payload"]["provider_options"]["conversation_mode"] == "shared_scene"
         for child in children
     )
+
+
+def test_shared_scene_can_route_to_omnihuman_with_motion_prompt():
+    context = _shared_context()
+    metadata = {
+        **context.stage_metadata,
+        "shared_scene_video_provider": "omnihuman_v15",
+        "shared_scene_motion_mode": "natural_motion",
+        "shared_scene_video_prompt": "Use natural hand gestures and subtle torso movement.",
+    }
+    context = FusionSceneContext(**{**context.__dict__, "stage_metadata": metadata})
+
+    class FaceClient:
+        async def read_url(self, *, headers, media_id):
+            return "https://example.test/shared-scene.png"
+
+    class AudioClient:
+        async def read_url(self, *, headers, media_id):
+            return f"https://example.test/{media_id}.wav"
+
+    children = asyncio.run(
+        compile_children_performant(
+            context=context,
+            face_client=FaceClient(),
+            audio_client=AudioClient(),
+            headers={"Authorization": "Bearer test"},
+            external_provider_ok=True,
+        )
+    )
+
+    assert all(child["payload"]["provider"] == "omnihuman_v15" for child in children)
+    assert all(
+        child["payload"]["provider_options"]["prompt"]
+        == "Use natural hand gestures and subtle torso movement."
+        for child in children
+    )
+    assert all(
+        child["payload"]["provider_options"]["shared_scene_dimensions"]
+        == {"width": 1920, "height": 1080}
+        for child in children
+    )
+    assert all(
+        len(child["payload"]["provider_options"]["all_speaker_coordinates"]) == 2
+        for child in children
+    )

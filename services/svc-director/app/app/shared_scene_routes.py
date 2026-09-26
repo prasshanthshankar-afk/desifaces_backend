@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated
+import os
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -12,6 +13,17 @@ from .security import DirectorAuthContext, get_director_auth
 
 router = APIRouter()
 _PREVIEWABLE_STATES = frozenset({"pending", "ready", "failed", "rejected"})
+
+
+def _omnihuman_shared_scene_enabled() -> bool:
+    """Launch guard for the enhanced-motion provider.
+
+    Natural motion remains available to controlled DEV/beta runs only. The normal
+    shared-scene path must not inherit OmniHuman latency unless explicitly enabled.
+    """
+    return str(os.getenv("DF_OMNIHUMAN_SHARED_SCENE_ENABLED", "0") or "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 class NormalizedSpeakerBox(BaseModel):
@@ -54,6 +66,20 @@ class SharedSceneSpeakerTarget(BaseModel):
         return self
 
 
+_DEFAULT_NATURAL_MOTION_PROMPT = (
+    "Static medium-wide camera. Natural multi-person conversation. Animate only the active speaker. "
+    "Use believable conversational body language with visible but controlled hand gestures, subtle torso shifts, "
+    "realistic breathing, gentle head movement, expressive eyes and micro-expressions. Preserve the listener, "
+    "identity, clothing, furniture, lighting and background. No camera cuts, no reframing, no exaggerated gestures, "
+    "no extra fingers, no body warping, and no background deformation."
+)
+
+
+class SharedSceneVideoSettingsIn(BaseModel):
+    motion_mode: Literal["natural_motion", "precise_lipsync"] = "precise_lipsync"
+    video_prompt: str | None = Field(default=None, max_length=2400)
+
+
 class SharedSceneConversationIn(BaseModel):
     shared_scene_media_id: UUID
     image_width: int = Field(ge=64, le=16384)
@@ -68,6 +94,24 @@ class SharedSceneConversationIn(BaseModel):
         return self
 
 
+class SharedSceneDraftIn(BaseModel):
+    """Durable draft for a selected group photo and partial speaker mapping."""
+
+    shared_scene_media_id: UUID
+    image_width: int | None = Field(default=None, ge=64, le=16384)
+    image_height: int | None = Field(default=None, ge=64, le=16384)
+    speaker_targets: Annotated[list[SharedSceneSpeakerTarget], Field(default_factory=list, max_length=20)]
+
+    @model_validator(mode="after")
+    def valid_draft(self):
+        if (self.image_width is None) != (self.image_height is None):
+            raise ValueError("shared_scene_draft_dimensions_must_be_complete")
+        ids = [item.participant_id for item in self.speaker_targets]
+        if len(ids) != len(set(ids)):
+            raise ValueError("shared_scene_draft_speaker_targets_must_be_unique")
+        return self
+
+
 def _metadata(value) -> dict:
     if isinstance(value, dict):
         return dict(value)
@@ -75,6 +119,327 @@ def _metadata(value) -> dict:
         return dict(value or {})
     except Exception:
         return {}
+
+
+@router.post(
+    "/api/director/studio-workflows/{workflow_id}/shared-scene-people-approval"
+)
+async def approve_shared_scene_people(
+    workflow_id: UUID,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    """Persist the explicit people-phase HITL decision for shared-scene workflows."""
+
+    pool = request.app.state.business_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            workflow = await conn.fetchrow(
+                """
+                select workflow_id,metadata_json
+                from public.v3_studio_workflows
+                where workflow_id=$1 and account_id=$2
+                for update
+                """,
+                workflow_id,
+                auth.account_id,
+            )
+            if not workflow:
+                raise HTTPException(status_code=404, detail="shared_scene_workflow_not_found")
+
+            metadata = _metadata(workflow["metadata_json"])
+            if str(metadata.get("conversation_mode") or "").strip().lower() != "shared_scene":
+                raise HTTPException(status_code=409, detail="shared_scene_people_approval_requires_shared_scene")
+
+            rows = await conn.fetch(
+                """
+                select distinct p.participant_id,p.persona_json,p.metadata_json
+                from public.v3_studio_stage_runs s
+                join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
+                join public.v3_participants p on p.participant_id=dt.speaker_participant_id
+                where s.workflow_id=$1
+                  and s.stage_type='audio'
+                  and s.scope_type='dialogue_turn'
+                  and dt.speaker_participant_id is not null
+                order by p.participant_id
+                """,
+                workflow_id,
+            )
+            if len(rows) < 2:
+                raise HTTPException(status_code=422, detail="shared_scene_requires_at_least_two_speakers")
+
+            approved_ids: list[str] = []
+            missing_ids: list[str] = []
+            for row in rows:
+                participant_metadata = _metadata(row["metadata_json"])
+                persona = _metadata(row["persona_json"])
+                explicit = _metadata(participant_metadata.get("explicit_face_constraints"))
+                gender = str(
+                    explicit.get("gender")
+                    or explicit.get("gender_presentation")
+                    or persona.get("gender_presentation")
+                    or persona.get("gender")
+                    or ""
+                ).strip().lower()
+                if gender not in {"female", "male"}:
+                    missing_ids.append(str(row["participant_id"]))
+                else:
+                    approved_ids.append(str(row["participant_id"]))
+
+            if missing_ids:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "shared_scene_people_profiles_incomplete",
+                        "message": "Confirm gender presentation for every conversation speaker before approving the people phase.",
+                        "missing_participant_ids": missing_ids,
+                    },
+                )
+
+            metadata["shared_scene_people_approved"] = True
+            metadata["shared_scene_people_approved_participant_ids"] = approved_ids
+            await conn.execute(
+                """
+                update public.v3_studio_workflows
+                set metadata_json=$2::jsonb,updated_at=now()
+                where workflow_id=$1
+                """,
+                workflow_id,
+                json.dumps(metadata, ensure_ascii=False),
+            )
+
+    return {
+        "workflow_id": str(workflow_id),
+        "shared_scene_people_approved": True,
+        "participant_ids": approved_ids,
+        "persisted": True,
+    }
+
+
+@router.put(
+    "/api/director/studio-workflows/{workflow_id}/stage-runs/{stage_run_id}/shared-scene-draft"
+)
+async def set_shared_scene_draft(
+    workflow_id: UUID,
+    stage_run_id: UUID,
+    body: SharedSceneDraftIn,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    """Persist group-photo selection and partial mapping without advancing HITL.
+
+    This is resumability state only. Confirmed shared-scene generation keys are
+    still written exclusively by set_shared_scene_conversation after explicit
+    user approval.
+    """
+
+    pool = request.app.state.business_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            stage = await conn.fetchrow(
+                """
+                select s.stage_run_id,s.state,s.scene_id,s.metadata_json,w.project_id
+                from public.v3_studio_stage_runs s
+                join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+                where s.stage_run_id=$1 and s.workflow_id=$2 and w.account_id=$3
+                  and s.stage_type='fusion' and s.scope_type='scene'
+                for update of s
+                """,
+                stage_run_id,
+                workflow_id,
+                auth.account_id,
+            )
+            if not stage:
+                raise HTTPException(status_code=404, detail="fusion_scene_stage_not_found")
+
+            state = str(stage["state"] or "").strip().lower()
+            if state not in _PREVIEWABLE_STATES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"shared_scene_draft_locked_for_stage:{state}",
+                )
+
+            media = await conn.fetchrow(
+                """
+                select id,user_id,account_id,project_id,kind,lifecycle_state,meta_json
+                from public.media_assets
+                where id=$1 and user_id=$2
+                  and (account_id=$3 or account_id is null)
+                  and kind in ('image','face_image','face_source_image','source_image')
+                  and lifecycle_state='active'
+                """,
+                body.shared_scene_media_id,
+                auth.user_id,
+                auth.account_id,
+            )
+            if not media:
+                raise HTTPException(status_code=422, detail="shared_scene_media_not_owned_active_image")
+
+            media_meta = _metadata(media["meta_json"])
+            validation = _metadata(media_meta.get("shared_scene_validation"))
+            if (
+                not validation
+                or not bool(validation.get("allow"))
+                or str(validation.get("status") or "").upper() == "FAIL"
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "shared_scene_media_validation_required",
+                        "message": "This group photo must pass content-safety and quality checks before it can be saved.",
+                        "recoverable": True,
+                        "action": "validate_group_photo",
+                    },
+                )
+
+            speech_rows = await conn.fetch(
+                """
+                select distinct speaker_participant_id
+                from public.v3_dialogue_turns
+                where scene_id=$1 and turn_kind='speech'
+                  and speaker_participant_id is not null
+                order by speaker_participant_id
+                """,
+                stage["scene_id"],
+            )
+            speaking_ids = {
+                UUID(str(row["speaker_participant_id"]))
+                for row in speech_rows
+                if row["speaker_participant_id"] is not None
+            }
+            target_ids = {item.participant_id for item in body.speaker_targets}
+            if not target_ids.issubset(speaking_ids):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "shared_scene_draft_target_not_speaker",
+                        "unexpected_participant_ids": sorted(str(value) for value in (target_ids - speaking_ids)),
+                    },
+                )
+
+            metadata = _metadata(stage["metadata_json"])
+            metadata["shared_scene_draft_version"] = 1
+            metadata["shared_scene_draft_media_id"] = str(body.shared_scene_media_id)
+            metadata["shared_scene_draft_dimensions"] = (
+                {"width": body.image_width, "height": body.image_height}
+                if body.image_width is not None and body.image_height is not None
+                else None
+            )
+            metadata["shared_scene_draft_targets"] = {
+                str(item.participant_id): (
+                    {"point": item.point.model_dump(mode="json")}
+                    if item.point is not None
+                    else {"box": item.box.model_dump(mode="json")}
+                )
+                for item in body.speaker_targets
+            }
+            metadata["shared_scene_draft_source"] = "user_selected_unapproved"
+
+            await conn.execute(
+                """
+                update public.v3_studio_stage_runs
+                set metadata_json=$2::jsonb,updated_at=now()
+                where stage_run_id=$1
+                """,
+                stage_run_id,
+                json.dumps(metadata, ensure_ascii=False),
+            )
+
+    return {
+        "workflow_id": str(workflow_id),
+        "stage_run_id": str(stage_run_id),
+        "shared_scene_media_id": str(body.shared_scene_media_id),
+        "speaker_target_count": len(body.speaker_targets),
+        "persisted": True,
+        "approved": False,
+    }
+
+
+@router.put(
+    "/api/director/studio-workflows/{workflow_id}/stage-runs/{stage_run_id}/shared-scene-video-settings"
+)
+async def set_shared_scene_video_settings(
+    workflow_id: UUID,
+    stage_run_id: UUID,
+    body: SharedSceneVideoSettingsIn,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    pool = request.app.state.business_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            stage = await conn.fetchrow(
+                """
+                select s.stage_run_id,s.state,s.metadata_json
+                from public.v3_studio_stage_runs s
+                join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+                where s.stage_run_id=$1 and s.workflow_id=$2 and w.account_id=$3
+                  and s.stage_type='fusion' and s.scope_type='scene'
+                for update of s
+                """,
+                stage_run_id,
+                workflow_id,
+                auth.account_id,
+            )
+            if not stage:
+                raise HTTPException(status_code=404, detail="fusion_scene_stage_not_found")
+            state = str(stage["state"] or "").strip().lower()
+            if state not in _PREVIEWABLE_STATES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"shared_scene_video_settings_locked_for_stage:{state}",
+                )
+
+            metadata = _metadata(stage["metadata_json"])
+            if str(metadata.get("conversation_mode") or "").strip().lower() != "shared_scene":
+                raise HTTPException(status_code=409, detail="shared_scene_video_settings_require_shared_scene")
+            if not str(metadata.get("shared_scene_media_id") or "").strip():
+                raise HTTPException(status_code=409, detail="shared_scene_video_settings_require_group_photo")
+            if not isinstance(metadata.get("speaker_targets"), dict) or len(metadata["speaker_targets"]) < 2:
+                raise HTTPException(status_code=409, detail="shared_scene_video_settings_require_speaker_mapping")
+
+            motion_mode = body.motion_mode
+            if motion_mode == "natural_motion" and not _omnihuman_shared_scene_enabled():
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "natural_motion_temporarily_unavailable",
+                        "message": "Natural motion is temporarily unavailable while desifaces improves render performance. Use Precise lip-sync.",
+                        "recoverable": True,
+                        "action": "choose_precise_lipsync",
+                    },
+                )
+            provider = "omnihuman_v15" if motion_mode == "natural_motion" else "sync3"
+            prompt = str(body.video_prompt or "").strip()
+            if motion_mode == "natural_motion" and not prompt:
+                prompt = _DEFAULT_NATURAL_MOTION_PROMPT
+            if motion_mode == "precise_lipsync":
+                prompt = ""
+
+            metadata["shared_scene_video_settings_version"] = 1
+            metadata["shared_scene_motion_mode"] = motion_mode
+            metadata["shared_scene_video_provider"] = provider
+            metadata["shared_scene_video_prompt"] = prompt
+
+            await conn.execute(
+                """
+                update public.v3_studio_stage_runs
+                set metadata_json=$2::jsonb,updated_at=now()
+                where stage_run_id=$1
+                """,
+                stage_run_id,
+                json.dumps(metadata, ensure_ascii=False),
+            )
+
+    return {
+        "workflow_id": str(workflow_id),
+        "stage_run_id": str(stage_run_id),
+        "motion_mode": motion_mode,
+        "provider": provider,
+        "video_prompt": prompt,
+        "persisted": True,
+        "pricing_must_refresh": True,
+    }
 
 
 @router.put(
@@ -128,20 +493,43 @@ async def set_shared_scene_conversation(
                 """
                 select id,user_id,account_id,project_id,kind,lifecycle_state,meta_json
                 from public.media_assets
-                where id=$1 and user_id=$2 and account_id=$3
-                  and (project_id is null or project_id=$4)
-                  and kind in ('image','face_image','face_source_image')
+                where id=$1 and user_id=$2
+                  and (account_id=$3 or account_id is null)
+                  and kind in ('image','face_image','face_source_image','source_image')
                   and lifecycle_state='active'
                 """,
                 body.shared_scene_media_id,
                 auth.user_id,
                 auth.account_id,
-                stage["project_id"],
             )
             if not media:
                 raise HTTPException(
                     status_code=422,
-                    detail="shared_scene_media_not_owned_active_face_image",
+                    detail="shared_scene_media_not_owned_active_image",
+                )
+
+            # Group photos are reusable saved media within the same authenticated account,
+            # so project_id is provenance, not an authorization boundary. Same-user,
+            # same-account (or legacy account-null) ownership plus active lifecycle is the gate.
+            # Face Studio's legacy MediaAssetsRepo writes canonical user ownership
+            # but does not populate the V3 account/project lineage columns. When a
+            # same-user active Face asset is explicitly selected for this workflow,
+            # adopt the missing lineage here before persisting the shared-scene
+            # contract. Assets already scoped to another account/project remain
+            # rejected by the query above.
+            if media["account_id"] is None:
+                await conn.execute(
+                    """
+                    update public.media_assets
+                    set account_id=$2,
+                        project_id=coalesce(project_id,$3),
+                        updated_at=now()
+                    where id=$1 and user_id=$4 and account_id is null
+                    """,
+                    body.shared_scene_media_id,
+                    auth.account_id,
+                    stage["project_id"],
+                    auth.user_id,
                 )
 
             speech_rows = await conn.fetch(
@@ -246,6 +634,14 @@ async def set_shared_scene_conversation(
                 "validated_at": validation.get("validated_at"),
                 "contract_version": int(validation.get("contract_version") or 1),
             }
+            for draft_key in (
+                "shared_scene_draft_version",
+                "shared_scene_draft_media_id",
+                "shared_scene_draft_dimensions",
+                "shared_scene_draft_targets",
+                "shared_scene_draft_source",
+            ):
+                metadata.pop(draft_key, None)
 
             await conn.execute(
                 """
@@ -284,6 +680,8 @@ __all__ = [
     "NormalizedSpeakerBox",
     "NormalizedSpeakerPoint",
     "SharedSceneConversationIn",
+    "SharedSceneDraftIn",
+    "SharedSceneVideoSettingsIn",
     "SharedSceneSpeakerTarget",
     "router",
 ]

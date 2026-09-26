@@ -67,6 +67,25 @@ def _assert_conversation_mode_supported(context: FusionSceneContext) -> dict[str
     }
 
 
+def _shared_scene_video_provider(context: FusionSceneContext) -> str:
+    provider = _clean((context.stage_metadata or {}).get("shared_scene_video_provider")).casefold()
+    return provider if provider in {"sync3", "omnihuman_v15"} else "sync3"
+
+
+def _shared_scene_video_prompt(context: FusionSceneContext) -> str:
+    return _clean((context.stage_metadata or {}).get("shared_scene_video_prompt"))
+
+
+def _all_speaker_coordinates(shared_scene: dict[str, Any]) -> list[list[int]]:
+    coords: list[list[int]] = []
+    for participant_id in shared_scene["speaker_targets"].keys():
+        try:
+            coords.append(_speaker_coordinates(shared_scene, participant_id))
+        except Exception:
+            continue
+    return coords
+
+
 def _speaker_coordinates(shared_scene: dict[str, Any], participant_id) -> list[int]:
     target = shared_scene["speaker_targets"].get(str(participant_id))
     if not isinstance(target, dict):
@@ -169,10 +188,22 @@ async def compile_children_performant(
         provider_options: dict[str, Any] = {}
         provider_name = "veed_fabric"
         if shared_scene:
-            provider_name = "sync3"
-            provider_options["active_speaker_coordinates"] = _speaker_coordinates(shared_scene, turn.participant_id)
+            provider_name = _shared_scene_video_provider(context)
+            active_coords = _speaker_coordinates(shared_scene, turn.participant_id)
+            provider_options["active_speaker_coordinates"] = active_coords
             provider_options["conversation_mode"] = "shared_scene"
             provider_options["shared_scene_media_id"] = shared_scene["shared_scene_media_id"]
+            provider_options["shared_scene_dimensions"] = {
+                "width": shared_scene["image_width"],
+                "height": shared_scene["image_height"],
+            }
+            provider_options["all_speaker_coordinates"] = _all_speaker_coordinates(shared_scene)
+            if provider_name == "omnihuman_v15":
+                prompt_text = _shared_scene_video_prompt(context)
+                if prompt_text:
+                    provider_options["prompt"] = prompt_text
+                provider_options["resolution"] = "720p"
+                provider_options["turbo_mode"] = False
 
         payload: dict[str, Any] = {
             "face_image_url": face_url,
@@ -191,6 +222,8 @@ async def compile_children_performant(
                 "segment_sequence": turn.sequence_no,
                 "aspect_ratio": aspect_ratio,
                 "conversation_mode": "shared_scene" if shared_scene else "ordered_speaker_shots",
+                "shared_scene_video_provider": provider_name if shared_scene else None,
+                "shared_scene_motion_mode": _clean((context.stage_metadata or {}).get("shared_scene_motion_mode")) if shared_scene else None,
             },
         }
         if request_nonce:
@@ -219,4 +252,6 @@ __all__ = [
     "_scene_aspect_ratio",
     "_assert_conversation_mode_supported",
     "_speaker_coordinates",
+    "_shared_scene_video_provider",
+    "_shared_scene_video_prompt",
 ]

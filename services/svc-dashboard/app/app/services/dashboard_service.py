@@ -1101,7 +1101,8 @@ async def _fetch_library_view_rows(
 
         try:
             rows = await conn.fetch(query_sql, *params, limit, offset)
-            return [dict(r) for r in rows], total_count
+            items = [dict(r) for r in rows]
+            return await _attach_media_asset_meta(conn, items), total_count
         except Exception:
             return [], total_count
 
@@ -1365,6 +1366,7 @@ async def _fetch_library_view_rows(
     try:
         rows = await conn.fetch(combined_sql, user_id, limit, offset)
         items = [dict(r) for r in rows]
+        items = await _attach_media_asset_meta(conn, items)
     except Exception:
         return [], total_count
 
@@ -1408,6 +1410,57 @@ def _signed_url_from_parts(
     return existing
 
 
+async def _attach_media_asset_meta(
+    conn: asyncpg.Connection,
+    items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    media_ids = sorted({
+        _clean_text(item.get("media_asset_id"))
+        for item in items
+        if _clean_text(item.get("media_asset_id"))
+    })
+    if not media_ids:
+        return items
+    try:
+        rows = await conn.fetch(
+            """
+            select id::text as id, meta_json
+            from public.media_assets
+            where id::text = any($1::text[])
+            """,
+            media_ids,
+        )
+        by_id = {str(row["id"]): _coerce_json(row["meta_json"]) or {} for row in rows}
+        for item in items:
+            media_id = _clean_text(item.get("media_asset_id"))
+            if media_id and media_id in by_id:
+                item["_media_asset_meta_json"] = by_id[media_id]
+    except Exception:
+        # Library rendering must remain available even if lineage enrichment is
+        # temporarily unavailable; semantic routing then falls back to row metadata.
+        pass
+    return items
+
+
+def _is_group_photo_library_asset(
+    meta: Dict[str, Any],
+    reuse: Dict[str, Any],
+    asset_meta: Dict[str, Any],
+) -> bool:
+    candidates = (
+        reuse.get("asset_class"),
+        meta.get("asset_class"),
+        asset_meta.get("asset_class"),
+    )
+    if any(_clean_text(value).lower() == "group_photo" for value in candidates):
+        return True
+    if _clean_text(reuse.get("intended_reuse") or asset_meta.get("intended_reuse")).lower() == "group_photo_conversation":
+        return True
+    if _clean_text(reuse.get("conversation_mode") or asset_meta.get("conversation_mode")).lower() == "shared_scene":
+        return True
+    return isinstance(asset_meta.get("shared_scene_validation"), dict)
+
+
 def _library_conversation_mode(meta: Dict[str, Any], reuse: Dict[str, Any]) -> str:
     job_meta = _coerce_json(meta.get("job_meta")) or {}
     job_tags = _coerce_json(job_meta.get("tags")) or {}
@@ -1438,6 +1491,8 @@ def _normalize_library_item(
 
     meta = _coerce_json(_pick_first(item, "metadata_json", "meta_json", "metadata")) or {}
     reuse = _coerce_json(_pick_first(item, "reuse_payload_json", "reuse_payload")) or {}
+    asset_meta = _coerce_json(item.get("_media_asset_meta_json")) or {}
+    is_group_photo = studio == "face" and _is_group_photo_library_asset(meta, reuse, asset_meta)
 
     face_ttl_seconds = int(getattr(settings, "DASHBOARD_FACE_SAS_TTL_SECONDS", 2 * 24 * 3600))
     audio_ttl_seconds = int(getattr(settings, "DASHBOARD_AUDIO_SAS_TTL_SECONDS", 2 * 24 * 3600))
@@ -1496,16 +1551,31 @@ def _normalize_library_item(
 
     if studio == "face":
         resolved_image_url = _clean_text(_pick_first(reuse, "image_url", "face_image_url")) or _clean_text(preview_url) or _clean_text(thumbnail_url)
-        reuse_payload = {
-            "face_artifact_id": _clean_text(_pick_first(reuse, "face_artifact_id", "artifact_id")) or artifact_id or None,
-            "media_asset_id": _clean_text(_pick_first(reuse, "media_asset_id", "face_media_asset_id")) or media_asset_id or None,
-            "face_profile_id": _clean_text(_pick_first(reuse, "face_profile_id")) or face_profile_id or None,
-            "image_url": resolved_image_url or None,
-            "gender": _clean_text(_pick_first(reuse, "gender")) or _clean_text(meta.get("gender")) or None,
-            "aspect_ratio": _clean_text(_pick_first(reuse, "aspect_ratio")) or _clean_text(meta.get("aspect_ratio")) or None,
-        }
-        title = _build_face_library_title(item, meta, reuse)
-        asset_type = _clean_text(_pick_first(item, "asset_type")) or "image"
+        if is_group_photo:
+            validation = _coerce_json(asset_meta.get("shared_scene_validation")) or {}
+            reuse_payload = {
+                "media_asset_id": _clean_text(_pick_first(reuse, "media_asset_id", "face_media_asset_id")) or media_asset_id or None,
+                "image_url": resolved_image_url or None,
+                "aspect_ratio": _clean_text(_pick_first(reuse, "aspect_ratio")) or _clean_text(meta.get("aspect_ratio")) or None,
+                "asset_class": "group_photo",
+                "conversation_mode": "shared_scene",
+                "intended_reuse": "group_photo_conversation",
+                "participant_count": _as_number(asset_meta.get("participant_count") or validation.get("expected_speakers")),
+            }
+            title = _clean_text(_pick_first(item, "title", "name")) or "Group Photo"
+            asset_type = "group_photo"
+        else:
+            reuse_payload = {
+                "face_artifact_id": _clean_text(_pick_first(reuse, "face_artifact_id", "artifact_id")) or artifact_id or None,
+                "media_asset_id": _clean_text(_pick_first(reuse, "media_asset_id", "face_media_asset_id")) or media_asset_id or None,
+                "face_profile_id": _clean_text(_pick_first(reuse, "face_profile_id")) or face_profile_id or None,
+                "image_url": resolved_image_url or None,
+                "gender": _clean_text(_pick_first(reuse, "gender")) or _clean_text(meta.get("gender")) or None,
+                "aspect_ratio": _clean_text(_pick_first(reuse, "aspect_ratio")) or _clean_text(meta.get("aspect_ratio")) or None,
+                "asset_class": "single_face",
+            }
+            title = _build_face_library_title(item, meta, reuse)
+            asset_type = _clean_text(_pick_first(item, "asset_type")) or "image"
     elif studio == "audio":
         resolved_audio_url = _clean_text(_pick_first(reuse, "audio_url")) or _clean_text(preview_url) or _clean_text(download_url)
         duration_sec = _as_number(_pick_first(reuse, "duration_sec", "audio_duration_sec", "duration_seconds", "duration")) or _as_number(_pick_first(item, "duration_sec", "audio_duration_sec"))
@@ -1548,6 +1618,7 @@ def _normalize_library_item(
         "library_id": library_id,
         "studio": studio,
         "asset_type": asset_type,
+        "asset_class": "group_photo" if is_group_photo else ("single_face" if studio == "face" else studio),
         "title": title,
         "status": _clean_text(_pick_first(item, "status")) or "ready",
         "created_at": created_at.isoformat() if isinstance(created_at, datetime) else created_at,
@@ -1675,7 +1746,7 @@ async def get_dashboard_library(
     offset: int = 0,
 ) -> Dict[str, Any]:
     asset_type = _clean_text(asset_type).lower() or "all"
-    if asset_type not in {"all", "face", "audio", "video"}:
+    if asset_type not in {"all", "face", "group_photo", "audio", "video"}:
         asset_type = "all"
 
     safe_limit = max(1, min(int(limit or 50), 100))
@@ -1684,8 +1755,13 @@ async def get_dashboard_library(
     async with pool.acquire() as conn:
         signer = AzureBlobSasSigner.from_connection_string(settings.AZURE_STORAGE_CONNECTION_STRING)
 
-        view_rows, total_count = await _fetch_library_view_rows(conn, user_id, asset_type, safe_limit, safe_offset)
+        source_type = "face" if asset_type == "group_photo" else asset_type
+        view_rows, total_count = await _fetch_library_view_rows(conn, user_id, source_type, safe_limit, safe_offset)
         normalized_items = [x for x in (_normalize_library_item(row, signer) for row in view_rows) if x]
+        if asset_type == "face":
+            normalized_items = [x for x in normalized_items if x.get("asset_class") != "group_photo"]
+        elif asset_type == "group_photo":
+            normalized_items = [x for x in normalized_items if x.get("asset_class") == "group_photo"]
 
         if normalized_items:
             return {

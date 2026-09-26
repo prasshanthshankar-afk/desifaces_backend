@@ -175,6 +175,12 @@ services:
     container_name: df-v3-svc-fusion-worker
     profiles: !override ["v3-execution"]
     environment:
+      DF_FUSION_WORKER_CONCURRENCY: ${DF_FUSION_WORKER_CONCURRENCY:-8}
+      # Shared-scene dialogue clips must render concurrently end-to-end.
+      # Keep this aligned to the actual Sync provider account concurrency.
+      # Launch certification requires >= 2; target 6 for a six-turn scene.
+      DF_SYNC3_PROVIDER_CONCURRENCY: ${DF_SYNC3_PROVIDER_CONCURRENCY:-6}
+      DF_SYNC3_CONCURRENCY_WAIT_SECONDS: ${DF_SYNC3_CONCURRENCY_WAIT_SECONDS:-900}
       AZURE_VIDEO_OUTPUT_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
       AZURE_FINAL_VIDEO_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
 

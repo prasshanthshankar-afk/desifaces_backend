@@ -349,7 +349,7 @@ async def set_shared_scene_participant_profile(
         async with conn.transaction():
             participant = await conn.fetchrow(
                 """
-                select distinct p.participant_id,p.display_name,p.metadata_json,p.persona_json
+                select p.participant_id,p.display_name,p.metadata_json,p.persona_json
                 from public.v3_studio_workflows w
                 join public.v3_studio_stage_runs s on s.workflow_id=w.workflow_id
                 join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id

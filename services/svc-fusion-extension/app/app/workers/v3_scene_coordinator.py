@@ -360,12 +360,18 @@ async def _finalize_scene(pool, row: dict[str, Any], children: list[dict[str, An
     started = time.perf_counter()
     await _persist_children(pool, attempt_id=UUID(str(row["attempt_id"])), children=ordered, phase="scene_stitch")
 
+    stage_metadata = _as_dict(row.get("stage_metadata"))
+    conversation_mode = _clean(stage_metadata.get("conversation_mode")).lower() or None
+    stitch_mode = "conversation_handoff" if conversation_mode == "shared_scene" else None
+
     stitch_body = SceneStitchIn(
         project_id=UUID(str(row["project_id"])),
         workflow_id=UUID(str(row["workflow_id"])),
         stage_run_id=UUID(str(row["stage_run_id"])),
         attempt_id=UUID(str(row["attempt_id"])),
         segment_urls=segment_urls,
+        stitch_mode=stitch_mode,
+        conversation_mode=conversation_mode,
     )
     try:
         stitched = await stitch_scene(
@@ -515,7 +521,21 @@ async def reconcile_one(pool, row: dict[str, Any]) -> None:
                 children=refreshed,
                 phase="video_generation",
             )
-            if any(_clean(item.get("status")).lower() in _FAILED for item in refreshed):
+            has_failed = any(
+                _clean(item.get("status")).lower() in _FAILED
+                for item in refreshed
+            )
+            all_terminal = bool(refreshed) and all(
+                _clean(item.get("status")).lower() in (_SUCCESS | _FAILED)
+                for item in refreshed
+            )
+
+            # Do not fail the parent scene while sibling provider jobs are still
+            # rendering. Keep reconciling until every child is terminal so any
+            # successful clips are captured and reusable on retry. Previously the
+            # first failed child stopped the coordinator immediately, leaving
+            # still-running siblings orphaned from the durable parent attempt.
+            if has_failed and all_terminal:
                 await _release_failed_scene(
                     pool,
                     row,
@@ -523,6 +543,7 @@ async def reconcile_one(pool, row: dict[str, Any]) -> None:
                     reason="one_or_more_child_fusion_jobs_failed",
                 )
                 return
+
             all_succeeded = bool(refreshed) and all(
                 _clean(item.get("status")).lower() in _SUCCESS and _clean(item.get("video_url"))
                 for item in refreshed
