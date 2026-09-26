@@ -185,13 +185,13 @@ if "A terminal child failure has already been persisted" not in text:
                     stage_run_id=stage_run_id,
                 )
                 failed_row = await conn.fetchrow(
-                    """
+                    '''
                     select created_at,metadata_json
                     from public.v3_studio_stage_attempts
                     where stage_run_id=$1
                     order by attempt_no desc
                     limit 1
-                    """,
+                    ''',
                     stage_run_id,
                 )
             failed_meta = _as_dict(failed_row["metadata_json"]) if failed_row else {}
