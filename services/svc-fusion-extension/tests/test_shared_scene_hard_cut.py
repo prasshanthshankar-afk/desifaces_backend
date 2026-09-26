@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.services import stitch_service
+from app.api.routes.v3_scene_stitch import _effective_scene_stitch_mode
 
 
 def _capture_normalize_command(monkeypatch, *, edge_fade_override):
@@ -33,3 +34,13 @@ def test_default_normalization_keeps_existing_edge_fades(monkeypatch):
     vf = command[command.index("-vf") + 1]
     assert "fade=t=in" in vf
     assert "fade=t=out" in vf
+
+
+def test_shared_scene_forces_hard_cut_even_if_xfade_requested():
+    assert _effective_scene_stitch_mode("xfade", "shared_scene") == "hard_cut"
+    assert _effective_scene_stitch_mode("fade", "shared_scene") == "hard_cut"
+
+
+def test_ordered_speaker_shots_preserve_requested_mode():
+    assert _effective_scene_stitch_mode("xfade", "ordered_speaker_shots") == "xfade"
+    assert _effective_scene_stitch_mode("concat", "ordered_speaker_shots") == "concat"
