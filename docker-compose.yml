@@ -2,7 +2,7 @@ name: desifaces
 
 x-common-env: &common_env
   env_file:
-    - ./infra/.env
+    - ${DESIFACES_RUNTIME_ENV_FILE:-./infra/.env}
 
 x-common-python-service: &python_service
   <<: *common_env
