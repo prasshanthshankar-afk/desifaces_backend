@@ -105,7 +105,7 @@ compose(){
 }
 
 # Structural Compose validation: no grep/window assumptions.
-compose config --format json >/tmp/df-next3-targeted-compose.json
+compose --profile v3-execution config --format json >/tmp/df-next3-targeted-compose.json
 python3 - /tmp/df-next3-targeted-compose.json <<'PY'
 import json,sys
 cfg=json.load(open(sys.argv[1]))
