@@ -61,12 +61,35 @@ PY
 [[ "$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' df-v3-svc-director-worker)" == "unless-stopped" ]] ||   fail "Director worker restart policy is not durable before completion"
 echo "PRECHECK_DIRECTOR_WORKER_DURABILITY=PASS"
 
-for c in   df-v3-svc-face   df-v3-svc-face-worker   df-v3-svc-audio   df-v3-svc-audio-worker   df-v3-svc-pricing   df-v3-svc-core   df-v3-svc-dashboard   df-v3-svc-fusion   df-v3-svc-fusion-extension   desifaces-v3-db   desifaces-v3-redis
-do
-  [[ "$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || true)" == "running" ]] ||     fail "untouched runtime not running before completion: $c"
+UNTOUCHED=(
+  df-v3-svc-face
+  df-v3-svc-face-worker
+  df-v3-svc-audio
+  df-v3-svc-audio-worker
+  df-v3-svc-pricing
+  df-v3-svc-core
+  df-v3-svc-dashboard
+  df-v3-svc-fusion
+  df-v3-svc-fusion-extension
+  desifaces-v3-db
+  desifaces-v3-redis
+)
+declare -A UNTOUCHED_BEFORE
+PREEXISTING_NOT_RUNNING=()
+for c in "${UNTOUCHED[@]}"; do
+  if docker inspect "$c" >/dev/null 2>&1; then
+    UNTOUCHED_BEFORE["$c"]="$(docker inspect -f '{{.State.Status}}|{{.State.StartedAt}}|{{.Image}}|{{.RestartCount}}' "$c")"
+    state="$(docker inspect -f '{{.State.Status}}' "$c")"
+    [[ "$state" == "running" ]] || PREEXISTING_NOT_RUNNING+=("$c:$state")
+  else
+    UNTOUCHED_BEFORE["$c"]="ABSENT"
+    PREEXISTING_NOT_RUNNING+=("$c:absent")
+  fi
 done
-echo "PRECHECK_UNTOUCHED_RUNTIME=PASS"
-
+echo "PRECHECK_UNTOUCHED_RUNTIME_BASELINE=PASS"
+if ((${#PREEXISTING_NOT_RUNNING[@]})); then
+  printf 'PREEXISTING_UNTOUCHED_NOT_RUNNING=%s\n' "$(IFS=,; echo "${PREEXISTING_NOT_RUNNING[*]}")"
+fi
 # The prior bounded deployment intentionally stopped because the canonical build
 # lost the proven parallel-worker runtime. Restore that exact worker application
 # code from the immutable pre-fix image before changing only its provider gate.
@@ -190,12 +213,17 @@ PY
 [[ "$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' df-v3-svc-director-worker)" == "unless-stopped" ]] ||   fail "Director worker restart policy is not durable"
 echo "DIRECTOR_WORKER_DURABILITY=PASS"
 
-for c in   df-v3-svc-face   df-v3-svc-face-worker   df-v3-svc-audio   df-v3-svc-audio-worker   df-v3-svc-pricing   df-v3-svc-core   df-v3-svc-dashboard   df-v3-svc-fusion   df-v3-svc-fusion-extension   desifaces-v3-db   desifaces-v3-redis
-do
-  [[ "$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || true)" == "running" ]] ||     fail "untouched runtime not running: $c"
+for c in "${UNTOUCHED[@]}"; do
+  before="${UNTOUCHED_BEFORE[$c]}"
+  if [[ "$before" == "ABSENT" ]]; then
+    docker inspect "$c" >/dev/null 2>&1 && fail "untouched runtime unexpectedly appeared: $c"
+    continue
+  fi
+  docker inspect "$c" >/dev/null 2>&1 || fail "untouched runtime disappeared: $c"
+  after="$(docker inspect -f '{{.State.Status}}|{{.State.StartedAt}}|{{.Image}}|{{.RestartCount}}' "$c")"
+  [[ "$after" == "$before" ]] || fail "untouched runtime changed during completion: $c before=$before after=$after"
 done
-echo "UNTOUCHED_RUNTIME_HEALTH=PASS"
-
+echo "UNTOUCHED_RUNTIME_INVARIANCE=PASS"
 WEB_ROOT=""
 for candidate in   /home/azureuser/workspace/desifaces_web   /home/azureuser/workspace/desifaces-web   /home/azureuser/workspace/desifaces_frontend
 do
