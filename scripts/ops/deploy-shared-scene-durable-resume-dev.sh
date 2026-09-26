@@ -56,6 +56,11 @@ for c in "$DIRECTOR" "$FUSION_WORKER" "$WEB"; do
   docker inspect "$c" >/dev/null 2>&1 || fail "$c missing"
 done
 
+AVAILABLE_KB="$(df -Pk / | awk 'NR==2 {print $4}')"
+[[ "$AVAILABLE_KB" =~ ^[0-9]+$ ]] || fail "could not determine free disk space"
+(( AVAILABLE_KB >= 6 * 1024 * 1024 )) || fail "less than 6 GiB free; no build or runtime cutover attempted"
+echo "FREE_DISK_GIB=$(( AVAILABLE_KB / 1024 / 1024 ))"
+
 WORKER_IMAGE_BEFORE="$(docker inspect -f '{{.Image}}' "$FUSION_WORKER")"
 SYNC_CONCURRENCY_BEFORE="$(docker exec "$FUSION_WORKER" sh -lc 'printf "%s" "${DF_SYNC3_PROVIDER_CONCURRENCY:-1}"')"
 
