@@ -4,8 +4,8 @@ set -Eeuo pipefail
 EXPECTED_HOST="desifaces-dev"
 ROOT="/home/azureuser/workspace/desifaces-v3"
 ENV_FILE="$ROOT/infra/.env"
-BACKEND_SHA="ee3b042e97195e3dc770a515be8ac0393affb644"
-WEB_SHA="599b45fedff355ad32b679a2d3b954b54bc5c723"
+BACKEND_SHA="0f75500690665ff5724423274c69fe38664c5628"
+WEB_SHA="0cf568c9f09ca94502246e504c31c5f03c81fd0c"
 WT="/tmp/desifaces-shared-scene-durable-resume"
 DIRECTOR="df-v3-svc-director"
 FUSION_WORKER="df-v3-svc-fusion-worker"
@@ -90,8 +90,13 @@ grep -Fq "shared-scene-draft" "$WT/services/svc-director/app/app/shared_scene_ro
 grep -Fq "shared_scene_draft_media_id" "$WT/services/svc-director/app/app/shared_scene_routes.py"
 grep -Fq "metadata.pop(draft_key, None)" "$WT/services/svc-director/app/app/shared_scene_routes.py"
 grep -Fq "'source_image'" "$WT/services/svc-director/app/app/shared_scene_routes.py"
+grep -Fq "shared-scene-people-approval" "$WT/services/svc-director/app/app/shared_scene_routes.py"
+grep -Fq "shared_scene_people_approved" "$WT/services/svc-director/app/app/shared_scene_routes.py"
+! grep -Fq "(project_id is null or project_id=\$4)" "$WT/services/svc-director/app/app/shared_scene_routes.py"
 python3 -m py_compile "$WT/services/svc-director/app/app/shared_scene_routes.py"
 echo "DURABLE_GROUP_PHOTO_BACKEND_SOURCE=PASS"
+echo "PEOPLE_HITL_DURABILITY_SOURCE=PASS"
+echo "GROUP_PHOTO_CROSS_PROJECT_REUSE_SOURCE=PASS"
 
 DIR_PROJECT="$(project_of "$DIRECTOR")" || fail "Director Compose project missing"
 echo "DIRECTOR_PROJECT=$DIR_PROJECT"
@@ -105,7 +110,7 @@ docker run --rm \
   --env-file "$ENV_FILE" \
   --entrypoint python \
   desifaces-v3-svc-director \
-  -c 'import inspect; from app.shared_scene_routes import SharedSceneDraftIn,set_shared_scene_draft,set_shared_scene_conversation; d=SharedSceneDraftIn(shared_scene_media_id="00000000-0000-0000-0000-000000000001",speaker_targets=[]); assert d.image_width is None; s=inspect.getsource(set_shared_scene_draft); a=inspect.getsource(set_shared_scene_conversation); assert "source_image" in s; assert "shared_scene_draft_media_id" in a; print("DIRECTOR_DURABLE_DRAFT_CANDIDATE=PASS")'
+  -c 'import inspect; from app.shared_scene_routes import SharedSceneDraftIn,approve_shared_scene_people,set_shared_scene_draft,set_shared_scene_conversation; d=SharedSceneDraftIn(shared_scene_media_id="00000000-0000-0000-0000-000000000001",speaker_targets=[]); assert d.image_width is None; s=inspect.getsource(set_shared_scene_draft); a=inspect.getsource(set_shared_scene_conversation); p=inspect.getsource(approve_shared_scene_people); assert "source_image" in s; assert "shared_scene_draft_media_id" in a; assert "shared_scene_people_approved" in p; assert "(project_id is null or project_id=$4)" not in s; assert "(project_id is null or project_id=$4)" not in a; print("DIRECTOR_DURABLE_DRAFT_CANDIDATE=PASS")'
 
 echo
 echo "=== 3. CUT OVER DIRECTOR ONLY ==="
@@ -114,15 +119,23 @@ V3_ENV_FILE="$ENV_FILE" ./scripts/v3-compose.sh -p "$DIR_PROJECT" up -d --no-dep
 
 docker exec -i "$DIRECTOR" python - <<'PY'
 import inspect
-from app.shared_scene_routes import SharedSceneDraftIn,set_shared_scene_draft,set_shared_scene_conversation
+from app.shared_scene_routes import SharedSceneDraftIn,approve_shared_scene_people,set_shared_scene_draft,set_shared_scene_conversation
 draft=SharedSceneDraftIn(
     shared_scene_media_id="00000000-0000-0000-0000-000000000001",
     speaker_targets=[],
 )
 assert draft.image_width is None
-assert "source_image" in inspect.getsource(set_shared_scene_draft)
-assert "shared_scene_draft_media_id" in inspect.getsource(set_shared_scene_conversation)
+draft_src=inspect.getsource(set_shared_scene_draft)
+approve_src=inspect.getsource(set_shared_scene_conversation)
+people_src=inspect.getsource(approve_shared_scene_people)
+assert "source_image" in draft_src
+assert "shared_scene_draft_media_id" in approve_src
+assert "shared_scene_people_approved" in people_src
+assert "(project_id is null or project_id=$4)" not in draft_src
+assert "(project_id is null or project_id=$4)" not in approve_src
 print("DIRECTOR_DURABLE_DRAFT_RUNTIME=PASS")
+print("PEOPLE_HITL_DURABILITY_RUNTIME=PASS")
+print("GROUP_PHOTO_CROSS_PROJECT_REUSE_RUNTIME=PASS")
 PY
 
 echo
@@ -138,7 +151,9 @@ WEB_REPO_ROOT="$WEB_ROOT" bash "$WEB_SCRIPT" "$WEB_SHA"
 
 docker exec "$WEB" sh -lc "grep -R -F -m1 'Restored group photo and' /app/.next >/dev/null"
 docker exec "$WEB" sh -lc "grep -R -F -m1 'Refreshing secure group-photo access' /app/.next >/dev/null"
+docker exec "$WEB" sh -lc "grep -R -F -m1 'People approved and saved' /app/.next >/dev/null"
 echo "WEB_DURABLE_GROUP_PHOTO_RUNTIME=PASS"
+echo "WEB_PEOPLE_HITL_RESUME_RUNTIME=PASS"
 
 echo
 echo "=== 5. NO-REGRESSION RUNTIME GUARD ==="
@@ -156,6 +171,8 @@ echo " GROUP_PHOTO_URL=REFRESHED_FROM_DURABLE_MEDIA_ID"
 echo " EXPIRED_SAS_SELF_HEAL=ENABLED"
 echo " PARTIAL_SPEAKER_MAPPING=SERVER_PERSISTED"
 echo " RESUME_AFTER_REFRESH=ENABLED"
+echo " PEOPLE_APPROVAL=SERVER_PERSISTED"
+echo " SAME_ACCOUNT_CROSS_PROJECT_GROUP_PHOTO_REUSE=ENABLED"
 echo " FINAL_APPROVAL_CONTRACT=UNCHANGED"
 echo " SYNC3_PARALLEL_WORKER=PRESERVED"
 echo " PRODUCTION_TOUCH=NONE"
