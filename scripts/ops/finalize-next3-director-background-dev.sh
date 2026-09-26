@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 EXPECTED_HOST="desifaces-dev"
-TARGET="df-v3-svc-director"
+TARGET="df-svc-director"
 IMAGE="desifaces-v3-svc-director:latest"
 LIVE_ENV="/home/azureuser/workspace/desifaces-v3/infra/.env"
 
@@ -81,16 +81,16 @@ python3 -m py_compile "$ROUTE" \
   "$ROOT/services/svc-director/app/app/fusion_execution_background_read.py"
 
 UNTOUCHED=(
-  df-v3-svc-director-worker
-  df-v3-svc-fusion-worker
-  df-v3-svc-fusion-extension-stitch-worker
+  df-svc-director-worker
+  df-svc-fusion-worker
+  df-svc-fusion-extension-stitch-worker
   df-web-dev
-  df-v3-svc-face
-  df-v3-svc-audio
-  df-v3-svc-pricing
-  df-v3-svc-fusion
-  desifaces-v3-db
-  desifaces-v3-redis
+  df-svc-face
+  df-svc-audio
+  df-svc-pricing
+  df-svc-fusion
+  desifaces-db
+  desifaces-redis
 )
 declare -A BEFORE
 for c in "${UNTOUCHED[@]}"; do
