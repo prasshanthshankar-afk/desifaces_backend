@@ -176,6 +176,7 @@ services:
     container_name: df-svc-fusion-worker
     profiles: !override ["v3-execution"]
     environment:
+      DF_FUSION_WORKER_CONCURRENCY: ${DF_FUSION_WORKER_CONCURRENCY:-8}
       # Sync3 currently advertises one provider generation slot for this account.
       # Keep platform/worker concurrency independent; serialize only provider submissions
       # to avoid 429 wait storms and preserve overall application throughput.
