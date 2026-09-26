@@ -69,15 +69,30 @@ echo "============================================================"
 
 mkdir -p "$DURABLE_ROOT"
 
+LIVE_ROOT="/home/azureuser/workspace/desifaces-v3"
+
 copy_runtime_tree(){
-  local container="$1" dest="$2" source_dir
+  local container="$1" dest="$2" source_dir fallback_reason=""
   source_dir="$(docker inspect "$container" -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}')"
-  [[ -n "$source_dir" && -d "$source_dir" ]] || fail "current Compose working dir unavailable for $container: $source_dir"
+
+  # Older DEV cutovers were launched from ephemeral /tmp worktrees. Those
+  # source directories can disappear while the containers continue running.
+  # Reconstruct from the canonical DEV V3 repository, then overlay the exact
+  # currently-running service code from the container below.
+  if [[ -z "$source_dir" || ! -d "$source_dir" ]]; then
+    [[ -d "$LIVE_ROOT/.git" || -f "$LIVE_ROOT/.git" ]] || \
+      fail "canonical DEV V3 repository unavailable: $LIVE_ROOT"
+    fallback_reason="missing_ephemeral_compose_source"
+    source_dir="$LIVE_ROOT"
+  fi
+
   mkdir -p "$dest"
   cp -a --reflink=auto "$source_dir/." "$dest/"
   mkdir -p "$dest/infra"
   rm -f "$dest/infra/.env"
   ln -s "$LIVE_ENV" "$dest/infra/.env"
+
+  echo "RUNTIME_TREE_SOURCE container=$container source=$source_dir fallback=${fallback_reason:-none}"
 }
 
 DIRECTOR_ROOT="$DURABLE_ROOT/director"
@@ -87,6 +102,8 @@ STITCH_ROOT="$DURABLE_ROOT/stitch-worker"
 copy_runtime_tree df-v3-svc-director "$DIRECTOR_ROOT"
 copy_runtime_tree df-v3-svc-fusion-worker "$FUSION_ROOT"
 copy_runtime_tree df-v3-svc-fusion-extension-stitch-worker "$STITCH_ROOT"
+
+echo "DURABLE_RUNTIME_RECONSTRUCTION=PASS"
 
 # The running containers are the no-regression source of truth. Overlay only the
 # affected service source from those containers, then apply the bounded repair.
