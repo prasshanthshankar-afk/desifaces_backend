@@ -120,7 +120,7 @@ compose build svc-director
 echo "DIRECTOR_IMAGE_BUILD=PASS"
 
 # Verify the built image before changing the live container.
-docker run --rm --entrypoint python "$IMAGE" - <<'PY'
+docker run --rm --env-file "$LIVE_ENV" --entrypoint python "$IMAGE" - <<'PY'
 from app.studio_e2e_routes import fusion_execution
 from app.fusion_execution_background_read import BackgroundFinalizedParallelSceneFusionExecutionService
 from app.fusion_execution_parallel_dispatch import ParallelOrphanReconciledParentPricedSceneFusionExecutionService
