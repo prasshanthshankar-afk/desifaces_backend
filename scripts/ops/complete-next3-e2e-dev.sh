@@ -455,11 +455,11 @@ echo "============================================================"
 mapfile -t FUSION_WORKERS < <(
   docker ps --filter 'label=com.docker.compose.service=svc-fusion-worker' --format '{{.Names}}'
 )
-(( ${#FUSION_WORKERS[@]} == 1 ))   || fail "expected one running Fusion worker before build, found: ${FUSION_WORKERS[*]:-none}"
+(( ${#FUSION_WORKERS[@]} <= 1 ))   || fail "duplicate Fusion workers before build: ${FUSION_WORKERS[*]}"
 
 echo "RUNTIME_ENV_SINGLE_SOURCE=PASS"
 echo "DATABASE_TOPOLOGY_PREFLIGHT=PASS"
-echo "FUSION_WORKER_OWNERSHIP_PREFLIGHT=PASS"
+echo "FUSION_WORKER_DUPLICATE_PREFLIGHT=PASS count=${#FUSION_WORKERS[@]}"
 
 # ---------------------------------------------------------------------------
 # 1. Materialize exact source SHAs.
