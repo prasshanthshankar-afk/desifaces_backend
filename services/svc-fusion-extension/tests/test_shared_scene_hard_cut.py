@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.services import stitch_service
-from app.api.routes.v3_scene_stitch import _effective_scene_stitch_mode
+from app.api.routes.v3_scene_stitch import _effective_scene_stitch_mode, _media_storage_location
 
 
 def _capture_normalize_command(monkeypatch, *, edge_fade_override):
@@ -44,3 +44,12 @@ def test_shared_scene_forces_hard_cut_even_if_xfade_requested():
 def test_ordered_speaker_shots_preserve_requested_mode():
     assert _effective_scene_stitch_mode("xfade", "ordered_speaker_shots") == "xfade"
     assert _effective_scene_stitch_mode("concat", "ordered_speaker_shots") == "concat"
+
+
+def test_shared_media_location_recovers_face_upload_storage():
+    container, blob = _media_storage_location(
+        "https://account.blob.core.windows.net/face-output/group/a.png?sig=expired",
+        {},
+    )
+    assert container == "face-output"
+    assert blob == "group/a.png"
