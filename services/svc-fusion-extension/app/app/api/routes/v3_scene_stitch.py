@@ -6,6 +6,7 @@ import hashlib
 import os
 import tempfile
 from typing import Any
+from urllib.parse import urlparse
 from uuid import UUID
 
 import asyncpg
@@ -41,6 +42,12 @@ class SceneStitchOut(BaseModel):
 
 class VideoReadUrlOut(BaseModel):
     media_id: UUID
+    read_url: str
+
+
+class MediaReadUrlOut(BaseModel):
+    media_id: UUID
+    kind: str
     read_url: str
 
 
@@ -84,6 +91,31 @@ def _file_sha256_and_size(path: str) -> tuple[str, int]:
             digest.update(chunk)
             total += len(chunk)
     return digest.hexdigest(), total
+
+
+def _media_storage_location(storage_ref: str | None, meta: dict[str, Any]) -> tuple[str, str]:
+    container = str(meta.get("storage_container") or "").strip()
+    blob_name = str(meta.get("blob_name") or meta.get("storage_path") or "").strip()
+
+    for raw in (blob_name, str(storage_ref or "").strip()):
+        if not raw:
+            continue
+        if raw.startswith(("az://", "azure://")):
+            path = raw.split("://", 1)[1].lstrip("/")
+            if "/" in path:
+                c, b = path.split("/", 1)
+                container = container or c
+                blob_name = b
+                break
+        if raw.startswith(("http://", "https://")):
+            path = urlparse(raw).path.lstrip("/")
+            if "/" in path:
+                c, b = path.split("/", 1)
+                container = container or c
+                blob_name = b
+                break
+
+    return container.strip(), blob_name.lstrip("/").strip()
 
 
 def _sign_video(*, container: str, blob_name: str) -> str:
@@ -292,6 +324,57 @@ async def stitch_scene(
         video_url=signed_url,
         segment_count=len(segment_urls),
         reused=False,
+    )
+
+
+@router.get("/media/{media_id}/read-url", response_model=MediaReadUrlOut)
+async def get_v3_media_read_url(
+    media_id: UUID,
+    user_id: str = Depends(get_current_user_id),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+) -> MediaReadUrlOut:
+    """Mint a fresh URL for any user-owned active media used by a V3 workflow.
+
+    This provides a durable resume path for shared-scene group photos even when
+    the Face API is temporarily unavailable. Authorization remains user/account
+    scoped and the durable media id remains the source of truth.
+    """
+    try:
+        canonical_user_id = UUID(str(user_id))
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="invalid_user_identity") from exc
+
+    async with pool.acquire() as conn:
+        account = await _resolve_account_or_401(conn, canonical_user_id)
+        row = await conn.fetchrow(
+            """
+            select id,user_id,account_id,project_id,kind,lifecycle_state,storage_ref,meta_json
+            from public.media_assets
+            where id=$1 and user_id=$2 and lifecycle_state='active'
+            """,
+            media_id,
+            canonical_user_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="media_not_found")
+        if row["account_id"] and UUID(str(row["account_id"])) != account.account_id:
+            raise HTTPException(status_code=404, detail="media_not_found")
+
+    meta = _as_dict(row["meta_json"])
+    container, blob_name = _media_storage_location(row["storage_ref"], meta)
+    if not container or not blob_name:
+        raise HTTPException(status_code=409, detail="media_storage_lineage_missing")
+
+    sas = AzureBlobService(settings.AZURE_STORAGE_CONNECTION_STRING)
+    read_url = sas.sign_read_url(
+        container,
+        blob_name,
+        int(getattr(settings, "FINAL_SAS_TTL_SECONDS", 86400)),
+    )
+    return MediaReadUrlOut(
+        media_id=UUID(str(row["id"])),
+        kind=str(row["kind"] or ""),
+        read_url=read_url,
     )
 
 
