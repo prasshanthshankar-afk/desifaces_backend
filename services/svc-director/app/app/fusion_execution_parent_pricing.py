@@ -143,10 +143,16 @@ class ParentScenePricingClient:
         }
 
     async def _post(self, path: str, *, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
-        response = await self._client.post(path, headers=headers, json=body)
+        action = path.rsplit("/", 1)[-1]
+        try:
+            response = await self._client.post(path, headers=headers, json=body)
+        except httpx.HTTPError as exc:
+            raise SceneFusionBridgeError(
+                f"fusion_parent_pricing_{action}_unavailable:{str(exc)[:1200]}"
+            ) from exc
         if response.status_code != 200:
             raise SceneFusionBridgeError(
-                f"fusion_parent_pricing_{path.rsplit('/', 1)[-1]}_failed:"
+                f"fusion_parent_pricing_{action}_failed:"
                 f"{response.status_code}:{response.text[:1600]}"
             )
         return dict(response.json() or {})
