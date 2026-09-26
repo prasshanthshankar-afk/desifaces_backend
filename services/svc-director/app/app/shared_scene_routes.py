@@ -94,6 +94,24 @@ class SharedSceneConversationIn(BaseModel):
         return self
 
 
+class SharedSceneDraftIn(BaseModel):
+    """Durable draft for a selected group photo and partial speaker mapping."""
+
+    shared_scene_media_id: UUID
+    image_width: int | None = Field(default=None, ge=64, le=16384)
+    image_height: int | None = Field(default=None, ge=64, le=16384)
+    speaker_targets: Annotated[list[SharedSceneSpeakerTarget], Field(default_factory=list, max_length=20)]
+
+    @model_validator(mode="after")
+    def valid_draft(self):
+        if (self.image_width is None) != (self.image_height is None):
+            raise ValueError("shared_scene_draft_dimensions_must_be_complete")
+        ids = [item.participant_id for item in self.speaker_targets]
+        if len(ids) != len(set(ids)):
+            raise ValueError("shared_scene_draft_speaker_targets_must_be_unique")
+        return self
+
+
 def _metadata(value) -> dict:
     if isinstance(value, dict):
         return dict(value)
@@ -101,6 +119,147 @@ def _metadata(value) -> dict:
         return dict(value or {})
     except Exception:
         return {}
+
+
+@router.put(
+    "/api/director/studio-workflows/{workflow_id}/stage-runs/{stage_run_id}/shared-scene-draft"
+)
+async def set_shared_scene_draft(
+    workflow_id: UUID,
+    stage_run_id: UUID,
+    body: SharedSceneDraftIn,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    """Persist group-photo selection and partial mapping without advancing HITL.
+
+    This is resumability state only. Confirmed shared-scene generation keys are
+    still written exclusively by set_shared_scene_conversation after explicit
+    user approval.
+    """
+
+    pool = request.app.state.business_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            stage = await conn.fetchrow(
+                """
+                select s.stage_run_id,s.state,s.scene_id,s.metadata_json,w.project_id
+                from public.v3_studio_stage_runs s
+                join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+                where s.stage_run_id=$1 and s.workflow_id=$2 and w.account_id=$3
+                  and s.stage_type='fusion' and s.scope_type='scene'
+                for update of s
+                """,
+                stage_run_id,
+                workflow_id,
+                auth.account_id,
+            )
+            if not stage:
+                raise HTTPException(status_code=404, detail="fusion_scene_stage_not_found")
+
+            state = str(stage["state"] or "").strip().lower()
+            if state not in _PREVIEWABLE_STATES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"shared_scene_draft_locked_for_stage:{state}",
+                )
+
+            media = await conn.fetchrow(
+                """
+                select id,user_id,account_id,project_id,kind,lifecycle_state,meta_json
+                from public.media_assets
+                where id=$1 and user_id=$2
+                  and (account_id=$3 or account_id is null)
+                  and (project_id is null or project_id=$4)
+                  and kind in ('image','face_image','face_source_image','source_image')
+                  and lifecycle_state='active'
+                """,
+                body.shared_scene_media_id,
+                auth.user_id,
+                auth.account_id,
+                stage["project_id"],
+            )
+            if not media:
+                raise HTTPException(status_code=422, detail="shared_scene_media_not_owned_active_image")
+
+            media_meta = _metadata(media["meta_json"])
+            validation = _metadata(media_meta.get("shared_scene_validation"))
+            if (
+                not validation
+                or not bool(validation.get("allow"))
+                or str(validation.get("status") or "").upper() == "FAIL"
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "shared_scene_media_validation_required",
+                        "message": "This group photo must pass content-safety and quality checks before it can be saved.",
+                        "recoverable": True,
+                        "action": "validate_group_photo",
+                    },
+                )
+
+            speech_rows = await conn.fetch(
+                """
+                select distinct speaker_participant_id
+                from public.v3_dialogue_turns
+                where scene_id=$1 and turn_kind='speech'
+                  and speaker_participant_id is not null
+                order by speaker_participant_id
+                """,
+                stage["scene_id"],
+            )
+            speaking_ids = {
+                UUID(str(row["speaker_participant_id"]))
+                for row in speech_rows
+                if row["speaker_participant_id"] is not None
+            }
+            target_ids = {item.participant_id for item in body.speaker_targets}
+            if not target_ids.issubset(speaking_ids):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "shared_scene_draft_target_not_speaker",
+                        "unexpected_participant_ids": sorted(str(value) for value in (target_ids - speaking_ids)),
+                    },
+                )
+
+            metadata = _metadata(stage["metadata_json"])
+            metadata["shared_scene_draft_version"] = 1
+            metadata["shared_scene_draft_media_id"] = str(body.shared_scene_media_id)
+            metadata["shared_scene_draft_dimensions"] = (
+                {"width": body.image_width, "height": body.image_height}
+                if body.image_width is not None and body.image_height is not None
+                else None
+            )
+            metadata["shared_scene_draft_targets"] = {
+                str(item.participant_id): (
+                    {"point": item.point.model_dump(mode="json")}
+                    if item.point is not None
+                    else {"box": item.box.model_dump(mode="json")}
+                )
+                for item in body.speaker_targets
+            }
+            metadata["shared_scene_draft_source"] = "user_selected_unapproved"
+
+            await conn.execute(
+                """
+                update public.v3_studio_stage_runs
+                set metadata_json=$2::jsonb,updated_at=now()
+                where stage_run_id=$1
+                """,
+                stage_run_id,
+                json.dumps(metadata, ensure_ascii=False),
+            )
+
+    return {
+        "workflow_id": str(workflow_id),
+        "stage_run_id": str(stage_run_id),
+        "shared_scene_media_id": str(body.shared_scene_media_id),
+        "speaker_target_count": len(body.speaker_targets),
+        "persisted": True,
+        "approved": False,
+    }
 
 
 @router.put(
@@ -381,6 +540,14 @@ async def set_shared_scene_conversation(
                 "validated_at": validation.get("validated_at"),
                 "contract_version": int(validation.get("contract_version") or 1),
             }
+            for draft_key in (
+                "shared_scene_draft_version",
+                "shared_scene_draft_media_id",
+                "shared_scene_draft_dimensions",
+                "shared_scene_draft_targets",
+                "shared_scene_draft_source",
+            ):
+                metadata.pop(draft_key, None)
 
             await conn.execute(
                 """
@@ -419,6 +586,7 @@ __all__ = [
     "NormalizedSpeakerBox",
     "NormalizedSpeakerPoint",
     "SharedSceneConversationIn",
+    "SharedSceneDraftIn",
     "SharedSceneVideoSettingsIn",
     "SharedSceneSpeakerTarget",
     "router",
