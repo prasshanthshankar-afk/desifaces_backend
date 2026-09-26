@@ -149,17 +149,9 @@ async def stitch_scene(
     stitch_mode = str(body.stitch_mode or "").strip().lower() or None
     if stitch_mode not in {None, "xfade", "fade", "concat", "hard_cut"}:
         raise HTTPException(status_code=422, detail="scene_stitch_mode_invalid")
-    conversation_mode = str(body.conversation_mode or "").strip().lower() or None
-    if conversation_mode not in {None, "shared_scene", "ordered_speaker_shots"}:
+    requested_conversation_mode = str(body.conversation_mode or "").strip().lower() or None
+    if requested_conversation_mode not in {None, "shared_scene", "ordered_speaker_shots"}:
         raise HTTPException(status_code=422, detail="scene_stitch_conversation_mode_invalid")
-
-    # Shared-scene conversations keep the same authoritative group photo in every
-    # dialogue child. Cross-fading those independently lip-synced clips creates
-    # unnecessary frame blending and has proven fragile across provider encodes.
-    # The product contract is a deterministic speaker-by-speaker conversation, so
-    # shared_scene always uses a hard cut between turns. Existing ordered-speaker
-    # and non-shared longform behavior remains unchanged.
-    effective_stitch_mode = _effective_scene_stitch_mode(stitch_mode, conversation_mode)
     if len(segment_urls) != len(body.segment_urls):
         raise HTTPException(status_code=422, detail="scene_stitch_segment_url_required")
 
@@ -167,7 +159,8 @@ async def stitch_scene(
         account = await _resolve_account_or_401(conn, canonical_user_id)
         workflow = await conn.fetchrow(
             """
-            select w.workflow_id,w.project_id,s.stage_run_id,s.stage_type,s.scope_type
+            select w.workflow_id,w.project_id,s.stage_run_id,s.stage_type,s.scope_type,
+                   s.metadata_json as stage_metadata
             from public.v3_studio_workflows w
             join public.v3_studio_stage_runs s on s.workflow_id=w.workflow_id
             where w.workflow_id=$1 and w.project_id=$2 and w.account_id=$3
@@ -180,6 +173,20 @@ async def stitch_scene(
         )
         if not workflow:
             raise HTTPException(status_code=404, detail="scene_stitch_workflow_stage_not_found")
+
+        stage_metadata = _as_dict(workflow["stage_metadata"])
+        canonical_conversation_mode = str(stage_metadata.get("conversation_mode") or "").strip().lower() or None
+        if canonical_conversation_mode not in {None, "shared_scene", "ordered_speaker_shots"}:
+            raise HTTPException(status_code=409, detail="scene_stitch_stage_conversation_mode_invalid")
+        if (
+            requested_conversation_mode
+            and canonical_conversation_mode
+            and requested_conversation_mode != canonical_conversation_mode
+        ):
+            raise HTTPException(status_code=409, detail="scene_stitch_conversation_mode_mismatch")
+
+        conversation_mode = canonical_conversation_mode or requested_conversation_mode
+        effective_stitch_mode = _effective_scene_stitch_mode(stitch_mode, conversation_mode)
 
         attempt_ok = await conn.fetchval(
             """
