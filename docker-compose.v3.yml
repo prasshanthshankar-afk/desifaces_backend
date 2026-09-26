@@ -240,16 +240,21 @@ volumes:
     name: desifaces-v3_df_pgdata
 
   df_redisdata:
+    external: true
     name: desifaces-v3_df_redisdata
 
   df_saree_templates_cache:
+    external: true
     name: desifaces-v3_df_saree_templates_cache
 
   df_saree_drape_runs:
+    external: true
     name: desifaces-v3_df_saree_drape_runs
 
   df_hf_cache:
+    external: true
     name: desifaces-v3_df_hf_cache
 
   df_marketing_output:
+    external: true
     name: desifaces-v3_df_marketing_output
