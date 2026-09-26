@@ -32,6 +32,41 @@ echo " preserved_worker_image=$OLD_FUSION_IMAGE"
 echo " production_touch=NONE"
 echo "============================================================"
 
+# The previous deployment already cut over Director + stitch before the
+# performance guard intentionally stopped. Prove those bounded changes are
+# healthy before touching the Fusion worker.
+docker exec -i df-v3-svc-director python - <<'PY'
+from app.studio_e2e_routes import fusion_execution
+name=type(fusion_execution).__name__
+assert name == "ParallelOrphanReconciledParentPricedSceneFusionExecutionService", name
+from pathlib import Path
+s=Path("/app/app/fusion_execution_parallel_dispatch.py").read_text()
+assert "A terminal child failure has already been persisted" in s
+assert '"retry_scope": "failed_child_only"' in s
+print("PRECHECK_DIRECTOR_RECOVERY_RUNTIME=PASS")
+PY
+
+docker exec -i df-v3-svc-fusion-extension-stitch-worker python - <<'PY'
+import inspect
+from app.services import stitch_service
+src=inspect.getsource(stitch_service._xfade_pair)
+assert "fps=30" in src
+assert "settb=AVTB" in src
+assert "setpts=PTS-STARTPTS" in src
+assert "concat" in inspect.getsource(stitch_service.stitch_videos)
+print("PRECHECK_STITCH_RUNTIME=PASS")
+PY
+
+[[ "$(docker inspect -f '{{.State.Status}}' df-v3-svc-director-worker)" == "running" ]] ||   fail "Director worker is not running before completion"
+[[ "$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' df-v3-svc-director-worker)" == "unless-stopped" ]] ||   fail "Director worker restart policy is not durable before completion"
+echo "PRECHECK_DIRECTOR_WORKER_DURABILITY=PASS"
+
+for c in   df-v3-svc-face   df-v3-svc-face-worker   df-v3-svc-audio   df-v3-svc-audio-worker   df-v3-svc-pricing   df-v3-svc-core   df-v3-svc-dashboard   df-v3-svc-fusion   df-v3-svc-fusion-extension   desifaces-v3-db   desifaces-v3-redis
+do
+  [[ "$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || true)" == "running" ]] ||     fail "untouched runtime not running before completion: $c"
+done
+echo "PRECHECK_UNTOUCHED_RUNTIME=PASS"
+
 # The prior bounded deployment intentionally stopped because the canonical build
 # lost the proven parallel-worker runtime. Restore that exact worker application
 # code from the immutable pre-fix image before changing only its provider gate.
