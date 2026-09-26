@@ -70,31 +70,25 @@ echo "============================================================"
 mkdir -p "$DURABLE_ROOT"
 
 LIVE_ROOT="/home/azureuser/workspace/desifaces-v3"
+[[ -d "$LIVE_ROOT/.git" || -f "$LIVE_ROOT/.git" ]] || fail "canonical DEV V3 repository unavailable: $LIVE_ROOT"
+command -v tar >/dev/null || fail "tar missing"
+
+# Materialize the exact bounded repair commit so all Docker build metadata and
+# shared-package sources are present even when the previous runtime was launched
+# from an ephemeral /tmp tree. Service application code is overlaid from the
+# currently-running containers immediately afterward, preserving live behavior.
+git -C "$LIVE_ROOT" fetch --no-tags origin "$BACKEND_SHA"
+git -C "$LIVE_ROOT" cat-file -e "$BACKEND_SHA^{commit}"
 
 copy_runtime_tree(){
-  local container="$1" dest="$2" source_dir fallback_reason=""
-  source_dir="$(docker inspect "$container" -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}')"
-
-  # Older DEV cutovers were launched from ephemeral /tmp worktrees. Those
-  # source directories can disappear while the containers continue running.
-  # Reconstruct from the canonical DEV V3 repository, then overlay the exact
-  # currently-running service code from the container below.
-  if [[ -z "$source_dir" || ! -d "$source_dir" ]]; then
-    [[ -d "$LIVE_ROOT/.git" || -f "$LIVE_ROOT/.git" ]] || \
-      fail "canonical DEV V3 repository unavailable: $LIVE_ROOT"
-    fallback_reason="missing_ephemeral_compose_source"
-    source_dir="$LIVE_ROOT"
-  fi
-
+  local container="$1" dest="$2"
   mkdir -p "$dest"
-  cp -a --reflink=auto "$source_dir/." "$dest/"
+  git -C "$LIVE_ROOT" archive "$BACKEND_SHA" | tar -x -C "$dest"
   mkdir -p "$dest/infra"
   rm -f "$dest/infra/.env"
   ln -s "$LIVE_ENV" "$dest/infra/.env"
-
-  echo "RUNTIME_TREE_SOURCE container=$container source=$source_dir fallback=${fallback_reason:-none}"
+  echo "RUNTIME_TREE_SOURCE container=$container source=git:$BACKEND_SHA fallback=exact_repair_commit"
 }
-
 DIRECTOR_ROOT="$DURABLE_ROOT/director"
 FUSION_ROOT="$DURABLE_ROOT/fusion-worker"
 STITCH_ROOT="$DURABLE_ROOT/stitch-worker"
