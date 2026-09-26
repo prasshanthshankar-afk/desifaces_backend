@@ -234,32 +234,94 @@ import re, sys
 
 path=Path(sys.argv[1])/"services/svc-fusion-extension/app/app/services/stitch_service.py"
 text=path.read_text()
+
 m=re.search(r"(?ms)^def _xfade_pair\(.*?(?=^def |\Z)", text)
 if not m:
     raise SystemExit("_xfade_pair not found")
-block=m.group(0)
-if "fps=30" not in block:
-    if "setsar=1,settb=AVTB" in block:
-        block=block.replace("setsar=1,settb=AVTB","setsar=1,fps=30,settb=AVTB")
-    elif 'f"[0:v][1:v]xfade=' in block:
-        block=block.replace(
-            'f"[0:v][1:v]xfade=transition={transition_style}:duration={xfade_duration:.3f}:offset={offset:.3f}[v];"\n'
-            '            f"[0:a][1:a]acrossfade=d={xfade_duration:.3f}:c1={audio_curve}:c2={audio_curve}[a]"',
-            'f"[0:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v0];"\n'
-            '            f"[1:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v1];"\n'
-            '            f"[v0][v1]xfade=transition={transition_style}:duration={xfade_duration:.3f}:offset={offset:.3f}[v];"\n'
-            '            f"[0:a]aresample=48000,asetpts=PTS-STARTPTS[a0];"\n'
-            '            f"[1:a]aresample=48000,asetpts=PTS-STARTPTS[a1];"\n'
-            '            f"[a0][a1]acrossfade=d={xfade_duration:.3f}:c1={audio_curve}:c2={audio_curve}[a]"'
-        )
-    else:
-        raise SystemExit("xfade filter contract changed; refusing unsafe patch")
-    text=text[:m.start()]+block+text[m.end():]
-if "fps=30" not in re.search(r"(?ms)^def _xfade_pair\(.*?(?=^def |\Z)", text).group(0):
-    raise SystemExit("CFR guard not established")
+
+required_helpers=(
+    "_require_nonempty_file",
+    "_ensure_parent_dir",
+    "_probe_duration_seconds",
+    "_safe_transition_duration",
+    "_transition_style",
+    "_transition_audio_curve",
+    "_run",
+    "_ffmpeg_threads",
+    "_ffmpeg_preset",
+    "_ffmpeg_crf",
+)
+missing=[name for name in required_helpers if name not in text]
+if missing:
+    raise SystemExit("xfade helper contract missing: "+",".join(missing))
+
+replacement = '''def _xfade_pair(
+    left_mp4: str,
+    right_mp4: str,
+    out_mp4: str,
+    *,
+    transition_duration_sec: float,
+) -> None:
+    _require_nonempty_file(left_mp4)
+    _require_nonempty_file(right_mp4)
+    _ensure_parent_dir(out_mp4)
+
+    left_duration = _probe_duration_seconds(left_mp4)
+    right_duration = _probe_duration_seconds(right_mp4)
+    if left_duration is None:
+        raise RuntimeError(f"Unable to probe duration for {left_mp4}")
+    if right_duration is None:
+        raise RuntimeError(f"Unable to probe duration for {right_mp4}")
+
+    xfade_duration = _safe_transition_duration(
+        transition_duration_sec, left_duration, right_duration
+    )
+    offset = max(0.0, float(left_duration) - xfade_duration)
+    transition_style = _transition_style()
+    audio_curve = _transition_audio_curve()
+
+    filter_complex = (
+        f"[0:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v0];"
+        f"[1:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v1];"
+        f"[v0][v1]xfade=transition={transition_style}:duration={xfade_duration:.3f}:offset={offset:.3f}[v];"
+        f"[0:a]aresample=48000,asetpts=PTS-STARTPTS[a0];"
+        f"[1:a]aresample=48000,asetpts=PTS-STARTPTS[a1];"
+        f"[a0][a1]acrossfade=d={xfade_duration:.3f}:c1={audio_curve}:c2={audio_curve}[a]"
+    )
+
+    _run([
+        "ffmpeg", "-y",
+        "-threads", _ffmpeg_threads(),
+        "-i", left_mp4,
+        "-i", right_mp4,
+        "-filter_complex", filter_complex,
+        "-map", "[v]",
+        "-map", "[a]",
+        "-c:v", "libx264",
+        "-preset", _ffmpeg_preset(),
+        "-crf", _ffmpeg_crf(),
+        "-pix_fmt", "yuv420p",
+        "-r", "30",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ar", "48000",
+        "-movflags", "+faststart",
+        out_mp4,
+    ])
+    _require_nonempty_file(out_mp4)
+
+'''
+
+text=text[:m.start()]+replacement+text[m.end():]
+patched=re.search(r"(?ms)^def _xfade_pair\(.*?(?=^def |\Z)", text)
+if not patched:
+    raise SystemExit("xfade patch disappeared")
+patched_text=patched.group(0)
+for marker in ("fps=30", "settb=AVTB", "setpts=PTS-STARTPTS", "aresample=48000", "xfade=transition="):
+    if marker not in patched_text:
+        raise SystemExit("CFR xfade marker missing: "+marker)
 path.write_text(text)
 PY
-
 python3 - "$FUSION_ROOT" <<'PY'
 from pathlib import Path
 import re, sys
