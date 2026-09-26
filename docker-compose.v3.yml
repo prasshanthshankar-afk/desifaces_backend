@@ -232,7 +232,7 @@ services:
 networks:
   df-net:
     name: df-v3-net
-    driver: bridge
+    external: true
 
 volumes:
   df_pgdata:
