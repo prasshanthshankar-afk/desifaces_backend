@@ -1049,6 +1049,12 @@ async def main() -> None:
         durable_output_url = azure.sign_read_url(output_container, output_blob, 15 * 24 * 3600)
 
         dims = _dict(stage_meta.get("shared_scene_dimensions"))
+        motion_qc = _motion_presence_qc(
+            video_path=motion_video,
+            proof_turns=manifest_turns,
+            source_width=int(dims["width"]),
+            source_height=int(dims["height"]),
+        )
         qc = _active_speaker_qc(
             video_path=output_path,
             proof_turns=manifest_turns,
@@ -1057,10 +1063,18 @@ async def main() -> None:
         )
 
         manifest = {
-            "contract": "next3_shared_scene_two_turn_segments_proof_v2",
+            "contract": "next3_shared_scene_two_turn_performance_proof_v1",
             "workflow_id": str(workflow_id),
             "stage_run_id": str(stage_run_id),
             "shared_scene_media_id": str(shared_media_id),
+            "performance_director": performance_plan,
+            "performance_motion_provider": "fal",
+            "performance_motion_model": motion_model,
+            "performance_motion_provider_job_id": motion_job_id,
+            "performance_motion_request": motion_payload,
+            "performance_motion_result": motion_result,
+            "performance_motion_qc": motion_qc,
+            "performance_motion_storage_path": source_blob,
             "provider": "sync3",
             "provider_model": "sync-3",
             "provider_job_id": provider_job_id,
@@ -1068,7 +1082,7 @@ async def main() -> None:
             "total_duration_seconds": total_duration,
             "turns": manifest_turns,
             "active_speaker_qc": qc,
-            "human_proof_review": "REQUIRED_BEFORE_FULL_SEVEN_TURN_GENERATION",
+            "human_proof_review": "REQUIRED_FOR_EXPRESSION_BLINKS_GAZE_GESTURES_HANDS_IDENTITY_AND_CONVERSATIONAL_NATURALNESS",
             "qa_storage_path": output_blob,
         }
         manifest_path = root / "manifest.json"
@@ -1078,7 +1092,14 @@ async def main() -> None:
         manifest_url = azure.sign_read_url(output_container, manifest_blob, 15 * 24 * 3600)
 
         print("============================================================")
-        print("NEXT3_TWO_TURN_SEGMENTS_PROVIDER=PASS")
+        print("NEXT3_TWO_TURN_PERFORMANCE_PROVIDER=PASS")
+        print(f"PERFORMANCE_MOTION_QC={motion_qc['status']}")
+        for result in motion_qc["participants"]:
+            print(
+                "MOTION_QC "
+                f"speaker={result['display_name']} status={result['status']} "
+                f"score={result['upper_body_motion_score']} reason={result['reason']}"
+            )
         print(f"ACTIVE_SPEAKER_QC={qc['status']}")
         for result in qc["segments"]:
             print(
@@ -1090,10 +1111,11 @@ async def main() -> None:
                 f"ratio={result['non_speaker_to_intended_ratio']} "
                 f"corr={result['motion_correlation']}"
             )
-        print("HUMAN_PROOF_REVIEW=REQUIRED")
+        print("HUMAN_QUALITY_REVIEW=REQUIRED")
+        print("HUMAN_REVIEW_DIMENSIONS=context_specific_expression,blinks,gaze,head_motion,body_motion,gestures,hands,listener_reaction,identity,temporal_continuity")
         print(f"OUTPUT_URL={durable_output_url}")
         print(f"MANIFEST_URL={manifest_url}")
-        print("FULL_SEVEN_TURN_GENERATION=BLOCKED_UNTIL_QC_AND_HUMAN_REVIEW_PASS")
+        print("FULL_SEVEN_TURN_GENERATION=BLOCKED_UNTIL_ACTIVE_SPEAKER_QC_AND_PERFORMANCE_REVIEW_PASS")
         print("DATABASE_WRITE=NONE")
         print("PRODUCTION_TOUCH=NONE")
         print("============================================================")
