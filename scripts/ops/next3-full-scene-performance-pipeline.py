@@ -2031,18 +2031,45 @@ async def _build_identity_elements(
                 width=width,
                 height=height,
             )
-            crop = source_rgb.crop(crop_box)
-            crop_path = root / f"identity-{index}.jpg"
-            crop.save(crop_path, format="JPEG", quality=96, subsampling=0)
-            blob = f"{base_path}/identity/participant-{index}.jpg"
-            azure.upload_file(output_container, blob, str(crop_path), "image/jpeg")
-            url = azure.sign_read_url(output_container, blob, 6 * 3600)
-            elements.append({"frontal_image_url": url})
+            left, top, right, bottom = crop_box
+
+            # Tight frontal crop anchors facial identity/apparent age.
+            frontal_crop = source_rgb.crop(crop_box)
+            frontal_path = root / f"identity-{index}-frontal.jpg"
+            frontal_crop.save(frontal_path, format="JPEG", quality=96, subsampling=0)
+            frontal_blob = f"{base_path}/identity/participant-{index}-frontal.jpg"
+            azure.upload_file(output_container, frontal_blob, str(frontal_path), "image/jpeg")
+            frontal_url = azure.sign_read_url(output_container, frontal_blob, 6 * 3600)
+
+            # A wider same-source reference is required by Kling's image-set
+            # element contract and also anchors hairstyle/shoulders/clothing
+            # without introducing a second synthetic identity source.
+            face_w = right - left
+            face_h = bottom - top
+            wide_box = (
+                max(0, int(round(left - 0.45 * face_w))),
+                max(0, int(round(top - 0.25 * face_h))),
+                min(width, int(round(right + 0.45 * face_w))),
+                min(height, int(round(bottom + 0.90 * face_h))),
+            )
+            wide_crop = source_rgb.crop(wide_box)
+            reference_path = root / f"identity-{index}-reference.jpg"
+            wide_crop.save(reference_path, format="JPEG", quality=96, subsampling=0)
+            reference_blob = f"{base_path}/identity/participant-{index}-reference.jpg"
+            azure.upload_file(output_container, reference_blob, str(reference_path), "image/jpeg")
+            reference_url = azure.sign_read_url(output_container, reference_blob, 6 * 3600)
+
+            elements.append({
+                "frontal_image_url": frontal_url,
+                "reference_image_urls": [reference_url],
+            })
             refs[participant_id] = {
                 "element_index": index,
                 "display_name": display_name,
-                "crop_box": list(crop_box),
-                "storage_path": blob,
+                "frontal_crop_box": list(crop_box),
+                "reference_crop_box": list(wide_box),
+                "frontal_storage_path": frontal_blob,
+                "reference_storage_path": reference_blob,
             }
     return elements, refs
 
