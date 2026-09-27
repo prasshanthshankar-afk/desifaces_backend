@@ -968,6 +968,7 @@ async def main() -> None:
             "prompt": motion_prompt,
             "start_image_url": image_url,
             "duration": str(motion_duration),
+            "aspect_ratio": "16:9",
             "generate_audio": False,
             "shot_type": "customize",
             "negative_prompt": negative_prompt,
@@ -985,6 +986,26 @@ async def main() -> None:
         motion_video = root / "performance-motion.mp4"
         async with httpx.AsyncClient(timeout=180, follow_redirects=True) as motion_client:
             await _download(motion_client, motion_url, motion_video)
+
+        motion_info = _probe_video_info(motion_video)
+        motion_aspect = float(motion_info["width"]) / float(motion_info["height"])
+        if abs(motion_aspect - (16.0 / 9.0)) > 0.08:
+            raise RuntimeError(
+                "PERFORMANCE_MOTION_ASPECT_RATIO_DRIFT:"
+                f"{motion_info['width']}x{motion_info['height']}"
+            )
+        if float(motion_info["duration"]) + 0.10 < total_duration:
+            raise RuntimeError(
+                "PERFORMANCE_MOTION_TOO_SHORT:"
+                f"duration={motion_info['duration']}:required={total_duration}"
+            )
+        print(
+            "PERFORMANCE_MOTION_VIDEO_INFO="
+            f"{motion_info['width']}x{motion_info['height']}"
+            f" fps={motion_info['fps']:.6f}"
+            f" duration={motion_info['duration']:.3f}"
+            f" frames={motion_info['frame_count']}"
+        )
 
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         base_path = f"v3/qa/shared-scene-performance/{workflow_id}/{stage_run_id}/{stamp}"
