@@ -33,7 +33,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_v3_studio_stage_one_active_attempt
 -- Every confirmed shared-scene Fusion stage must have a durable relational
 -- reference to the authoritative group photo, not only JSON metadata. Fail
 -- closed if existing metadata points outside the workflow account/project.
-DO $
+DO $$
 DECLARE
   v_stage uuid;
 BEGIN
@@ -60,7 +60,7 @@ BEGIN
       'next3 integrity preflight failed: invalid shared-scene media lineage for stage %',
       v_stage;
   END IF;
-END $;
+END $$;
 
 INSERT INTO public.v3_studio_stage_inputs(
   stage_run_id,media_id,input_role,source_stage_run_id
