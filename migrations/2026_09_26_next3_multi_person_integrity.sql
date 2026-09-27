@@ -30,6 +30,54 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_v3_studio_stage_one_active_attempt
   ON public.v3_studio_stage_attempts(stage_run_id)
   WHERE state IN ('dispatching','queued','running');
 
+-- Group photos explicitly marked for group-photo conversation reuse may be
+-- referenced by multiple projects owned by the same user/account. In that
+-- narrow case the correct durable scope is account/user level (project_id NULL),
+-- which preserves the single media asset for every referencing workflow.
+-- This normalization is fail-safe: it applies only when every shared-scene
+-- reference resolves to the same account/user and the asset's current project
+-- is one of the referencing projects.
+UPDATE public.media_assets m
+SET project_id = NULL,
+    updated_at = now()
+WHERE m.project_id IS NOT NULL
+  AND m.lifecycle_state = 'active'
+  AND m.kind IN ('image','source_image','face_image','face_source_image')
+  AND m.meta_json->>'asset_class' = 'group_photo'
+  AND m.meta_json->>'intended_reuse' = 'group_photo_conversation'
+  AND EXISTS (
+    SELECT 1
+    FROM public.v3_studio_stage_runs s
+    JOIN public.v3_studio_workflows w ON w.workflow_id = s.workflow_id
+    WHERE s.stage_type = 'fusion'
+      AND s.scope_type = 'scene'
+      AND s.metadata_json->>'conversation_mode' = 'shared_scene'
+      AND nullif(s.metadata_json->>'shared_scene_media_id','')::uuid = m.id
+      AND w.project_id = m.project_id
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM public.v3_studio_stage_runs s
+    JOIN public.v3_studio_workflows w ON w.workflow_id = s.workflow_id
+    WHERE s.stage_type = 'fusion'
+      AND s.scope_type = 'scene'
+      AND s.metadata_json->>'conversation_mode' = 'shared_scene'
+      AND nullif(s.metadata_json->>'shared_scene_media_id','')::uuid = m.id
+      AND (
+        w.account_id IS DISTINCT FROM m.account_id
+        OR w.owner_user_id IS DISTINCT FROM m.user_id
+      )
+  )
+  AND (
+    SELECT count(DISTINCT w.project_id)
+    FROM public.v3_studio_stage_runs s
+    JOIN public.v3_studio_workflows w ON w.workflow_id = s.workflow_id
+    WHERE s.stage_type = 'fusion'
+      AND s.scope_type = 'scene'
+      AND s.metadata_json->>'conversation_mode' = 'shared_scene'
+      AND nullif(s.metadata_json->>'shared_scene_media_id','')::uuid = m.id
+  ) > 1;
+
 -- Every confirmed shared-scene Fusion stage must have a durable relational
 -- reference to the authoritative group photo, not only JSON metadata. Fail
 -- closed if existing metadata points outside the workflow account/project.
