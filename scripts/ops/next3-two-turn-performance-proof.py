@@ -38,6 +38,29 @@ def _dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+_TEXT_KEYS = (
+    "spoken_text", "dialogue_text", "utterance_text", "script_text",
+    "line_text", "text", "content", "source_text", "voiceover_text",
+)
+
+
+def _extract_spoken_text(turn_json: dict[str, Any], audio_meta: dict[str, Any]) -> tuple[str, str]:
+    for source_name, source in (("turn", turn_json), ("audio", audio_meta)):
+        for key in _TEXT_KEYS:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip(), f"{source_name}.{key}"
+        for nested_key in ("script", "tts", "request", "input", "metadata"):
+            nested = _dict(source.get(nested_key))
+            for key in _TEXT_KEYS:
+                value = nested.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip(), f"{source_name}.{nested_key}.{key}"
+    raise RuntimeError(
+        "DIALOGUE_TEXT_NOT_FOUND:"
+        f"turn_keys={sorted(turn_json.keys())}:audio_meta_keys={sorted(audio_meta.keys())}"
+    )
+
 def _db_dsn() -> str:
     raw = _clean(os.getenv("DATABASE_URL"))
     if raw.startswith("postgresql+asyncpg://"):
@@ -401,9 +424,11 @@ async def main() -> None:
         stage = await conn.fetchrow(
             """
             select s.stage_run_id,s.scene_id,s.metadata_json,
-                   w.workflow_id,w.account_id,w.owner_user_id,w.project_id
+                   w.workflow_id,w.account_id,w.owner_user_id,w.project_id,
+                   sc.title as scene_title,sc.summary as scene_summary,sc.direction_json as scene_direction
             from public.v3_studio_stage_runs s
             join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+            join public.v3_scenes sc on sc.scene_id=s.scene_id
             where s.stage_run_id=$1 and w.workflow_id=$2
               and s.stage_type='fusion' and s.scope_type='scene'
             """,
@@ -432,6 +457,7 @@ async def main() -> None:
         rows = await conn.fetch(
             """
             select dt.turn_id,dt.sequence_no,dt.speaker_participant_id,p.display_name,
+                   dt.emotion_code,to_jsonb(dt) as turn_json,
                    ao.media_id as audio_media_id,
                    ma.storage_ref,ma.meta_json,ma.duration_ms,ma.lifecycle_state
             from public.v3_dialogue_turns dt
@@ -464,6 +490,21 @@ async def main() -> None:
         if second is None:
             raise RuntimeError("TWO_DISTINCT_SPEAKERS_REQUIRED")
         selected = [first, second]
+        dialogue_context: list[dict[str, Any]] = []
+        for row in selected:
+            turn_json = _dict(row["turn_json"])
+            audio_meta = _dict(row["meta_json"])
+            spoken_text, text_source = _extract_spoken_text(turn_json, audio_meta)
+            dialogue_context.append(
+                {
+                    "sequence_no": int(row["sequence_no"]),
+                    "speaker_participant_id": str(row["speaker_participant_id"]),
+                    "speaker_name": _clean(row["display_name"]),
+                    "emotion_code": _clean(row["emotion_code"]) or None,
+                    "spoken_text": spoken_text,
+                    "text_source": text_source,
+                }
+            )
     finally:
         await conn.close()
 
