@@ -1049,6 +1049,312 @@ async def _wait_capacity(client: httpx.AsyncClient, headers: dict[str, str], bas
         await asyncio.sleep(5)
 
 
+
+def _clamp(value: Any, low: float, high: float, default: float) -> float:
+    try:
+        number = float(value)
+    except Exception:
+        number = float(default)
+    return max(low, min(high, number))
+
+
+async def _full_scene_performance_plan(
+    *,
+    scene_title: str,
+    scene_summary: str,
+    scene_direction: dict[str, Any],
+    turns: list[dict[str, Any]],
+) -> dict[str, Any]:
+    system = (
+        "You are desifaces Performance Director for a multi-person shared-scene conversation. "
+        "Plan one continuous, photorealistic human performance across the entire conversation. "
+        "Interpret emotion from the actual dialogue, explicit emotion_code, scene context, prior/next turns, and relationship dynamics. "
+        "Expressions must be context-specific and restrained: happy, sad, angry, anxious, relieved, proud, affectionate, skeptical, "
+        "surprised, frustrated, calm and all other human emotions must only appear when the dialogue supports them. "
+        "The current speaker should have natural gaze, blinking, facial micro-expression, subtle head/body movement and occasional motivated gestures. "
+        "Every listener must remain alive and reactive without appearing to speak. Avoid mechanical blink counts, exact choreographed gesture timestamps, "
+        "generic smiles, constant nodding, repetitive hand motion, exaggerated acting, frozen poses, identity drift, warped hands or camera jumps. "
+        "This plan drives a PRE-LIPSYNC motion plate, so mouths must remain non-speaking apart from subtle non-speech expression. "
+        "Preserve identity, clothing, body shape, seating, background and left-right continuity. Return valid JSON only."
+    )
+    required_schema = {
+        "scene_emotional_arc": "string",
+        "opening_seconds": "0.3-1.2",
+        "closing_seconds": "0.5-1.5",
+        "turns": [
+            {
+                "sequence_no": 1,
+                "speaker_participant_id": "uuid",
+                "speaker_name": "string",
+                "primary_emotion": "string",
+                "secondary_emotion": "string|null",
+                "intensity": "0.0-1.0",
+                "expression_trajectory": ["string"],
+                "speaker_gaze": "string",
+                "speaker_blinks": "natural intent, not an exact count",
+                "speaker_head_motion": "string",
+                "speaker_body_motion": "string",
+                "speaker_gesture": "string",
+                "speaker_microexpressions": ["string"],
+                "listener_emotion": "string",
+                "listener_reaction": "string",
+                "listener_gaze": "string",
+                "listener_body_motion": "string",
+                "listener_mouth": "silent neutral",
+                "handoff_pause_seconds": "0.25-1.0"
+            }
+        ],
+        "negative_constraints": ["string"],
+    }
+    payload = {
+        "scene_title": scene_title,
+        "scene_summary": scene_summary,
+        "scene_direction": scene_direction,
+        "turns": turns,
+        "required_schema": required_schema,
+    }
+    user_message = (
+        "Create the full-scene performance plan. Keep the acting natural and context-specific. "
+        "Choose a short opening presence, a context-aware handoff pause after each dialogue turn, and a closing reaction tail. "
+        "Do not change dialogue order, speaker identity, or spoken text. Return JSON only.\n\n"
+        + json.dumps(payload, ensure_ascii=False)
+    )
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user_message}]
+
+    openai_key = _clean(os.getenv("OPENAI_API_KEY"))
+    azure_key = _clean(os.getenv("AZURE_OPENAI_KEY"))
+    async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
+        if openai_key:
+            base = _clean(os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+            model = _clean(os.getenv("DF_PERFORMANCE_DIRECTOR_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4.1-mini")
+            response = await client.post(
+                f"{base}/chat/completions",
+                headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                    "messages": messages,
+                },
+            )
+            if response.status_code != 200:
+                raise RuntimeError(f"FULL_PERFORMANCE_DIRECTOR_OPENAI_FAILED:{response.status_code}:{response.text[:1600]}")
+            body = response.json()
+            content = _clean(body["choices"][0]["message"]["content"])
+            provider_meta = {"provider": "openai", "model": model}
+        elif azure_key:
+            endpoint = _clean(os.getenv("AZURE_OPENAI_ENDPOINT")).rstrip("/")
+            deployment = _clean(os.getenv("AZURE_OPENAI_DEPLOYMENT"))
+            api_version = _clean(os.getenv("AZURE_OPENAI_API_VERSION") or "2024-10-21")
+            if not endpoint or not deployment:
+                raise RuntimeError("FULL_PERFORMANCE_DIRECTOR_AZURE_CONFIG_INCOMPLETE")
+            response = await client.post(
+                f"{endpoint}/openai/deployments/{deployment}/chat/completions",
+                params={"api-version": api_version},
+                headers={"api-key": azure_key, "Content-Type": "application/json"},
+                json={
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                    "messages": messages,
+                },
+            )
+            if response.status_code != 200:
+                raise RuntimeError(f"FULL_PERFORMANCE_DIRECTOR_AZURE_FAILED:{response.status_code}:{response.text[:1600]}")
+            body = response.json()
+            content = _clean(body["choices"][0]["message"]["content"])
+            provider_meta = {"provider": "azure_openai", "deployment": deployment}
+        else:
+            raise RuntimeError("FULL_PERFORMANCE_DIRECTOR_LLM_NOT_CONFIGURED")
+
+    plan = _json_from_model_content(content)
+    plan_turns = list(plan.get("turns") or [])
+    if len(plan_turns) != len(turns):
+        raise RuntimeError(
+            f"FULL_PERFORMANCE_DIRECTOR_TURN_COUNT_MISMATCH:expected={len(turns)}:actual={len(plan_turns)}"
+        )
+
+    expected = [(int(item["sequence_no"]), str(item["speaker_participant_id"])) for item in turns]
+    actual = [
+        (int(item.get("sequence_no") or 0), str(item.get("speaker_participant_id") or ""))
+        for item in plan_turns
+    ]
+    if actual != expected:
+        raise RuntimeError(f"FULL_PERFORMANCE_DIRECTOR_LINEAGE_MISMATCH:expected={expected}:actual={actual}")
+
+    plan["opening_seconds"] = round(_clamp(plan.get("opening_seconds"), 0.3, 1.2, 0.55), 3)
+    plan["closing_seconds"] = round(_clamp(plan.get("closing_seconds"), 0.5, 1.5, 0.8), 3)
+    normalized_turns: list[dict[str, Any]] = []
+    for source, directed in zip(turns, plan_turns):
+        item = dict(directed)
+        item["sequence_no"] = int(source["sequence_no"])
+        item["speaker_participant_id"] = str(source["speaker_participant_id"])
+        item["speaker_name"] = source["speaker_name"]
+        item["handoff_pause_seconds"] = round(
+            _clamp(item.get("handoff_pause_seconds"), 0.25, 1.0, 0.45),
+            3,
+        )
+        normalized_turns.append(item)
+    plan["turns"] = normalized_turns
+    plan["llm"] = provider_meta
+    return plan
+
+
+def _build_full_timeline(
+    *,
+    turns: list[dict[str, Any]],
+    durations: list[float],
+    plan: dict[str, Any],
+) -> tuple[list[dict[str, Any]], float]:
+    if len(turns) != len(durations):
+        raise RuntimeError("FULL_TIMELINE_DURATION_COUNT_MISMATCH")
+    directed = list(plan.get("turns") or [])
+    if len(directed) != len(turns):
+        raise RuntimeError("FULL_TIMELINE_PLAN_COUNT_MISMATCH")
+
+    cursor = float(plan["opening_seconds"])
+    timeline: list[dict[str, Any]] = []
+    for idx, (turn, duration, direction) in enumerate(zip(turns, durations, directed)):
+        start = round(cursor, 3)
+        end = round(start + float(duration), 3)
+        pause_after = (
+            float(plan["closing_seconds"])
+            if idx == len(turns) - 1
+            else float(direction["handoff_pause_seconds"])
+        )
+        pause_end = round(end + pause_after, 3)
+        timeline.append(
+            {
+                **turn,
+                "duration_seconds": round(float(duration), 3),
+                "start_time": start,
+                "end_time": end,
+                "pause_after_seconds": round(pause_after, 3),
+                "pause_end_time": pause_end,
+                "performance_direction": direction,
+            }
+        )
+        cursor = pause_end
+    return timeline, round(cursor, 3)
+
+
+def _pack_motion_chunks(
+    timeline: list[dict[str, Any]],
+    *,
+    total_duration: float,
+    max_chunk_seconds: float = 14.0,
+) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    chunk_start = 0.0
+    chunk_turns: list[dict[str, Any]] = []
+
+    for idx, turn in enumerate(timeline):
+        candidate_end = float(turn["pause_end_time"])
+        candidate_duration = candidate_end - chunk_start
+        if chunk_turns and candidate_duration > max_chunk_seconds:
+            prior_end = float(chunk_turns[-1]["pause_end_time"])
+            chunks.append(
+                {
+                    "chunk_no": len(chunks) + 1,
+                    "start_time": round(chunk_start, 3),
+                    "end_time": round(prior_end, 3),
+                    "duration_seconds": round(prior_end - chunk_start, 3),
+                    "turns": list(chunk_turns),
+                }
+            )
+            chunk_start = prior_end
+            chunk_turns = []
+
+        turn_duration_from_chunk = candidate_end - chunk_start
+        if not chunk_turns and turn_duration_from_chunk > max_chunk_seconds:
+            raise RuntimeError(
+                "FULL_PERFORMANCE_SINGLE_TURN_EXCEEDS_MOTION_LIMIT:"
+                f"sequence={turn['sequence_no']}:duration_with_context={turn_duration_from_chunk:.3f}"
+            )
+        chunk_turns.append(turn)
+
+    if chunk_turns:
+        final_end = max(float(total_duration), float(chunk_turns[-1]["pause_end_time"]))
+        chunks.append(
+            {
+                "chunk_no": len(chunks) + 1,
+                "start_time": round(chunk_start, 3),
+                "end_time": round(final_end, 3),
+                "duration_seconds": round(final_end - chunk_start, 3),
+                "turns": list(chunk_turns),
+            }
+        )
+
+    if not chunks:
+        raise RuntimeError("FULL_PERFORMANCE_NO_MOTION_CHUNKS")
+    return chunks
+
+
+def _chunk_motion_prompt(
+    *,
+    scene_title: str,
+    chunk: dict[str, Any],
+    plan: dict[str, Any],
+) -> str:
+    start = float(chunk["start_time"])
+    lines = [
+        f"Continuous photorealistic two-person conversation performance for scene '{scene_title}'.",
+        "PRE-LIPSYNC MOTION PLATE: neither person visibly articulates words; mouths remain naturally non-speaking.",
+        "Preserve both identities, seating, wardrobe, hands, background, lighting and left-right screen position.",
+        "Use subtle natural blinking, gaze, facial micro-expressions, head motion, body posture changes and motivated gestures.",
+        "The listener stays alive and contextually reactive without appearing to speak.",
+        "No camera cuts, no morphing, no identity swap, no generic smiling, no repetitive nodding, no exaggerated gestures.",
+    ]
+    for turn in chunk["turns"]:
+        d = dict(turn["performance_direction"])
+        rel_start = max(0.0, float(turn["start_time"]) - start)
+        rel_end = max(rel_start, float(turn["end_time"]) - start)
+        rel_pause_end = max(rel_end, float(turn["pause_end_time"]) - start)
+        lines.append(
+            f"{rel_start:.2f}-{rel_end:.2f}s speaker {turn['speaker_name']}: "
+            f"emotion {d.get('primary_emotion')}"
+            + (f" with {d.get('secondary_emotion')}" if d.get("secondary_emotion") else "")
+            + f", intensity {d.get('intensity')}. "
+            f"Gaze: {d.get('speaker_gaze')}. Blinking: {d.get('speaker_blinks')}. "
+            f"Head: {d.get('speaker_head_motion')}. Body: {d.get('speaker_body_motion')}. "
+            f"Gesture: {d.get('speaker_gesture')}. Microexpressions: {d.get('speaker_microexpressions')}. "
+            f"Listener: {d.get('listener_emotion')}; reaction {d.get('listener_reaction')}; "
+            f"gaze {d.get('listener_gaze')}; body {d.get('listener_body_motion')}; mouth silent."
+        )
+        if rel_pause_end > rel_end + 0.05:
+            lines.append(
+                f"{rel_end:.2f}-{rel_pause_end:.2f}s conversational handoff: both remain naturally present; "
+                "speaker relaxes after the line while listener reacts before the next turn. No speech articulation."
+            )
+
+    if chunk["chunk_no"] == 1 and float(plan.get("opening_seconds") or 0) > 0:
+        lines.append(
+            f"0.00-{float(plan['opening_seconds']):.2f}s opening presence: natural settling, eye contact and subtle breathing; no speech articulation."
+        )
+    return " ".join(lines)[:3200]
+
+
+def _concat_h264_segments(segment_paths: list[Path], output_path: Path) -> None:
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as handle:
+        list_path = Path(handle.name)
+        for path in segment_paths:
+            escaped = str(path.resolve()).replace("'", "'\\''")
+            handle.write(f"file '{escaped}'\n")
+    try:
+        _run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(list_path), "-c", "copy", str(output_path),
+        ])
+    finally:
+        list_path.unlink(missing_ok=True)
+
+
+def _extract_last_frame(video_path: Path, output_path: Path) -> None:
+    _run([
+        "ffmpeg", "-y", "-sseof", "-0.08", "-i", str(video_path),
+        "-frames:v", "1", str(output_path),
+    ])
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workflow-id", required=True)
