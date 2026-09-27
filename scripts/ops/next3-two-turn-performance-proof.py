@@ -939,6 +939,9 @@ async def main() -> None:
                     "end_time": end_time,
                     "frame_number": frame_number,
                     "coordinates": coordinates,
+                    "spoken_text": dialogue_context[index - 1]["spoken_text"],
+                    "emotion_code": dialogue_context[index - 1]["emotion_code"],
+                    "performance_direction": performance_plan["turns"][index - 1],
                 }
             )
             cursor = end_time
@@ -951,8 +954,8 @@ async def main() -> None:
         }
 
         print("============================================================")
-        print(" NEXT3 TWO-TURN SEGMENTS PROOF")
-        print(" mutation=provider_generation_and_qa_blob_only")
+        print(" NEXT3 TWO-TURN PERFORMANCE + SEGMENTS PROOF")
+        print(" mutation=performance_provider_generation_plus_sync_generation_and_qa_blob_only")
         print(" db_write=NONE")
         print(" production_touch=NONE")
         print(f"workflow_id={workflow_id}")
