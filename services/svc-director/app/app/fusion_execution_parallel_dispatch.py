@@ -537,13 +537,64 @@ class ParallelOrphanReconciledParentPricedSceneFusionExecutionService(
         stage_run_id: UUID,
         headers: dict[str, str],
     ) -> dict[str, Any]:
-        result = await super().sync(
-            pool,
-            account_id=account_id,
-            workflow_id=workflow_id,
-            stage_run_id=stage_run_id,
-            headers=headers,
-        )
+        try:
+            result = await super().sync(
+                pool,
+                account_id=account_id,
+                workflow_id=workflow_id,
+                stage_run_id=stage_run_id,
+                headers=headers,
+            )
+        except SceneFusionBridgeError as exc:
+            # A terminal child failure has already been persisted by the resilient
+            # execution chain and parent pricing has already been released by the
+            # parent-priced layer. Return the durable child states to the UI instead
+            # of collapsing status sync into a 409. This keeps successful children
+            # visible and enables failed-child-only retry without re-rendering them.
+            if str(exc) != "fusion_child_job_failed":
+                raise
+            async with pool.acquire() as conn:
+                context = await load_fusion_scene_context(
+                    conn,
+                    account_id=account_id,
+                    workflow_id=workflow_id,
+                    stage_run_id=stage_run_id,
+                )
+                failed_row = await conn.fetchrow(
+                    """
+                    select created_at,metadata_json
+                    from public.v3_studio_stage_attempts
+                    where stage_run_id=$1
+                    order by attempt_no desc
+                    limit 1
+                    """,
+                    stage_run_id,
+                )
+            failed_meta = _as_dict(failed_row["metadata_json"]) if failed_row else {}
+            failed_children = list(failed_meta.get("children") or [])
+            preserved_count = sum(
+                1
+                for item in failed_children
+                if _clean(item.get("status")).lower() in _TERMINAL_SUCCESS
+                and bool(_clean(item.get("video_url")))
+            )
+            result = {
+                "workflow_id": str(workflow_id),
+                "stage_run_id": str(stage_run_id),
+                "scene_id": str(context.scene_id),
+                "provider_state": "failed",
+                "stage_state": "failed",
+                "media_asset_id": None,
+                "video_url": None,
+                "review_item_id": None,
+                "review_decision": None,
+                "children": failed_children,
+                "error_code": "fusion_child_failed",
+                "error_message": "one_or_more_child_fusion_jobs_failed",
+                "retryable": True,
+                "retry_scope": "failed_child_only",
+                "preserved_child_count": preserved_count,
+            }
 
         async with pool.acquire() as conn:
             row = await conn.fetchrow(

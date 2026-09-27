@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -42,3 +43,15 @@ def test_shared_scene_contract_requires_unique_speakers():
             image_height=1080,
             speaker_targets=[target, target],
         )
+
+
+def test_shared_scene_route_persists_relational_group_photo_lineage():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "shared_scene_routes.py"
+    ).read_text(encoding="utf-8")
+    assert "'source_image'" in source
+    assert "'approved_shared_scene_image'" in source
+    assert "v3_studio_stage_inputs" in source

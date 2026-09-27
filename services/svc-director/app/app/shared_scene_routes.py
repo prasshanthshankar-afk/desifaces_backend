@@ -130,7 +130,7 @@ async def set_shared_scene_conversation(
                 from public.media_assets
                 where id=$1 and user_id=$2 and account_id=$3
                   and (project_id is null or project_id=$4)
-                  and kind in ('image','face_image','face_source_image')
+                  and kind in ('image','source_image','face_image','face_source_image')
                   and lifecycle_state='active'
                 """,
                 body.shared_scene_media_id,
@@ -255,6 +255,21 @@ async def set_shared_scene_conversation(
                 """,
                 stage_run_id,
                 json.dumps(metadata, ensure_ascii=False),
+            )
+
+            # Persist the authoritative group photo as canonical Fusion input
+            # lineage. The media itself is not produced by another Studio stage,
+            # therefore source_stage_run_id is intentionally NULL.
+            await conn.execute(
+                """
+                insert into public.v3_studio_stage_inputs(
+                    stage_run_id,media_id,input_role,source_stage_run_id
+                )
+                values($1,$2,'approved_shared_scene_image',null)
+                on conflict(stage_run_id,media_id,input_role) do nothing
+                """,
+                stage_run_id,
+                body.shared_scene_media_id,
             )
 
     return {

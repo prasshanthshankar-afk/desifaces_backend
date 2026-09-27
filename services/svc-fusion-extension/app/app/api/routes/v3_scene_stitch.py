@@ -6,6 +6,7 @@ import hashlib
 import os
 import tempfile
 from typing import Any
+from urllib.parse import urlparse
 from uuid import UUID
 
 import asyncpg
@@ -44,6 +45,27 @@ class VideoReadUrlOut(BaseModel):
     read_url: str
 
 
+class MediaReadUrlOut(BaseModel):
+    media_id: UUID
+    kind: str
+    read_url: str
+
+
+def _effective_scene_stitch_mode(
+    stitch_mode: str | None,
+    conversation_mode: str | None,
+) -> str | None:
+    """Return the deterministic assembly mode for one canonical scene.
+
+    Shared-scene conversations must never cross-fade independently generated
+    active-speaker clips. They all originate from the same group photo, so a
+    hard cut preserves identity/geometry and avoids provider-frame blending.
+    """
+    if str(conversation_mode or "").strip().lower() == "shared_scene":
+        return "hard_cut"
+    return str(stitch_mode or "").strip().lower() or None
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
@@ -69,6 +91,31 @@ def _file_sha256_and_size(path: str) -> tuple[str, int]:
             digest.update(chunk)
             total += len(chunk)
     return digest.hexdigest(), total
+
+
+def _media_storage_location(storage_ref: str | None, meta: dict[str, Any]) -> tuple[str, str]:
+    container = str(meta.get("storage_container") or "").strip()
+    blob_name = str(meta.get("blob_name") or meta.get("storage_path") or "").strip()
+
+    for raw in (blob_name, str(storage_ref or "").strip()):
+        if not raw:
+            continue
+        if raw.startswith(("az://", "azure://")):
+            path = raw.split("://", 1)[1].lstrip("/")
+            if "/" in path:
+                c, b = path.split("/", 1)
+                container = container or c
+                blob_name = b
+                break
+        if raw.startswith(("http://", "https://")):
+            path = urlparse(raw).path.lstrip("/")
+            if "/" in path:
+                c, b = path.split("/", 1)
+                container = container or c
+                blob_name = b
+                break
+
+    return container.strip(), blob_name.lstrip("/").strip()
 
 
 def _sign_video(*, container: str, blob_name: str) -> str:
@@ -102,8 +149,8 @@ async def stitch_scene(
     stitch_mode = str(body.stitch_mode or "").strip().lower() or None
     if stitch_mode not in {None, "xfade", "fade", "concat", "hard_cut"}:
         raise HTTPException(status_code=422, detail="scene_stitch_mode_invalid")
-    conversation_mode = str(body.conversation_mode or "").strip().lower() or None
-    if conversation_mode not in {None, "shared_scene", "ordered_speaker_shots"}:
+    requested_conversation_mode = str(body.conversation_mode or "").strip().lower() or None
+    if requested_conversation_mode not in {None, "shared_scene", "ordered_speaker_shots"}:
         raise HTTPException(status_code=422, detail="scene_stitch_conversation_mode_invalid")
     if len(segment_urls) != len(body.segment_urls):
         raise HTTPException(status_code=422, detail="scene_stitch_segment_url_required")
@@ -112,7 +159,8 @@ async def stitch_scene(
         account = await _resolve_account_or_401(conn, canonical_user_id)
         workflow = await conn.fetchrow(
             """
-            select w.workflow_id,w.project_id,s.stage_run_id,s.stage_type,s.scope_type
+            select w.workflow_id,w.project_id,s.stage_run_id,s.stage_type,s.scope_type,
+                   s.metadata_json as stage_metadata
             from public.v3_studio_workflows w
             join public.v3_studio_stage_runs s on s.workflow_id=w.workflow_id
             where w.workflow_id=$1 and w.project_id=$2 and w.account_id=$3
@@ -125,6 +173,20 @@ async def stitch_scene(
         )
         if not workflow:
             raise HTTPException(status_code=404, detail="scene_stitch_workflow_stage_not_found")
+
+        stage_metadata = _as_dict(workflow["stage_metadata"])
+        canonical_conversation_mode = str(stage_metadata.get("conversation_mode") or "").strip().lower() or None
+        if canonical_conversation_mode not in {None, "shared_scene", "ordered_speaker_shots"}:
+            raise HTTPException(status_code=409, detail="scene_stitch_stage_conversation_mode_invalid")
+        if (
+            requested_conversation_mode
+            and canonical_conversation_mode
+            and requested_conversation_mode != canonical_conversation_mode
+        ):
+            raise HTTPException(status_code=409, detail="scene_stitch_conversation_mode_mismatch")
+
+        conversation_mode = canonical_conversation_mode or requested_conversation_mode
+        effective_stitch_mode = _effective_scene_stitch_mode(stitch_mode, conversation_mode)
 
         attempt_ok = await conn.fetchval(
             """
@@ -182,7 +244,7 @@ async def stitch_scene(
                 resilient_stitch_video_urls,
                 segment_urls,
                 out_mp4,
-                stitch_mode_override=stitch_mode,
+                stitch_mode_override=effective_stitch_mode,
             )
             sha256, byte_count = await asyncio.to_thread(_file_sha256_and_size, out_mp4)
             uploaded_storage_path, signed_url = await asyncio.to_thread(
@@ -246,7 +308,7 @@ async def stitch_scene(
                     "v3_studio_stage_run_id": str(body.stage_run_id),
                     "v3_studio_attempt_id": str(body.attempt_id),
                     "segment_count": len(segment_urls),
-                    "stitch_mode": stitch_mode or "default",
+                    "stitch_mode": effective_stitch_mode or "default",
                     "conversation_mode": conversation_mode,
                     "conversation_kind": (
                         "group_photo_conversation"
@@ -269,6 +331,57 @@ async def stitch_scene(
         video_url=signed_url,
         segment_count=len(segment_urls),
         reused=False,
+    )
+
+
+@router.get("/media/{media_id}/read-url", response_model=MediaReadUrlOut)
+async def get_v3_media_read_url(
+    media_id: UUID,
+    user_id: str = Depends(get_current_user_id),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+) -> MediaReadUrlOut:
+    """Mint a fresh URL for any user-owned active media used by a V3 workflow.
+
+    This provides a durable resume path for shared-scene group photos even when
+    the Face API is temporarily unavailable. Authorization remains user/account
+    scoped and the durable media id remains the source of truth.
+    """
+    try:
+        canonical_user_id = UUID(str(user_id))
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="invalid_user_identity") from exc
+
+    async with pool.acquire() as conn:
+        account = await _resolve_account_or_401(conn, canonical_user_id)
+        row = await conn.fetchrow(
+            """
+            select id,user_id,account_id,project_id,kind,lifecycle_state,storage_ref,meta_json
+            from public.media_assets
+            where id=$1 and user_id=$2 and lifecycle_state='active'
+            """,
+            media_id,
+            canonical_user_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="media_not_found")
+        if row["account_id"] and UUID(str(row["account_id"])) != account.account_id:
+            raise HTTPException(status_code=404, detail="media_not_found")
+
+    meta = _as_dict(row["meta_json"])
+    container, blob_name = _media_storage_location(row["storage_ref"], meta)
+    if not container or not blob_name:
+        raise HTTPException(status_code=409, detail="media_storage_lineage_missing")
+
+    sas = AzureBlobService(settings.AZURE_STORAGE_CONNECTION_STRING)
+    read_url = sas.sign_read_url(
+        container,
+        blob_name,
+        int(getattr(settings, "FINAL_SAS_TTL_SECONDS", 86400)),
+    )
+    return MediaReadUrlOut(
+        media_id=UUID(str(row["id"])),
+        kind=str(row["kind"] or ""),
+        read_url=read_url,
     )
 
 

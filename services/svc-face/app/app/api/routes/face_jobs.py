@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlparse
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field, ValidationError
@@ -225,6 +225,42 @@ logger = logging.getLogger("api.face_jobs")
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB
 UPLOAD_CONTAINER = getattr(settings, "FACE_OUTPUT_CONTAINER", "face-output")
 UPLOAD_PREFIX = "face-input"
+
+
+class FaceAssetReadUrlResponse(BaseModel):
+    media_id: str
+    read_url: str
+    image_url: str
+
+
+def _asset_blob_location(storage_ref: str | None, meta: dict[str, Any]) -> tuple[str, str]:
+    container = str(meta.get("storage_container") or "").strip()
+    blob_name = str(meta.get("blob_name") or meta.get("storage_path") or "").strip()
+
+    if blob_name.startswith(("az://", "azure://")):
+        raw = blob_name.split("://", 1)[1].lstrip("/")
+        if "/" in raw:
+            parsed_container, parsed_blob = raw.split("/", 1)
+            container = container or parsed_container
+            blob_name = parsed_blob
+
+    ref = str(storage_ref or "").strip()
+    if (not container or not blob_name) and ref:
+        if ref.startswith(("az://", "azure://")):
+            raw = ref.split("://", 1)[1].lstrip("/")
+            if "/" in raw:
+                parsed_container, parsed_blob = raw.split("/", 1)
+                container = container or parsed_container
+                blob_name = blob_name or parsed_blob
+        elif ref.startswith(("http://", "https://")):
+            parsed = urlparse(ref)
+            raw = parsed.path.lstrip("/")
+            if "/" in raw:
+                parsed_container, parsed_blob = raw.split("/", 1)
+                container = container or parsed_container
+                blob_name = blob_name or parsed_blob
+
+    return container.strip(), blob_name.lstrip("/").strip()
 
 
 def _parse_unsafe_prompt_reason(err: Exception) -> Optional[str]:
@@ -1009,6 +1045,61 @@ async def upload_source_image(
         content_type=content_type,
         size_bytes=int(len(data)),
         storage_path=storage_path,
+    )
+
+
+@router.get("/assets/{media_id}/read-url", response_model=FaceAssetReadUrlResponse)
+async def get_face_asset_read_url(
+    media_id: UUID,
+    user_id: str = Depends(get_current_user_id),
+) -> FaceAssetReadUrlResponse:
+    """Mint a fresh read URL for one user-owned active image asset.
+
+    Saved/shared-scene workflows persist the durable media id, never an expiring
+    SAS URL. Resume therefore rehydrates the image from media_assets each time.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            select id,user_id,kind,lifecycle_state,storage_ref,meta_json
+            from public.media_assets
+            where id=$1::uuid and user_id=$2::uuid
+              and lifecycle_state='active'
+              and kind in ('image','source_image','face_image','face_source_image')
+            """,
+            media_id,
+            UUID(str(user_id)),
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail="face_media_not_found")
+
+    meta = row["meta_json"] if isinstance(row["meta_json"], dict) else {}
+    container, blob_name = _asset_blob_location(row["storage_ref"], meta)
+    if not container or not blob_name:
+        raise HTTPException(status_code=409, detail="face_media_storage_lineage_missing")
+
+    try:
+        _, account_name, account_key, endpoint_suffix = _azure_clients()
+        read_url = _make_read_sas_url(
+            account_name,
+            account_key,
+            endpoint_suffix,
+            container=container,
+            blob_name=blob_name,
+            hours=24,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("face_asset_read_url_failed media_id=%s user_id=%s", media_id, user_id)
+        raise HTTPException(status_code=503, detail="face_media_read_url_unavailable") from exc
+
+    return FaceAssetReadUrlResponse(
+        media_id=str(row["id"]),
+        read_url=read_url,
+        image_url=read_url,
     )
 
 

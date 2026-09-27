@@ -143,10 +143,16 @@ class ParentScenePricingClient:
         }
 
     async def _post(self, path: str, *, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
-        response = await self._client.post(path, headers=headers, json=body)
+        action = path.rsplit("/", 1)[-1]
+        try:
+            response = await self._client.post(path, headers=headers, json=body)
+        except httpx.HTTPError as exc:
+            raise SceneFusionBridgeError(
+                f"fusion_parent_pricing_{action}_unavailable:{str(exc)[:1200]}"
+            ) from exc
         if response.status_code != 200:
             raise SceneFusionBridgeError(
-                f"fusion_parent_pricing_{path.rsplit('/', 1)[-1]}_failed:"
+                f"fusion_parent_pricing_{action}_failed:"
                 f"{response.status_code}:{response.text[:1600]}"
             )
         return dict(response.json() or {})
@@ -316,22 +322,37 @@ class ParentPricedSceneFusionExecutionService(PerformantResilientSceneFusionExec
             if latest:
                 preserved = _completed_children(_as_dict(latest["metadata_json"]))
 
+        all_turn_ids = {str(turn.dialogue_turn_id) for turn in context.turns}
+        unexpected_preserved = set(preserved) - all_turn_ids
+        if unexpected_preserved:
+            raise SceneFusionBridgeError("fusion_preserved_child_lineage_mismatch")
+
         required_turn_ids = {
-            str(turn.dialogue_turn_id)
-            for turn in context.turns
-            if str(turn.dialogue_turn_id) not in preserved
+            turn_id
+            for turn_id in all_turn_ids
+            if turn_id not in preserved
         }
         request_nonce_by_turn = {
             turn_id: uuid4().hex for turn_id in required_turn_ids
         }
-        children = await _compile_children(
-            context=context,
-            face_client=self.face_client,
-            audio_client=self.audio_client,
-            headers=headers,
-            external_provider_ok=external_provider_ok,
-            request_nonce_by_turn=request_nonce_by_turn,
-        )
+
+        # Stitch-only recovery already has a concrete video artifact for every
+        # dialogue turn. Do not resolve Face/Audio inputs again in that case:
+        # those services are generation prerequisites, not stitch prerequisites.
+        # This keeps technical finalization independent from upstream service
+        # availability and guarantees zero child provider work on a 0-required
+        # retry.
+        children: list[dict[str, Any]] = []
+        if required_turn_ids:
+            children = await _compile_children(
+                context=context,
+                face_client=self.face_client,
+                audio_client=self.audio_client,
+                headers=headers,
+                external_provider_ok=external_provider_ok,
+                request_nonce_by_turn=request_nonce_by_turn,
+            )
+
         required_children = [
             {
                 **child,
@@ -432,6 +453,9 @@ class ParentPricedSceneFusionExecutionService(PerformantResilientSceneFusionExec
                     preserved = _completed_children(_as_dict(prior_attempt["metadata_json"]))
 
             all_turn_ids = {str(turn.dialogue_turn_id) for turn in context.turns}
+            unexpected_preserved = set(preserved) - all_turn_ids
+            if unexpected_preserved:
+                raise SceneFusionBridgeError("fusion_preserved_child_lineage_mismatch")
             expected_turns = all_turn_ids - set(preserved)
             if set(child_confirmation_by_turn) != expected_turns:
                 raise SceneFusionBridgeError("fusion_child_confirmation_bundle_mismatch")
