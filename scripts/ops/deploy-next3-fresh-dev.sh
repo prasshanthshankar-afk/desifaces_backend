@@ -229,15 +229,15 @@ wait_http http://127.0.0.1:18011/api/health 200 DIRECTOR || fail "director unhea
 
 for service in "${SERVICES[@]}"; do
   target="${TARGET[$service]}"
-  docker inspect "$target" --format '{{range .Config.Env}}{{println .}}{{end}}' \
-  | python3 - "$target" <<'PY'
+  envtxt="$(docker inspect "$target" --format '{{range .Config.Env}}{{println .}}{{end}}')"
+  python3 - "$target" "$envtxt" <<'PY'
 import sys
 from urllib.parse import urlsplit
 
 target=sys.argv[1]
+raw=sys.argv[2]
 env={}
-for line in sys.stdin:
-    line=line.rstrip("\n")
+for line in raw.splitlines():
     if "=" in line:
         k,v=line.split("=",1)
         env[k]=v
