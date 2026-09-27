@@ -61,6 +61,146 @@ def _extract_spoken_text(turn_json: dict[str, Any], audio_meta: dict[str, Any]) 
         f"turn_keys={sorted(turn_json.keys())}:audio_meta_keys={sorted(audio_meta.keys())}"
     )
 
+def _json_from_model_content(content: str) -> dict[str, Any]:
+    raw = _clean(content)
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\\s*", "", raw, flags=re.I)
+        raw = re.sub(r"\\s*```$", "", raw)
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(f"PERFORMANCE_DIRECTOR_JSON_INVALID:{raw[:1200]}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("PERFORMANCE_DIRECTOR_JSON_NOT_OBJECT")
+    return parsed
+
+
+async def _performance_director_plan(
+    *,
+    scene_title: str,
+    scene_summary: str,
+    scene_direction: dict[str, Any],
+    turns: list[dict[str, Any]],
+) -> dict[str, Any]:
+    system = (
+        "You are desifaces Performance Director. Design a photorealistic, restrained, context-specific "
+        "nonverbal performance for two people in one continuous conversation shot. "
+        "Infer emotion from dialogue meaning, explicit emotion_code, scene context, prior/next turn, and speaker/listener role. "
+        "Human expression must be nuanced: happy, sad, angry, anxious, relieved, proud, affectionate, skeptical, surprised, "
+        "frustrated, calm and other states only when context supports them. Avoid generic smiling, constant nodding, repetitive "
+        "gestures, exaggerated acting, or frozen mannequin behavior. The speaker should use natural blinks, eye focus, "
+        "micro-expressions, subtle head/body motion and occasional motivated gestures. The listener must remain alive: natural "
+        "blinking, gaze toward the speaker, small posture shifts and context-appropriate reactions. CRITICAL: this is a PRE-LIPSYNC "
+        "motion plate. Neither person should visibly articulate speech or mouth words; keep mouths neutral apart from subtle non-speech "
+        "expression. Preserve both identities, clothing, body shape, composition, background and realistic hands. Use one continuous "
+        "stable two-shot with no scene cut, no identity swap, no camera jump, no morphing. Return valid JSON only."
+    )
+    schema = {
+        "scene_emotional_arc": "short string",
+        "continuous_motion_prompt": "provider-ready prompt under 2200 chars with explicit timing phases",
+        "turns": [
+            {
+                "sequence_no": 1,
+                "speaker_participant_id": "uuid",
+                "speaker_name": "string",
+                "primary_emotion": "string",
+                "secondary_emotion": "string|null",
+                "intensity": 0.0,
+                "expression_trajectory": ["string", "string"],
+                "speaker_gaze": "string",
+                "speaker_blinks": "string",
+                "speaker_head_motion": "string",
+                "speaker_body_motion": "string",
+                "speaker_gesture": "string",
+                "speaker_microexpressions": ["string"],
+                "listener_participant_id": "uuid",
+                "listener_name": "string",
+                "listener_emotion": "string",
+                "listener_reaction": "string",
+                "listener_gaze": "string",
+                "listener_body_motion": "string",
+                "listener_mouth": "silent neutral",
+            }
+        ],
+        "negative_constraints": ["string"],
+    }
+    payload = {
+        "scene_title": scene_title,
+        "scene_summary": scene_summary,
+        "scene_direction": scene_direction,
+        "turns": turns,
+        "required_schema": schema,
+    }
+    messages = [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": (
+                "Create the two-turn performance plan. continuous_motion_prompt must contain exact turn timing in seconds and "
+                "describe BOTH speaker and listener behavior for each phase while keeping mouths non-speaking.\\n\\n"
+                + json.dumps(payload, ensure_ascii=False)
+            ),
+        },
+    ]
+
+    openai_key = _clean(os.getenv("OPENAI_API_KEY"))
+    azure_key = _clean(os.getenv("AZURE_OPENAI_KEY"))
+    async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
+        if openai_key:
+            base = _clean(os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+            model = _clean(os.getenv("DF_PERFORMANCE_DIRECTOR_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4.1-mini")
+            response = await client.post(
+                f"{base}/chat/completions",
+                headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "temperature": 0.25,
+                    "response_format": {"type": "json_object"},
+                    "messages": messages,
+                },
+            )
+            if response.status_code != 200:
+                raise RuntimeError(f"PERFORMANCE_DIRECTOR_OPENAI_FAILED:{response.status_code}:{response.text[:1600]}")
+            body = response.json()
+            content = _clean(body["choices"][0]["message"]["content"])
+            provider_meta = {"provider": "openai", "model": model}
+        elif azure_key:
+            endpoint = _clean(os.getenv("AZURE_OPENAI_ENDPOINT")).rstrip("/")
+            deployment = _clean(os.getenv("AZURE_OPENAI_DEPLOYMENT"))
+            api_version = _clean(os.getenv("AZURE_OPENAI_API_VERSION") or "2024-10-21")
+            if not endpoint or not deployment:
+                raise RuntimeError("PERFORMANCE_DIRECTOR_AZURE_CONFIG_INCOMPLETE")
+            response = await client.post(
+                f"{endpoint}/openai/deployments/{deployment}/chat/completions",
+                params={"api-version": api_version},
+                headers={"api-key": azure_key, "Content-Type": "application/json"},
+                json={"temperature": 0.25, "response_format": {"type": "json_object"}, "messages": messages},
+            )
+            if response.status_code != 200:
+                raise RuntimeError(f"PERFORMANCE_DIRECTOR_AZURE_FAILED:{response.status_code}:{response.text[:1600]}")
+            body = response.json()
+            content = _clean(body["choices"][0]["message"]["content"])
+            provider_meta = {"provider": "azure_openai", "deployment": deployment}
+        else:
+            raise RuntimeError("PERFORMANCE_DIRECTOR_LLM_NOT_CONFIGURED")
+
+    plan = _json_from_model_content(content)
+    plan_turns = list(plan.get("turns") or [])
+    if len(plan_turns) != len(turns):
+        raise RuntimeError("PERFORMANCE_DIRECTOR_TURN_COUNT_MISMATCH")
+    expected_ids = [str(item["speaker_participant_id"]) for item in turns]
+    planned_ids = [str(item.get("speaker_participant_id") or "") for item in plan_turns]
+    if planned_ids != expected_ids:
+        raise RuntimeError(f"PERFORMANCE_DIRECTOR_SPEAKER_ORDER_MISMATCH:expected={expected_ids}:actual={planned_ids}")
+    prompt = _clean(plan.get("continuous_motion_prompt"))
+    if not prompt:
+        raise RuntimeError("PERFORMANCE_DIRECTOR_MOTION_PROMPT_MISSING")
+    if len(prompt) > 2400:
+        prompt = prompt[:2400]
+        plan["continuous_motion_prompt"] = prompt
+    plan["llm"] = provider_meta
+    return plan
+
 def _db_dsn() -> str:
     raw = _clean(os.getenv("DATABASE_URL"))
     if raw.startswith("postgresql+asyncpg://"):
