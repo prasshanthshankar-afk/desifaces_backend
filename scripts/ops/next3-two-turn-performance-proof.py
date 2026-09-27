@@ -201,6 +201,83 @@ async def _performance_director_plan(
     plan["llm"] = provider_meta
     return plan
 
+def _extract_video_url(value: Any) -> str:
+    if isinstance(value, str):
+        s = value.strip()
+        if s.startswith(("http://", "https://")):
+            return s
+        return ""
+    if isinstance(value, list):
+        for item in value:
+            found = _extract_video_url(item)
+            if found:
+                return found
+        return ""
+    if isinstance(value, dict):
+        for key in ("video_url", "url"):
+            direct = value.get(key)
+            if isinstance(direct, str) and direct.strip().startswith(("http://", "https://")):
+                return direct.strip()
+        for key in ("video", "videos", "output", "outputs", "data", "result", "file"):
+            found = _extract_video_url(value.get(key))
+            if found:
+                return found
+        for nested in value.values():
+            found = _extract_video_url(nested)
+            if found:
+                return found
+    return ""
+
+
+async def _fal_generate_motion(
+    *,
+    model_id: str,
+    fal_key: str,
+    payload: dict[str, Any],
+    existing_request_id: str = "",
+) -> tuple[str, str, dict[str, Any]]:
+    base_url = _clean(os.getenv("FAL_QUEUE_BASE_URL") or "https://queue.fal.run").rstrip("/")
+    headers = {"Authorization": f"Key {fal_key}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        request_id = _clean(existing_request_id)
+        if request_id:
+            status_url = f"{base_url}/{model_id}/requests/{request_id}/status"
+            response_url = f"{base_url}/{model_id}/requests/{request_id}"
+            print(f"PERFORMANCE_MOTION_PROVIDER_JOB_REUSE={request_id}")
+        else:
+            submit = await client.post(f"{base_url}/{model_id}", headers=headers, json=payload)
+            if submit.status_code not in {200, 201, 202}:
+                raise RuntimeError(f"PERFORMANCE_MOTION_SUBMIT_FAILED:{submit.status_code}:{submit.text[:1600]}")
+            body = submit.json()
+            request_id = _clean(body.get("request_id"))
+            status_url = _clean(body.get("status_url"))
+            response_url = _clean(body.get("response_url"))
+            if not request_id or not status_url or not response_url:
+                raise RuntimeError(f"PERFORMANCE_MOTION_SUBMIT_RESPONSE_INVALID:{body}")
+            print(f"PERFORMANCE_MOTION_PROVIDER_JOB_ID={request_id}")
+
+        deadline = time.monotonic() + 1800
+        while time.monotonic() < deadline:
+            status_resp = await client.get(status_url, headers=headers)
+            if status_resp.status_code not in {200, 202}:
+                raise RuntimeError(f"PERFORMANCE_MOTION_STATUS_FAILED:{status_resp.status_code}:{status_resp.text[:1200]}")
+            status_payload = status_resp.json()
+            status = _clean(status_payload.get("status")).upper()
+            print(f"PERFORMANCE_MOTION_STATUS={status or 'UNKNOWN'}")
+            if status in {"COMPLETED", "SUCCEEDED"}:
+                result_resp = await client.get(response_url, headers=headers)
+                if result_resp.status_code != 200:
+                    raise RuntimeError(f"PERFORMANCE_MOTION_RESULT_FAILED:{result_resp.status_code}:{result_resp.text[:1200]}")
+                result_payload = result_resp.json()
+                video_url = _extract_video_url(result_payload)
+                if not video_url:
+                    raise RuntimeError(f"PERFORMANCE_MOTION_RESULT_VIDEO_MISSING:{json.dumps(result_payload)[:1800]}")
+                return request_id, video_url, result_payload
+            if status in {"FAILED", "ERROR", "CANCELED", "CANCELLED"}:
+                raise RuntimeError("PERFORMANCE_MOTION_PROVIDER_FAILED:" + json.dumps(status_payload, ensure_ascii=False)[:1800])
+            await asyncio.sleep(8)
+    raise RuntimeError("PERFORMANCE_MOTION_POLL_TIMEOUT")
+
 def _db_dsn() -> str:
     raw = _clean(os.getenv("DATABASE_URL"))
     if raw.startswith("postgresql+asyncpg://"):
