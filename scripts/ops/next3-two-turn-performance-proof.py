@@ -1021,10 +1021,29 @@ async def main() -> None:
             zip(selected, audio_urls, durations), start=1
         ):
             ref_id = f"audio_{index}"
-            coordinates = _speaker_coordinates(stage_meta, UUID(str(row["speaker_participant_id"])))
+            source_coordinates = _speaker_coordinates(
+                stage_meta,
+                UUID(str(row["speaker_participant_id"])),
+            )
+            coordinates = _speaker_coordinates_for_video(
+                stage_meta,
+                UUID(str(row["speaker_participant_id"])),
+                video_width=int(motion_info["width"]),
+                video_height=int(motion_info["height"]),
+            )
             start_time = round(cursor, 3)
             end_time = round(cursor + duration, 3)
-            frame_number = max(0, int(round(start_time * fps)))
+            reference_time = min(
+                max(start_time + 0.15, start_time),
+                max(start_time, end_time - 0.05),
+            )
+            frame_number = max(
+                0,
+                min(
+                    int(motion_info["frame_count"]) - 1,
+                    int(round(reference_time * float(motion_info["fps"]))),
+                ),
+            )
             inputs.append({"type": "audio", "url": audio_url, "refId": ref_id})
             segments.append(
                 {
@@ -1051,6 +1070,8 @@ async def main() -> None:
                     "start_time": start_time,
                     "end_time": end_time,
                     "frame_number": frame_number,
+                    "reference_time_seconds": round(reference_time, 3),
+                    "source_image_coordinates": source_coordinates,
                     "coordinates": coordinates,
                     "spoken_text": dialogue_context[index - 1]["spoken_text"],
                     "emotion_code": dialogue_context[index - 1]["emotion_code"],
@@ -1079,7 +1100,9 @@ async def main() -> None:
             print(
                 "TURN "
                 f"seq={turn['sequence_no']} speaker={turn['display_name']} "
-                f"coords={turn['coordinates']} "
+                f"source_coords={turn['source_image_coordinates']} "
+                f"video_coords={turn['coordinates']} "
+                f"frame={turn['frame_number']} "
                 f"start={turn['start_time']} end={turn['end_time']}"
             )
         print("============================================================")
