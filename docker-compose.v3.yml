@@ -46,7 +46,7 @@ services:
 
   svc-audio:
     container_name: df-svc-audio
-    image: desifaces-v3-svc-audio
+    image: desifaces-svc-audio
     environment:
       DF_V3_CANONICAL_ADAPTER_SHADOW_ENABLED: "true"
     ports: !override
@@ -79,7 +79,7 @@ services:
 
   svc-pricing:
     container_name: df-svc-pricing
-    image: desifaces-v3-svc-pricing
+    image: desifaces-svc-pricing
     build:
       context: .
       dockerfile: services/svc-pricing/app/Dockerfile.v3
@@ -99,7 +99,7 @@ services:
   # orchestration runner below.
   svc-director:
     container_name: df-svc-director
-    image: desifaces-v3-svc-director
+    image: desifaces-svc-director
     restart: unless-stopped
     build:
       context: .
@@ -130,7 +130,7 @@ services:
   # worker, and therefore has its own explicit profile.
   svc-director-worker:
     container_name: df-svc-director-worker
-    image: desifaces-v3-svc-director
+    image: desifaces-svc-director
     restart: unless-stopped
     build:
       context: .
@@ -169,7 +169,7 @@ services:
 
   svc-audio-worker:
     container_name: df-svc-audio-worker
-    image: desifaces-v3-svc-audio-worker
+    image: desifaces-svc-audio-worker
     profiles: !override ["v3-execution"]
 
   svc-fusion-worker:
