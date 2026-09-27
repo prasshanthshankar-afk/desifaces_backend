@@ -1243,49 +1243,97 @@ def _pack_motion_chunks(
     total_duration: float,
     max_chunk_seconds: float = 14.0,
 ) -> list[dict[str, Any]]:
-    chunks: list[dict[str, Any]] = []
-    chunk_start = 0.0
-    chunk_turns: list[dict[str, Any]] = []
+    if not timeline:
+        raise RuntimeError("FULL_PERFORMANCE_NO_TIMELINE")
 
-    for idx, turn in enumerate(timeline):
-        candidate_end = float(turn["pause_end_time"])
-        candidate_duration = candidate_end - chunk_start
-        if chunk_turns and candidate_duration > max_chunk_seconds:
-            prior_end = float(chunk_turns[-1]["pause_end_time"])
-            chunks.append(
+    total = float(total_duration)
+    max_len = max(3.0, float(max_chunk_seconds))
+    chunks: list[dict[str, Any]] = []
+    cursor = 0.0
+
+    natural_boundaries = sorted(
+        {
+            round(float(item["pause_end_time"]), 3)
+            for item in timeline
+            if 0.0 < float(item["pause_end_time"]) < total
+        }
+    )
+
+    while cursor < total - 0.001:
+        hard_end = min(total, cursor + max_len)
+
+        # Prefer a conversational handoff boundary when one exists near the end
+        # of the provider window. If a single dialogue turn itself is longer than
+        # the provider window, fall back to a deterministic mid-turn slice.
+        candidates = [
+            boundary
+            for boundary in natural_boundaries
+            if cursor + 3.0 <= boundary <= hard_end + 1e-6
+        ]
+        if candidates:
+            chunk_end = max(candidates)
+            # Avoid creating a tiny trailing chunk solely because a natural
+            # boundary happened just before the end of the scene.
+            if total - chunk_end < 1.0 and hard_end >= total - 1e-6:
+                chunk_end = total
+        else:
+            chunk_end = hard_end
+
+        if chunk_end <= cursor + 0.05:
+            raise RuntimeError(
+                f"FULL_PERFORMANCE_CHUNKING_STALLED:start={cursor}:end={chunk_end}:total={total}"
+            )
+
+        slices: list[dict[str, Any]] = []
+        for turn in timeline:
+            turn_window_start = float(turn["start_time"])
+            turn_window_end = float(turn["pause_end_time"])
+            overlap_start = max(cursor, turn_window_start)
+            overlap_end = min(chunk_end, turn_window_end)
+            if overlap_end <= overlap_start + 1e-6:
+                continue
+
+            speech_start = max(overlap_start, float(turn["start_time"]))
+            speech_end = min(overlap_end, float(turn["end_time"]))
+            handoff_start = max(overlap_start, float(turn["end_time"]))
+            handoff_end = min(overlap_end, float(turn["pause_end_time"]))
+
+            item = dict(turn)
+            item.update(
                 {
-                    "chunk_no": len(chunks) + 1,
-                    "start_time": round(chunk_start, 3),
-                    "end_time": round(prior_end, 3),
-                    "duration_seconds": round(prior_end - chunk_start, 3),
-                    "turns": list(chunk_turns),
+                    "slice_start_time": round(overlap_start, 3),
+                    "slice_end_time": round(overlap_end, 3),
+                    "speech_slice_start_time": round(speech_start, 3),
+                    "speech_slice_end_time": round(max(speech_start, speech_end), 3),
+                    "handoff_slice_start_time": round(handoff_start, 3),
+                    "handoff_slice_end_time": round(max(handoff_start, handoff_end), 3),
+                    "continues_from_previous_chunk": bool(float(turn["start_time"]) < cursor - 1e-6),
+                    "continues_into_next_chunk": bool(float(turn["pause_end_time"]) > chunk_end + 1e-6),
                 }
             )
-            chunk_start = prior_end
-            chunk_turns = []
+            slices.append(item)
 
-        turn_duration_from_chunk = candidate_end - chunk_start
-        if not chunk_turns and turn_duration_from_chunk > max_chunk_seconds:
-            raise RuntimeError(
-                "FULL_PERFORMANCE_SINGLE_TURN_EXCEEDS_MOTION_LIMIT:"
-                f"sequence={turn['sequence_no']}:duration_with_context={turn_duration_from_chunk:.3f}"
-            )
-        chunk_turns.append(turn)
-
-    if chunk_turns:
-        final_end = max(float(total_duration), float(chunk_turns[-1]["pause_end_time"]))
         chunks.append(
             {
                 "chunk_no": len(chunks) + 1,
-                "start_time": round(chunk_start, 3),
-                "end_time": round(final_end, 3),
-                "duration_seconds": round(final_end - chunk_start, 3),
-                "turns": list(chunk_turns),
+                "start_time": round(cursor, 3),
+                "end_time": round(chunk_end, 3),
+                "duration_seconds": round(chunk_end - cursor, 3),
+                "turns": slices,
             }
         )
+        cursor = chunk_end
 
     if not chunks:
         raise RuntimeError("FULL_PERFORMANCE_NO_MOTION_CHUNKS")
+
+    covered = sum(float(item["duration_seconds"]) for item in chunks)
+    if abs(covered - total) > 0.05:
+        raise RuntimeError(
+            f"FULL_PERFORMANCE_CHUNK_COVERAGE_MISMATCH:covered={covered}:total={total}"
+        )
+    if any(float(item["duration_seconds"]) > max_len + 0.05 for item in chunks):
+        raise RuntimeError("FULL_PERFORMANCE_CHUNK_EXCEEDS_PROVIDER_LIMIT")
     return chunks
 
 
@@ -1296,6 +1344,7 @@ def _chunk_motion_prompt(
     plan: dict[str, Any],
 ) -> str:
     start = float(chunk["start_time"])
+    end = float(chunk["end_time"])
     lines = [
         f"Continuous photorealistic two-person conversation performance for scene '{scene_title}'.",
         "PRE-LIPSYNC MOTION PLATE: neither person visibly articulates words; mouths remain naturally non-speaking.",
@@ -1304,33 +1353,58 @@ def _chunk_motion_prompt(
         "The listener stays alive and contextually reactive without appearing to speak.",
         "No camera cuts, no morphing, no identity swap, no generic smiling, no repetitive nodding, no exaggerated gestures.",
     ]
+
+    opening_seconds = float(plan.get("opening_seconds") or 0.0)
+    opening_overlap_start = max(start, 0.0)
+    opening_overlap_end = min(end, opening_seconds)
+    if opening_overlap_end > opening_overlap_start + 0.05:
+        lines.append(
+            f"{opening_overlap_start - start:.2f}-{opening_overlap_end - start:.2f}s opening presence: "
+            "natural settling, eye contact and subtle breathing; no speech articulation."
+        )
+
     for turn in chunk["turns"]:
         d = dict(turn["performance_direction"])
-        rel_start = max(0.0, float(turn["start_time"]) - start)
-        rel_end = max(rel_start, float(turn["end_time"]) - start)
-        rel_pause_end = max(rel_end, float(turn["pause_end_time"]) - start)
-        lines.append(
-            f"{rel_start:.2f}-{rel_end:.2f}s speaker {turn['speaker_name']}: "
-            f"emotion {d.get('primary_emotion')}"
-            + (f" with {d.get('secondary_emotion')}" if d.get("secondary_emotion") else "")
-            + f", intensity {d.get('intensity')}. "
-            f"Gaze: {d.get('speaker_gaze')}. Blinking: {d.get('speaker_blinks')}. "
-            f"Head: {d.get('speaker_head_motion')}. Body: {d.get('speaker_body_motion')}. "
-            f"Gesture: {d.get('speaker_gesture')}. Microexpressions: {d.get('speaker_microexpressions')}. "
-            f"Listener: {d.get('listener_emotion')}; reaction {d.get('listener_reaction')}; "
-            f"gaze {d.get('listener_gaze')}; body {d.get('listener_body_motion')}; mouth silent."
-        )
-        if rel_pause_end > rel_end + 0.05:
+        speech_abs_start = float(turn["speech_slice_start_time"])
+        speech_abs_end = float(turn["speech_slice_end_time"])
+        if speech_abs_end > speech_abs_start + 0.05:
+            rel_start = speech_abs_start - start
+            rel_end = speech_abs_end - start
+            continuity = (
+                " This is a continuation of the same speaker performance from the previous motion chunk; "
+                "preserve pose, gaze, expression and gesture continuity."
+                if turn.get("continues_from_previous_chunk")
+                else ""
+            )
             lines.append(
-                f"{rel_end:.2f}-{rel_pause_end:.2f}s conversational handoff: both remain naturally present; "
-                "speaker relaxes after the line while listener reacts before the next turn. No speech articulation."
+                f"{rel_start:.2f}-{rel_end:.2f}s speaker {turn['speaker_name']}: "
+                f"emotion {d.get('primary_emotion')}"
+                + (f" with {d.get('secondary_emotion')}" if d.get("secondary_emotion") else "")
+                + f", intensity {d.get('intensity')}. "
+                f"Gaze: {d.get('speaker_gaze')}. Blinking: {d.get('speaker_blinks')}. "
+                f"Head: {d.get('speaker_head_motion')}. Body: {d.get('speaker_body_motion')}. "
+                f"Gesture: {d.get('speaker_gesture')}. Microexpressions: {d.get('speaker_microexpressions')}. "
+                f"Listener: {d.get('listener_emotion')}; reaction {d.get('listener_reaction')}; "
+                f"gaze {d.get('listener_gaze')}; body {d.get('listener_body_motion')}; mouth silent."
+                + continuity
             )
 
-    if chunk["chunk_no"] == 1 and float(plan.get("opening_seconds") or 0) > 0:
-        lines.append(
-            f"0.00-{float(plan['opening_seconds']):.2f}s opening presence: natural settling, eye contact and subtle breathing; no speech articulation."
-        )
-    return " ".join(lines)[:3200]
+        handoff_abs_start = float(turn["handoff_slice_start_time"])
+        handoff_abs_end = float(turn["handoff_slice_end_time"])
+        if handoff_abs_end > handoff_abs_start + 0.05:
+            lines.append(
+                f"{handoff_abs_start - start:.2f}-{handoff_abs_end - start:.2f}s conversational handoff: "
+                "both remain naturally present; the prior speaker relaxes after the line while the listener reacts "
+                "before the next turn. No speech articulation."
+            )
+
+        if turn.get("continues_into_next_chunk"):
+            lines.append(
+                "At the end of this chunk, hold a natural in-motion continuity pose suitable for seamless continuation "
+                "from this exact frame in the next chunk; do not reset expression, seating or body orientation."
+            )
+
+    return " ".join(lines)[:3600]
 
 
 def _concat_h264_segments(segment_paths: list[Path], output_path: Path) -> None:
