@@ -760,6 +760,130 @@ def _motion_presence_qc(
             ),
         }
 
+def _differential_active_speaker_qc(
+    *,
+    base_video_path: Path,
+    output_video_path: Path,
+    proof_turns: list[dict[str, Any]],
+    source_width: int,
+    source_height: int,
+    sample_fps: int = 10,
+) -> dict[str, Any]:
+    base_width, base_height = _probe_video_geometry(base_video_path)
+    out_width, out_height = _probe_video_geometry(output_video_path)
+    if (base_width, base_height) != (out_width, out_height):
+        return {
+            "status": "WARN",
+            "reason": "base_output_geometry_mismatch",
+            "base_geometry": [base_width, base_height],
+            "output_geometry": [out_width, out_height],
+            "segments": [],
+        }
+
+    def extract_frames(video_path: Path, frame_dir: str) -> list[Path]:
+        pattern = str(Path(frame_dir) / "frame-%06d.png")
+        _run([
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vf", f"fps={sample_fps}", "-vsync", "vfr", pattern,
+        ])
+        return sorted(Path(frame_dir).glob("frame-*.png"))
+
+    with tempfile.TemporaryDirectory(prefix="df_next3_base_qc_") as base_dir, tempfile.TemporaryDirectory(prefix="df_next3_out_qc_") as out_dir:
+        base_frames = extract_frames(base_video_path, base_dir)
+        out_frames = extract_frames(output_video_path, out_dir)
+        frame_count = min(len(base_frames), len(out_frames))
+        if frame_count < 4:
+            return {"status": "FAIL", "reason": "insufficient_differential_frames", "segments": []}
+        base_frames = base_frames[:frame_count]
+        out_frames = out_frames[:frame_count]
+
+        rois = {
+            turn["participant_id"]: _mouth_roi(
+                turn["source_image_coordinates"],
+                source_width=source_width,
+                source_height=source_height,
+                output_width=out_width,
+                output_height=out_height,
+            )
+            for turn in proof_turns
+        }
+
+        overall = "PASS"
+        segment_results: list[dict[str, Any]] = []
+        for turn in proof_turns:
+            start = max(0.0, float(turn["start_time"]) + 0.20)
+            end = max(start, float(turn["end_time"]) - 0.20)
+            start_index = max(0, int(math.floor(start * sample_fps)))
+            end_index = min(frame_count, int(math.ceil(end * sample_fps)) + 1)
+            base_segment = base_frames[start_index:end_index]
+            out_segment = out_frames[start_index:end_index]
+
+            if len(base_segment) < 4 or len(out_segment) < 4:
+                status = "WARN"
+                reason = "insufficient_segment_frames"
+                participant_metrics = []
+            else:
+                participant_metrics = []
+                for participant_id, roi in rois.items():
+                    base_score = _mean(_roi_motion_series(base_segment, roi))
+                    out_score = _mean(_roi_motion_series(out_segment, roi))
+                    delta = out_score - base_score
+                    participant_metrics.append({
+                        "participant_id": participant_id,
+                        "base_motion_score": round(base_score, 4),
+                        "output_motion_score": round(out_score, 4),
+                        "lipsync_added_motion": round(delta, 4),
+                        "roi": list(roi),
+                    })
+
+                intended_id = turn["participant_id"]
+                intended = next(item for item in participant_metrics if item["participant_id"] == intended_id)
+                others = [item for item in participant_metrics if item["participant_id"] != intended_id]
+                max_other = max(
+                    others,
+                    key=lambda item: float(item["lipsync_added_motion"]),
+                    default={"lipsync_added_motion": 0.0},
+                )
+                intended_delta = float(intended["lipsync_added_motion"])
+                non_speaker_delta = max(0.0, float(max_other["lipsync_added_motion"]))
+
+                if intended_delta < 0.25:
+                    status = "WARN"
+                    reason = "intended_lipsync_delta_low"
+                elif non_speaker_delta > max(0.35, intended_delta * 0.45):
+                    status = "FAIL"
+                    reason = "non_speaker_received_excess_lipsync_motion"
+                else:
+                    status = "PASS"
+                    reason = "speaker_specific_lipsync_delta_detected"
+
+            if status == "FAIL":
+                overall = "FAIL"
+            elif status == "WARN" and overall != "FAIL":
+                overall = "WARN"
+
+            segment_results.append({
+                "sequence_no": turn["sequence_no"],
+                "participant_id": turn["participant_id"],
+                "display_name": turn["display_name"],
+                "status": status,
+                "reason": reason,
+                "participants": participant_metrics,
+            })
+
+        return {
+            "status": overall,
+            "sample_fps": sample_fps,
+            "method": "output_mouth_motion_minus_pre_lipsync_motion_baseline",
+            "segments": segment_results,
+            "policy": {
+                "pass": "intended speaker gains lip-sync-specific mouth motion while listeners remain near their natural-motion baseline",
+                "warn": "automated evidence is insufficient; human review required",
+                "fail": "non-speaker gains material mouth motion attributable to lip-sync",
+            },
+        }
+
+
 def _active_count(payload: Any) -> int:
     if isinstance(payload, list):
         return len(payload)
@@ -1227,6 +1351,13 @@ async def main() -> None:
             source_width=int(dims["width"]),
             source_height=int(dims["height"]),
         )
+        differential_qc = _differential_active_speaker_qc(
+            base_video_path=motion_video,
+            output_video_path=output_path,
+            proof_turns=manifest_turns,
+            source_width=int(dims["width"]),
+            source_height=int(dims["height"]),
+        )
 
         manifest = {
             "contract": "next3_shared_scene_two_turn_performance_proof_v1",
@@ -1248,7 +1379,8 @@ async def main() -> None:
             "fps": fps,
             "total_duration_seconds": total_duration,
             "turns": manifest_turns,
-            "active_speaker_qc": qc,
+            "active_speaker_qc_raw_motion": qc,
+            "active_speaker_qc": differential_qc,
             "human_proof_review": "REQUIRED_FOR_EXPRESSION_BLINKS_GAZE_GESTURES_HANDS_IDENTITY_AND_CONVERSATIONAL_NATURALNESS",
             "qa_storage_path": output_blob,
         }
@@ -1267,16 +1399,14 @@ async def main() -> None:
                 f"speaker={result['display_name']} status={result['status']} "
                 f"score={result['upper_body_motion_score']} reason={result['reason']}"
             )
-        print(f"ACTIVE_SPEAKER_QC={qc['status']}")
-        for result in qc["segments"]:
+        print(f"ACTIVE_SPEAKER_RAW_MOTION_QC={qc['status']}")
+        print(f"ACTIVE_SPEAKER_QC={differential_qc['status']}")
+        for result in differential_qc["segments"]:
             print(
-                "QC_SEGMENT "
+                "DIFFERENTIAL_QC_SEGMENT "
                 f"seq={result['sequence_no']} speaker={result['display_name']} "
                 f"status={result['status']} reason={result['reason']} "
-                f"target_motion={result['intended_motion_score']} "
-                f"non_speaker_motion={result['max_non_speaker_motion_score']} "
-                f"ratio={result['non_speaker_to_intended_ratio']} "
-                f"corr={result['motion_correlation']}"
+                f"participants={json.dumps(result['participants'], separators=(',', ':'))}"
             )
         print("HUMAN_QUALITY_REVIEW=REQUIRED")
         print("HUMAN_REVIEW_DIMENSIONS=context_specific_expression,blinks,gaze,head_motion,body_motion,gestures,hands,listener_reaction,identity,temporal_continuity")
