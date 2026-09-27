@@ -815,7 +815,7 @@ async def main() -> None:
 
     manifest_turns: list[dict[str, Any]] = []
 
-    with tempfile.TemporaryDirectory(prefix="df_next3_segments_proof_") as td:
+    with tempfile.TemporaryDirectory(prefix="df_next3_performance_proof_") as td:
         root = Path(td)
         image_path = root / "source-image"
         async with httpx.AsyncClient(timeout=120, follow_redirects=True) as download_client:
@@ -840,28 +840,65 @@ async def main() -> None:
                 durations.append(duration)
 
         total_duration = round(sum(durations), 3)
-        source_video = root / "static-source.mp4"
-        _run(
-            [
-                "ffmpeg", "-y",
-                "-loop", "1",
-                "-i", str(image_path),
-                "-t", f"{total_duration:.3f}",
-                "-r", str(fps),
-                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1",
-                "-an",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "18",
-                "-pix_fmt", "yuv420p",
-                str(source_video),
-            ]
+        motion_duration = int(math.ceil(total_duration))
+        if motion_duration < 3 or motion_duration > 15:
+            raise RuntimeError(
+                f"PERFORMANCE_PROOF_DURATION_UNSUPPORTED:{total_duration}:requires_3_to_15_seconds"
+            )
+
+        cursor = 0.0
+        timed_dialogue_context: list[dict[str, Any]] = []
+        for item, duration in zip(dialogue_context, durations):
+            start = round(cursor, 3)
+            end = round(cursor + duration, 3)
+            timed_dialogue_context.append({**item, "start_time": start, "end_time": end})
+            cursor = end
+
+        performance_plan = await _performance_director_plan(
+            scene_title=_clean(stage["scene_title"]),
+            scene_summary=_clean(stage["scene_summary"]),
+            scene_direction=_dict(stage["scene_direction"]),
+            turns=timed_dialogue_context,
         )
 
+        motion_model = _clean(
+            args.motion_model
+            or os.getenv("DF_NEXT3_PERFORMANCE_MODEL")
+            or os.getenv("FAL_KLING_I2V_MODEL")
+            or "fal-ai/kling-video/v3/standard/image-to-video"
+        )
+        motion_prompt = _clean(performance_plan["continuous_motion_prompt"])
+        negative_prompt = (
+            "visible speech articulation before lipsync, both people talking, repeated mouth flapping, "
+            "frozen mannequin pose, identity drift, face morphing, duplicate person, warped hands, extra fingers, "
+            "exaggerated gestures, constant nodding, constant smiling, camera jump, scene cut, clothing change, background change"
+        )
+        motion_payload = {
+            "prompt": motion_prompt,
+            "start_image_url": image_url,
+            "duration": str(motion_duration),
+            "generate_audio": False,
+            "shot_type": "customize",
+            "negative_prompt": negative_prompt,
+        }
+
+        print("PERFORMANCE_DIRECTOR_PLAN=" + json.dumps(performance_plan, ensure_ascii=False))
+        print(f"PERFORMANCE_MOTION_MODEL={motion_model}")
+        motion_job_id, motion_url, motion_result = await _fal_generate_motion(
+            model_id=motion_model,
+            fal_key=fal_key,
+            payload=motion_payload,
+            existing_request_id=args.motion_provider_job_id,
+        )
+
+        motion_video = root / "performance-motion.mp4"
+        async with httpx.AsyncClient(timeout=180, follow_redirects=True) as motion_client:
+            await _download(motion_client, motion_url, motion_video)
+
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        base_path = f"v3/qa/shared-scene-segments/{workflow_id}/{stage_run_id}/{stamp}"
-        source_blob = f"{base_path}/static-source.mp4"
-        azure.upload_file(output_container, source_blob, str(source_video), "video/mp4")
+        base_path = f"v3/qa/shared-scene-performance/{workflow_id}/{stage_run_id}/{stamp}"
+        source_blob = f"{base_path}/performance-motion.mp4"
+        azure.upload_file(output_container, source_blob, str(motion_video), "video/mp4")
         source_video_url = azure.sign_read_url(output_container, source_blob, 3600)
 
         segments: list[dict[str, Any]] = []
