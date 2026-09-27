@@ -9,6 +9,7 @@ import re
 import subprocess
 import tempfile
 import time
+import math
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -16,6 +17,7 @@ from uuid import UUID
 
 import asyncpg
 import httpx
+from PIL import Image, ImageChops, ImageStat
 
 from app.services.sas_service import AzureBlobService
 
@@ -135,6 +137,216 @@ def _probe_duration(path: Path) -> float:
     if duration <= 0:
         raise RuntimeError("AUDIO_DURATION_INVALID")
     return duration
+
+
+def _probe_video_geometry(path: Path) -> tuple[int, int]:
+    proc = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json",
+            str(path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("VIDEO_GEOMETRY_PROBE_FAILED:" + (proc.stderr or "")[-1200:])
+    payload = json.loads(proc.stdout or "{}")
+    streams = list(payload.get("streams") or [])
+    if not streams:
+        raise RuntimeError("VIDEO_GEOMETRY_MISSING")
+    width = int(streams[0].get("width") or 0)
+    height = int(streams[0].get("height") or 0)
+    if width < 64 or height < 64:
+        raise RuntimeError("VIDEO_GEOMETRY_INVALID")
+    return width, height
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _correlation(a: list[float], b: list[float]) -> float:
+    n = min(len(a), len(b))
+    if n < 4:
+        return 0.0
+    x = a[:n]
+    y = b[:n]
+    mx = _mean(x)
+    my = _mean(y)
+    dx = [v - mx for v in x]
+    dy = [v - my for v in y]
+    den = math.sqrt(sum(v * v for v in dx) * sum(v * v for v in dy))
+    if den <= 1e-12:
+        return 0.0
+    return max(-1.0, min(1.0, sum(px * py for px, py in zip(dx, dy)) / den))
+
+
+def _mouth_roi(
+    coordinates: list[int],
+    *,
+    source_width: int,
+    source_height: int,
+    output_width: int,
+    output_height: int,
+) -> tuple[int, int, int, int]:
+    sx = output_width / float(source_width)
+    sy = output_height / float(source_height)
+    cx = int(round(coordinates[0] * sx))
+    cy = int(round(coordinates[1] * sy + 0.075 * output_height))
+    half_w = max(24, int(round(0.06 * output_width)))
+    half_h = max(18, int(round(0.04 * output_height)))
+    return (
+        max(0, cx - half_w),
+        max(0, cy - half_h),
+        min(output_width, cx + half_w),
+        min(output_height, cy + half_h),
+    )
+
+
+def _roi_motion_series(
+    frame_paths: list[Path],
+    roi: tuple[int, int, int, int],
+) -> list[float]:
+    if len(frame_paths) < 2:
+        return []
+    out: list[float] = []
+    previous = Image.open(frame_paths[0]).convert("L").crop(roi)
+    for frame_path in frame_paths[1:]:
+        current = Image.open(frame_path).convert("L").crop(roi)
+        diff = ImageChops.difference(current, previous)
+        out.append(float(ImageStat.Stat(diff).mean[0]))
+        previous = current
+    return out
+
+
+def _active_speaker_qc(
+    *,
+    video_path: Path,
+    proof_turns: list[dict[str, Any]],
+    source_width: int,
+    source_height: int,
+    sample_fps: int = 10,
+) -> dict[str, Any]:
+    output_width, output_height = _probe_video_geometry(video_path)
+    with tempfile.TemporaryDirectory(prefix="df_next3_qc_frames_") as frame_dir:
+        pattern = str(Path(frame_dir) / "frame-%06d.png")
+        _run(
+            [
+                "ffmpeg", "-y",
+                "-i", str(video_path),
+                "-vf", f"fps={sample_fps}",
+                "-vsync", "vfr",
+                pattern,
+            ]
+        )
+        all_frames = sorted(Path(frame_dir).glob("frame-*.png"))
+        if len(all_frames) < 4:
+            raise RuntimeError("ACTIVE_SPEAKER_QC_INSUFFICIENT_FRAMES")
+
+        rois = {
+            turn["participant_id"]: _mouth_roi(
+                turn["coordinates"],
+                source_width=source_width,
+                source_height=source_height,
+                output_width=output_width,
+                output_height=output_height,
+            )
+            for turn in proof_turns
+        }
+
+        segment_results: list[dict[str, Any]] = []
+        overall = "PASS"
+        for turn in proof_turns:
+            start = max(0.0, float(turn["start_time"]) + 0.15)
+            end = max(start, float(turn["end_time"]) - 0.15)
+            start_index = max(0, int(math.floor(start * sample_fps)))
+            end_index = min(len(all_frames), int(math.ceil(end * sample_fps)) + 1)
+            frames = all_frames[start_index:end_index]
+            if len(frames) < 4:
+                status = "WARN"
+                reason = "insufficient_segment_frames"
+                intended_score = 0.0
+                max_non_speaker_score = 0.0
+                max_corr = 0.0
+                ratio = 0.0
+            else:
+                series = {
+                    participant_id: _roi_motion_series(frames, roi)
+                    for participant_id, roi in rois.items()
+                }
+                intended_id = turn["participant_id"]
+                intended = series[intended_id]
+                intended_score = _mean(intended)
+
+                non_speakers = [
+                    (pid, values)
+                    for pid, values in series.items()
+                    if pid != intended_id
+                ]
+                non_scores = [(_mean(values), pid, values) for pid, values in non_speakers]
+                max_non_speaker_score, max_non_id, max_non_series = max(
+                    non_scores,
+                    default=(0.0, "", []),
+                )
+                ratio = (
+                    max_non_speaker_score / intended_score
+                    if intended_score > 1e-9
+                    else 999.0
+                )
+                max_corr = _correlation(intended, max_non_series) if max_non_series else 0.0
+
+                if intended_score < 0.45:
+                    status = "FAIL"
+                    reason = "intended_speaker_motion_too_low"
+                elif ratio >= 0.65:
+                    status = "FAIL"
+                    reason = "non_speaker_motion_too_high"
+                elif ratio >= 0.30 and max_corr >= 0.55:
+                    status = "FAIL"
+                    reason = "non_speaker_motion_synchronized_with_intended_speaker"
+                elif ratio >= 0.25 or max_corr >= 0.50:
+                    status = "WARN"
+                    reason = "speaker_isolation_borderline"
+                else:
+                    status = "PASS"
+                    reason = "speaker_isolation_detected"
+
+            if status == "FAIL":
+                overall = "FAIL"
+            elif status == "WARN" and overall != "FAIL":
+                overall = "WARN"
+
+            segment_results.append(
+                {
+                    "sequence_no": turn["sequence_no"],
+                    "participant_id": turn["participant_id"],
+                    "display_name": turn["display_name"],
+                    "status": status,
+                    "reason": reason,
+                    "intended_motion_score": round(intended_score, 4),
+                    "max_non_speaker_motion_score": round(max_non_speaker_score, 4),
+                    "non_speaker_to_intended_ratio": round(ratio, 4),
+                    "motion_correlation": round(max_corr, 4),
+                    "roi": list(rois[turn["participant_id"]]),
+                }
+            )
+
+        return {
+            "status": overall,
+            "sample_fps": sample_fps,
+            "output_width": output_width,
+            "output_height": output_height,
+            "segments": segment_results,
+            "policy": {
+                "auto_accept": "PASS only",
+                "warn": "requires human review",
+                "fail": "blocks full scene generation",
+            },
+        }
 
 
 def _active_count(payload: Any) -> int:
@@ -436,8 +648,16 @@ async def main() -> None:
         azure.upload_file(output_container, output_blob, str(output_path), "video/mp4")
         durable_output_url = azure.sign_read_url(output_container, output_blob, 15 * 24 * 3600)
 
+        dims = _dict(stage_meta.get("shared_scene_dimensions"))
+        qc = _active_speaker_qc(
+            video_path=output_path,
+            proof_turns=manifest_turns,
+            source_width=int(dims["width"]),
+            source_height=int(dims["height"]),
+        )
+
         manifest = {
-            "contract": "next3_shared_scene_two_turn_segments_proof_v1",
+            "contract": "next3_shared_scene_two_turn_segments_proof_v2",
             "workflow_id": str(workflow_id),
             "stage_run_id": str(stage_run_id),
             "shared_scene_media_id": str(shared_media_id),
@@ -447,10 +667,8 @@ async def main() -> None:
             "fps": fps,
             "total_duration_seconds": total_duration,
             "turns": manifest_turns,
-            "active_speaker_qc": {
-                "status": "MANUAL_REVIEW_REQUIRED",
-                "reason": "Two-turn provider proof must be visually approved before full-scene generation. Automated active-speaker QC is the next gate and is intentionally not bypassed.",
-            },
+            "active_speaker_qc": qc,
+            "human_proof_review": "REQUIRED_BEFORE_FULL_SEVEN_TURN_GENERATION",
             "qa_storage_path": output_blob,
         }
         manifest_path = root / "manifest.json"
@@ -461,10 +679,21 @@ async def main() -> None:
 
         print("============================================================")
         print("NEXT3_TWO_TURN_SEGMENTS_PROVIDER=PASS")
-        print("ACTIVE_SPEAKER_QC=MANUAL_REVIEW_REQUIRED")
+        print(f"ACTIVE_SPEAKER_QC={qc['status']}")
+        for result in qc["segments"]:
+            print(
+                "QC_SEGMENT "
+                f"seq={result['sequence_no']} speaker={result['display_name']} "
+                f"status={result['status']} reason={result['reason']} "
+                f"target_motion={result['intended_motion_score']} "
+                f"non_speaker_motion={result['max_non_speaker_motion_score']} "
+                f"ratio={result['non_speaker_to_intended_ratio']} "
+                f"corr={result['motion_correlation']}"
+            )
+        print("HUMAN_PROOF_REVIEW=REQUIRED")
         print(f"OUTPUT_URL={durable_output_url}")
         print(f"MANIFEST_URL={manifest_url}")
-        print("FULL_SEVEN_TURN_GENERATION=BLOCKED_UNTIL_QC_PASS")
+        print("FULL_SEVEN_TURN_GENERATION=BLOCKED_UNTIL_QC_AND_HUMAN_REVIEW_PASS")
         print("DATABASE_WRITE=NONE")
         print("PRODUCTION_TOUCH=NONE")
         print("============================================================")
