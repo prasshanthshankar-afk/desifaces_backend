@@ -2207,6 +2207,15 @@ async def full_scene_main() -> None:
                 print(f"MOTION_CHUNK_GENERATED={chunk_no}:{provider_job_id}")
 
             info = _probe_video_info(local_normalized)
+            source_dims_for_ratio = _dict(stage_meta.get("shared_scene_dimensions"))
+            source_ratio = float(source_dims_for_ratio["width"]) / float(source_dims_for_ratio["height"])
+            chunk_ratio = float(info["width"]) / float(info["height"])
+            if abs(chunk_ratio - source_ratio) > 0.08:
+                raise RuntimeError(
+                    "MOTION_CHUNK_ASPECT_RATIO_DRIFT:"
+                    f"chunk={chunk_no}:source_ratio={source_ratio:.6f}:"
+                    f"video={info['width']}x{info['height']}"
+                )
             if target_width <= 0:
                 target_width = int(info["width"])
                 target_height = int(info["height"])
@@ -2244,6 +2253,15 @@ async def full_scene_main() -> None:
         full_motion_path = root / "full-performance-motion.mp4"
         _concat_h264_segments(normalized_paths, full_motion_path)
         full_info = _probe_video_info(full_motion_path)
+        full_ratio = float(full_info["width"]) / float(full_info["height"])
+        source_dims_for_ratio = _dict(stage_meta.get("shared_scene_dimensions"))
+        source_ratio = float(source_dims_for_ratio["width"]) / float(source_dims_for_ratio["height"])
+        if abs(full_ratio - source_ratio) > 0.08:
+            raise RuntimeError(
+                "FULL_PERFORMANCE_ASPECT_RATIO_DRIFT:"
+                f"source_ratio={source_ratio:.6f}:"
+                f"video={full_info['width']}x{full_info['height']}"
+            )
         if abs(float(full_info["duration"]) - float(total_duration)) > 0.6:
             raise RuntimeError(
                 "FULL_PERFORMANCE_DURATION_MISMATCH:"
