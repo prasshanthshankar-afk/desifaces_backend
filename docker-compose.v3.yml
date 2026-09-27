@@ -241,7 +241,7 @@ volumes:
 
   df_redisdata:
     external: true
-    name: desifaces-v3_df_redisdata
+    name: desifaces-dev_df_redisdata
 
   df_saree_templates_cache:
     external: true
