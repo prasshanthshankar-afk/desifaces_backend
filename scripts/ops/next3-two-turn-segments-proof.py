@@ -380,6 +380,7 @@ async def main() -> None:
     parser.add_argument("--workflow-id", required=True)
     parser.add_argument("--stage-run-id", required=True)
     parser.add_argument("--fps", type=int, default=25)
+    parser.add_argument("--provider-job-id", default="")
     args = parser.parse_args()
 
     workflow_id = UUID(args.workflow_id)
@@ -475,7 +476,7 @@ async def main() -> None:
     with tempfile.TemporaryDirectory(prefix="df_next3_segments_proof_") as td:
         root = Path(td)
         image_path = root / "source-image"
-        async with httpx.AsyncClient(timeout=120) as download_client:
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as download_client:
             await _download(download_client, image_url, image_path)
 
             audio_paths: list[Path] = []
@@ -593,27 +594,34 @@ async def main() -> None:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        async with httpx.AsyncClient(timeout=60) as client:
-            await _wait_capacity(client, headers, sync_base)
-            response = await client.post(
-                f"{sync_base}/v2/generate",
-                headers=headers,
-                json=request_json,
-            )
-            if response.status_code not in {200, 201, 202}:
-                raise RuntimeError(
-                    f"SYNC_SEGMENTS_SUBMIT_FAILED:{response.status_code}:{response.text[:2000]}"
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            provider_job_id = _clean(args.provider_job_id)
+            if provider_job_id:
+                print(f"SYNC_SEGMENTS_PROVIDER_JOB_REUSE={provider_job_id}")
+            else:
+                await _wait_capacity(client, headers, sync_base)
+                response = await client.post(
+                    f"{sync_base}/v2/generate",
+                    headers=headers,
+                    json=request_json,
                 )
-            payload = response.json()
-            provider_job_id = _clean(payload.get("id"))
-            if not provider_job_id:
-                raise RuntimeError("SYNC_SEGMENTS_JOB_ID_MISSING")
-            print(f"SYNC_SEGMENTS_PROVIDER_JOB_ID={provider_job_id}")
+                if response.status_code not in {200, 201, 202}:
+                    raise RuntimeError(
+                        f"SYNC_SEGMENTS_SUBMIT_FAILED:{response.status_code}:{response.text[:2000]}"
+                    )
+                payload = response.json()
+                provider_job_id = _clean(payload.get("id"))
+                if not provider_job_id:
+                    raise RuntimeError("SYNC_SEGMENTS_JOB_ID_MISSING")
+                print(f"SYNC_SEGMENTS_PROVIDER_JOB_ID={provider_job_id}")
 
             deadline = time.monotonic() + 1800
             output_url = ""
+            first_poll = True
             while time.monotonic() < deadline:
-                await asyncio.sleep(8)
+                if not first_poll:
+                    await asyncio.sleep(8)
+                first_poll = False
                 status_response = await client.get(
                     f"{sync_base}/v2/generate/{provider_job_id}",
                     headers=headers,
