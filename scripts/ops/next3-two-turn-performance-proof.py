@@ -39,6 +39,7 @@ def _dict(value: Any) -> dict[str, Any]:
 
 
 _TEXT_KEYS = (
+    "text_value", "final_text",
     "spoken_text", "dialogue_text", "utterance_text", "script_text",
     "line_text", "text", "content", "source_text", "voiceover_text",
 )
