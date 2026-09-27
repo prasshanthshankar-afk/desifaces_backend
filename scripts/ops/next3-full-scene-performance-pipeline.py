@@ -2084,7 +2084,7 @@ async def full_scene_main() -> None:
     parser.add_argument("--motion-model", default="")
     parser.add_argument("--run-id", default="")
     parser.add_argument("--reuse-plan-run-id", default="")
-    parser.add_argument("--max-motion-chunk-seconds", type=float, default=10.0)
+    parser.add_argument("--max-motion-chunk-seconds", type=float, default=12.0)
     parser.add_argument("--quality-profile", choices=["standard", "premium"], default="premium")
     args = parser.parse_args()
 
@@ -2355,14 +2355,23 @@ async def full_scene_main() -> None:
         motion_model = _clean(
             args.motion_model
             or os.getenv("DF_NEXT3_PERFORMANCE_MODEL")
-            or os.getenv("FAL_KLING_I2V_MODEL")
+            or (
+                "fal-ai/kling-video/v3/pro/image-to-video"
+                if args.quality_profile == "premium"
+                else os.getenv("FAL_KLING_I2V_MODEL")
+            )
             or "fal-ai/kling-video/v3/standard/image-to-video"
         )
         negative_prompt = (
             "visible speech articulation before lipsync, both people talking, repeated mouth flapping, "
             "frozen mannequin pose, identity drift, face morphing, duplicate person, warped hands, extra fingers, "
+            "age progression, aging, de-aging, older face, younger face, new wrinkles, facial proportion drift, "
+            "skin texture drift, temporal flicker, visual noise, film grain, compression noise, crawling texture, "
             "exaggerated gestures, constant nodding, constant smiling, camera jump, scene cut, clothing change, background change"
         )
+
+        print(f"QUALITY_PROFILE={args.quality_profile}")
+        print(f"PERFORMANCE_MOTION_MODEL={motion_model}")
 
         identity_elements, identity_refs = await _build_identity_elements(
             source_image_url=image_url,
@@ -2556,6 +2565,19 @@ async def full_scene_main() -> None:
                 "automated_check": "upper_body_motion_presence",
             },
             "speaker_isolation": {"status": "PENDING", "reason": "sync_phase_not_started"},
+            "identity_age_stability": {
+                "status": "PENDING",
+                "reason": "human_review_required_after_identity_anchored_generation",
+            },
+            "visual_noise": {
+                "status": "PENDING",
+                "cleanup_applied": True,
+                "filter": "hqdn3d+light_unsharp",
+            },
+            "transition_smoothness": {
+                "status": "PENDING",
+                "reason": "human_review_required_across_motion_chunk_boundaries",
+            },
             "human_performance_review": {
                 "status": "PENDING",
                 "required_dimensions": [
@@ -2568,7 +2590,10 @@ async def full_scene_main() -> None:
                     "hands",
                     "listener_reaction",
                     "identity",
+                    "apparent_age_stability",
+                    "visual_noise",
                     "temporal_continuity",
+                    "transition_smoothness",
                     "conversation_pacing",
                 ],
             },
@@ -2583,17 +2608,21 @@ async def full_scene_main() -> None:
             "run_id": run_id,
             "turn_count": len(timeline),
             "planned_duration_seconds": total_duration,
-            "actual_duration_seconds": float(full_info["duration"]),
+            "actual_duration_seconds": float(clean_info["duration"]),
             "media": {
-                "width": int(full_info["width"]),
-                "height": int(full_info["height"]),
-                "fps": float(full_info["fps"]),
-                "frame_count": int(full_info["frame_count"]),
+                "width": int(clean_info["width"]),
+                "height": int(clean_info["height"]),
+                "fps": float(clean_info["fps"]),
+                "frame_count": int(clean_info["frame_count"]),
                 "storage_path": clean_motion_blob,
                 "raw_storage_path": raw_full_motion_blob,
                 "cleaned": True,
             },
             "performance_director": performance_plan,
+            "identity_references": identity_refs,
+            "quality_profile": args.quality_profile,
+            "motion_model": motion_model,
+            "max_motion_chunk_seconds": max(5.0, min(14.0, float(args.max_motion_chunk_seconds))),
             "timeline": timeline,
             "motion_chunks": chunk_records,
             "quality_gate": quality_gate,
@@ -2626,7 +2655,7 @@ async def full_scene_main() -> None:
             )
         print(f"TURN_COUNT={len(timeline)}")
         print(f"PLANNED_DURATION_SECONDS={total_duration}")
-        print(f"ACTUAL_DURATION_SECONDS={float(full_info['duration']):.3f}")
+        print(f"ACTUAL_DURATION_SECONDS={float(clean_info['duration']):.3f}")
         print(f"RAW_FULL_MOTION_URL={raw_motion_review_url}")
         print(f"FULL_MOTION_BASE_URL={motion_review_url}")
         print("AUDIO_PRESENT=NO")
