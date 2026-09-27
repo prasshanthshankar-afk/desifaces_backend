@@ -19,6 +19,7 @@ import asyncpg
 import httpx
 from PIL import Image, ImageChops, ImageStat
 
+from azure.storage.blob import BlobServiceClient
 from app.services.sas_service import AzureBlobService
 
 
@@ -793,6 +794,7 @@ async def main() -> None:
     parser.add_argument("--sync-provider-job-id", default="")
     parser.add_argument("--motion-provider-job-id", default="")
     parser.add_argument("--motion-model", default="")
+    parser.add_argument("--reuse-latest-motion-blob", action="store_true")
     args = parser.parse_args()
 
     workflow_id = UUID(args.workflow_id)
@@ -808,7 +810,7 @@ async def main() -> None:
         raise RuntimeError("SYNC_API_KEY_MISSING")
     if not azure_conn:
         raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING_MISSING")
-    if not fal_key:
+    if not fal_key and not args.reuse_latest_motion_blob:
         raise RuntimeError("FAL_KEY_MISSING")
 
     conn = await asyncpg.connect(_db_dsn())
@@ -968,7 +970,6 @@ async def main() -> None:
             "prompt": motion_prompt,
             "start_image_url": image_url,
             "duration": str(motion_duration),
-            "aspect_ratio": "16:9",
             "generate_audio": False,
             "shot_type": "customize",
             "negative_prompt": negative_prompt,
@@ -976,23 +977,56 @@ async def main() -> None:
 
         print("PERFORMANCE_DIRECTOR_PLAN=" + json.dumps(performance_plan, ensure_ascii=False))
         print(f"PERFORMANCE_MOTION_MODEL={motion_model}")
-        motion_job_id, motion_url, motion_result = await _fal_generate_motion(
-            model_id=motion_model,
-            fal_key=fal_key,
-            payload=motion_payload,
-            existing_request_id=args.motion_provider_job_id,
-        )
 
         motion_video = root / "performance-motion.mp4"
-        async with httpx.AsyncClient(timeout=180, follow_redirects=True) as motion_client:
-            await _download(motion_client, motion_url, motion_video)
+        if args.reuse_latest_motion_blob:
+            prefix = f"v3/qa/shared-scene-performance/{workflow_id}/{stage_run_id}/"
+            bsc = BlobServiceClient.from_connection_string(azure_conn)
+            cc = bsc.get_container_client(output_container)
+            candidates = [
+                blob for blob in cc.list_blobs(name_starts_with=prefix)
+                if str(blob.name).endswith("/performance-motion.mp4")
+            ]
+            if not candidates:
+                raise RuntimeError("NO_EXISTING_PERFORMANCE_MOTION_BLOB")
+            candidates.sort(key=lambda blob: blob.last_modified, reverse=True)
+            selected_motion_blob = candidates[0]
+            motion_video.write_bytes(cc.download_blob(selected_motion_blob.name).readall())
+            source_blob = str(selected_motion_blob.name)
+            source_video_url = azure.sign_read_url(output_container, source_blob, 3600)
+            durable_motion_url = azure.sign_read_url(output_container, source_blob, 15 * 24 * 3600)
+            motion_job_id = "azure-reuse:" + source_blob
+            motion_result = {
+                "reused_existing_motion_blob": source_blob,
+                "last_modified": selected_motion_blob.last_modified.isoformat(),
+            }
+            print(f"PERFORMANCE_MOTION_BLOB_REUSE={source_blob}")
+        else:
+            motion_job_id, motion_url, motion_result = await _fal_generate_motion(
+                model_id=motion_model,
+                fal_key=fal_key,
+                payload=motion_payload,
+                existing_request_id=args.motion_provider_job_id,
+            )
+            async with httpx.AsyncClient(timeout=180, follow_redirects=True) as motion_client:
+                await _download(motion_client, motion_url, motion_video)
+
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            base_path = f"v3/qa/shared-scene-performance/{workflow_id}/{stage_run_id}/{stamp}"
+            source_blob = f"{base_path}/performance-motion.mp4"
+            azure.upload_file(output_container, source_blob, str(motion_video), "video/mp4")
+            source_video_url = azure.sign_read_url(output_container, source_blob, 3600)
+            durable_motion_url = azure.sign_read_url(output_container, source_blob, 15 * 24 * 3600)
 
         motion_info = _probe_video_info(motion_video)
+        dims_for_ratio = _dict(stage_meta.get("shared_scene_dimensions"))
+        source_ratio = float(dims_for_ratio["width"]) / float(dims_for_ratio["height"])
         motion_aspect = float(motion_info["width"]) / float(motion_info["height"])
-        if abs(motion_aspect - (16.0 / 9.0)) > 0.08:
+        if abs(motion_aspect - source_ratio) > 0.08:
             raise RuntimeError(
                 "PERFORMANCE_MOTION_ASPECT_RATIO_DRIFT:"
-                f"{motion_info['width']}x{motion_info['height']}"
+                f"source_ratio={source_ratio:.6f}:"
+                f"video={motion_info['width']}x{motion_info['height']}"
             )
         if float(motion_info["duration"]) + 0.10 < total_duration:
             raise RuntimeError(
@@ -1008,11 +1042,7 @@ async def main() -> None:
         )
 
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        base_path = f"v3/qa/shared-scene-performance/{workflow_id}/{stage_run_id}/{stamp}"
-        source_blob = f"{base_path}/performance-motion.mp4"
-        azure.upload_file(output_container, source_blob, str(motion_video), "video/mp4")
-        source_video_url = azure.sign_read_url(output_container, source_blob, 3600)
-        durable_motion_url = azure.sign_read_url(output_container, source_blob, 15 * 24 * 3600)
+        base_path = f"v3/qa/shared-scene-performance-sync/{workflow_id}/{stage_run_id}/{stamp}"
 
         segments: list[dict[str, Any]] = []
         inputs: list[dict[str, Any]] = [{"type": "video", "url": source_video_url}]
