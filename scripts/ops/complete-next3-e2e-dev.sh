@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 BACKEND_SHA="${1:-}"
 WEB_SHA="${2:-}"
+RESUME_AFTER_DB="${NEXT3_RESUME_AFTER_DB:-0}"
 EXPECTED_HOST="desifaces-dev"
 BACKEND_REPO="${BACKEND_REPO:-/home/azureuser/workspace/desifaces-v3}"
 WEB_REPO="${WEB_REPO:-/home/azureuser/workspace/desifaces-web}"
@@ -37,10 +38,48 @@ echo "============================================================"
 # ---------------------------------------------------------------------------
 # 0. Fail-fast topology gate BEFORE any build.
 # ---------------------------------------------------------------------------
-[[ "$LIVE_ENV" == "/home/azureuser/workspace/desifaces-v3/infra/.env" ]]   || fail "unexpected runtime env path: $LIVE_ENV"
+[[ "$LIVE_ENV" == "/home/azureuser/workspace/desifaces-v3/infra/.env" ]] \
+  || fail "unexpected runtime env path: $LIVE_ENV"
 
 mapfile -t DB_RUNNING < <(
-  docker ps --format '{{.Names}}'   | grep -E '^desifaces(-v3)?-db# ---------------------------------------------------------------------------
+  docker ps --format '{{.Names}}' | grep -E '^desifaces(-v3)?-db$' || true
+)
+(( ${#DB_RUNNING[@]} == 1 )) \
+  || fail "expected exactly one running DB container before build, found: ${DB_RUNNING[*]:-none}"
+[[ "${DB_RUNNING[0]}" == "desifaces-db" ]] \
+  || fail "authoritative DB must use canonical container name desifaces-db"
+
+DB_NAME="$(
+  docker exec desifaces-db sh -lc 'printf %s "$POSTGRES_DB"'
+)"
+[[ "$DB_NAME" == "desifaces" ]] \
+  || fail "canonical DB container must expose POSTGRES_DB=desifaces, found: $DB_NAME"
+
+docker exec desifaces-db sh -lc \
+  'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d desifaces -Atc "select current_database();"' \
+  | grep -qx desifaces \
+  || fail "canonical logical DB desifaces is unavailable"
+
+mapfile -t REDIS_RUNNING < <(
+  docker ps --format '{{.Names}}' | grep -E '^desifaces(-v3)?-redis$' || true
+)
+(( ${#REDIS_RUNNING[@]} == 1 )) \
+  || fail "expected exactly one running Redis container, found: ${REDIS_RUNNING[*]:-none}"
+[[ "${REDIS_RUNNING[0]}" == "desifaces-redis" ]] \
+  || fail "Redis must use canonical container name desifaces-redis"
+
+mapfile -t FUSION_WORKERS < <(
+  docker ps --filter 'label=com.docker.compose.service=svc-fusion-worker' --format '{{.Names}}'
+)
+(( ${#FUSION_WORKERS[@]} <= 1 )) \
+  || fail "duplicate Fusion workers before build: ${FUSION_WORKERS[*]}"
+
+echo "RUNTIME_ENV_SINGLE_SOURCE=PASS"
+echo "DATABASE_TOPOLOGY_PREFLIGHT=PASS"
+echo "REDIS_TOPOLOGY_PREFLIGHT=PASS"
+echo "FUSION_WORKER_DUPLICATE_PREFLIGHT=PASS count=${#FUSION_WORKERS[@]}"
+
+# ---------------------------------------------------------------------------
 # 1. Materialize exact source SHAs.
 # ---------------------------------------------------------------------------
 git -C "$BACKEND_REPO" fetch --no-tags origin "$BACKEND_SHA"
@@ -62,68 +101,91 @@ compose(){
 }
 
 # ---------------------------------------------------------------------------
-# 2. Build every NEXT3-owned runtime before touching live containers.
+# 2-3. Candidate build/certification.
 # ---------------------------------------------------------------------------
-compose build   svc-director   svc-director-worker   svc-face   svc-face-worker   svc-fusion   svc-fusion-worker   svc-fusion-extension   svc-fusion-extension-stitch-worker
-
-echo "BACKEND_CANDIDATE_BUILD=PASS"
-
-docker build   -t "desifaces-web-next3:${WEB_SHA}"   "$WWT/web"
-
-echo "WEB_CANDIDATE_BUILD=PASS"
-
-# ---------------------------------------------------------------------------
-# 3. Candidate contract gates: no live mutation.
-# ---------------------------------------------------------------------------
-compose run --rm --no-deps --entrypoint python svc-director - <<'PY'
-import inspect
-from app.studio_e2e_routes import fusion_execution
-from app.fusion_execution_background_read import BackgroundFinalizedParallelSceneFusionExecutionService
-from app.fusion_execution_parent_pricing import ParentPricedSceneFusionExecutionService
-from app.fusion_execution_parallel_dispatch import ParallelOrphanReconciledParentPricedSceneFusionExecutionService
-
-assert isinstance(fusion_execution, BackgroundFinalizedParallelSceneFusionExecutionService)
-assert isinstance(fusion_execution, ParallelOrphanReconciledParentPricedSceneFusionExecutionService)
-source = inspect.getsource(ParentPricedSceneFusionExecutionService.preview)
-assert "if required_turn_ids:" in source
-assert "fusion_preserved_child_lineage_mismatch" in source
-print("DIRECTOR_BACKGROUND_RUNTIME_CONTRACT=PASS")
-print("STITCH_ONLY_SKIPS_UPSTREAM_GENERATION_INPUTS=PASS")
-print("PRESERVED_CHILD_LINEAGE_GUARD=PASS")
-PY
-
-compose run --rm --no-deps --entrypoint python svc-fusion-extension - <<'PY'
-from app.api.routes.v3_scene_stitch import _effective_scene_stitch_mode, _media_storage_location
-assert _effective_scene_stitch_mode("xfade", "shared_scene") == "hard_cut"
-assert _effective_scene_stitch_mode(None, "shared_scene") == "hard_cut"
-assert _effective_scene_stitch_mode("xfade", "ordered_speaker_shots") == "xfade"
-c,b = _media_storage_location(
-    "https://account.blob.core.windows.net/face-output/shared/group.png?sig=old",
-    {},
-)
-assert c == "face-output" and b == "shared/group.png"
-print("SHARED_SCENE_HARD_CUT_CONTRACT=PASS")
-print("SHARED_MEDIA_FALLBACK_CONTRACT=PASS")
-PY
-
-compose run --rm --no-deps --entrypoint python svc-face - <<'PY'
-from app.main import app
-paths={getattr(route,"path","") for route in app.routes}
-assert "/api/face/config/countries" in paths
-assert "/api/face/assets/{media_id}/read-url" in paths
-print("FACE_COUNTRY_CATALOG_ROUTE=PASS")
-print("FACE_DURABLE_MEDIA_READ_ROUTE=PASS")
-PY
-
-compose run --rm --no-deps --entrypoint python svc-fusion - <<'PY'
-from app.services.providers.sync3_adapter import _provider_concurrency_limit, _provider_wait_seconds
-assert _provider_concurrency_limit() == 1
-assert _provider_wait_seconds() == 900.0
-print("SYNC3_PROVIDER_CONCURRENCY=1")
-print("SYNC3_CONCURRENCY_WAIT_SECONDS=900")
-PY
-
-echo "BACKEND_CANDIDATE_CONTRACTS=PASS"
+if [[ "$RESUME_AFTER_DB" == "1" ]]; then
+  for image in \
+    desifaces-v3-svc-director \
+    desifaces-svc-face \
+    desifaces-svc-face-worker \
+    desifaces-svc-fusion \
+    desifaces-svc-fusion-worker \
+    desifaces-svc-fusion-extension \
+    desifaces-svc-fusion-extension-stitch-worker \
+    "desifaces-web-next3:${WEB_SHA}"
+  do
+    docker image inspect "$image" >/dev/null 2>&1 \
+      || fail "required certified candidate image missing: $image"
+  done
+  echo "CANDIDATE_IMAGES_REUSED=PASS"
+  echo "CANDIDATE_REBUILD=SKIPPED"
+else
+  # ---------------------------------------------------------------------------
+  # 2. Build every NEXT3-owned runtime before touching live containers.
+  # ---------------------------------------------------------------------------
+  compose build   svc-director   svc-director-worker   svc-face   svc-face-worker   svc-fusion   svc-fusion-worker   svc-fusion-extension   svc-fusion-extension-stitch-worker
+  
+  echo "BACKEND_CANDIDATE_BUILD=PASS"
+  
+  docker build   -t "desifaces-web-next3:${WEB_SHA}"   "$WWT/web"
+  
+  echo "WEB_CANDIDATE_BUILD=PASS"
+  
+  # ---------------------------------------------------------------------------
+  # 3. Candidate contract gates: no live mutation.
+  # ---------------------------------------------------------------------------
+  compose run --rm --no-deps --entrypoint python svc-director - <<'PY'
+  import inspect
+  from app.studio_e2e_routes import fusion_execution
+  from app.fusion_execution_background_read import BackgroundFinalizedParallelSceneFusionExecutionService
+  from app.fusion_execution_parent_pricing import ParentPricedSceneFusionExecutionService
+  from app.fusion_execution_parallel_dispatch import ParallelOrphanReconciledParentPricedSceneFusionExecutionService
+  
+  assert isinstance(fusion_execution, BackgroundFinalizedParallelSceneFusionExecutionService)
+  assert isinstance(fusion_execution, ParallelOrphanReconciledParentPricedSceneFusionExecutionService)
+  source = inspect.getsource(ParentPricedSceneFusionExecutionService.preview)
+  assert "if required_turn_ids:" in source
+  assert "fusion_preserved_child_lineage_mismatch" in source
+  print("DIRECTOR_BACKGROUND_RUNTIME_CONTRACT=PASS")
+  print("STITCH_ONLY_SKIPS_UPSTREAM_GENERATION_INPUTS=PASS")
+  print("PRESERVED_CHILD_LINEAGE_GUARD=PASS")
+  PY
+  
+  compose run --rm --no-deps --entrypoint python svc-fusion-extension - <<'PY'
+  from app.api.routes.v3_scene_stitch import _effective_scene_stitch_mode, _media_storage_location
+  assert _effective_scene_stitch_mode("xfade", "shared_scene") == "hard_cut"
+  assert _effective_scene_stitch_mode(None, "shared_scene") == "hard_cut"
+  assert _effective_scene_stitch_mode("xfade", "ordered_speaker_shots") == "xfade"
+  c,b = _media_storage_location(
+      "https://account.blob.core.windows.net/face-output/shared/group.png?sig=old",
+      {},
+  )
+  assert c == "face-output" and b == "shared/group.png"
+  print("SHARED_SCENE_HARD_CUT_CONTRACT=PASS")
+  print("SHARED_MEDIA_FALLBACK_CONTRACT=PASS")
+  PY
+  
+  compose run --rm --no-deps --entrypoint python svc-face - <<'PY'
+  from app.main import app
+  paths={getattr(route,"path","") for route in app.routes}
+  assert "/api/face/config/countries" in paths
+  assert "/api/face/assets/{media_id}/read-url" in paths
+  print("FACE_COUNTRY_CATALOG_ROUTE=PASS")
+  print("FACE_DURABLE_MEDIA_READ_ROUTE=PASS")
+  PY
+  
+  compose run --rm --no-deps --entrypoint python svc-fusion - <<'PY'
+  from app.services.providers.sync3_adapter import _provider_concurrency_limit, _provider_wait_seconds
+  assert _provider_concurrency_limit() == 1
+  assert _provider_wait_seconds() == 900.0
+  print("SYNC3_PROVIDER_CONCURRENCY=1")
+  print("SYNC3_CONCURRENCY_WAIT_SECONDS=900")
+  PY
+  
+  echo "BACKEND_CANDIDATE_CONTRACTS=PASS"
+  
+  
+fi
 
 # ---------------------------------------------------------------------------
 # 4. Database integrity migration. No container restart and no destructive cleanup.
@@ -151,23 +213,35 @@ echo "NEXT3_DB_INTEGRITY_MIGRATION=PASS"
 #    NEXT3-owned services. All new container names are stable and non-versioned.
 # ---------------------------------------------------------------------------
 declare -A TARGET=(
+  [svc-core]="df-svc-core"
+  [svc-pricing]="df-svc-pricing"
   [svc-face]="df-svc-face"
-  [svc-fusion]="df-svc-fusion"
-  [svc-fusion-extension]="df-svc-fusion-extension"
-  [svc-director]="df-svc-director"
   [svc-face-worker]="df-svc-face-worker"
+  [svc-audio]="df-svc-audio"
+  [svc-audio-worker]="df-svc-audio-worker"
+  [svc-fusion]="df-svc-fusion"
   [svc-fusion-worker]="df-svc-fusion-worker"
+  [svc-fusion-extension]="df-svc-fusion-extension"
+  [svc-fusion-extension-worker]="df-svc-fusion-extension-worker"
   [svc-fusion-extension-stitch-worker]="df-svc-fusion-extension-stitch-worker"
+  [svc-dashboard]="df-svc-dashboard"
+  [svc-director]="df-svc-director"
   [svc-director-worker]="df-svc-director-worker"
 )
 SERVICES=(
+  svc-core
+  svc-pricing
   svc-face
-  svc-fusion
-  svc-fusion-extension
-  svc-director
   svc-face-worker
+  svc-audio
+  svc-audio-worker
+  svc-fusion
   svc-fusion-worker
+  svc-fusion-extension
+  svc-fusion-extension-worker
   svc-fusion-extension-stitch-worker
+  svc-dashboard
+  svc-director
   svc-director-worker
 )
 
@@ -261,7 +335,7 @@ CUTOVER_STARTED=1
 
 for service in "${SERVICES[@]}"; do
   preserve_live "$service"
-  compose up -d --no-deps --force-recreate "$service"
+  compose up -d --no-deps --no-build --force-recreate "$service"
   target="${TARGET[$service]}"
   for _ in $(seq 1 30); do
     [[ "$(docker inspect -f '{{.State.Status}}' "$target" 2>/dev/null || true)" == "running" ]] && break
@@ -326,6 +400,15 @@ print("LIVE_DIRECTOR_BACKGROUND_FINALIZATION=PASS")
 PY
 
 echo "BACKEND_LIVE_CERTIFICATION=PASS"
+
+for service in "${SERVICES[@]}"; do
+  target="${TARGET[$service]}"
+  ENV_TEXT="$(docker inspect "$target" --format '{{range .Config.Env}}{{println .}}{{end}}')"
+  if grep -Eq 'desifaces_v3|desifaces-v3-db|desifaces_dev' <<<"$ENV_TEXT"; then
+    fail "stale database target remains in $target"
+  fi
+done
+echo "CANONICAL_DATABASE_TARGETS=PASS"
 
 # ---------------------------------------------------------------------------
 # 7. Deploy exact web SHA through its candidate/rollback path.
