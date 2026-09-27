@@ -106,6 +106,9 @@ compose(){
 if [[ "$RESUME_AFTER_DB" == "1" ]]; then
   for image in \
     desifaces-v3-svc-director \
+    desifaces-v3-svc-pricing \
+    desifaces-v3-svc-audio \
+    desifaces-v3-svc-audio-worker \
     desifaces-svc-face \
     desifaces-svc-face-worker \
     desifaces-svc-fusion \
@@ -120,71 +123,71 @@ if [[ "$RESUME_AFTER_DB" == "1" ]]; then
   echo "CANDIDATE_IMAGES_REUSED=PASS"
   echo "CANDIDATE_REBUILD=SKIPPED"
 else
-  # ---------------------------------------------------------------------------
-  # 2. Build every NEXT3-owned runtime before touching live containers.
-  # ---------------------------------------------------------------------------
-  compose build   svc-director   svc-director-worker   svc-face   svc-face-worker   svc-fusion   svc-fusion-worker   svc-fusion-extension   svc-fusion-extension-stitch-worker
-  
-  echo "BACKEND_CANDIDATE_BUILD=PASS"
-  
-  docker build   -t "desifaces-web-next3:${WEB_SHA}"   "$WWT/web"
-  
-  echo "WEB_CANDIDATE_BUILD=PASS"
-  
-  # ---------------------------------------------------------------------------
-  # 3. Candidate contract gates: no live mutation.
-  # ---------------------------------------------------------------------------
-  compose run --rm --no-deps --entrypoint python svc-director - <<'PY'
-  import inspect
-  from app.studio_e2e_routes import fusion_execution
-  from app.fusion_execution_background_read import BackgroundFinalizedParallelSceneFusionExecutionService
-  from app.fusion_execution_parent_pricing import ParentPricedSceneFusionExecutionService
-  from app.fusion_execution_parallel_dispatch import ParallelOrphanReconciledParentPricedSceneFusionExecutionService
-  
-  assert isinstance(fusion_execution, BackgroundFinalizedParallelSceneFusionExecutionService)
-  assert isinstance(fusion_execution, ParallelOrphanReconciledParentPricedSceneFusionExecutionService)
-  source = inspect.getsource(ParentPricedSceneFusionExecutionService.preview)
-  assert "if required_turn_ids:" in source
-  assert "fusion_preserved_child_lineage_mismatch" in source
-  print("DIRECTOR_BACKGROUND_RUNTIME_CONTRACT=PASS")
-  print("STITCH_ONLY_SKIPS_UPSTREAM_GENERATION_INPUTS=PASS")
-  print("PRESERVED_CHILD_LINEAGE_GUARD=PASS")
-  PY
-  
-  compose run --rm --no-deps --entrypoint python svc-fusion-extension - <<'PY'
-  from app.api.routes.v3_scene_stitch import _effective_scene_stitch_mode, _media_storage_location
-  assert _effective_scene_stitch_mode("xfade", "shared_scene") == "hard_cut"
-  assert _effective_scene_stitch_mode(None, "shared_scene") == "hard_cut"
-  assert _effective_scene_stitch_mode("xfade", "ordered_speaker_shots") == "xfade"
-  c,b = _media_storage_location(
-      "https://account.blob.core.windows.net/face-output/shared/group.png?sig=old",
-      {},
-  )
-  assert c == "face-output" and b == "shared/group.png"
-  print("SHARED_SCENE_HARD_CUT_CONTRACT=PASS")
-  print("SHARED_MEDIA_FALLBACK_CONTRACT=PASS")
-  PY
-  
-  compose run --rm --no-deps --entrypoint python svc-face - <<'PY'
-  from app.main import app
-  paths={getattr(route,"path","") for route in app.routes}
-  assert "/api/face/config/countries" in paths
-  assert "/api/face/assets/{media_id}/read-url" in paths
-  print("FACE_COUNTRY_CATALOG_ROUTE=PASS")
-  print("FACE_DURABLE_MEDIA_READ_ROUTE=PASS")
-  PY
-  
-  compose run --rm --no-deps --entrypoint python svc-fusion - <<'PY'
-  from app.services.providers.sync3_adapter import _provider_concurrency_limit, _provider_wait_seconds
-  assert _provider_concurrency_limit() == 1
-  assert _provider_wait_seconds() == 900.0
-  print("SYNC3_PROVIDER_CONCURRENCY=1")
-  print("SYNC3_CONCURRENCY_WAIT_SECONDS=900")
-  PY
-  
-  echo "BACKEND_CANDIDATE_CONTRACTS=PASS"
-  
-  
+# ---------------------------------------------------------------------------
+# 2. Build every NEXT3-owned runtime before touching live containers.
+# ---------------------------------------------------------------------------
+compose build   svc-director   svc-director-worker   svc-face   svc-face-worker   svc-fusion   svc-fusion-worker   svc-fusion-extension   svc-fusion-extension-stitch-worker
+
+echo "BACKEND_CANDIDATE_BUILD=PASS"
+
+docker build   -t "desifaces-web-next3:${WEB_SHA}"   "$WWT/web"
+
+echo "WEB_CANDIDATE_BUILD=PASS"
+
+# ---------------------------------------------------------------------------
+# 3. Candidate contract gates: no live mutation.
+# ---------------------------------------------------------------------------
+compose run --rm --no-deps --entrypoint python svc-director - <<'PY'
+import inspect
+from app.studio_e2e_routes import fusion_execution
+from app.fusion_execution_background_read import BackgroundFinalizedParallelSceneFusionExecutionService
+from app.fusion_execution_parent_pricing import ParentPricedSceneFusionExecutionService
+from app.fusion_execution_parallel_dispatch import ParallelOrphanReconciledParentPricedSceneFusionExecutionService
+
+assert isinstance(fusion_execution, BackgroundFinalizedParallelSceneFusionExecutionService)
+assert isinstance(fusion_execution, ParallelOrphanReconciledParentPricedSceneFusionExecutionService)
+source = inspect.getsource(ParentPricedSceneFusionExecutionService.preview)
+assert "if required_turn_ids:" in source
+assert "fusion_preserved_child_lineage_mismatch" in source
+print("DIRECTOR_BACKGROUND_RUNTIME_CONTRACT=PASS")
+print("STITCH_ONLY_SKIPS_UPSTREAM_GENERATION_INPUTS=PASS")
+print("PRESERVED_CHILD_LINEAGE_GUARD=PASS")
+PY
+
+compose run --rm --no-deps --entrypoint python svc-fusion-extension - <<'PY'
+from app.api.routes.v3_scene_stitch import _effective_scene_stitch_mode, _media_storage_location
+assert _effective_scene_stitch_mode("xfade", "shared_scene") == "hard_cut"
+assert _effective_scene_stitch_mode(None, "shared_scene") == "hard_cut"
+assert _effective_scene_stitch_mode("xfade", "ordered_speaker_shots") == "xfade"
+c,b = _media_storage_location(
+    "https://account.blob.core.windows.net/face-output/shared/group.png?sig=old",
+    {},
+)
+assert c == "face-output" and b == "shared/group.png"
+print("SHARED_SCENE_HARD_CUT_CONTRACT=PASS")
+print("SHARED_MEDIA_FALLBACK_CONTRACT=PASS")
+PY
+
+compose run --rm --no-deps --entrypoint python svc-face - <<'PY'
+from app.main import app
+paths={getattr(route,"path","") for route in app.routes}
+assert "/api/face/config/countries" in paths
+assert "/api/face/assets/{media_id}/read-url" in paths
+print("FACE_COUNTRY_CATALOG_ROUTE=PASS")
+print("FACE_DURABLE_MEDIA_READ_ROUTE=PASS")
+PY
+
+compose run --rm --no-deps --entrypoint python svc-fusion - <<'PY'
+from app.services.providers.sync3_adapter import _provider_concurrency_limit, _provider_wait_seconds
+assert _provider_concurrency_limit() == 1
+assert _provider_wait_seconds() == 900.0
+print("SYNC3_PROVIDER_CONCURRENCY=1")
+print("SYNC3_CONCURRENCY_WAIT_SECONDS=900")
+PY
+
+echo "BACKEND_CANDIDATE_CONTRACTS=PASS"
+
+
 fi
 
 # ---------------------------------------------------------------------------
@@ -210,10 +213,9 @@ echo "NEXT3_DB_INTEGRITY_MIGRATION=PASS"
 
 # ---------------------------------------------------------------------------
 # 5. Preserve current runtimes for automatic rollback, then cut over only
-#    NEXT3-owned services. All new container names are stable and non-versioned.
+#    E2E-critical services only. All container names are stable and non-versioned.
 # ---------------------------------------------------------------------------
 declare -A TARGET=(
-  [svc-core]="df-svc-core"
   [svc-pricing]="df-svc-pricing"
   [svc-face]="df-svc-face"
   [svc-face-worker]="df-svc-face-worker"
@@ -222,14 +224,11 @@ declare -A TARGET=(
   [svc-fusion]="df-svc-fusion"
   [svc-fusion-worker]="df-svc-fusion-worker"
   [svc-fusion-extension]="df-svc-fusion-extension"
-  [svc-fusion-extension-worker]="df-svc-fusion-extension-worker"
   [svc-fusion-extension-stitch-worker]="df-svc-fusion-extension-stitch-worker"
-  [svc-dashboard]="df-svc-dashboard"
   [svc-director]="df-svc-director"
   [svc-director-worker]="df-svc-director-worker"
 )
 SERVICES=(
-  svc-core
   svc-pricing
   svc-face
   svc-face-worker
@@ -238,9 +237,7 @@ SERVICES=(
   svc-fusion
   svc-fusion-worker
   svc-fusion-extension
-  svc-fusion-extension-worker
   svc-fusion-extension-stitch-worker
-  svc-dashboard
   svc-director
   svc-director-worker
 )
