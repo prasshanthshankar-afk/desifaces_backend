@@ -589,6 +589,85 @@ def _active_speaker_qc(
         }
 
 
+def _upper_body_roi(
+    coordinates: list[int],
+    *,
+    source_width: int,
+    source_height: int,
+    output_width: int,
+    output_height: int,
+) -> tuple[int, int, int, int]:
+    sx = output_width / float(source_width)
+    sy = output_height / float(source_height)
+    cx = int(round(coordinates[0] * sx))
+    cy = int(round(coordinates[1] * sy))
+    half_w = max(40, int(round(0.11 * output_width)))
+    top = max(0, cy - int(round(0.08 * output_height)))
+    bottom = min(output_height, cy + int(round(0.32 * output_height)))
+    return (
+        max(0, cx - half_w),
+        top,
+        min(output_width, cx + half_w),
+        bottom,
+    )
+
+
+def _motion_presence_qc(
+    *,
+    video_path: Path,
+    proof_turns: list[dict[str, Any]],
+    source_width: int,
+    source_height: int,
+    sample_fps: int = 5,
+) -> dict[str, Any]:
+    output_width, output_height = _probe_video_geometry(video_path)
+    with tempfile.TemporaryDirectory(prefix="df_next3_motion_qc_") as frame_dir:
+        pattern = str(Path(frame_dir) / "frame-%06d.png")
+        _run(["ffmpeg", "-y", "-i", str(video_path), "-vf", f"fps={sample_fps}", "-vsync", "vfr", pattern])
+        frames = sorted(Path(frame_dir).glob("frame-*.png"))
+        if len(frames) < 5:
+            return {"status": "FAIL", "reason": "insufficient_motion_frames", "participants": []}
+
+        unique: dict[str, dict[str, Any]] = {}
+        for turn in proof_turns:
+            unique.setdefault(turn["participant_id"], turn)
+        participants = []
+        overall = "PASS"
+        for participant_id, turn in unique.items():
+            roi = _upper_body_roi(
+                turn["coordinates"],
+                source_width=source_width,
+                source_height=source_height,
+                output_width=output_width,
+                output_height=output_height,
+            )
+            series = _roi_motion_series(frames, roi)
+            score = _mean(series)
+            if score < 0.08:
+                status = "FAIL"
+                reason = "upper_body_motion_near_static"
+                overall = "FAIL"
+            else:
+                status = "PASS"
+                reason = "motion_present_manual_naturalness_review_required"
+            participants.append({
+                "participant_id": participant_id,
+                "display_name": turn["display_name"],
+                "status": status,
+                "reason": reason,
+                "upper_body_motion_score": round(score, 4),
+                "roi": list(roi),
+            })
+        return {
+            "status": overall,
+            "sample_fps": sample_fps,
+            "participants": participants,
+            "note": (
+                "Automated gate detects near-static upper-body performance only. Blink quality, gesture anatomy, "
+                "expression-context alignment, identity preservation and conversational naturalness remain mandatory human-review gates."
+            ),
+        }
+
 def _active_count(payload: Any) -> int:
     if isinstance(payload, list):
         return len(payload)
