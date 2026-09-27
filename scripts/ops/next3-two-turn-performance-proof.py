@@ -699,7 +699,9 @@ async def main() -> None:
     parser.add_argument("--workflow-id", required=True)
     parser.add_argument("--stage-run-id", required=True)
     parser.add_argument("--fps", type=int, default=25)
-    parser.add_argument("--provider-job-id", default="")
+    parser.add_argument("--sync-provider-job-id", default="")
+    parser.add_argument("--motion-provider-job-id", default="")
+    parser.add_argument("--motion-model", default="")
     args = parser.parse_args()
 
     workflow_id = UUID(args.workflow_id)
@@ -710,10 +712,13 @@ async def main() -> None:
     sync_base = _clean(os.getenv("SYNC_API_BASE_URL") or "https://api.sync.so").rstrip("/")
     azure_conn = _clean(os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
     output_container = _clean(os.getenv("AZURE_VIDEO_OUTPUT_CONTAINER") or "video-output")
+    fal_key = _clean(os.getenv("FAL_KEY") or os.getenv("FAL_API_KEY"))
     if not sync_key:
         raise RuntimeError("SYNC_API_KEY_MISSING")
     if not azure_conn:
         raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING_MISSING")
+    if not fal_key:
+        raise RuntimeError("FAL_KEY_MISSING")
 
     conn = await asyncpg.connect(_db_dsn())
     try:
@@ -932,7 +937,7 @@ async def main() -> None:
             "Accept": "application/json",
         }
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            provider_job_id = _clean(args.provider_job_id)
+            provider_job_id = _clean(args.sync_provider_job_id)
             if provider_job_id:
                 print(f"SYNC_SEGMENTS_PROVIDER_JOB_REUSE={provider_job_id}")
             else:
