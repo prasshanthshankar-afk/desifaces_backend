@@ -1876,5 +1876,490 @@ async def main() -> None:
         print("============================================================")
 
 
+
+async def full_scene_main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--workflow-id", required=True)
+    parser.add_argument("--stage-run-id", required=True)
+    parser.add_argument("--phase", choices=["motion"], default="motion")
+    parser.add_argument("--expected-turn-count", type=int, default=7)
+    parser.add_argument("--motion-model", default="")
+    parser.add_argument("--run-id", default="")
+    args = parser.parse_args()
+
+    workflow_id = UUID(args.workflow_id)
+    stage_run_id = UUID(args.stage_run_id)
+    expected_turn_count = max(1, int(args.expected_turn_count))
+
+    azure_conn = _clean(os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
+    output_container = _clean(os.getenv("AZURE_VIDEO_OUTPUT_CONTAINER") or "video-output")
+    fal_key = _clean(os.getenv("FAL_KEY") or os.getenv("FAL_API_KEY"))
+    if not azure_conn:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING_MISSING")
+    if not fal_key:
+        raise RuntimeError("FAL_KEY_MISSING")
+
+    conn = await asyncpg.connect(_db_dsn())
+    try:
+        stage = await conn.fetchrow(
+            """
+            select s.stage_run_id,s.scene_id,s.metadata_json,
+                   w.workflow_id,w.account_id,w.owner_user_id,w.project_id,
+                   sc.title as scene_title,sc.summary as scene_summary,sc.direction_json as scene_direction
+            from public.v3_studio_stage_runs s
+            join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+            join public.v3_scenes sc on sc.scene_id=s.scene_id
+            where s.stage_run_id=$1 and w.workflow_id=$2
+              and s.stage_type='fusion' and s.scope_type='scene'
+            """,
+            stage_run_id,
+            workflow_id,
+        )
+        if not stage:
+            raise RuntimeError("FULL_SCENE_STAGE_NOT_FOUND")
+        stage_meta = _dict(stage["metadata_json"])
+        if _clean(stage_meta.get("conversation_mode")).lower() != "shared_scene":
+            raise RuntimeError("FULL_SCENE_REQUIRES_SHARED_SCENE_MODE")
+
+        shared_media_id = UUID(_clean(stage_meta.get("shared_scene_media_id")))
+        image_row = await conn.fetchrow(
+            """
+            select id,storage_ref,meta_json,width,height,lifecycle_state
+            from public.media_assets
+            where id=$1 and lifecycle_state='active'
+            """,
+            shared_media_id,
+        )
+        if not image_row:
+            raise RuntimeError("FULL_SCENE_SHARED_IMAGE_NOT_ACTIVE")
+
+        rows = await conn.fetch(
+            """
+            select dt.turn_id,dt.sequence_no,dt.speaker_participant_id,p.display_name,
+                   dt.emotion_code,to_jsonb(dt) as turn_json,
+                   ao.media_id as audio_media_id,
+                   ma.storage_ref,ma.meta_json,ma.duration_ms,ma.lifecycle_state
+            from public.v3_dialogue_turns dt
+            join public.v3_participants p on p.participant_id=dt.speaker_participant_id
+            join public.v3_studio_stage_runs a
+              on a.workflow_id=$1 and a.stage_type='audio'
+             and a.scope_type='dialogue_turn' and a.dialogue_turn_id=dt.turn_id
+             and a.state='approved'
+            join public.v3_studio_stage_outputs ao
+              on ao.stage_run_id=a.stage_run_id and ao.is_active=true
+            join public.v3_studio_review_items ar
+              on ar.stage_run_id=a.stage_run_id and ar.media_id=ao.media_id
+             and ar.decision='approved'
+            join public.media_assets ma on ma.id=ao.media_id
+            where dt.scene_id=$2 and dt.turn_kind='speech'
+              and ma.lifecycle_state='active'
+            order by dt.sequence_no,dt.turn_id
+            """,
+            workflow_id,
+            stage["scene_id"],
+        )
+        if len(rows) != expected_turn_count:
+            raise RuntimeError(
+                f"FULL_SCENE_APPROVED_TURN_COUNT_MISMATCH:expected={expected_turn_count}:actual={len(rows)}"
+            )
+
+        turns: list[dict[str, Any]] = []
+        for row in rows:
+            spoken_text, text_source = _extract_spoken_text(
+                _dict(row["turn_json"]),
+                _dict(row["meta_json"]),
+            )
+            turns.append(
+                {
+                    "sequence_no": int(row["sequence_no"]),
+                    "dialogue_turn_id": str(row["turn_id"]),
+                    "speaker_participant_id": str(row["speaker_participant_id"]),
+                    "speaker_name": _clean(row["display_name"]),
+                    "emotion_code": _clean(row["emotion_code"]) or None,
+                    "spoken_text": spoken_text,
+                    "text_source": text_source,
+                    "audio_media_id": str(row["audio_media_id"]),
+                    "_row": row,
+                }
+            )
+    finally:
+        await conn.close()
+
+    azure = AzureBlobService(azure_conn)
+    bsc = BlobServiceClient.from_connection_string(azure_conn)
+    cc = bsc.get_container_client(output_container)
+    image_container, image_blob = _blob_location(image_row)
+    image_url = azure.sign_read_url(image_container, image_blob, 4 * 3600)
+
+    run_id = _clean(args.run_id) or time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    base_path = f"v3/qa/shared-scene-full-performance/{workflow_id}/{stage_run_id}/{run_id}"
+    plan_blob = f"{base_path}/plan.json"
+
+    print("============================================================")
+    print(" NEXT3 FULL-SCENE PERFORMANCE PIPELINE")
+    print(" phase=motion")
+    print(" environment=DEV_ONLY")
+    print(" database_write=NONE")
+    print(" production_touch=NONE")
+    print(f"workflow_id={workflow_id}")
+    print(f"stage_run_id={stage_run_id}")
+    print(f"shared_scene_media_id={shared_media_id}")
+    print(f"turn_count={len(turns)}")
+    print(f"run_id={run_id}")
+    print("============================================================")
+
+    with tempfile.TemporaryDirectory(prefix="df_next3_full_scene_") as td:
+        root = Path(td)
+
+        durations: list[float] = []
+        audio_urls: list[str] = []
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+            for index, turn in enumerate(turns, start=1):
+                row = turn["_row"]
+                container, blob = _blob_location(row)
+                url = azure.sign_read_url(container, blob, 4 * 3600)
+                audio_urls.append(url)
+                duration = (
+                    float(row["duration_ms"]) / 1000.0
+                    if row["duration_ms"] is not None and int(row["duration_ms"]) > 0
+                    else 0.0
+                )
+                if duration <= 0:
+                    local_audio = root / f"audio-{index}.bin"
+                    await _download(client, url, local_audio)
+                    duration = _probe_duration(local_audio)
+                durations.append(max(0.25, round(float(duration), 3)))
+
+        reusable_plan = None
+        plan_client = cc.get_blob_client(plan_blob)
+        if args.run_id and plan_client.exists():
+            reusable_plan = json.loads(plan_client.download_blob().readall().decode("utf-8"))
+            existing_lineage = [
+                (int(item["sequence_no"]), str(item["dialogue_turn_id"]))
+                for item in list(reusable_plan.get("timeline") or [])
+            ]
+            current_lineage = [
+                (int(item["sequence_no"]), str(item["dialogue_turn_id"]))
+                for item in turns
+            ]
+            if existing_lineage != current_lineage:
+                raise RuntimeError("FULL_SCENE_RESUME_LINEAGE_MISMATCH")
+            performance_plan = dict(reusable_plan["performance_director"])
+            timeline = list(reusable_plan["timeline"])
+            total_duration = float(reusable_plan["planned_duration_seconds"])
+            chunks = list(reusable_plan["motion_chunks"])
+            print(f"PERFORMANCE_PLAN_REUSE={plan_blob}")
+        else:
+            performance_plan = await _full_scene_performance_plan(
+                scene_title=_clean(stage["scene_title"]),
+                scene_summary=_clean(stage["scene_summary"]),
+                scene_direction=_dict(stage["scene_direction"]),
+                turns=[
+                    {
+                        "sequence_no": item["sequence_no"],
+                        "speaker_participant_id": item["speaker_participant_id"],
+                        "speaker_name": item["speaker_name"],
+                        "emotion_code": item["emotion_code"],
+                        "spoken_text": item["spoken_text"],
+                        "duration_seconds": duration,
+                    }
+                    for item, duration in zip(turns, durations)
+                ],
+            )
+            timeline, total_duration = _build_full_timeline(
+                turns=[
+                    {k: v for k, v in item.items() if k != "_row"}
+                    for item in turns
+                ],
+                durations=durations,
+                plan=performance_plan,
+            )
+            chunks = _pack_motion_chunks(
+                timeline,
+                total_duration=total_duration,
+                max_chunk_seconds=14.0,
+            )
+            plan_payload = {
+                "contract": "next3_shared_scene_full_performance_plan_v1",
+                "workflow_id": str(workflow_id),
+                "stage_run_id": str(stage_run_id),
+                "shared_scene_media_id": str(shared_media_id),
+                "performance_director": performance_plan,
+                "timeline": timeline,
+                "planned_duration_seconds": total_duration,
+                "motion_chunks": chunks,
+            }
+            plan_local = root / "plan.json"
+            plan_local.write_text(json.dumps(plan_payload, indent=2), encoding="utf-8")
+            azure.upload_file(output_container, plan_blob, str(plan_local), "application/json")
+            print(f"PERFORMANCE_PLAN_CREATED={plan_blob}")
+
+        print(
+            "PERFORMANCE_TIMELINE="
+            + json.dumps(
+                [
+                    {
+                        "seq": item["sequence_no"],
+                        "speaker": item["speaker_name"],
+                        "emotion": item["emotion_code"],
+                        "start": item["start_time"],
+                        "end": item["end_time"],
+                        "pause_after": item["pause_after_seconds"],
+                    }
+                    for item in timeline
+                ],
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        )
+        print(
+            "MOTION_CHUNKS="
+            + json.dumps(
+                [
+                    {
+                        "chunk_no": item["chunk_no"],
+                        "start": item["start_time"],
+                        "end": item["end_time"],
+                        "duration": item["duration_seconds"],
+                        "turns": [t["sequence_no"] for t in item["turns"]],
+                    }
+                    for item in chunks
+                ],
+                separators=(",", ":"),
+            )
+        )
+
+        motion_model = _clean(
+            args.motion_model
+            or os.getenv("DF_NEXT3_PERFORMANCE_MODEL")
+            or os.getenv("FAL_KLING_I2V_MODEL")
+            or "fal-ai/kling-video/v3/standard/image-to-video"
+        )
+        negative_prompt = (
+            "visible speech articulation before lipsync, both people talking, repeated mouth flapping, "
+            "frozen mannequin pose, identity drift, face morphing, duplicate person, warped hands, extra fingers, "
+            "exaggerated gestures, constant nodding, constant smiling, camera jump, scene cut, clothing change, background change"
+        )
+
+        normalized_paths: list[Path] = []
+        chunk_records: list[dict[str, Any]] = []
+        current_start_url = image_url
+        target_width = 0
+        target_height = 0
+        target_fps = 0
+
+        for chunk in chunks:
+            chunk_no = int(chunk["chunk_no"])
+            planned = float(chunk["duration_seconds"])
+            requested_duration = max(3, min(15, int(math.ceil(planned))))
+            chunk_blob = f"{base_path}/motion-chunks/chunk-{chunk_no:02d}.mp4"
+            last_frame_blob = f"{base_path}/motion-chunks/chunk-{chunk_no:02d}-last.png"
+            local_normalized = root / f"chunk-{chunk_no:02d}.mp4"
+            chunk_client = cc.get_blob_client(chunk_blob)
+
+            prompt = _chunk_motion_prompt(
+                scene_title=_clean(stage["scene_title"]),
+                chunk=chunk,
+                plan=performance_plan,
+            )
+            motion_payload = {
+                "prompt": prompt,
+                "start_image_url": current_start_url,
+                "duration": str(requested_duration),
+                "generate_audio": False,
+                "shot_type": "customize",
+                "negative_prompt": negative_prompt,
+            }
+
+            if args.run_id and chunk_client.exists():
+                local_normalized.write_bytes(chunk_client.download_blob().readall())
+                provider_job_id = "azure-reuse:" + chunk_blob
+                print(f"MOTION_CHUNK_REUSE={chunk_no}:{chunk_blob}")
+            else:
+                provider_job_id, provider_url, _ = await _fal_generate_motion(
+                    model_id=motion_model,
+                    fal_key=fal_key,
+                    payload=motion_payload,
+                )
+                raw_path = root / f"chunk-{chunk_no:02d}-raw.mp4"
+                async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
+                    await _download(client, provider_url, raw_path)
+                raw_info = _probe_video_info(raw_path)
+                if target_width <= 0:
+                    target_width = int(raw_info["width"])
+                    target_height = int(raw_info["height"])
+                    target_fps = max(20, min(30, int(round(float(raw_info["fps"])))))
+                filter_value = (
+                    f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+                    f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+                )
+                _run([
+                    "ffmpeg", "-y", "-i", str(raw_path),
+                    "-t", f"{planned:.3f}",
+                    "-vf", filter_value,
+                    "-r", str(target_fps),
+                    "-an",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    str(local_normalized),
+                ])
+                azure.upload_file(output_container, chunk_blob, str(local_normalized), "video/mp4")
+                print(f"MOTION_CHUNK_GENERATED={chunk_no}:{provider_job_id}")
+
+            info = _probe_video_info(local_normalized)
+            if target_width <= 0:
+                target_width = int(info["width"])
+                target_height = int(info["height"])
+                target_fps = max(20, min(30, int(round(float(info["fps"])))))
+            if abs(float(info["duration"]) - planned) > 0.35:
+                raise RuntimeError(
+                    f"MOTION_CHUNK_DURATION_MISMATCH:chunk={chunk_no}:planned={planned}:actual={info['duration']}"
+                )
+
+            last_frame_path = root / f"chunk-{chunk_no:02d}-last.png"
+            last_client = cc.get_blob_client(last_frame_blob)
+            if args.run_id and last_client.exists():
+                last_frame_path.write_bytes(last_client.download_blob().readall())
+            else:
+                _extract_last_frame(local_normalized, last_frame_path)
+                azure.upload_file(output_container, last_frame_blob, str(last_frame_path), "image/png")
+            current_start_url = azure.sign_read_url(output_container, last_frame_blob, 4 * 3600)
+
+            normalized_paths.append(local_normalized)
+            chunk_records.append(
+                {
+                    "chunk_no": chunk_no,
+                    "planned_start_time": float(chunk["start_time"]),
+                    "planned_end_time": float(chunk["end_time"]),
+                    "planned_duration_seconds": planned,
+                    "provider_job_id": provider_job_id,
+                    "storage_path": chunk_blob,
+                    "last_frame_storage_path": last_frame_blob,
+                    "video_info": info,
+                    "turn_sequence_numbers": [int(t["sequence_no"]) for t in chunk["turns"]],
+                    "performance_prompt": prompt,
+                }
+            )
+
+        full_motion_path = root / "full-performance-motion.mp4"
+        _concat_h264_segments(normalized_paths, full_motion_path)
+        full_info = _probe_video_info(full_motion_path)
+        if abs(float(full_info["duration"]) - float(total_duration)) > 0.6:
+            raise RuntimeError(
+                "FULL_PERFORMANCE_DURATION_MISMATCH:"
+                f"planned={total_duration}:actual={full_info['duration']}"
+            )
+
+        full_motion_blob = f"{base_path}/full-performance-motion.mp4"
+        azure.upload_file(output_container, full_motion_blob, str(full_motion_path), "video/mp4")
+        motion_review_url = azure.sign_read_url(output_container, full_motion_blob, 15 * 24 * 3600)
+
+        source_dims = _dict(stage_meta.get("shared_scene_dimensions"))
+        qc_turns: list[dict[str, Any]] = []
+        for turn in timeline:
+            coords = _speaker_coordinates(
+                stage_meta,
+                UUID(str(turn["speaker_participant_id"])),
+            )
+            qc_turns.append(
+                {
+                    "sequence_no": turn["sequence_no"],
+                    "participant_id": turn["speaker_participant_id"],
+                    "display_name": turn["speaker_name"],
+                    "coordinates": coords,
+                    "start_time": turn["start_time"],
+                    "end_time": turn["end_time"],
+                }
+            )
+
+        motion_qc = _motion_presence_qc(
+            video_path=full_motion_path,
+            proof_turns=qc_turns,
+            source_width=int(source_dims["width"]),
+            source_height=int(source_dims["height"]),
+        )
+
+        quality_gate = {
+            "status": "REVIEW_REQUIRED" if motion_qc["status"] != "FAIL" else "FAIL",
+            "performance_motion": {
+                "status": motion_qc["status"],
+                "automated_check": "upper_body_motion_presence",
+            },
+            "speaker_isolation": {"status": "PENDING", "reason": "sync_phase_not_started"},
+            "human_performance_review": {
+                "status": "PENDING",
+                "required_dimensions": [
+                    "context_specific_expression",
+                    "blinks",
+                    "gaze",
+                    "head_motion",
+                    "body_motion",
+                    "gestures",
+                    "hands",
+                    "listener_reaction",
+                    "identity",
+                    "temporal_continuity",
+                    "conversation_pacing",
+                ],
+            },
+        }
+
+        final_manifest = {
+            "contract": "next3_shared_scene_full_performance_motion_v1",
+            "phase": "motion",
+            "workflow_id": str(workflow_id),
+            "stage_run_id": str(stage_run_id),
+            "shared_scene_media_id": str(shared_media_id),
+            "run_id": run_id,
+            "turn_count": len(timeline),
+            "planned_duration_seconds": total_duration,
+            "actual_duration_seconds": float(full_info["duration"]),
+            "media": {
+                "width": int(full_info["width"]),
+                "height": int(full_info["height"]),
+                "fps": float(full_info["fps"]),
+                "frame_count": int(full_info["frame_count"]),
+                "storage_path": full_motion_blob,
+            },
+            "performance_director": performance_plan,
+            "timeline": timeline,
+            "motion_chunks": chunk_records,
+            "quality_gate": quality_gate,
+            "diagnostics": {
+                "performance_motion_qc": motion_qc,
+            },
+            "database_write": "NONE",
+            "production_touch": "NONE",
+        }
+
+        manifest_path = root / "full-performance-manifest.json"
+        manifest_path.write_text(json.dumps(final_manifest, indent=2), encoding="utf-8")
+        manifest_blob = f"{base_path}/full-performance-manifest.json"
+        azure.upload_file(output_container, manifest_blob, str(manifest_path), "application/json")
+        manifest_url = azure.sign_read_url(output_container, manifest_blob, 15 * 24 * 3600)
+
+        print("============================================================")
+        print("NEXT3_FULL_SCENE_MOTION_PHASE=PASS")
+        print(f"QUALITY_GATE={quality_gate['status']}")
+        print(f"PERFORMANCE_MOTION_QC={motion_qc['status']}")
+        for item in motion_qc["participants"]:
+            print(
+                "MOTION_QC "
+                f"participant={item['display_name']} "
+                f"status={item['status']} "
+                f"score={item['upper_body_motion_score']}"
+            )
+        print(f"TURN_COUNT={len(timeline)}")
+        print(f"PLANNED_DURATION_SECONDS={total_duration}")
+        print(f"ACTUAL_DURATION_SECONDS={float(full_info['duration']):.3f}")
+        print(f"FULL_MOTION_BASE_URL={motion_review_url}")
+        print(f"MANIFEST_URL={manifest_url}")
+        print(f"RUN_ID={run_id}")
+        print("SYNC_PHASE=BLOCKED_PENDING_HUMAN_PERFORMANCE_REVIEW")
+        print("DATABASE_WRITE=NONE")
+        print("PRODUCTION_TOUCH=NONE")
+        print("============================================================")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(full_scene_main())
