@@ -380,6 +380,96 @@ def _probe_duration(path: Path) -> float:
     return duration
 
 
+def _parse_rate(value: str) -> float:
+    raw = _clean(value)
+    if not raw:
+        return 0.0
+    if "/" in raw:
+        left, right = raw.split("/", 1)
+        try:
+            denom = float(right)
+            return float(left) / denom if denom else 0.0
+        except Exception:
+            return 0.0
+    try:
+        return float(raw)
+    except Exception:
+        return 0.0
+
+
+def _probe_video_info(path: Path) -> dict[str, Any]:
+    proc = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames:format=duration",
+            "-of", "json",
+            str(path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("VIDEO_INFO_PROBE_FAILED:" + (proc.stderr or "")[-1200:])
+    payload = json.loads(proc.stdout or "{}")
+    streams = list(payload.get("streams") or [])
+    if not streams:
+        raise RuntimeError("VIDEO_INFO_MISSING")
+    stream = streams[0]
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    fps = _parse_rate(str(stream.get("avg_frame_rate") or "")) or _parse_rate(str(stream.get("r_frame_rate") or ""))
+    duration = float(_dict(payload.get("format")).get("duration") or 0.0)
+    frame_count_raw = stream.get("nb_frames")
+    try:
+        frame_count = int(frame_count_raw) if frame_count_raw not in (None, "", "N/A") else 0
+    except Exception:
+        frame_count = 0
+    if frame_count <= 0 and fps > 0 and duration > 0:
+        frame_count = max(1, int(round(fps * duration)))
+    if width < 64 or height < 64 or fps <= 0 or duration <= 0:
+        raise RuntimeError(
+            f"VIDEO_INFO_INVALID:width={width}:height={height}:fps={fps}:duration={duration}"
+        )
+    return {
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "duration": duration,
+        "frame_count": frame_count,
+    }
+
+
+def _speaker_coordinates_for_video(
+    stage_meta: dict[str, Any],
+    participant_id: UUID,
+    *,
+    video_width: int,
+    video_height: int,
+) -> list[int]:
+    targets = _dict(stage_meta.get("speaker_targets"))
+    target = _dict(targets.get(str(participant_id)))
+    point = _dict(target.get("point"))
+    if point:
+        x = float(point["x"])
+        y = float(point["y"])
+    else:
+        box = _dict(target.get("box"))
+        if not box:
+            raise RuntimeError(f"SPEAKER_TARGET_MISSING:{participant_id}")
+        x = float(box["x"]) + float(box["width"]) / 2.0
+        y = float(box["y"]) + float(box["height"]) / 2.0
+
+    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+        raise RuntimeError(f"SPEAKER_TARGET_INVALID:{participant_id}")
+
+    return [
+        max(0, min(video_width - 1, int(round(x * video_width)))),
+        max(0, min(video_height - 1, int(round(y * video_height)))),
+    ]
+
+
 def _probe_video_geometry(path: Path) -> tuple[int, int]:
     proc = subprocess.run(
         [
