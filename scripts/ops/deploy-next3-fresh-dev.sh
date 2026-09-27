@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 BACKEND_SHA="${1:-}"
 WEB_SHA="${2:-}"
+SKIP_BUILD="${NEXT3_SKIP_BUILD:-0}"
 EXPECTED_HOST="desifaces-dev"
 BACKEND_REPO="${BACKEND_REPO:-/home/azureuser/workspace/desifaces-v3}"
 WEB_REPO="${WEB_REPO:-/home/azureuser/workspace/desifaces-web}"
@@ -74,11 +75,16 @@ BUILD_SERVICES=(
   svc-director-worker
 )
 
-compose build "${BUILD_SERVICES[@]}"
-echo "FRESH_BACKEND_IMAGES_BUILD=PASS"
+if [[ "$SKIP_BUILD" == "1" ]]; then
+  echo "FRESH_BACKEND_IMAGES_BUILD=REUSED"
+  echo "FRESH_WEB_IMAGE_BUILD=REUSED"
+else
+  compose build "${BUILD_SERVICES[@]}"
+  echo "FRESH_BACKEND_IMAGES_BUILD=PASS"
 
-docker build -t "desifaces-web-next3:${WEB_SHA}" "$WWT/web"
-echo "FRESH_WEB_IMAGE_BUILD=PASS"
+  docker build -t "desifaces-web-next3:${WEB_SHA}" "$WWT/web"
+  echo "FRESH_WEB_IMAGE_BUILD=PASS"
+fi
 
 compose run --rm --no-deps --entrypoint python svc-director - <<'PY'
 import inspect
