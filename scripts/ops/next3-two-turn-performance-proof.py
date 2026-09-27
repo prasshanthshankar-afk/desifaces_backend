@@ -1031,8 +1031,18 @@ async def main() -> None:
             if not output_url:
                 raise RuntimeError("SYNC_SEGMENTS_POLL_TIMEOUT")
 
-            output_path = root / "segments-output.mp4"
-            await _download(client, output_url, output_path)
+            raw_output_path = root / "segments-output-raw.mp4"
+            await _download(client, output_url, raw_output_path)
+
+        output_path = root / "segments-output.mp4"
+        _run(
+            [
+                "ffmpeg", "-y", "-i", str(raw_output_path),
+                "-t", f"{total_duration:.3f}",
+                "-c", "copy",
+                str(output_path),
+            ]
+        )
 
         output_blob = f"{base_path}/segments-output.mp4"
         azure.upload_file(output_container, output_blob, str(output_path), "video/mp4")
