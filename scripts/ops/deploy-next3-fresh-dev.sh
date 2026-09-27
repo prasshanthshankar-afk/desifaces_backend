@@ -229,10 +229,31 @@ wait_http http://127.0.0.1:18011/api/health 200 DIRECTOR || fail "director unhea
 
 for service in "${SERVICES[@]}"; do
   target="${TARGET[$service]}"
-  envtxt="$(docker inspect "$target" --format '{{range .Config.Env}}{{println .}}{{end}}')"
-  if grep -Eq 'desifaces_v3|desifaces_dev|desifaces-v3-db|desifaces-v3-redis' <<<"$envtxt"; then
-    fail "stale DB/Redis target in $target"
-  fi
+  docker inspect "$target" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | python3 - "$target" <<'PY'
+import sys
+from urllib.parse import urlsplit
+
+target=sys.argv[1]
+env={}
+for line in sys.stdin:
+    line=line.rstrip("\n")
+    if "=" in line:
+        k,v=line.split("=",1)
+        env[k]=v
+
+db=env.get("DATABASE_URL","")
+redis=env.get("REDIS_URL","")
+if db:
+    u=urlsplit(db)
+    if u.hostname != "desifaces-db" or u.path.lstrip("/") != "desifaces":
+        raise SystemExit(f"{target}: DATABASE_URL points to {u.hostname}/{u.path.lstrip('/')}")
+if redis:
+    u=urlsplit(redis)
+    if u.hostname != "desifaces-redis":
+        raise SystemExit(f"{target}: REDIS_URL points to {u.hostname}")
+print(f"RUNTIME_DATA_TARGETS {target}=PASS")
+PY
 done
 
 [[ "$(docker ps --filter 'label=com.docker.compose.service=svc-fusion-worker' --format '{{.Names}}' | wc -l)" -eq 1 ]]   || fail "Fusion worker ownership is not singular"
