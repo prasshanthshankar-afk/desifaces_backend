@@ -760,6 +760,145 @@ def _motion_presence_qc(
             ),
         }
 
+def _frame_aligned_lipsync_attribution_qc(
+    *,
+    base_video_path: Path,
+    output_video_path: Path,
+    proof_turns: list[dict[str, Any]],
+    source_width: int,
+    source_height: int,
+    sample_fps: int = 10,
+) -> dict[str, Any]:
+    base_width, base_height = _probe_video_geometry(base_video_path)
+    out_width, out_height = _probe_video_geometry(output_video_path)
+    if (base_width, base_height) != (out_width, out_height):
+        return {
+            "status": "WARN",
+            "reason": "base_output_geometry_mismatch",
+            "segments": [],
+        }
+
+    def extract_frames(video_path: Path, frame_dir: str) -> list[Path]:
+        pattern = str(Path(frame_dir) / "frame-%06d.png")
+        _run([
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vf", f"fps={sample_fps}", "-vsync", "vfr", pattern,
+        ])
+        return sorted(Path(frame_dir).glob("frame-*.png"))
+
+    with tempfile.TemporaryDirectory(prefix="df_next3_attr_base_") as base_dir, tempfile.TemporaryDirectory(prefix="df_next3_attr_out_") as out_dir:
+        base_frames = extract_frames(base_video_path, base_dir)
+        out_frames = extract_frames(output_video_path, out_dir)
+        frame_count = min(len(base_frames), len(out_frames))
+        if frame_count < 4:
+            return {"status": "FAIL", "reason": "insufficient_frame_aligned_frames", "segments": []}
+        base_frames = base_frames[:frame_count]
+        out_frames = out_frames[:frame_count]
+
+        rois = {
+            turn["participant_id"]: _mouth_roi(
+                turn["source_image_coordinates"],
+                source_width=source_width,
+                source_height=source_height,
+                output_width=out_width,
+                output_height=out_height,
+            )
+            for turn in proof_turns
+        }
+
+        def aligned_diff_series(
+            base_paths: list[Path],
+            out_paths: list[Path],
+            roi: tuple[int, int, int, int],
+        ) -> list[float]:
+            values: list[float] = []
+            for base_path, out_path in zip(base_paths, out_paths):
+                base_img = Image.open(base_path).convert("L").crop(roi)
+                out_img = Image.open(out_path).convert("L").crop(roi)
+                diff = ImageChops.difference(out_img, base_img)
+                values.append(float(ImageStat.Stat(diff).mean[0]))
+            return values
+
+        overall = "PASS"
+        segment_results: list[dict[str, Any]] = []
+        for turn in proof_turns:
+            start = max(0.0, float(turn["start_time"]) + 0.20)
+            end = max(start, float(turn["end_time"]) - 0.20)
+            start_index = max(0, int(math.floor(start * sample_fps)))
+            end_index = min(frame_count, int(math.ceil(end * sample_fps)) + 1)
+            base_segment = base_frames[start_index:end_index]
+            out_segment = out_frames[start_index:end_index]
+
+            metrics: list[dict[str, Any]] = []
+            for participant_id, roi in rois.items():
+                series = aligned_diff_series(base_segment, out_segment, roi)
+                mean_diff = _mean(series)
+                p90_diff = 0.0
+                if series:
+                    ordered = sorted(series)
+                    p90_diff = ordered[min(len(ordered) - 1, int(round(0.90 * (len(ordered) - 1))))]
+                metrics.append({
+                    "participant_id": participant_id,
+                    "mean_base_output_mouth_diff": round(mean_diff, 4),
+                    "p90_base_output_mouth_diff": round(p90_diff, 4),
+                    "roi": list(roi),
+                })
+
+            intended_id = turn["participant_id"]
+            intended = next(item for item in metrics if item["participant_id"] == intended_id)
+            others = [item for item in metrics if item["participant_id"] != intended_id]
+            max_other = max(
+                others,
+                key=lambda item: float(item["mean_base_output_mouth_diff"]),
+                default={"mean_base_output_mouth_diff": 0.0},
+            )
+            intended_score = float(intended["mean_base_output_mouth_diff"])
+            other_score = float(max_other["mean_base_output_mouth_diff"])
+            ratio = other_score / intended_score if intended_score > 1e-9 else 999.0
+
+            if intended_score < 0.35:
+                status = "WARN"
+                reason = "intended_base_output_change_low"
+            elif ratio >= 0.75 and other_score >= 0.50:
+                status = "FAIL"
+                reason = "non_speaker_base_output_change_too_high"
+            elif ratio >= 0.45:
+                status = "WARN"
+                reason = "speaker_attribution_borderline"
+            else:
+                status = "PASS"
+                reason = "speaker_specific_frame_aligned_change_detected"
+
+            if status == "FAIL":
+                overall = "FAIL"
+            elif status == "WARN" and overall != "FAIL":
+                overall = "WARN"
+
+            segment_results.append({
+                "sequence_no": turn["sequence_no"],
+                "participant_id": intended_id,
+                "display_name": turn["display_name"],
+                "status": status,
+                "reason": reason,
+                "intended_mean_diff": round(intended_score, 4),
+                "max_non_speaker_mean_diff": round(other_score, 4),
+                "non_speaker_to_intended_ratio": round(ratio, 4),
+                "participants": metrics,
+            })
+
+        return {
+            "status": overall,
+            "sample_fps": sample_fps,
+            "method": "frame_aligned_output_minus_pre_lipsync_base_mouth_region",
+            "segments": segment_results,
+            "policy": {
+                "pass": "frame-aligned changes are concentrated on the intended speaker",
+                "warn": "attribution is inconclusive and requires human review",
+                "fail": "frame-aligned changes are materially present on the non-speaker",
+            },
+        }
+
+
 def _differential_active_speaker_qc(
     *,
     base_video_path: Path,
@@ -1358,6 +1497,13 @@ async def main() -> None:
             source_width=int(dims["width"]),
             source_height=int(dims["height"]),
         )
+        attribution_qc = _frame_aligned_lipsync_attribution_qc(
+            base_video_path=motion_video,
+            output_video_path=output_path,
+            proof_turns=manifest_turns,
+            source_width=int(dims["width"]),
+            source_height=int(dims["height"]),
+        )
 
         manifest = {
             "contract": "next3_shared_scene_two_turn_performance_proof_v1",
@@ -1380,7 +1526,8 @@ async def main() -> None:
             "total_duration_seconds": total_duration,
             "turns": manifest_turns,
             "active_speaker_qc_raw_motion": qc,
-            "active_speaker_qc": differential_qc,
+            "active_speaker_qc_temporal_delta": differential_qc,
+            "active_speaker_qc": attribution_qc,
             "human_proof_review": "REQUIRED_FOR_EXPRESSION_BLINKS_GAZE_GESTURES_HANDS_IDENTITY_AND_CONVERSATIONAL_NATURALNESS",
             "qa_storage_path": output_blob,
         }
@@ -1400,12 +1547,16 @@ async def main() -> None:
                 f"score={result['upper_body_motion_score']} reason={result['reason']}"
             )
         print(f"ACTIVE_SPEAKER_RAW_MOTION_QC={qc['status']}")
-        print(f"ACTIVE_SPEAKER_QC={differential_qc['status']}")
-        for result in differential_qc["segments"]:
+        print(f"ACTIVE_SPEAKER_TEMPORAL_DELTA_QC={differential_qc['status']}")
+        print(f"ACTIVE_SPEAKER_QC={attribution_qc['status']}")
+        for result in attribution_qc["segments"]:
             print(
-                "DIFFERENTIAL_QC_SEGMENT "
+                "FRAME_ALIGNED_QC_SEGMENT "
                 f"seq={result['sequence_no']} speaker={result['display_name']} "
                 f"status={result['status']} reason={result['reason']} "
+                f"target_diff={result['intended_mean_diff']} "
+                f"non_speaker_diff={result['max_non_speaker_mean_diff']} "
+                f"ratio={result['non_speaker_to_intended_ratio']} "
                 f"participants={json.dumps(result['participants'], separators=(',', ':'))}"
             )
         print("HUMAN_QUALITY_REVIEW=REQUIRED")
