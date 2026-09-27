@@ -1600,13 +1600,19 @@ async def main() -> None:
         motion_model = _clean(
             args.motion_model
             or os.getenv("DF_NEXT3_PERFORMANCE_MODEL")
-            or os.getenv("FAL_KLING_I2V_MODEL")
+            or (
+                "fal-ai/kling-video/v3/pro/image-to-video"
+                if args.quality_profile == "premium"
+                else os.getenv("FAL_KLING_I2V_MODEL")
+            )
             or "fal-ai/kling-video/v3/standard/image-to-video"
         )
         motion_prompt = _clean(performance_plan["continuous_motion_prompt"])
         negative_prompt = (
             "visible speech articulation before lipsync, both people talking, repeated mouth flapping, "
             "frozen mannequin pose, identity drift, face morphing, duplicate person, warped hands, extra fingers, "
+            "age progression, aging, de-aging, older face, younger face, new wrinkles, facial proportion drift, "
+            "skin texture drift, temporal flicker, visual noise, film grain, compression noise, crawling texture, "
             "exaggerated gestures, constant nodding, constant smiling, camera jump, scene cut, clothing change, background change"
         )
         motion_payload = {
@@ -1891,6 +1897,9 @@ async def main() -> None:
             "stage_run_id": str(stage_run_id),
             "shared_scene_media_id": str(shared_media_id),
             "performance_director": performance_plan,
+            "identity_references": identity_refs,
+            "quality_profile": args.quality_profile,
+            "max_motion_chunk_seconds": max(5.0, min(14.0, float(args.max_motion_chunk_seconds))),
             "performance_motion_provider": "fal",
             "performance_motion_model": motion_model,
             "performance_motion_provider_job_id": motion_job_id,
@@ -1951,6 +1960,121 @@ async def main() -> None:
 
 
 
+
+async def _download_to_path(url: str, path: Path) -> None:
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+        await _download(client, url, path)
+
+
+def _identity_crop_box(
+    *,
+    stage_meta: dict[str, Any],
+    participant_id: UUID,
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    targets = _dict(stage_meta.get("speaker_targets"))
+    target = _dict(targets.get(str(participant_id)))
+    point = _dict(target.get("point"))
+    box = _dict(target.get("box"))
+    if box:
+        cx = (float(box["x"]) + float(box["width"]) / 2.0) * width
+        cy = (float(box["y"]) + float(box["height"]) / 2.0) * height
+        half_w = max(float(box["width"]) * width * 0.85, width * 0.10)
+        half_h = max(float(box["height"]) * height * 0.95, height * 0.15)
+    elif point:
+        cx = float(point["x"]) * width
+        cy = float(point["y"]) * height
+        half_w = width * 0.11
+        half_h = height * 0.17
+    else:
+        raise RuntimeError(f"IDENTITY_REFERENCE_TARGET_MISSING:{participant_id}")
+
+    left = max(0, int(round(cx - half_w)))
+    top = max(0, int(round(cy - half_h)))
+    right = min(width, int(round(cx + half_w)))
+    bottom = min(height, int(round(cy + half_h)))
+    if right - left < 96 or bottom - top < 96:
+        raise RuntimeError(f"IDENTITY_REFERENCE_CROP_TOO_SMALL:{participant_id}")
+    return left, top, right, bottom
+
+
+async def _build_identity_elements(
+    *,
+    source_image_url: str,
+    stage_meta: dict[str, Any],
+    timeline: list[dict[str, Any]],
+    azure: AzureBlobService,
+    output_container: str,
+    base_path: str,
+    root: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    source_path = root / "approved-group-photo.png"
+    await _download_to_path(source_image_url, source_path)
+    with Image.open(source_path) as source_image:
+        source_rgb = source_image.convert("RGB")
+        width, height = source_rgb.size
+        ordered: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for turn in timeline:
+            participant_id = str(turn["speaker_participant_id"])
+            if participant_id not in seen:
+                seen.add(participant_id)
+                ordered.append((participant_id, str(turn["speaker_name"])))
+
+        elements: list[dict[str, Any]] = []
+        refs: dict[str, Any] = {}
+        for index, (participant_id, display_name) in enumerate(ordered, start=1):
+            crop_box = _identity_crop_box(
+                stage_meta=stage_meta,
+                participant_id=UUID(participant_id),
+                width=width,
+                height=height,
+            )
+            crop = source_rgb.crop(crop_box)
+            crop_path = root / f"identity-{index}.jpg"
+            crop.save(crop_path, format="JPEG", quality=96, subsampling=0)
+            blob = f"{base_path}/identity/participant-{index}.jpg"
+            azure.upload_file(output_container, blob, str(crop_path), "image/jpeg")
+            url = azure.sign_read_url(output_container, blob, 6 * 3600)
+            elements.append({"frontal_image_url": url})
+            refs[participant_id] = {
+                "element_index": index,
+                "display_name": display_name,
+                "crop_box": list(crop_box),
+                "storage_path": blob,
+            }
+    return elements, refs
+
+
+def _identity_prompt_prefix(identity_refs: dict[str, Any]) -> str:
+    ordered = sorted(identity_refs.values(), key=lambda item: int(item["element_index"]))
+    parts = []
+    for item in ordered:
+        parts.append(
+            f"@Element{item['element_index']} is {item['display_name']}; preserve this person's exact identity, "
+            "apparent age, facial proportions, skin texture, hairstyle and gender presentation throughout"
+        )
+    return ". ".join(parts) + "."
+
+
+def _clean_motion_video(input_path: Path, output_path: Path, *, fps: int) -> None:
+    # Conservative cleanup: temporal/spatial denoise plus light detail restoration.
+    # No motion interpolation here: generated hands/faces are safer without synthetic optical-flow frames.
+    _run([
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-vf",
+        f"hqdn3d=1.25:1.25:4.5:4.5,unsharp=5:5:0.22:3:3:0.0,fps={int(fps)}",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "slow",
+        "-crf", "16",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(output_path),
+    ])
+
+
 async def full_scene_main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workflow-id", required=True)
@@ -1959,6 +2083,9 @@ async def full_scene_main() -> None:
     parser.add_argument("--expected-turn-count", type=int, default=7)
     parser.add_argument("--motion-model", default="")
     parser.add_argument("--run-id", default="")
+    parser.add_argument("--reuse-plan-run-id", default="")
+    parser.add_argument("--max-motion-chunk-seconds", type=float, default=10.0)
+    parser.add_argument("--quality-profile", choices=["standard", "premium"], default="premium")
     args = parser.parse_args()
 
     workflow_id = UUID(args.workflow_id)
@@ -2106,8 +2233,18 @@ async def full_scene_main() -> None:
 
         reusable_plan = None
         plan_client = cc.get_blob_client(plan_blob)
-        if args.run_id and plan_client.exists():
-            reusable_plan = json.loads(plan_client.download_blob().readall().decode("utf-8"))
+        source_plan_blob = plan_blob
+        if args.reuse_plan_run_id:
+            source_plan_blob = (
+                f"v3/qa/shared-scene-full-performance/{workflow_id}/{stage_run_id}/"
+                f"{_clean(args.reuse_plan_run_id)}/plan.json"
+            )
+        source_plan_client = cc.get_blob_client(source_plan_blob)
+
+        if (args.run_id and plan_client.exists()) or (args.reuse_plan_run_id and source_plan_client.exists()):
+            selected_plan_client = plan_client if (args.run_id and plan_client.exists()) else source_plan_client
+            selected_plan_blob = plan_blob if selected_plan_client is plan_client else source_plan_blob
+            reusable_plan = json.loads(selected_plan_client.download_blob().readall().decode("utf-8"))
             existing_lineage = [
                 (int(item["sequence_no"]), str(item["dialogue_turn_id"]))
                 for item in list(reusable_plan.get("timeline") or [])
@@ -2121,8 +2258,20 @@ async def full_scene_main() -> None:
             performance_plan = dict(reusable_plan["performance_director"])
             timeline = list(reusable_plan["timeline"])
             total_duration = float(reusable_plan["planned_duration_seconds"])
-            chunks = list(reusable_plan["motion_chunks"])
-            print(f"PERFORMANCE_PLAN_REUSE={plan_blob}")
+            chunks = _pack_motion_chunks(
+                timeline,
+                total_duration=total_duration,
+                max_chunk_seconds=max(5.0, min(14.0, float(args.max_motion_chunk_seconds))),
+            )
+            if selected_plan_blob != plan_blob:
+                copied_plan = dict(reusable_plan)
+                copied_plan["motion_chunks"] = chunks
+                copied_plan["quality_profile"] = args.quality_profile
+                copied_plan["reused_from_plan_blob"] = selected_plan_blob
+                plan_local = root / "plan.json"
+                plan_local.write_text(json.dumps(copied_plan, indent=2), encoding="utf-8")
+                azure.upload_file(output_container, plan_blob, str(plan_local), "application/json")
+            print(f"PERFORMANCE_PLAN_REUSE={selected_plan_blob}")
         else:
             performance_plan = await _full_scene_performance_plan(
                 scene_title=_clean(stage["scene_title"]),
@@ -2151,7 +2300,7 @@ async def full_scene_main() -> None:
             chunks = _pack_motion_chunks(
                 timeline,
                 total_duration=total_duration,
-                max_chunk_seconds=14.0,
+                max_chunk_seconds=max(5.0, min(14.0, float(args.max_motion_chunk_seconds))),
             )
             plan_payload = {
                 "contract": "next3_shared_scene_full_performance_plan_v1",
@@ -2215,6 +2364,18 @@ async def full_scene_main() -> None:
             "exaggerated gestures, constant nodding, constant smiling, camera jump, scene cut, clothing change, background change"
         )
 
+        identity_elements, identity_refs = await _build_identity_elements(
+            source_image_url=image_url,
+            stage_meta=stage_meta,
+            timeline=timeline,
+            azure=azure,
+            output_container=output_container,
+            base_path=base_path,
+            root=root,
+        )
+        identity_prefix = _identity_prompt_prefix(identity_refs)
+        print("IDENTITY_REFERENCES=" + json.dumps(identity_refs, separators=(",", ":")))
+
         normalized_paths: list[Path] = []
         chunk_records: list[dict[str, Any]] = []
         current_start_url = image_url
@@ -2231,16 +2392,22 @@ async def full_scene_main() -> None:
             local_normalized = root / f"chunk-{chunk_no:02d}.mp4"
             chunk_client = cc.get_blob_client(chunk_blob)
 
-            prompt = _chunk_motion_prompt(
-                scene_title=_clean(stage["scene_title"]),
-                chunk=chunk,
-                plan=performance_plan,
-            )
+            prompt = (
+                identity_prefix
+                + " "
+                + _chunk_motion_prompt(
+                    scene_title=_clean(stage["scene_title"]),
+                    chunk=chunk,
+                    plan=performance_plan,
+                )
+            )[:3600]
             motion_payload = {
                 "prompt": prompt,
                 "start_image_url": current_start_url,
                 "duration": str(requested_duration),
                 "generate_audio": False,
+                "elements": identity_elements,
+                "cfg_scale": 0.55,
                 "shot_type": "customize",
                 "negative_prompt": negative_prompt,
             }
@@ -2342,9 +2509,20 @@ async def full_scene_main() -> None:
                 f"planned={total_duration}:actual={full_info['duration']}"
             )
 
-        full_motion_blob = f"{base_path}/full-performance-motion.mp4"
-        azure.upload_file(output_container, full_motion_blob, str(full_motion_path), "video/mp4")
-        motion_review_url = azure.sign_read_url(output_container, full_motion_blob, 15 * 24 * 3600)
+        raw_full_motion_blob = f"{base_path}/full-performance-motion-raw.mp4"
+        azure.upload_file(output_container, raw_full_motion_blob, str(full_motion_path), "video/mp4")
+        raw_motion_review_url = azure.sign_read_url(output_container, raw_full_motion_blob, 15 * 24 * 3600)
+
+        clean_motion_path = root / "full-performance-motion-clean.mp4"
+        _clean_motion_video(
+            full_motion_path,
+            clean_motion_path,
+            fps=max(20, min(30, int(round(float(full_info["fps"]))))),
+        )
+        clean_info = _probe_video_info(clean_motion_path)
+        clean_motion_blob = f"{base_path}/full-performance-motion-clean.mp4"
+        azure.upload_file(output_container, clean_motion_blob, str(clean_motion_path), "video/mp4")
+        motion_review_url = azure.sign_read_url(output_container, clean_motion_blob, 15 * 24 * 3600)
 
         source_dims = _dict(stage_meta.get("shared_scene_dimensions"))
         qc_turns: list[dict[str, Any]] = []
@@ -2365,7 +2543,7 @@ async def full_scene_main() -> None:
             )
 
         motion_qc = _motion_presence_qc(
-            video_path=full_motion_path,
+            video_path=clean_motion_path,
             proof_turns=qc_turns,
             source_width=int(source_dims["width"]),
             source_height=int(source_dims["height"]),
@@ -2411,7 +2589,9 @@ async def full_scene_main() -> None:
                 "height": int(full_info["height"]),
                 "fps": float(full_info["fps"]),
                 "frame_count": int(full_info["frame_count"]),
-                "storage_path": full_motion_blob,
+                "storage_path": clean_motion_blob,
+                "raw_storage_path": raw_full_motion_blob,
+                "cleaned": True,
             },
             "performance_director": performance_plan,
             "timeline": timeline,
@@ -2419,6 +2599,9 @@ async def full_scene_main() -> None:
             "quality_gate": quality_gate,
             "diagnostics": {
                 "performance_motion_qc": motion_qc,
+                "raw_motion_review_url": raw_motion_review_url,
+                "clean_motion_review_url": motion_review_url,
+                "cleanup_filter": "hqdn3d+light_unsharp+fps_normalization",
             },
             "database_write": "NONE",
             "production_touch": "NONE",
@@ -2444,7 +2627,10 @@ async def full_scene_main() -> None:
         print(f"TURN_COUNT={len(timeline)}")
         print(f"PLANNED_DURATION_SECONDS={total_duration}")
         print(f"ACTUAL_DURATION_SECONDS={float(full_info['duration']):.3f}")
+        print(f"RAW_FULL_MOTION_URL={raw_motion_review_url}")
         print(f"FULL_MOTION_BASE_URL={motion_review_url}")
+        print("AUDIO_PRESENT=NO")
+        print("AUDIO_REASON=PRE_LIPSYNC_MOTION_REVIEW_PHASE")
         print(f"MANIFEST_URL={manifest_url}")
         print(f"RUN_ID={run_id}")
         print("SYNC_PHASE=BLOCKED_PENDING_HUMAN_PERFORMANCE_REVIEW")
