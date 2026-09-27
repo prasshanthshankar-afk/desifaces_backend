@@ -900,6 +900,7 @@ async def main() -> None:
         source_blob = f"{base_path}/performance-motion.mp4"
         azure.upload_file(output_container, source_blob, str(motion_video), "video/mp4")
         source_video_url = azure.sign_read_url(output_container, source_blob, 3600)
+        durable_motion_url = azure.sign_read_url(output_container, source_blob, 15 * 24 * 3600)
 
         segments: list[dict[str, Any]] = []
         inputs: list[dict[str, Any]] = [{"type": "video", "url": source_video_url}]
@@ -1075,6 +1076,7 @@ async def main() -> None:
             "performance_motion_result": motion_result,
             "performance_motion_qc": motion_qc,
             "performance_motion_storage_path": source_blob,
+            "performance_motion_review_url": durable_motion_url,
             "provider": "sync3",
             "provider_model": "sync-3",
             "provider_job_id": provider_job_id,
@@ -1113,6 +1115,7 @@ async def main() -> None:
             )
         print("HUMAN_QUALITY_REVIEW=REQUIRED")
         print("HUMAN_REVIEW_DIMENSIONS=context_specific_expression,blinks,gaze,head_motion,body_motion,gestures,hands,listener_reaction,identity,temporal_continuity")
+        print(f"MOTION_BASE_URL={durable_motion_url}")
         print(f"OUTPUT_URL={durable_output_url}")
         print(f"MANIFEST_URL={manifest_url}")
         print("FULL_SEVEN_TURN_GENERATION=BLOCKED_UNTIL_ACTIVE_SPEAKER_QC_AND_PERFORMANCE_REVIEW_PASS")
