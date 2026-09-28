@@ -64,6 +64,29 @@ def _active_count(payload: Any) -> int:
     raise Sync3AdapterError("SYNC3_ACTIVE_GENERATIONS_RESPONSE_INVALID")
 
 
+def _concurrency_retry_after(response: httpx.Response) -> float | None:
+    """Return a bounded retry delay only for Sync's temporary concurrency 429."""
+
+    if int(response.status_code) != 429:
+        return None
+
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("errorCode") or payload.get("error_code") or "").strip().lower() != "concurrency_limit_reached":
+        return None
+
+    try:
+        retry_after = float(payload.get("retryAfterSeconds") or payload.get("retry_after_seconds") or 5.0)
+    except Exception:
+        retry_after = 5.0
+    return max(1.0, min(20.0, retry_after))
+
+
 class Sync3Adapter(ProviderClient):
     """Sync Labs sync-3 adapter for deterministic multi-face still-image lipsync."""
 
@@ -145,7 +168,13 @@ class Sync3Adapter(ProviderClient):
             },
         )
 
-    async def _wait_for_submission_capacity(self, client: httpx.AsyncClient, headers: Dict[str, str]) -> None:
+    async def _wait_for_submission_capacity(
+        self,
+        client: httpx.AsyncClient,
+        headers: Dict[str, str],
+        *,
+        deadline: float | None = None,
+    ) -> None:
         """Wait until Sync reports capacity before a new generation is submitted.
 
         The module-level semaphore serializes capacity-check + submit so two local
@@ -153,7 +182,8 @@ class Sync3Adapter(ProviderClient):
         Provider-side active generation count remains authoritative, which also
         protects us after worker restarts or generations started elsewhere.
         """
-        deadline = time.monotonic() + float(self.concurrency_wait_seconds)
+        if deadline is None:
+            deadline = time.monotonic() + float(self.concurrency_wait_seconds)
         last_active: int | None = None
         last_status = 0
         last_text = ""
@@ -210,16 +240,39 @@ class Sync3Adapter(ProviderClient):
             if safe_name:
                 body.setdefault("outputFileName", safe_name)
 
+        # One bounded window covers both provider-capacity polling and the
+        # unavoidable race where capacity changes between GET and POST.
+        deadline = time.monotonic() + float(self.concurrency_wait_seconds)
         gate = _submission_gate()
         async with gate:
             try:
                 async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                    await self._wait_for_submission_capacity(client, headers)
-                    response = await client.post(
-                        f"{self.base_url}/v2/generate",
-                        headers=headers,
-                        json=body,
-                    )
+                    while True:
+                        await self._wait_for_submission_capacity(
+                            client,
+                            headers,
+                            deadline=deadline,
+                        )
+                        response = await client.post(
+                            f"{self.base_url}/v2/generate",
+                            headers=headers,
+                            json=body,
+                        )
+
+                        retry_after = _concurrency_retry_after(response)
+                        if retry_after is None:
+                            break
+
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise Sync3AdapterError(
+                                "SYNC3_CONCURRENCY_WAIT_TIMEOUT:"
+                                f"submit_429:{response.text[:1200]}"
+                            )
+
+                        # Keep the same request body/outputFileName so retries
+                        # preserve the original provider idempotency identity.
+                        await asyncio.sleep(min(retry_after, remaining))
             except Sync3AdapterError:
                 raise
             except Exception as exc:
