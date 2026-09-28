@@ -231,7 +231,7 @@ services:
 
 networks:
   df-net:
-    name: df-v3-net
+    name: df-net
     external: true
 
 volumes:
