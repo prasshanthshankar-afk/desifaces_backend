@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
 
 from app.domain.models import FusionJobCreate, VoiceAudio
 from app.services.providers.base import ProviderPrepareInput
-from app.services.providers.sync3_adapter import Sync3Adapter, Sync3AdapterError, _active_count, _provider_concurrency_limit, _provider_wait_seconds
+from app.services.providers.sync3_adapter import Sync3Adapter, Sync3AdapterError, _active_count, _concurrency_retry_after, _provider_concurrency_limit, _provider_wait_seconds
 
 
 def test_sync3_provider_is_accepted_by_fusion_contract():
@@ -89,3 +90,38 @@ def test_sync3_concurrency_env_is_bounded(monkeypatch):
     monkeypatch.setenv("DF_SYNC3_CONCURRENCY_WAIT_SECONDS", "99999")
     assert _provider_concurrency_limit() == 16
     assert _provider_wait_seconds() == 3600.0
+
+
+def test_sync3_concurrency_429_is_retryable_and_honors_provider_delay():
+    response = httpx.Response(
+        429,
+        json={
+            "errorCode": "concurrency_limit_reached",
+            "retryAfterSeconds": 20,
+            "activeGenerations": 1,
+            "concurrencyLimit": 1,
+        },
+    )
+    assert _concurrency_retry_after(response) == 20.0
+
+
+def test_sync3_other_429_is_not_reclassified_as_capacity_wait():
+    response = httpx.Response(
+        429,
+        json={
+            "errorCode": "rate_limit_exceeded",
+            "retryAfterSeconds": 20,
+        },
+    )
+    assert _concurrency_retry_after(response) is None
+
+
+def test_sync3_concurrency_retry_delay_is_bounded():
+    response = httpx.Response(
+        429,
+        json={
+            "errorCode": "concurrency_limit_reached",
+            "retryAfterSeconds": 999,
+        },
+    )
+    assert _concurrency_retry_after(response) == 20.0
