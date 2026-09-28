@@ -12,6 +12,7 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="/tmp/next3-dns-contract-${STAMP}.txt"
 
 {
+  set +e
   echo "============================================================"
   echo " NEXT3 — WEB SERVICE DISCOVERY CONTRACT"
   echo "============================================================"
@@ -48,6 +49,7 @@ for (const key of keys) {
   }
 }
 NODE
+  echo "WEB_SERVICE_HOSTS_EXIT=$?" || true
 
   echo
   echo "===== RUNNING TARGET CONTAINERS ====="
@@ -68,7 +70,7 @@ for _,v in sorted(obj.items(), key=lambda kv: str(kv[1].get("Name",""))):
 
   echo
   echo "===== WEB DNS LOOKUPS ====="
-  timeout 15s docker exec -i "$WEB" node - <<'NODE'
+  timeout 30s docker exec -i "$WEB" node - <<'NODE'
 const dns = require("node:dns").promises;
 const keys = ["DIRECTOR_BASE_URL","CORE_BASE_URL","FACE_BASE_URL","AUDIO_BASE_URL","FUSION_BASE_URL","PRICING_BASE_URL","COMMERCE_BASE_URL","DASHBOARD_BASE_URL"];
 
@@ -83,7 +85,7 @@ const keys = ["DIRECTOR_BASE_URL","CORE_BASE_URL","FACE_BASE_URL","AUDIO_BASE_UR
       try {
         const r=await Promise.race([
           dns.lookup(host),
-          new Promise((_,rej)=>setTimeout(()=>rej(new Error("TIMEOUT")),1500)),
+          new Promise((_,rej)=>setTimeout(()=>rej(new Error("TIMEOUT")),700)),
         ]);
         attempts.push("OK:"+r.address);
       } catch (e) {
@@ -97,7 +99,7 @@ NODE
 
   echo
   echo "===== WEB HTTP HEALTH VIA CONFIGURED HOSTS ====="
-  timeout 20s docker exec -i "$WEB" node - <<'NODE'
+  timeout 30s docker exec -i "$WEB" node - <<'NODE'
 const keys = ["DIRECTOR_BASE_URL","CORE_BASE_URL","FACE_BASE_URL","AUDIO_BASE_URL","FUSION_BASE_URL","PRICING_BASE_URL","COMMERCE_BASE_URL","DASHBOARD_BASE_URL"];
 
 (async () => {
@@ -107,7 +109,7 @@ const keys = ["DIRECTOR_BASE_URL","CORE_BASE_URL","FACE_BASE_URL","AUDIO_BASE_UR
     try {
       const r=await Promise.race([
         fetch(raw+"/api/health"),
-        new Promise((_,rej)=>setTimeout(()=>rej(new Error("TIMEOUT")),2500)),
+        new Promise((_,rej)=>setTimeout(()=>rej(new Error("TIMEOUT")),1200)),
       ]);
       console.log(key+" HTTP_"+r.status);
     } catch(e) {
