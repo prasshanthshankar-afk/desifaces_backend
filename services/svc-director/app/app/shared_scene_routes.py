@@ -54,6 +54,23 @@ class SharedSceneSpeakerTarget(BaseModel):
         return self
 
 
+class SharedSceneVideoSettingsIn(BaseModel):
+    motion_mode: str = Field(min_length=1, max_length=64)
+    video_prompt: str | None = Field(default=None, max_length=2400)
+
+    @model_validator(mode="after")
+    def validate_motion_mode(self):
+        mode = str(self.motion_mode or "").strip().lower()
+        if mode not in {"precise_lipsync", "natural_motion"}:
+            raise ValueError("unsupported_shared_scene_motion_mode")
+        self.motion_mode = mode
+        prompt = str(self.video_prompt or "").strip()
+        if mode == "natural_motion" and not prompt:
+            raise ValueError("natural_motion_video_prompt_required")
+        self.video_prompt = prompt or None
+        return self
+
+
 class SharedSceneConversationIn(BaseModel):
     shared_scene_media_id: UUID
     image_width: int = Field(ge=64, le=16384)
@@ -316,10 +333,91 @@ async def set_shared_scene_conversation(
     }
 
 
+@router.put(
+    "/api/director/studio-workflows/{workflow_id}/stage-runs/{stage_run_id}/shared-scene-video-settings"
+)
+async def set_shared_scene_video_settings(
+    workflow_id: UUID,
+    stage_run_id: UUID,
+    body: SharedSceneVideoSettingsIn,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    """Persist the explicit motion choice that gates shared-scene video pricing.
+
+    This route is control-plane only. It does not generate media or charge the
+    account. Settings may change only while the Fusion scene is still in a
+    previewable/retryable state.
+    """
+
+    pool = request.app.state.business_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            stage = await conn.fetchrow(
+                """
+                select s.stage_run_id,s.state,s.metadata_json,w.account_id
+                from public.v3_studio_stage_runs s
+                join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+                where s.stage_run_id=$1 and s.workflow_id=$2 and w.account_id=$3
+                  and s.stage_type='fusion' and s.scope_type='scene'
+                for update of s
+                """,
+                stage_run_id,
+                workflow_id,
+                auth.account_id,
+            )
+            if not stage:
+                raise HTTPException(status_code=404, detail="fusion_scene_stage_not_found")
+
+            state = str(stage["state"] or "").strip().lower()
+            if state not in _PREVIEWABLE_STATES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"shared_scene_video_settings_locked_for_stage:{state}",
+                )
+
+            metadata = _metadata(stage["metadata_json"])
+            if str(metadata.get("conversation_mode") or "").strip().lower() != "shared_scene":
+                raise HTTPException(
+                    status_code=409,
+                    detail="shared_scene_video_settings_wrong_conversation_mode",
+                )
+            if not str(metadata.get("shared_scene_media_id") or "").strip():
+                raise HTTPException(
+                    status_code=409,
+                    detail="shared_scene_video_settings_requires_approved_group_photo",
+                )
+
+            metadata["shared_scene_motion_mode"] = body.motion_mode
+            metadata["shared_scene_video_prompt"] = body.video_prompt
+            metadata["shared_scene_video_settings_version"] = 1
+
+            await conn.execute(
+                """
+                update public.v3_studio_stage_runs
+                set metadata_json=$2::jsonb,updated_at=now()
+                where stage_run_id=$1
+                """,
+                stage_run_id,
+                json.dumps(metadata, ensure_ascii=False),
+            )
+
+    return {
+        "workflow_id": str(workflow_id),
+        "stage_run_id": str(stage_run_id),
+        "motion_mode": body.motion_mode,
+        "video_prompt": body.video_prompt,
+        "shared_scene_video_settings_version": 1,
+        "pricing_ready": True,
+        "persisted": True,
+    }
+
+
 __all__ = [
     "NormalizedSpeakerBox",
     "NormalizedSpeakerPoint",
     "SharedSceneConversationIn",
+    "SharedSceneVideoSettingsIn",
     "SharedSceneSpeakerTarget",
     "router",
 ]
