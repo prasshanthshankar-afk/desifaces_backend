@@ -124,11 +124,17 @@ if ! docker image inspect desifaces-svc-assistant:latest >/dev/null 2>&1; then
     echo "ASSISTANT_IMAGE=RETAGGED_EXISTING"
   else
     echo "ASSISTANT_IMAGE=BUILD_REQUIRED"
-    "${DC[@]}" build svc-assistant
+    docker build \
+      -t desifaces-svc-assistant:latest \
+      -f "$PROJECT_ROOT/services/svc-assistant/app/Dockerfile.v3" \
+      "$PROJECT_ROOT"
   fi
 fi
 docker image inspect desifaces-svc-assistant:latest >/dev/null
+[[ "$(docker image inspect desifaces-svc-director:latest --format '{{.Id}}')" == "$DIRECTOR_ID" ]] \
+  || fail "Director image tag changed during Assistant build"
 echo "ASSISTANT_IMAGE=PASS"
+echo "DIRECTOR_IMAGE_PRESERVED=PASS"
 
 echo
 echo "===== 4. SNAPSHOT WEB ====="
