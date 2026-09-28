@@ -6,9 +6,10 @@ set -Eeuo pipefail
   exit 1
 }
 
-PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
-COMPOSE_FILE="${COMPOSE_FILE:-/tmp/docker-compose.canonical.yml}"
-ENV_FILE="${RUNTIME_ENV_FILE:-$PROJECT_ROOT/infra/.env}"
+SOURCE_REPO="${SOURCE_REPO:-$PWD}"
+SOURCE_REF="${SOURCE_REF:-fix/next3-shared-scene-profile-lock-fix-20260928}"
+RUNTIME_ROOT="${RUNTIME_ROOT:-$HOME/workspace/desifaces-runtime}"
+ENV_FILE="${RUNTIME_ENV_FILE:-$SOURCE_REPO/infra/.env}"
 NETWORK="df-net"
 OLD_NETWORK="df-v3-net"
 WEB="df-web-dev"
@@ -16,8 +17,32 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 
-[[ -f "$COMPOSE_FILE" ]] || fail "missing canonical compose: $COMPOSE_FILE"
+[[ -d "$SOURCE_REPO/.git" || -f "$SOURCE_REPO/.git" ]] || fail "source repo is not a Git checkout: $SOURCE_REPO"
 [[ -f "$ENV_FILE" ]] || fail "missing runtime env: $ENV_FILE"
+
+echo "===== 0. CLEAN SOURCE WORKTREE ====="
+git -C "$SOURCE_REPO" fetch --quiet origin "$SOURCE_REF"
+SOURCE_SHA="$(git -C "$SOURCE_REPO" rev-parse FETCH_HEAD)"
+
+if [[ -e "$RUNTIME_ROOT" ]]; then
+  git -C "$RUNTIME_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1     || fail "runtime root exists but is not a Git worktree: $RUNTIME_ROOT"
+  [[ -z "$(git -C "$RUNTIME_ROOT" status --porcelain)" ]]     || fail "runtime worktree is dirty: $RUNTIME_ROOT"
+  git -C "$RUNTIME_ROOT" checkout --quiet --detach "$SOURCE_SHA"
+else
+  mkdir -p "$(dirname "$RUNTIME_ROOT")"
+  git -C "$SOURCE_REPO" worktree add --quiet --detach "$RUNTIME_ROOT" "$SOURCE_SHA"
+fi
+
+PROJECT_ROOT="$RUNTIME_ROOT"
+COMPOSE_FILE="$PROJECT_ROOT/docker-compose.yml"
+[[ -f "$COMPOSE_FILE" ]] || fail "canonical compose missing from clean worktree"
+
+export DESIFACES_RUNTIME_ENV_FILE="$ENV_FILE"
+
+echo "SOURCE_SHA=$SOURCE_SHA"
+echo "PROJECT_ROOT=$PROJECT_ROOT"
+echo "COMPOSE_FILE=$COMPOSE_FILE"
+echo "CLEAN_SOURCE_WORKTREE=PASS"
 
 DC=(docker compose
   --project-directory "$PROJECT_ROOT"
@@ -31,6 +56,8 @@ echo "============================================================"
 echo " desifaces DEV — CLEAN CANONICAL RECREATE"
 echo "============================================================"
 echo "compose=$COMPOSE_FILE"
+echo "source_sha=$SOURCE_SHA"
+echo "runtime_root=$PROJECT_ROOT"
 echo "network=$NETWORK"
 echo "production=UNTOUCHED"
 
@@ -334,6 +361,8 @@ echo
 echo "============================================================"
 echo " DESIFACES_DEV_CANONICAL_RECREATE=PASS"
 echo " source_compose=docker-compose.yml"
+echo " source_sha=$SOURCE_SHA"
+echo " runtime_root=$PROJECT_ROOT"
 echo " network=df-net"
 echo " certified_director_image=$DIRECTOR_ID"
 echo " production=UNTOUCHED"
