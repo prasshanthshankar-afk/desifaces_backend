@@ -352,6 +352,7 @@ def normalize_segment_mp4(
     output_path: str,
     *,
     edge_fade_override: Optional[float] = None,
+    aspect_ratio: Optional[str] = None,
 ) -> None:
     _require_nonempty_file(input_path)
     _ensure_parent_dir(output_path)
@@ -363,7 +364,11 @@ def normalize_segment_mp4(
         else max(0.0, float(edge_fade_override))
     )
     duration = _probe_duration_seconds(input_path) or 0.0
-    vf_parts = ["fps=30", "format=yuv420p"]
+    vf_parts: List[str] = []
+    if aspect_ratio:
+        width, height = _aspect_dimensions(aspect_ratio)
+        vf_parts.append(_fit_pad_filter(width, height))
+    vf_parts.extend(["fps=30", "format=yuv420p"])
     af_parts: List[str] = []
 
     if edge_fade > 0.0 and duration > (edge_fade * 2.2):
@@ -946,7 +951,13 @@ def compose_presenter_with_motion_background(
 # Stitching / composition
 # ---------------------------------------------------------------------------
 
-def stitch_videos(segment_files: List[str], out_mp4: str, *, stitch_mode_override: Optional[str] = None) -> None:
+def stitch_videos(
+    segment_files: List[str],
+    out_mp4: str,
+    *,
+    stitch_mode_override: Optional[str] = None,
+    aspect_ratio: Optional[str] = None,
+) -> None:
     effective_mode = (str(stitch_mode_override or "").strip().lower() or _stitch_mode())
     logger.info("stitch_videos start out_mp4=%s segment_count=%s mode=%s", out_mp4, len(segment_files or []), effective_mode)
     if not segment_files:
@@ -968,6 +979,7 @@ def stitch_videos(segment_files: List[str], out_mp4: str, *, stitch_mode_overrid
                 src,
                 norm,
                 edge_fade_override=0.0 if effective_mode in {"concat", "hard_cut"} else None,
+                aspect_ratio=aspect_ratio,
             )
 
         with ThreadPoolExecutor(max_workers=_stitch_concurrency()) as ex:
@@ -1069,7 +1081,12 @@ def compose_timeline(
     aspect_ratio: Optional[str] = None,
     overlay_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    stitch_videos(segment_files, out_mp4, stitch_mode_override=_as_dict_loose(overlay_meta).get("stitch_mode"))
+    stitch_videos(
+        segment_files,
+        out_mp4,
+        stitch_mode_override=_as_dict_loose(overlay_meta).get("stitch_mode"),
+        aspect_ratio=aspect_ratio,
+    )
 
     duration_sec = _probe_duration_seconds(out_mp4)
     return {
