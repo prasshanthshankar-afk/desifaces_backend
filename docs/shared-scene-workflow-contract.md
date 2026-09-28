@@ -72,6 +72,23 @@ Rules:
 - A source-mode change is rejected after the group photo is approved.
 - Repeating the same source-mode command is idempotent.
 
+The generated-photo specification is also durable:
+
+`PUT /api/director/studio-workflows/{workflow_id}/shared-scene-group-photo-spec`
+
+It stores scene geography, context, background, editable description, variant count
+and the fixed 16:9 output contract. The backend combines this specification with
+the approved people snapshot and returns one canonical `generation_input` for
+Face pricing and generation. Web and mobile do not independently rebuild that
+request.
+
+The selected photo and partial speaker mapping are durable:
+
+`PUT /api/director/studio-workflows/{workflow_id}/stage-runs/{stage_run_id}/shared-scene-draft`
+
+This draft command never authorizes Fusion generation. Only final group-photo
+approval promotes the photo to `shared_scene_media_id`.
+
 ## Approved people snapshot
 
 People approval persists the exact approved speaker context into
