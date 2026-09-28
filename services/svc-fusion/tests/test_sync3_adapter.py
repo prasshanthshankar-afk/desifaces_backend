@@ -7,7 +7,7 @@ import pytest
 
 from app.domain.models import FusionJobCreate, VoiceAudio
 from app.services.providers.base import ProviderPrepareInput
-from app.services.providers.sync3_adapter import Sync3Adapter, Sync3AdapterError, _active_count, _concurrency_retry_after, _provider_concurrency_limit, _provider_wait_seconds
+from app.services.providers.sync3_adapter import Sync3Adapter, Sync3AdapterError, _active_count, _concurrency_retry_after, _download_url_from_response, _provider_concurrency_limit, _provider_wait_seconds
 
 
 def test_sync3_provider_is_accepted_by_fusion_contract():
@@ -125,3 +125,13 @@ def test_sync3_concurrency_retry_delay_is_bounded():
         },
     )
     assert _concurrency_retry_after(response) == 20.0
+
+
+def test_sync3_download_resolver_parses_plain_text_url():
+    response = httpx.Response(200, text="https://example.com/clean-output.mp4")
+    assert _download_url_from_response(response) == "https://example.com/clean-output.mp4"
+
+
+def test_sync3_download_resolver_ignores_non_200():
+    response = httpx.Response(403, text="forbidden")
+    assert _download_url_from_response(response) == ""
