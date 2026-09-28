@@ -179,7 +179,7 @@ services:
   # -------------------------
   svc-core-notification-worker:
     <<: *one_shot_python_job
-    profiles: ["execution"]
+    profiles: ["ops"]
 
     depends_on:
       desifaces-db:
