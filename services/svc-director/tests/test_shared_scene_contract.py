@@ -55,3 +55,15 @@ def test_shared_scene_route_persists_relational_group_photo_lineage():
     assert "'source_image'" in source
     assert "'approved_shared_scene_image'" in source
     assert "v3_studio_stage_inputs" in source
+
+
+def test_shared_scene_profile_row_lock_avoids_distinct_for_update():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "studio_preflight_routes.py"
+    ).read_text(encoding="utf-8")
+    assert "select distinct p.participant_id" not in source
+    assert "select p.participant_id,p.display_name,p.metadata_json,p.persona_json" in source
+    assert "for update of p" in source
