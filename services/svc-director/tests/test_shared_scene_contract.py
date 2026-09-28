@@ -79,3 +79,19 @@ def test_shared_scene_people_approval_route_is_persisted_on_workflow():
     assert "/shared-scene-people-approval" in source
     assert 'metadata["shared_scene_people_approved"] = True' in source
     assert "shared_scene_people_profiles_incomplete" in source
+
+
+def test_shared_scene_adopts_only_missing_media_lineage():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "shared_scene_routes.py"
+    ).read_text(encoding="utf-8")
+
+    assert "and (account_id is null or account_id=$3)" in source
+    assert "and (project_id is null or project_id=$4)" in source
+    assert "set account_id=coalesce(account_id,$2)" in source
+    assert "project_id=coalesce(project_id,$3)" in source
+    assert "for update" in source
+    assert "where id=$1 and user_id=$2 and account_id=$3" not in source
