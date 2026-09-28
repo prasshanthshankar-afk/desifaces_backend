@@ -10,7 +10,7 @@ NETWORK="df-net"
 IMAGE="desifaces-svc-fusion-worker:candidate-concurrency-retry"
 CANONICAL="desifaces-svc-fusion-worker:latest"
 ROLLBACK="desifaces-svc-fusion-worker:rollback-concurrency"
-ENV_FILE="${RUNTIME_ENV_FILE:-$HOME/workspace/desifaces-v3/infra/.env}"
+ENV_FILE="${RUNTIME_ENV_FILE:-$ROOT/infra/.env}"
 
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 
@@ -69,7 +69,29 @@ docker run --rm --entrypoint python "$IMAGE" -m py_compile   /app/app/services/p
 echo "PY_COMPILE=PASS"
 
 echo
-echo "===== 5. PROMOTE WORKER ONLY ====="
+echo "===== 5. ACTIVE FUSION JOB SAFETY GATE ====="
+for attempt in $(seq 1 80); do
+  ACTIVE="$(
+    docker exec desifaces-db sh -lc '
+      psql -X -Atq -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"         -c "select count(*) from public.studio_jobs where studio_type='''fusion''' and status in ('''running''','''processing''');"
+    '
+  )"
+  ACTIVE="${ACTIVE:-0}"
+  if [[ "$ACTIVE" == "0" ]]; then
+    echo "ACTIVE_FUSION_JOBS=0"
+    break
+  fi
+  if (( attempt == 1 || attempt % 4 == 0 )); then
+    echo "waiting_for_active_fusion_jobs=$ACTIVE attempt=$attempt/80"
+  fi
+  sleep 15
+done
+
+[[ "${ACTIVE:-0}" == "0" ]] || fail "active Fusion jobs did not drain; worker was NOT restarted"
+echo "ACTIVE_FUSION_JOB_GATE=PASS"
+
+echo
+echo "===== 6. PROMOTE WORKER ONLY =====
 docker tag "$NEW_ID" "$CANONICAL"
 
 rollback(){
