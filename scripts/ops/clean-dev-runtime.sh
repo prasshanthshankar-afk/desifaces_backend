@@ -317,6 +317,16 @@ echo "ZERO_V3_SERVICE_NAMES=PASS"
 echo "ZERO_V3_NETWORK_NAMES=PASS"
 
 echo
+echo "===== 12. RESTART-LOOP GATE ====="
+RESTARTING="$(docker ps --format '{{.Names}} {{.Status}}' | grep -E '^df-svc-.*Restarting' || true)"
+if [[ -n "$RESTARTING" ]]; then
+  echo "FAIL: canonical application containers are restart-looping"
+  echo "$RESTARTING"
+  exit 1
+fi
+echo "NO_RESTARTING_APPLICATION_CONTAINERS=PASS"
+
+echo
 echo "===== FINAL RUNTIME ====="
 docker ps --format 'table {{.Names}}	{{.Image}}	{{.Status}}' | sort
 
