@@ -50,7 +50,7 @@ echo "candidate_image=$NEW_ID"
 
 echo
 echo "===== 4. IN-IMAGE CONTRACT ====="
-docker run --rm --entrypoint python "$IMAGE" - <<'PY'
+docker run --rm -i --entrypoint python "$IMAGE" - <<'PY'
 import httpx
 from app.services.providers.sync3_adapter import _concurrency_retry_after
 r=httpx.Response(429,json={
