@@ -87,6 +87,14 @@ def _concurrency_retry_after(response: httpx.Response) -> float | None:
     return max(1.0, min(20.0, retry_after))
 
 
+def _download_url_from_response(response: httpx.Response) -> str:
+    """Parse Sync's plan-aware clean/watermarked download resolver response."""
+
+    if int(response.status_code) != 200:
+        return ""
+    return str(response.text or "").strip().strip('"').strip()
+
+
 class Sync3Adapter(ProviderClient):
     """Sync Labs sync-3 adapter for deterministic multi-face still-image lipsync."""
 
@@ -312,7 +320,22 @@ class Sync3Adapter(ProviderClient):
         if status in {"PROCESSING", "RUNNING"}:
             return ProviderPollResult(status="processing", video_url=None, share_url=None, error_message=None)
         if status == "COMPLETED":
-            video_url = self._safe_str(data.get("outputUrl") or data.get("segmentOutputUrl"))
+            fallback_url = self._safe_str(data.get("outputUrl") or data.get("segmentOutputUrl"))
+            video_url = ""
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                    download_response = await client.get(
+                        f"{self.base_url}/v2/generations/{job_id}/download",
+                        headers=self._headers(),
+                    )
+                video_url = _download_url_from_response(download_response)
+            except Exception:
+                video_url = ""
+
+            # The download resolver is plan-aware: eligible paid plans receive
+            # the clean output when available. Keep outputUrl as compatibility
+            # fallback for older records or transient resolver failures.
+            video_url = video_url or fallback_url
             if not video_url:
                 raise Sync3AdapterError("SYNC3_COMPLETED_WITHOUT_OUTPUT_URL")
             return ProviderPollResult(status="succeeded", video_url=video_url, share_url=None, error_message=None)
