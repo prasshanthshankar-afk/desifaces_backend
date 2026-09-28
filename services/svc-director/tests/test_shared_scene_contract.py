@@ -67,3 +67,15 @@ def test_shared_scene_profile_row_lock_avoids_distinct_for_update():
     assert "select distinct p.participant_id" not in source
     assert "select p.participant_id,p.display_name,p.metadata_json,p.persona_json" in source
     assert "for update of p" in source
+
+
+def test_shared_scene_people_approval_route_is_persisted_on_workflow():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "studio_preflight_routes.py"
+    ).read_text(encoding="utf-8")
+    assert "/shared-scene-people-approval" in source
+    assert 'metadata["shared_scene_people_approved"] = True' in source
+    assert "shared_scene_people_profiles_incomplete" in source
