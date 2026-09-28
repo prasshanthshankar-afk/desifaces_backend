@@ -108,7 +108,6 @@ echo "ACTIVE_STITCH_GATE=PASS"
 
 echo
 echo "===== 6. PROMOTE STITCH WORKER ONLY ====="
-docker tag "$OLD_ID" "${LIVE_REF}:rollback-aspect" 2>/dev/null || true
 docker tag "$NEW_ID" "$LIVE_REF"
 
 rollback(){
@@ -127,7 +126,7 @@ sleep 4
 [[ "$(docker inspect "$LIVE" --format '{{.Image}}')" == "$NEW_ID" ]] || fail "running image mismatch"
 [[ "$(docker inspect "$LIVE" --format '{{.RestartCount}}')" == "0" ]] || fail "stitch worker restarted"
 
-docker exec "$LIVE" python - <<'PY'
+docker exec -i "$LIVE" python - <<'PY'
 from app.services import stitch_service
 import inspect
 assert stitch_service._aspect_dimensions("16:9") == (1920, 1080)
