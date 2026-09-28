@@ -19,7 +19,7 @@ OUT="/tmp/next3-dns-contract-${STAMP}.txt"
 
   echo
   echo "===== WEB SERVICE HOSTS ====="
-  timeout 10s docker exec "$WEB" node - <<'NODE'
+  timeout 10s docker exec -i "$WEB" node - <<'NODE'
 const keys = [
   "CORE_BASE_URL",
   "DIRECTOR_BASE_URL",
@@ -63,12 +63,12 @@ for _,v in sorted(obj.items(), key=lambda kv: str(kv[1].get("Name",""))):
     name=str(v.get("Name",""))
     if any(x in name for x in wanted):
         aliases=v.get("Aliases") or []
-        print(f"name={name} ipv4={v.get("IPv4Address","")} aliases={aliases}")
+        print("name={} ipv4={} aliases={}".format(name, v.get("IPv4Address",""), aliases))
 ' || true
 
   echo
   echo "===== WEB DNS LOOKUPS ====="
-  timeout 15s docker exec "$WEB" node - <<'NODE'
+  timeout 15s docker exec -i "$WEB" node - <<'NODE'
 const dns = require("node:dns").promises;
 const keys = ["DIRECTOR_BASE_URL","CORE_BASE_URL","FACE_BASE_URL","AUDIO_BASE_URL","FUSION_BASE_URL","PRICING_BASE_URL","COMMERCE_BASE_URL","DASHBOARD_BASE_URL"];
 
@@ -97,7 +97,7 @@ NODE
 
   echo
   echo "===== WEB HTTP HEALTH VIA CONFIGURED HOSTS ====="
-  timeout 20s docker exec "$WEB" node - <<'NODE'
+  timeout 20s docker exec -i "$WEB" node - <<'NODE'
 const keys = ["DIRECTOR_BASE_URL","CORE_BASE_URL","FACE_BASE_URL","AUDIO_BASE_URL","FUSION_BASE_URL","PRICING_BASE_URL","COMMERCE_BASE_URL","DASHBOARD_BASE_URL"];
 
 (async () => {
