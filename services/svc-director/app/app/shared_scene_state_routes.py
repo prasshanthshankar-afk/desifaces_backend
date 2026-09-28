@@ -5,7 +5,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from .security import DirectorAuthContext, get_director_auth
 
@@ -18,6 +18,23 @@ _SHARED_SCENE_CONTRACT_VERSION = 1
 
 class SharedSceneSourceModeIn(BaseModel):
     mode: SourceMode
+
+
+class SharedSceneGroupPhotoSpecIn(BaseModel):
+    scene_country_code: str | None = Field(default=None, max_length=16)
+    scene_region_code: str | None = Field(default=None, max_length=160)
+    context_code: str | None = Field(default=None, max_length=160)
+    background: str | None = Field(default=None, max_length=1600)
+    prompt: str = Field(min_length=1, max_length=8000)
+    variant_count: int = 2
+    aspect_ratio: Literal["16:9"] = "16:9"
+
+    @model_validator(mode="after")
+    def validate_variants(self):
+        if int(self.variant_count) not in {1, 2, 4, 6, 8}:
+            raise ValueError("shared_scene_group_photo_variant_count_unsupported")
+        self.variant_count = int(self.variant_count)
+        return self
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -59,6 +76,67 @@ def _profile_from_row(row) -> dict[str, Any]:
             explicit.get("region_code")
             or persona.get("region_code")
         ) or None,
+    }
+
+
+def _approved_people(workflow_meta: dict[str, Any], live_speakers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    snapshot = workflow_meta.get("shared_scene_people_snapshot")
+    return [dict(item) for item in snapshot] if isinstance(snapshot, list) and snapshot else list(live_speakers)
+
+
+def _group_photo_generation_input(
+    *,
+    workflow_meta: dict[str, Any],
+    live_speakers: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    spec = _dict(workflow_meta.get("shared_scene_group_photo_spec"))
+    if not spec:
+        return None
+
+    speakers = _approved_people(workflow_meta, live_speakers)
+    if len(speakers) != 2:
+        return None
+
+    participant_lines: list[str] = []
+    subjects: list[dict[str, Any]] = []
+    for index, speaker in enumerate(speakers, start=1):
+        parts = [
+            f"AUTHORITATIVE Speaker {index} — {_clean(speaker.get('display_name')) or 'Speaker'}",
+            f"gender presentation: {_clean(speaker.get('gender_presentation')).lower()}" if _clean(speaker.get("gender_presentation")) else "",
+            f"age: {_clean(speaker.get('age_presentation'))}" if _clean(speaker.get("age_presentation")) else "",
+            f"country code: {_clean(speaker.get('country_code')).upper()}" if _clean(speaker.get("country_code")) else "",
+            f"region code: {_clean(speaker.get('region_code'))}" if _clean(speaker.get("region_code")) else "",
+        ]
+        participant_lines.append(", ".join(item for item in parts if item))
+        subjects.append({
+            "gender": _clean(speaker.get("gender_presentation")).lower() or None,
+            "relationship_role": "conversation participant",
+        })
+
+    setting_lines = [
+        f"Scene country code: {_clean(spec.get('scene_country_code')).upper()}" if _clean(spec.get("scene_country_code")) else "",
+        f"Scene region code: {_clean(spec.get('scene_region_code'))}" if _clean(spec.get("scene_region_code")) else "",
+        f"Scene context code: {_clean(spec.get('context_code'))}" if _clean(spec.get("context_code")) else "",
+        f"Background/environment: {_clean(spec.get('background'))}" if _clean(spec.get("background")) else "",
+    ]
+    enriched_prompt = "\n".join(item for item in [
+        "CURRENT APPROVED SPEAKER PROFILES — these override any conflicting text in the editable description:",
+        *participant_lines,
+        _clean(spec.get("prompt")),
+        *setting_lines,
+    ] if item)
+
+    return {
+        "mode": "text-to-image",
+        "language": "en",
+        "user_prompt": enriched_prompt,
+        "prompt": enriched_prompt,
+        "subject_composition_code": "two_people",
+        "subjects": subjects,
+        "region_code": _clean(spec.get("scene_region_code")) or None,
+        "context_code": _clean(spec.get("context_code")) or None,
+        "aspect_ratio": "16:9",
+        "num_variants": int(spec.get("variant_count") or 2),
     }
 
 
@@ -203,6 +281,11 @@ async def load_shared_scene_state(conn, *, workflow_id: UUID, account_id: UUID) 
         "group_photo": {
             "source_mode": source_mode,
             "generate_supported": len(speakers) == 2,
+            "generation_spec": _dict(workflow_meta.get("shared_scene_group_photo_spec")) or None,
+            "generation_input": _group_photo_generation_input(
+                workflow_meta=workflow_meta,
+                live_speakers=speakers,
+            ),
             "draft_media_id": draft_media_id,
             "approved_media_id": approved_media_id,
             "mapped_count": mapped_count,
@@ -306,7 +389,76 @@ async def set_shared_scene_source_mode(
         )
 
 
+@router.put("/api/director/studio-workflows/{workflow_id}/shared-scene-group-photo-spec")
+async def set_shared_scene_group_photo_spec(
+    workflow_id: UUID,
+    body: SharedSceneGroupPhotoSpecIn,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    pool = request.app.state.business_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            state = await load_shared_scene_state(
+                conn,
+                workflow_id=workflow_id,
+                account_id=auth.account_id,
+            )
+            if not state["people"]["approved"]:
+                raise HTTPException(status_code=409, detail="shared_scene_group_photo_spec_requires_people_approval")
+            if state["group_photo"]["source_mode"] != "generate":
+                raise HTTPException(status_code=409, detail="shared_scene_group_photo_spec_requires_generate_source")
+            if not state["group_photo"]["generate_supported"]:
+                raise HTTPException(status_code=422, detail="shared_scene_generate_requires_exactly_two_speakers")
+            if state["group_photo"]["draft_media_id"]:
+                raise HTTPException(status_code=409, detail="shared_scene_group_photo_spec_locked_after_photo_selection")
+
+            row = await conn.fetchrow(
+                """
+                select metadata_json
+                from public.v3_studio_workflows
+                where workflow_id=$1 and account_id=$2
+                for update
+                """,
+                workflow_id,
+                auth.account_id,
+            )
+            if not row:
+                raise HTTPException(status_code=404, detail="studio_workflow_not_found")
+
+            metadata = _dict(row["metadata_json"])
+            spec = {
+                "scene_country_code": _clean(body.scene_country_code).upper() or None,
+                "scene_region_code": _clean(body.scene_region_code) or None,
+                "context_code": _clean(body.context_code) or None,
+                "background": _clean(body.background) or None,
+                "prompt": _clean(body.prompt),
+                "variant_count": int(body.variant_count),
+                "aspect_ratio": "16:9",
+            }
+            if _dict(metadata.get("shared_scene_group_photo_spec")) != spec:
+                metadata["shared_scene_group_photo_spec"] = spec
+                metadata["shared_scene_state_version"] = int(metadata.get("shared_scene_state_version") or 0) + 1
+                await conn.execute(
+                    """
+                    update public.v3_studio_workflows
+                    set metadata_json=$2::jsonb,updated_at=now()
+                    where workflow_id=$1 and account_id=$3
+                    """,
+                    workflow_id,
+                    json.dumps(metadata, ensure_ascii=False),
+                    auth.account_id,
+                )
+
+        return await load_shared_scene_state(
+            conn,
+            workflow_id=workflow_id,
+            account_id=auth.account_id,
+        )
+
+
 __all__ = [
+    "SharedSceneGroupPhotoSpecIn",
     "SharedSceneSourceModeIn",
     "load_shared_scene_state",
     "router",
