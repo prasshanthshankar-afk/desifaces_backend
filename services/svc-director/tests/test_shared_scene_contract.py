@@ -95,3 +95,18 @@ def test_shared_scene_adopts_only_missing_media_lineage():
     assert "project_id=coalesce(project_id,$3)" in source
     assert "for update" in source
     assert "where id=$1 and user_id=$2 and account_id=$3" not in source
+
+
+def test_shared_scene_video_settings_route_persists_pricing_gate():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "shared_scene_routes.py"
+    ).read_text(encoding="utf-8")
+
+    assert "/shared-scene-video-settings" in source
+    assert 'metadata["shared_scene_motion_mode"] = body.motion_mode' in source
+    assert 'metadata["shared_scene_video_settings_version"] = 1' in source
+    assert "shared_scene_video_settings_requires_approved_group_photo" in source
+    assert "pricing_ready" in source
