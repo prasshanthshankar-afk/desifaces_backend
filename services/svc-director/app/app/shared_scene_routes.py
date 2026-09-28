@@ -128,10 +128,12 @@ async def set_shared_scene_conversation(
                 """
                 select id,user_id,account_id,project_id,kind,lifecycle_state,meta_json
                 from public.media_assets
-                where id=$1 and user_id=$2 and account_id=$3
+                where id=$1 and user_id=$2
+                  and (account_id is null or account_id=$3)
                   and (project_id is null or project_id=$4)
                   and kind in ('image','source_image','face_image','face_source_image')
                   and lifecycle_state='active'
+                for update
                 """,
                 body.shared_scene_media_id,
                 auth.user_id,
@@ -197,6 +199,25 @@ async def set_shared_scene_conversation(
                         "action": "validate_group_photo",
                     },
                 )
+
+            # Legacy/generated Face assets created before account/project lineage
+            # propagation may be user-owned and fully validated while these two
+            # columns are NULL. Adopt only missing lineage here, where the
+            # authenticated account and workflow project are authoritative.
+            # Existing non-NULL lineage is never overwritten; mismatches are
+            # rejected by the SELECT predicate above.
+            await conn.execute(
+                """
+                update public.media_assets
+                set account_id=coalesce(account_id,$2),
+                    project_id=coalesce(project_id,$3),
+                    updated_at=now()
+                where id=$1
+                """,
+                body.shared_scene_media_id,
+                auth.account_id,
+                stage["project_id"],
+            )
 
             member_rows = await conn.fetch(
                 """
