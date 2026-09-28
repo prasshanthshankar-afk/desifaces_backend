@@ -47,12 +47,25 @@ diff -u "$OLD" "$PATCH" || true
 
 echo
 echo "===== 3. SURGICAL CANDIDATE ====="
-docker rm -f "$PREP" >/dev/null 2>&1 || true
-docker image rm "$CANDIDATE" >/dev/null 2>&1 || true
-docker create --name "$PREP" "$OLD_ID" >/dev/null
-docker cp "$PATCH" "$PREP:/app/app/services/stitch_service.py"
-docker commit "$PREP" "$CANDIDATE" >/dev/null
-docker rm "$PREP" >/dev/null
+REUSE=0
+if docker image inspect "$CANDIDATE" >/dev/null 2>&1; then
+  PATCH_SHA="$(sha256sum "$PATCH" | awk '{print $1}')"
+  IMAGE_SHA="$(docker run --rm --entrypoint sha256sum "$CANDIDATE" /app/app/services/stitch_service.py | awk '{print $1}')"
+  if [[ "$PATCH_SHA" == "$IMAGE_SHA" ]]; then
+    REUSE=1
+  fi
+fi
+
+if (( REUSE == 1 )); then
+  echo "CANDIDATE_IMAGE_REUSED=PASS"
+else
+  docker rm -f "$PREP" >/dev/null 2>&1 || true
+  docker image rm "$CANDIDATE" >/dev/null 2>&1 || true
+  docker create --name "$PREP" "$OLD_ID" >/dev/null
+  docker cp "$PATCH" "$PREP:/app/app/services/stitch_service.py"
+  docker commit "$PREP" "$CANDIDATE" >/dev/null
+  docker rm "$PREP" >/dev/null
+fi
 
 NEW_ID="$(docker image inspect "$CANDIDATE" --format '{{.Id}}')"
 echo "candidate_image=$NEW_ID"
@@ -64,7 +77,7 @@ echo "NON_TARGET_CODE=BYTE_IDENTICAL"
 
 echo
 echo "===== 4. REAL VIDEO ASPECT CERTIFICATION ====="
-docker run --rm --entrypoint bash "$CANDIDATE" -lc '
+docker run --rm --env-file "$ENV_FILE" --entrypoint bash "$CANDIDATE" -lc '
 set -Eeuo pipefail
 ffmpeg -v error -y   -f lavfi -i "color=c=black:s=1536x1024:r=30:d=1"   -f lavfi -i "anullsrc=channel_layout=stereo:sample_rate=48000"   -shortest -c:v libx264 -pix_fmt yuv420p -c:a aac /tmp/in.mp4
 python - <<'"'"'PY'"'"'
