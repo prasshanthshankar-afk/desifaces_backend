@@ -37,3 +37,14 @@ def test_shared_scene_state_exposes_one_phase_and_one_next_action():
     assert '"allowed_actions": allowed_actions' in state
     assert "shared_scene_generate_requires_exactly_two_speakers" in state
     assert "shared_scene_source_locked_after_photo_selection" in state
+
+
+def test_shared_scene_group_photo_spec_and_draft_are_durable_commands():
+    state = (ROOT / "shared_scene_state_routes.py").read_text(encoding="utf-8")
+    scene = (ROOT / "shared_scene_routes.py").read_text(encoding="utf-8")
+
+    assert "/shared-scene-group-photo-spec" in state
+    assert "shared_scene_group_photo_spec" in state
+    assert "generation_input" in state
+    assert "/shared-scene-draft" in scene
+    assert "shared_scene_draft_media_id" in scene
