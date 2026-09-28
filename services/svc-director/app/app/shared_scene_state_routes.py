@@ -258,8 +258,15 @@ async def set_shared_scene_source_mode(
             )
             if not state["people"]["approved"]:
                 raise HTTPException(status_code=409, detail="shared_scene_source_requires_people_approval")
+            current_mode = state["group_photo"]["source_mode"]
             if state["group_photo"]["approved_media_id"]:
                 raise HTTPException(status_code=409, detail="shared_scene_source_locked_after_group_photo_approval")
+            if (
+                state["group_photo"]["draft_media_id"]
+                and current_mode
+                and current_mode != body.mode
+            ):
+                raise HTTPException(status_code=409, detail="shared_scene_source_locked_after_photo_selection")
             if body.mode == "generate" and not state["group_photo"]["generate_supported"]:
                 raise HTTPException(status_code=422, detail="shared_scene_generate_requires_exactly_two_speakers")
 
