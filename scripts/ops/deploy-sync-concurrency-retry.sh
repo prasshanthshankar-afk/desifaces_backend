@@ -42,8 +42,24 @@ docker tag "$OLD_ID" "$ROLLBACK"
 echo "old_image=$OLD_ID"
 
 echo
-echo "===== 3. BUILD CANDIDATE ====="
-docker build   --label "org.opencontainers.image.revision=$TARGET_SHA"   -t "$IMAGE"   -f "$ROOT/services/svc-fusion/app/Dockerfile"   "$ROOT"
+echo "===== 3. BUILD OR REUSE CANDIDATE ====="
+REUSE=0
+if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  EXISTING_REV="$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)"
+  if [[ "$EXISTING_REV" == "$TARGET_SHA" ]]; then
+    REUSE=1
+  fi
+fi
+
+if (( REUSE == 1 )); then
+  echo "CANDIDATE_IMAGE_REUSED=PASS"
+else
+  docker build \
+    --label "org.opencontainers.image.revision=$TARGET_SHA" \
+    -t "$IMAGE" \
+    -f "$ROOT/services/svc-fusion/app/Dockerfile" \
+    "$ROOT"
+fi
 
 NEW_ID="$(docker image inspect "$IMAGE" --format '{{.Id}}')"
 echo "candidate_image=$NEW_ID"
@@ -72,9 +88,14 @@ echo
 echo "===== 5. ACTIVE FUSION JOB SAFETY GATE ====="
 for attempt in $(seq 1 80); do
   ACTIVE="$(
-    docker exec desifaces-db sh -lc '
-      psql -X -Atq -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"         -c "select count(*) from public.studio_jobs where studio_type='''fusion''' and status in ('''running''','''processing''');"
-    '
+    docker exec -i desifaces-db sh -lc '
+      psql -X -Atq -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+    ' <<'SQL'
+select count(*)
+from public.studio_jobs
+where studio_type='fusion'
+  and status in ('running','processing');
+SQL
   )"
   ACTIVE="${ACTIVE:-0}"
   if [[ "$ACTIVE" == "0" ]]; then
@@ -91,7 +112,7 @@ done
 echo "ACTIVE_FUSION_JOB_GATE=PASS"
 
 echo
-echo "===== 6. PROMOTE WORKER ONLY =====
+echo "===== 6. PROMOTE WORKER ONLY ====="
 docker tag "$NEW_ID" "$CANONICAL"
 
 rollback(){
