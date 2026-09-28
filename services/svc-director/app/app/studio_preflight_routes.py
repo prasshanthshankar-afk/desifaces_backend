@@ -443,7 +443,116 @@ async def set_shared_scene_participant_profile(
                 auth.account_id,
             )
 
+
         return await _load_preflight(conn, workflow_id=workflow_id, account_id=auth.account_id)
+
+
+@router.post(
+    "/api/director/studio-workflows/{workflow_id}/shared-scene-people-approval"
+)
+async def approve_shared_scene_people(
+    workflow_id: UUID,
+    request: Request,
+    auth: DirectorAuthContext = Depends(get_director_auth),
+):
+    """Persist the explicit HITL gate between speaker setup and group-photo setup."""
+
+    async with request.app.state.business_pool.acquire() as conn:
+        async with conn.transaction():
+            workflow = await conn.fetchrow(
+                """
+                select metadata_json
+                from public.v3_studio_workflows
+                where workflow_id=$1 and account_id=$2
+                for update
+                """,
+                workflow_id,
+                auth.account_id,
+            )
+            if not workflow:
+                raise HTTPException(status_code=404, detail={
+                    "code": "studio_workflow_not_found",
+                    "message": "This Story Studio session could not be found.",
+                    "recoverable": False,
+                })
+
+            metadata = _as_dict(workflow["metadata_json"])
+            if _clean(metadata.get("conversation_mode")).casefold() != "shared_scene":
+                raise HTTPException(status_code=409, detail={
+                    "code": "shared_scene_people_approval_wrong_workflow_mode",
+                    "message": "People approval is only available for group-photo conversations.",
+                    "recoverable": False,
+                })
+
+            rows = await conn.fetch(
+                """
+                select p.participant_id,p.display_name,p.metadata_json,p.persona_json
+                from public.v3_studio_stage_runs s
+                join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
+                join public.v3_participants p on p.participant_id=dt.speaker_participant_id
+                where s.workflow_id=$1
+                  and s.stage_type='audio'
+                  and s.scope_type='dialogue_turn'
+                  and dt.speaker_participant_id is not null
+                """,
+                workflow_id,
+            )
+
+            speakers: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                participant_id = str(row["participant_id"])
+                if participant_id in speakers:
+                    continue
+                participant_metadata = _as_dict(row["metadata_json"])
+                persona = _as_dict(row["persona_json"])
+                explicit = _as_dict(participant_metadata.get("explicit_face_constraints"))
+                speakers[participant_id] = {
+                    "display_name": _clean(row["display_name"]) or "Speaker",
+                    "gender_presentation": _normalize_gender(
+                        explicit.get("gender")
+                        or explicit.get("gender_presentation")
+                        or persona.get("gender")
+                        or persona.get("gender_presentation")
+                    ),
+                }
+
+            if len(speakers) < 2:
+                raise HTTPException(status_code=422, detail={
+                    "code": "shared_scene_requires_at_least_two_speakers",
+                    "message": "A group-photo conversation requires at least two speakers.",
+                    "recoverable": True,
+                })
+
+            missing = [
+                item["display_name"]
+                for item in speakers.values()
+                if not item["gender_presentation"]
+            ]
+            if missing:
+                raise HTTPException(status_code=422, detail={
+                    "code": "shared_scene_people_profiles_incomplete",
+                    "message": "Confirm gender presentation for every speaker before approving the people phase.",
+                    "recoverable": True,
+                    "missing_speakers": missing,
+                })
+
+            metadata["shared_scene_people_approved"] = True
+            await conn.execute(
+                """
+                update public.v3_studio_workflows
+                set metadata_json=$2::jsonb,updated_at=now()
+                where workflow_id=$1 and account_id=$3
+                """,
+                workflow_id,
+                json.dumps(metadata, ensure_ascii=False),
+                auth.account_id,
+            )
+
+    return {
+        "workflow_id": str(workflow_id),
+        "shared_scene_people_approved": True,
+        "speaker_count": len(speakers),
+    }
 
 
 __all__ = ["router"]
