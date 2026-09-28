@@ -507,6 +507,7 @@ async def approve_shared_scene_people(
                 persona = _as_dict(row["persona_json"])
                 explicit = _as_dict(participant_metadata.get("explicit_face_constraints"))
                 speakers[participant_id] = {
+                    "participant_id": participant_id,
                     "display_name": _clean(row["display_name"]) or "Speaker",
                     "gender_presentation": _normalize_gender(
                         explicit.get("gender")
@@ -514,6 +515,19 @@ async def approve_shared_scene_people(
                         or persona.get("gender")
                         or persona.get("gender_presentation")
                     ),
+                    "age_presentation": _clean(
+                        explicit.get("age")
+                        or persona.get("age_presentation")
+                        or persona.get("age")
+                    ) or None,
+                    "country_code": _clean(
+                        explicit.get("country_code")
+                        or persona.get("country_code")
+                    ).upper() or None,
+                    "region_code": _clean(
+                        explicit.get("region_code")
+                        or persona.get("region_code")
+                    ) or None,
                 }
 
             if len(speakers) < 2:
@@ -537,6 +551,11 @@ async def approve_shared_scene_people(
                 })
 
             metadata["shared_scene_people_approved"] = True
+            metadata["shared_scene_people_snapshot"] = sorted(
+                speakers.values(),
+                key=lambda item: item["participant_id"],
+            )
+            metadata["shared_scene_state_version"] = int(metadata.get("shared_scene_state_version") or 0) + 1
             await conn.execute(
                 """
                 update public.v3_studio_workflows
