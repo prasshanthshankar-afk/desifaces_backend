@@ -105,7 +105,6 @@ echo "ACTIVE_FUSION_GATE=PASS"
 
 echo
 echo "===== 6. PROMOTE FUSION WORKER ONLY ====="
-docker tag "$OLD_ID" "${LIVE_REF}:rollback-clean-output" 2>/dev/null || true
 docker tag "$NEW_ID" "$LIVE_REF"
 
 rollback(){
@@ -124,7 +123,7 @@ sleep 4
 [[ "$(docker inspect "$LIVE" --format '{{.Image}}')" == "$NEW_ID" ]] || fail "running image mismatch"
 [[ "$(docker inspect "$LIVE" --format '{{.RestartCount}}')" == "0" ]] || fail "Fusion worker restarted"
 
-docker exec "$LIVE" python - <<'PY'
+docker exec -i "$LIVE" python - <<'PY'
 from pathlib import Path
 p=Path("/app/app/services/providers/sync3_adapter.py").read_text()
 assert "/v2/generations/{job_id}/download" in p
