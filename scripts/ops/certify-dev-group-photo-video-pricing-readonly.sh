@@ -4,10 +4,12 @@ set -Eeuo pipefail
 [[ "$(hostname -s)" == "desifaces-dev" ]] || { echo "FAIL: run on desifaces-dev"; exit 2; }
 
 DB_CONTAINER="${DB_CONTAINER:-desifaces-db}"
+PRICING_CONTAINER="${PRICING_CONTAINER:-df-svc-pricing}"
 FACE_CONTAINER="${FACE_CONTAINER:-df-svc-face}"
 FUSION_CONTAINER="${FUSION_CONTAINER:-df-svc-fusion}"
+FUSION_WORKER_CONTAINER="${FUSION_WORKER_CONTAINER:-df-svc-fusion-worker}"
 
-for c in "$DB_CONTAINER" "$FACE_CONTAINER" "$FUSION_CONTAINER"; do
+for c in "$DB_CONTAINER" "$PRICING_CONTAINER" "$FACE_CONTAINER" "$FUSION_CONTAINER" "$FUSION_WORKER_CONTAINER"; do
   docker inspect "$c" >/dev/null 2>&1 || { echo "FAIL: missing container $c"; exit 2; }
 done
 
@@ -15,10 +17,19 @@ FACE_SKU="$(docker exec "$FACE_CONTAINER" sh -lc 'printf "%s" "${DF_PRICING_SKU_
 FACE_MODEL="$(docker exec "$FACE_CONTAINER" sh -lc 'printf "%s" "${OPENAI_IMAGE_MODEL_T2I:-gpt-image-2}"')"
 FACE_QUALITY="$(docker exec "$FACE_CONTAINER" sh -lc 'printf "%s" "${OPENAI_IMAGE_QUALITY:-high}"')"
 FACE_SIZE="$(docker exec "$FACE_CONTAINER" sh -lc 'printf "%s" "${OPENAI_IMAGE_SIZE:-auto}"')"
-SYNC_MODEL="$(docker exec "$FUSION_CONTAINER" sh -lc 'printf "%s" "${DF_SYNC3_MODEL_ID:-sync-3}"')"
-SYNC_CAPACITY="$(docker exec "$FUSION_CONTAINER" sh -lc 'printf "%s" "${DF_SYNC3_PROVIDER_CONCURRENCY:-unset}"')"
+SYNC_MODEL="$(docker exec "$FUSION_WORKER_CONTAINER" sh -lc 'printf "%s" "${DF_SYNC3_MODEL_ID:-sync-3}"')"
+SYNC_CAPACITY="$(docker exec "$FUSION_WORKER_CONTAINER" sh -lc 'printf "%s" "${DF_SYNC3_PROVIDER_CONCURRENCY:-unset}"')"
 
-PSQL=(docker exec -i "$DB_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U desifaces_admin -d desifaces)
+DATABASE_URL="$(docker exec "$PRICING_CONTAINER" sh -lc 'printf "%s" "$DATABASE_URL"')"
+[[ -n "$DATABASE_URL" ]] || { echo "FAIL: pricing DATABASE_URL unavailable"; exit 2; }
+
+DB_USER="$(printf '%s' "$DATABASE_URL" | sed -E 's#^[a-zA-Z0-9+.-]+://([^:/@]+).*#\1#')"
+DB_NAME="$(printf '%s' "$DATABASE_URL" | sed -E 's#^.*/([^/?]+)(\?.*)?$#\1#')"
+
+[[ -n "$DB_USER" && "$DB_USER" != "$DATABASE_URL" ]] || { echo "FAIL: could not resolve live DB user"; exit 2; }
+[[ -n "$DB_NAME" && "$DB_NAME" != "$DATABASE_URL" ]] || { echo "FAIL: could not resolve live DB name"; exit 2; }
+
+PSQL=(docker exec -i "$DB_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME")
 
 sql_scalar() {
   "${PSQL[@]}" -Atqc "$1"
@@ -40,6 +51,8 @@ echo "face_size=$FACE_SIZE"
 echo "video_provider=sync"
 echo "video_model=$SYNC_MODEL"
 echo "sync_provider_capacity=$SYNC_CAPACITY"
+echo "db_user=$DB_USER"
+echo "db_name=$DB_NAME"
 
 FACE_VARIANT_COUNT="$(sql_scalar "select count(*) from public.pricing_variants where code='${FACE_SKU//\'/\'\'}' and is_active=true;")"
 FACE_LINE_COUNT="$(sql_scalar "select count(*) from public.pricing_variant_lines where variant_code='${FACE_SKU//\'/\'\'}';")"
