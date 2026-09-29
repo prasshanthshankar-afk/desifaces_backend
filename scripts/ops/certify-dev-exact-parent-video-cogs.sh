@@ -37,6 +37,22 @@ def d(v):
     except Exception:
         return Decimal("0")
 
+def obj(v):
+    if v is None:
+        return {}
+    if isinstance(v, dict):
+        return dict(v)
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    try:
+        return dict(v)
+    except Exception:
+        return {}
+
 def provider_rate(provider, request_json, meta_json):
     provider = str(provider or "").strip().lower()
     request_json = request_json or {}
@@ -174,8 +190,8 @@ async def main():
                     attempts += 1
                     provider = str(run["provider"] or "").strip().lower()
                     provider_counts[provider] = provider_counts.get(provider,0)+1
-                    request_json = dict(run["request_json"] or {})
-                    meta_json = dict(run["meta_json"] or {})
+                    request_json = obj(run["request_json"])
+                    meta_json = obj(run["meta_json"])
                     rate, basis = provider_rate(provider, request_json, meta_json)
 
                     # A provider_job_id or terminal success proves provider work was submitted.
