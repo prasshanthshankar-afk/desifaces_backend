@@ -277,6 +277,11 @@ async def load_shared_scene_state(conn, *, workflow_id: UUID, account_id: UUID) 
             "speaker_count": len(speakers),
             "speakers": speakers,
             "approved_snapshot": snapshot if isinstance(snapshot, list) else None,
+            "snapshot_status": (
+                "ready"
+                if isinstance(snapshot, list) and snapshot
+                else ("legacy_missing" if people_approved else "not_applicable")
+            ),
         },
         "group_photo": {
             "source_mode": source_mode,
@@ -367,9 +372,28 @@ async def set_shared_scene_source_mode(
                 raise HTTPException(status_code=404, detail="studio_workflow_not_found")
 
             metadata = _dict(row["metadata_json"])
+            changed = False
+
+            # Compatibility repair for shared-scene workflows approved before the
+            # durable speaker-snapshot contract existed. The first explicit
+            # post-approval source command atomically freezes the exact current
+            # approved profiles before any group-photo work can continue.
+            snapshot = metadata.get("shared_scene_people_snapshot")
+            if not (isinstance(snapshot, list) and snapshot):
+                if not state["people"]["profiles_complete"]:
+                    raise HTTPException(status_code=409, detail="shared_scene_people_snapshot_repair_requires_complete_profiles")
+                metadata["shared_scene_people_snapshot"] = sorted(
+                    (dict(item) for item in state["people"]["speakers"]),
+                    key=lambda item: str(item.get("participant_id") or ""),
+                )
+                changed = True
+
             current = _clean(metadata.get("shared_scene_source_mode")).lower()
             if current != body.mode:
                 metadata["shared_scene_source_mode"] = body.mode
+                changed = True
+
+            if changed:
                 metadata["shared_scene_state_version"] = int(metadata.get("shared_scene_state_version") or 0) + 1
                 await conn.execute(
                     """
@@ -427,6 +451,18 @@ async def set_shared_scene_group_photo_spec(
                 raise HTTPException(status_code=404, detail="studio_workflow_not_found")
 
             metadata = _dict(row["metadata_json"])
+            changed = False
+
+            snapshot = metadata.get("shared_scene_people_snapshot")
+            if not (isinstance(snapshot, list) and snapshot):
+                if not state["people"]["profiles_complete"]:
+                    raise HTTPException(status_code=409, detail="shared_scene_people_snapshot_repair_requires_complete_profiles")
+                metadata["shared_scene_people_snapshot"] = sorted(
+                    (dict(item) for item in state["people"]["speakers"]),
+                    key=lambda item: str(item.get("participant_id") or ""),
+                )
+                changed = True
+
             spec = {
                 "scene_country_code": _clean(body.scene_country_code).upper() or None,
                 "scene_region_code": _clean(body.scene_region_code) or None,
@@ -438,6 +474,9 @@ async def set_shared_scene_group_photo_spec(
             }
             if _dict(metadata.get("shared_scene_group_photo_spec")) != spec:
                 metadata["shared_scene_group_photo_spec"] = spec
+                changed = True
+
+            if changed:
                 metadata["shared_scene_state_version"] = int(metadata.get("shared_scene_state_version") or 0) + 1
                 await conn.execute(
                     """
