@@ -34,13 +34,13 @@ GROUP_VIDEO_RUNTIME_LEAF=""
 GROUP_VIDEO_RUNTIME_PROVIDER=""
 if docker inspect "$FUSION_EXTENSION_CONTAINER" >/dev/null 2>&1; then
   GROUP_VIDEO_RUNTIME_VARIANT="$(
-    docker exec "$FUSION_EXTENSION_CONTAINER" sh -lc       "grep -E '^_VARIANT_CODE[[:space:]]*=' /app/app/api/routes/v3_scene_pricing.py 2>/dev/null | head -n1 | sed -E 's/.*=[[:space:]]*[\"'\'' ]*([^\"'\'' ]+).*/\1/'"       2>/dev/null || true
+    docker exec "$FUSION_EXTENSION_CONTAINER" sh -lc "grep -E '^_VARIANT_CODE[[:space:]]*=' /app/app/api/routes/v3_scene_pricing.py 2>/dev/null | head -n1 | cut -d= -f2- | tr -d ' \"'" 2>/dev/null || true
   )"
   GROUP_VIDEO_RUNTIME_LEAF="$(
-    docker exec "$FUSION_EXTENSION_CONTAINER" sh -lc       "grep -E '^_LEAF_SKU_CODE[[:space:]]*=' /app/app/api/routes/v3_scene_pricing.py 2>/dev/null | head -n1 | sed -E 's/.*=[[:space:]]*[\"'\'' ]*([^\"'\'' ]+).*/\1/'"       2>/dev/null || true
+    docker exec "$FUSION_EXTENSION_CONTAINER" sh -lc "grep -E '^_LEAF_SKU_CODE[[:space:]]*=' /app/app/api/routes/v3_scene_pricing.py 2>/dev/null | head -n1 | cut -d= -f2- | tr -d ' \"'" 2>/dev/null || true
   )"
   GROUP_VIDEO_RUNTIME_PROVIDER="$(
-    docker exec "$FUSION_EXTENSION_CONTAINER" sh -lc       "grep -E '^_PROVIDER[[:space:]]*=' /app/app/api/routes/v3_scene_pricing.py 2>/dev/null | head -n1 | sed -E 's/.*=[[:space:]]*[\"'\'' ]*([^\"'\'' ]+).*/\1/'"       2>/dev/null || true
+    docker exec "$FUSION_EXTENSION_CONTAINER" sh -lc "grep -E '^_PROVIDER[[:space:]]*=' /app/app/api/routes/v3_scene_pricing.py 2>/dev/null | head -n1 | cut -d= -f2- | tr -d ' \"'" 2>/dev/null || true
   )"
 fi
 echo "group_video_runtime_variant=${GROUP_VIDEO_RUNTIME_VARIANT:-UNKNOWN}"
