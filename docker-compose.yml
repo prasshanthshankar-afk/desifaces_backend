@@ -327,10 +327,10 @@ services:
       DF_PRICING_BEARER_TOKEN: ${DF_PRICING_INTERNAL_BEARER}
 
       DF_FUSION_WORKER_CONCURRENCY: ${DF_FUSION_WORKER_CONCURRENCY:-8}
-      # Sync3 currently advertises one provider generation slot for this account.
-      # Keep platform/worker concurrency independent; serialize only provider submissions
-      # to avoid 429 wait storms and preserve overall application throughput.
-      DF_SYNC3_PROVIDER_CONCURRENCY: ${DF_SYNC3_PROVIDER_CONCURRENCY:-1}
+      # Sync account capacity is an external plan entitlement, independent from
+      # desifaces worker concurrency. The current Creator plan allows 3 concurrent
+      # provider jobs; override this value whenever the Sync plan changes.
+      DF_SYNC3_PROVIDER_CONCURRENCY: ${DF_SYNC3_PROVIDER_CONCURRENCY:-3}
       DF_SYNC3_CONCURRENCY_WAIT_SECONDS: ${DF_SYNC3_CONCURRENCY_WAIT_SECONDS:-900}
       AZURE_VIDEO_OUTPUT_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
       AZURE_FINAL_VIDEO_CONTAINER: ${DF_V3_FUSION_OUTPUT_CONTAINER:-video-output}
