@@ -59,7 +59,9 @@ grep -q 'shared_scene_state_routes' "$PATCH_DIR/studio_routes_runtime.py"
 grep -q 'snapshot_status' "$PATCH_DIR/shared_scene_state_routes.py"
 grep -q 'shared_scene_people_snapshot_repair_requires_complete_profiles' "$PATCH_DIR/shared_scene_state_routes.py"
 grep -q 'post-approval source command atomically freezes' "$PATCH_DIR/shared_scene_state_routes.py"
+grep -q 'max_face_prompt_chars = 1500' "$PATCH_DIR/shared_scene_state_routes.py"
 echo "SOURCE_CONTRACT=PASS"
+echo "FACE_PROMPT_CONTRACT_SOURCE=PASS"
 echo "LEGACY_SNAPSHOT_REPAIR_SOURCE=PASS"
 
 echo
@@ -132,7 +134,9 @@ source=Path("/app/app/shared_scene_state_routes.py").read_text(encoding="utf-8")
 assert "snapshot_status" in source
 assert "shared_scene_people_snapshot_repair_requires_complete_profiles" in source
 assert "post-approval source command atomically freezes" in source
+assert "max_face_prompt_chars = 1500" in source
 print("CANONICAL_SHARED_SCENE_ROUTES=PASS")
+print("FACE_PROMPT_CONTRACT_CANARY=PASS")
 print("LEGACY_SNAPSHOT_REPAIR_CANARY=PASS")
 PY
 
@@ -181,7 +185,9 @@ source=Path("/app/app/shared_scene_state_routes.py").read_text(encoding="utf-8")
 assert "snapshot_status" in source
 assert "shared_scene_people_snapshot_repair_requires_complete_profiles" in source
 assert "post-approval source command atomically freezes" in source
+assert "max_face_prompt_chars = 1500" in source
 print("LIVE_SHARED_SCENE_STATE_FRAMEWORK=PASS")
+print("LIVE_FACE_PROMPT_CONTRACT=PASS")
 print("LIVE_LEGACY_SNAPSHOT_REPAIR=PASS")
 PY
 
