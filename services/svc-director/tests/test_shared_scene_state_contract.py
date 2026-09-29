@@ -48,3 +48,13 @@ def test_shared_scene_group_photo_spec_and_draft_are_durable_commands():
     assert "generation_input" in state
     assert "/shared-scene-draft" in scene
     assert "shared_scene_draft_media_id" in scene
+
+
+def test_legacy_approved_snapshot_is_repaired_before_group_photo_progression():
+    state = (ROOT / "shared_scene_state_routes.py").read_text(encoding="utf-8")
+
+    assert '"legacy_missing"' in state
+    assert "shared_scene_people_snapshot" in state
+    assert "shared_scene_people_snapshot_repair_requires_complete_profiles" in state
+    assert "The first explicit" in state
+    assert "post-approval source command atomically freezes" in state
