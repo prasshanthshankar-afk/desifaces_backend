@@ -1058,6 +1058,245 @@ async def _fetch_library_view_columns(conn: asyncpg.Connection) -> List[str]:
         return []
 
 
+async def _attach_canonical_asset_lineage(
+    conn: asyncpg.Connection,
+    items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Attach user-facing asset taxonomy from canonical Studio lineage.
+
+    This is intentionally read-only and does not change generation/storage
+    contracts. The dashboard must distinguish standalone Face/Audio/Video work
+    from Group Photo Conversation and Add-people-one-by-one outputs.
+    """
+    if not items:
+        return items
+
+    media_ids = sorted(
+        {
+            _clean_text(item.get("media_asset_id"))
+            for item in items
+            if _clean_text(item.get("media_asset_id"))
+        }
+    )
+    source_job_ids = sorted(
+        {
+            _clean_text(item.get("source_job_id"))
+            for item in items
+            if _clean_text(item.get("source_job_id"))
+        }
+    )
+
+    lineage_by_media: Dict[str, Dict[str, Any]] = {}
+    lineage_by_job: Dict[str, Dict[str, Any]] = {}
+
+    if media_ids:
+        rows = await conn.fetch(
+            """
+            with speaker_counts as (
+              select
+                s.workflow_id,
+                count(distinct dt.speaker_participant_id)::int as speaker_count
+              from public.v3_studio_stage_runs s
+              left join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
+              where s.stage_type='audio'
+                and s.scope_type='dialogue_turn'
+                and dt.speaker_participant_id is not null
+              group by s.workflow_id
+            ),
+            stage_output_lineage as (
+              select
+                o.media_id::text as media_id,
+                s.stage_type::text as stage_type,
+                s.workflow_id,
+                w.story_id,
+                coalesce(nullif(w.metadata_json->>'conversation_mode',''), '') as conversation_mode,
+                coalesce(sc.speaker_count,0) as speaker_count,
+                false as is_group_photo
+              from public.v3_studio_stage_outputs o
+              join public.v3_studio_stage_runs s on s.stage_run_id=o.stage_run_id
+              join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+              left join speaker_counts sc on sc.workflow_id=s.workflow_id
+              where o.media_id::text = any($1::text[])
+            ),
+            shared_photo_lineage as (
+              select
+                media_id,
+                'fusion'::text as stage_type,
+                workflow_id,
+                story_id,
+                'shared_scene'::text as conversation_mode,
+                speaker_count,
+                true as is_group_photo
+              from (
+                select distinct on (media_id)
+                  media_id,
+                  s.workflow_id,
+                  w.story_id,
+                  coalesce(sc.speaker_count,0) as speaker_count,
+                  s.updated_at
+                from public.v3_studio_stage_runs s
+                join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+                left join speaker_counts sc on sc.workflow_id=s.workflow_id
+                cross join lateral (
+                  values
+                    (nullif(s.metadata_json->>'shared_scene_media_id','')),
+                    (nullif(s.metadata_json->>'shared_scene_draft_media_id',''))
+                ) m(media_id)
+                where s.stage_type='fusion'
+                  and m.media_id is not null
+                  and m.media_id = any($1::text[])
+                order by media_id,s.updated_at desc
+              ) x
+            )
+            select * from shared_photo_lineage
+            union all
+            select so.*
+            from stage_output_lineage so
+            where not exists (
+              select 1 from shared_photo_lineage gp where gp.media_id=so.media_id
+            )
+            """,
+            media_ids,
+        )
+        for row in rows:
+            key = _clean_text(row["media_id"])
+            if key and key not in lineage_by_media:
+                lineage_by_media[key] = dict(row)
+
+    if source_job_ids:
+        rows = await conn.fetch(
+            """
+            with speaker_counts as (
+              select
+                s.workflow_id,
+                count(distinct dt.speaker_participant_id)::int as speaker_count
+              from public.v3_studio_stage_runs s
+              left join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
+              where s.stage_type='audio'
+                and s.scope_type='dialogue_turn'
+                and dt.speaker_participant_id is not null
+              group by s.workflow_id
+            ),
+            direct_stage as (
+              select
+                s.stage_run_id::text as source_job_id,
+                s.stage_type::text as stage_type,
+                s.workflow_id,
+                w.story_id,
+                coalesce(nullif(w.metadata_json->>'conversation_mode',''), '') as conversation_mode,
+                coalesce(sc.speaker_count,0) as speaker_count
+              from public.v3_studio_stage_runs s
+              join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+              left join speaker_counts sc on sc.workflow_id=s.workflow_id
+              where s.stage_run_id::text = any($1::text[])
+            ),
+            provider_attempt as (
+              select distinct on (a.provider_job_ref)
+                a.provider_job_ref::text as source_job_id,
+                s.stage_type::text as stage_type,
+                s.workflow_id,
+                w.story_id,
+                coalesce(nullif(w.metadata_json->>'conversation_mode',''), '') as conversation_mode,
+                coalesce(sc.speaker_count,0) as speaker_count
+              from public.v3_studio_stage_attempts a
+              join public.v3_studio_stage_runs s on s.stage_run_id=a.stage_run_id
+              join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+              left join speaker_counts sc on sc.workflow_id=s.workflow_id
+              where a.provider_job_ref is not null
+                and a.provider_job_ref::text = any($1::text[])
+              order by a.provider_job_ref,a.updated_at desc
+            )
+            select * from direct_stage
+            union all
+            select pa.*
+            from provider_attempt pa
+            where not exists (
+              select 1 from direct_stage ds where ds.source_job_id=pa.source_job_id
+            )
+            """,
+            source_job_ids,
+        )
+        for row in rows:
+            key = _clean_text(row["source_job_id"])
+            if key and key not in lineage_by_job:
+                lineage_by_job[key] = dict(row)
+
+    for item in items:
+        media_id = _clean_text(item.get("media_asset_id"))
+        source_job_id = _clean_text(item.get("source_job_id"))
+        lineage = lineage_by_media.get(media_id) or lineage_by_job.get(source_job_id)
+        if not lineage:
+            continue
+
+        speaker_count = int(lineage.get("speaker_count") or 0)
+        mode = _clean_text(lineage.get("conversation_mode")).lower()
+        if not mode and speaker_count >= 2:
+            mode = "ordered_speaker_shots"
+
+        workflow_kind = (
+            "group_photo_conversation"
+            if mode == "shared_scene"
+            else "multi_person_conversation"
+            if mode == "ordered_speaker_shots"
+            else ""
+        )
+        if not workflow_kind:
+            continue
+
+        stage_type = _clean_text(lineage.get("stage_type")).lower()
+        is_group_photo = bool(lineage.get("is_group_photo"))
+        studio = _clean_text(item.get("studio")).lower()
+
+        if is_group_photo:
+            asset_role = "group_image"
+            asset_class = "group_photo"
+        elif stage_type == "face" or studio == "face":
+            asset_role = "participant_face"
+            asset_class = "multi_person_face"
+        elif stage_type == "audio" or studio == "audio":
+            asset_role = "dialogue_audio"
+            asset_class = (
+                "group_audio"
+                if workflow_kind == "group_photo_conversation"
+                else "multi_person_audio"
+            )
+        elif stage_type in {"fusion", "story_final"} or studio in {"video", "fusion"}:
+            asset_role = (
+                "group_video"
+                if workflow_kind == "group_photo_conversation"
+                else "multi_person_video"
+            )
+            asset_class = asset_role
+        else:
+            continue
+
+        classification = {
+            "workflow_kind": workflow_kind,
+            "conversation_kind": workflow_kind,
+            "conversation_mode": mode,
+            "asset_role": asset_role,
+            "asset_class": asset_class,
+            "workflow_id": _clean_text(lineage.get("workflow_id")) or None,
+            "story_id": _clean_text(lineage.get("story_id")) or None,
+            "participant_count": speaker_count or None,
+        }
+
+        item.update({k: v for k, v in classification.items() if v not in (None, "")})
+        reuse = _coerce_json(item.get("reuse_payload_json")) or {}
+        reuse.update({k: v for k, v in classification.items() if v not in (None, "")})
+        if asset_role == "group_image":
+            reuse["intended_reuse"] = "group_photo_conversation"
+        item["reuse_payload_json"] = reuse
+
+        meta = _coerce_json(item.get("metadata_json")) or {}
+        meta["canonical_asset_classification"] = {
+            k: v for k, v in classification.items() if v not in (None, "")
+        }
+        item["metadata_json"] = meta
+
+    return items
+
+
 async def _fetch_library_view_rows(
     conn: asyncpg.Connection,
     user_id: str,
@@ -1101,7 +1340,9 @@ async def _fetch_library_view_rows(
 
         try:
             rows = await conn.fetch(query_sql, *params, limit, offset)
-            return [dict(r) for r in rows], total_count
+            items = [dict(r) for r in rows]
+            items = await _attach_canonical_asset_lineage(conn, items)
+            return items, total_count
         except Exception:
             return [], total_count
 
@@ -1365,6 +1606,7 @@ async def _fetch_library_view_rows(
     try:
         rows = await conn.fetch(combined_sql, user_id, limit, offset)
         items = [dict(r) for r in rows]
+        items = await _attach_canonical_asset_lineage(conn, items)
     except Exception:
         return [], total_count
 
@@ -1439,6 +1681,19 @@ def _normalize_library_item(
     meta = _coerce_json(_pick_first(item, "metadata_json", "meta_json", "metadata")) or {}
     reuse = _coerce_json(_pick_first(item, "reuse_payload_json", "reuse_payload")) or {}
 
+    asset_class = _clean_text(_pick_first(item, "asset_class")) or _clean_text(reuse.get("asset_class"))
+    asset_role = _clean_text(_pick_first(item, "asset_role")) or _clean_text(reuse.get("asset_role"))
+    workflow_kind = _clean_text(_pick_first(item, "workflow_kind", "conversation_kind")) or _clean_text(
+        reuse.get("workflow_kind") or reuse.get("conversation_kind")
+    )
+    conversation_mode = _clean_text(_pick_first(item, "conversation_mode")) or _clean_text(reuse.get("conversation_mode"))
+    workflow_id = _clean_text(_pick_first(item, "workflow_id")) or _clean_text(reuse.get("workflow_id"))
+    story_id = _clean_text(_pick_first(item, "story_id")) or _clean_text(reuse.get("story_id"))
+    participant_count = (
+        int(_as_number(_pick_first(item, "participant_count")) or _as_number(reuse.get("participant_count")) or 0)
+        or None
+    )
+
     face_ttl_seconds = int(getattr(settings, "DASHBOARD_FACE_SAS_TTL_SECONDS", 2 * 24 * 3600))
     audio_ttl_seconds = int(getattr(settings, "DASHBOARD_AUDIO_SAS_TTL_SECONDS", 2 * 24 * 3600))
     recent_video_ttl_seconds = int(getattr(settings, "DASHBOARD_RECENT_VIDEO_SAS_TTL_SECONDS", 15 * 24 * 3600))
@@ -1503,6 +1758,15 @@ def _normalize_library_item(
             "image_url": resolved_image_url or None,
             "gender": _clean_text(_pick_first(reuse, "gender")) or _clean_text(meta.get("gender")) or None,
             "aspect_ratio": _clean_text(_pick_first(reuse, "aspect_ratio")) or _clean_text(meta.get("aspect_ratio")) or None,
+            "asset_class": asset_class or None,
+            "asset_role": asset_role or None,
+            "workflow_kind": workflow_kind or None,
+            "conversation_kind": workflow_kind or None,
+            "conversation_mode": conversation_mode or None,
+            "workflow_id": workflow_id or None,
+            "story_id": story_id or None,
+            "participant_count": participant_count,
+            "intended_reuse": _clean_text(reuse.get("intended_reuse")) or None,
         }
         title = _build_face_library_title(item, meta, reuse)
         asset_type = _clean_text(_pick_first(item, "asset_type")) or "image"
@@ -1518,6 +1782,14 @@ def _normalize_library_item(
             "voice_id": _clean_text(_pick_first(reuse, "voice_id", "voice")) or _clean_text(meta.get("audio_voice")) or None,
             "voice": _clean_text(_pick_first(reuse, "voice", "voice_id")) or _clean_text(meta.get("audio_voice")) or None,
             "script_text": _clean_text(_pick_first(reuse, "script_text")) or _clean_text(meta.get("script_text")) or None,
+            "asset_class": asset_class or None,
+            "asset_role": asset_role or None,
+            "workflow_kind": workflow_kind or None,
+            "conversation_kind": workflow_kind or None,
+            "conversation_mode": conversation_mode or None,
+            "workflow_id": workflow_id or None,
+            "story_id": story_id or None,
+            "participant_count": participant_count,
         }
         title = _clean_text(_pick_first(item, "title", "name")) or "Audio"
         asset_type = _clean_text(_pick_first(item, "asset_type")) or "audio"
@@ -1539,7 +1811,13 @@ def _normalize_library_item(
             "thumbnail_url": resolved_thumbnail_url or None,
             "poster_url": resolved_thumbnail_url or None,
             "conversation_mode": conversation_mode or None,
-            "conversation_kind": conversation_kind or None,
+            "conversation_kind": conversation_kind or workflow_kind or None,
+            "asset_class": asset_class or None,
+            "asset_role": asset_role or None,
+            "workflow_kind": workflow_kind or conversation_kind or None,
+            "workflow_id": workflow_id or None,
+            "story_id": story_id or None,
+            "participant_count": participant_count,
         }
         title = _clean_text(_pick_first(item, "title", "name")) or "Video"
         asset_type = _clean_text(_pick_first(item, "asset_type")) or "video"
@@ -1558,6 +1836,14 @@ def _normalize_library_item(
         "source_job_id": _clean_text(_pick_first(item, "source_job_id", "job_id")) or None,
         "artifact_id": artifact_id or None,
         "media_asset_id": media_asset_id or None,
+        "asset_class": asset_class or None,
+        "asset_role": asset_role or None,
+        "workflow_kind": workflow_kind or None,
+        "conversation_kind": workflow_kind or None,
+        "conversation_mode": conversation_mode or None,
+        "workflow_id": workflow_id or None,
+        "story_id": story_id or None,
+        "participant_count": participant_count,
         "reuse_payload": {k: v for k, v in reuse_payload.items() if v not in (None, "")},
     }
 
