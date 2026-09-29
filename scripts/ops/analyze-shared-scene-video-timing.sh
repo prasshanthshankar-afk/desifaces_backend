@@ -10,7 +10,7 @@ docker inspect df-svc-director >/dev/null 2>&1 || { echo "FAIL: df-svc-director 
 docker exec -i -e STORY_ID="$STORY_ID" df-svc-director python - <<'PY'
 import asyncio, json, os
 from datetime import datetime, timezone
-from app.db import get_pool
+from app.db import open_business_pool
 
 story_id = os.environ["STORY_ID"]
 
@@ -30,7 +30,7 @@ def fmt(v):
     return str(v)
 
 async def main():
-    pool = await get_pool()
+    pool = await open_business_pool()
     async with pool.acquire() as conn:
         workflow = await conn.fetchrow("""
             select workflow_id,story_id,state,current_stage,final_media_id,created_at,updated_at
