@@ -119,12 +119,31 @@ def _group_photo_generation_input(
         f"Scene context code: {_clean(spec.get('context_code'))}" if _clean(spec.get("context_code")) else "",
         f"Background/environment: {_clean(spec.get('background'))}" if _clean(spec.get("background")) else "",
     ]
-    enriched_prompt = "\n".join(item for item in [
+
+    # svc-face CreatorPlatformRequest.user_prompt is capped at 1500 chars.
+    # Keep authoritative approved profiles + scene controls intact and trim only
+    # the editable Director description so Director can never emit a payload that
+    # Face rejects during pricing.
+    fixed_prompt_parts = [
         "CURRENT APPROVED SPEAKER PROFILES — these override any conflicting text in the editable description:",
         *participant_lines,
-        _clean(spec.get("prompt")),
         *setting_lines,
-    ] if item)
+    ]
+    fixed_prompt = "\n".join(item for item in fixed_prompt_parts if item)
+    editable_prompt = _clean(spec.get("prompt"))
+    max_face_prompt_chars = 1500
+    remaining = max(0, max_face_prompt_chars - len(fixed_prompt) - (1 if fixed_prompt and editable_prompt else 0))
+    if len(editable_prompt) > remaining:
+        editable_prompt = editable_prompt[:remaining].rstrip()
+    enriched_prompt = "\n".join(
+        item for item in [fixed_prompt, editable_prompt] if item
+    )
+    if not enriched_prompt:
+        raise HTTPException(status_code=422, detail="shared_scene_group_photo_prompt_empty")
+    if len(enriched_prompt) > max_face_prompt_chars:
+        # This would mean the authoritative fixed contract itself exceeded Face's
+        # schema and must be corrected server-side rather than pushed to clients.
+        raise HTTPException(status_code=500, detail="shared_scene_group_photo_face_prompt_contract_exceeded")
 
     return {
         "mode": "text-to-image",
