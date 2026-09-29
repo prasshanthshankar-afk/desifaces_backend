@@ -81,6 +81,8 @@ grep -q '"group_photo_conversation"' "$WORKTREE/services/svc-dashboard/app/app/s
 grep -q '"multi_person_conversation"' "$WORKTREE/services/svc-dashboard/app/app/services/dashboard_service.py"
 grep -q '"group_audio"' "$WORKTREE/services/svc-dashboard/app/app/services/dashboard_service.py"
 grep -q '"group_video"' "$WORKTREE/services/svc-dashboard/app/app/services/dashboard_service.py"
+grep -q 'shared_scene_face_jobs' "$WORKTREE/services/svc-dashboard/app/app/services/dashboard_service.py"
+grep -q 'generated_group_photo_contract' "$WORKTREE/services/svc-dashboard/app/app/services/dashboard_service.py"
 echo "DASHBOARD_TAXONOMY_SOURCE=PASS"
 
 echo
