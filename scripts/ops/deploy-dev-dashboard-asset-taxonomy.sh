@@ -70,7 +70,7 @@ echo "candidate_image=$(docker image inspect "$IMAGE" -f '{{.Id}}')"
 echo
 echo "===== 4. IN-IMAGE CERTIFICATION ====="
 docker run --rm "$IMAGE" python -m py_compile /app/app/services/dashboard_service.py
-docker run --rm "$IMAGE" python - <<'PY'
+docker run --rm -i "$IMAGE" python - <<'PY'
 from pathlib import Path
 p=Path("/app/app/services/dashboard_service.py")
 text=p.read_text()
@@ -131,7 +131,7 @@ if [[ "$LIVE_OK" != "1" ]]; then
 fi
 
 LIVE_IMAGE_ID="$(docker inspect -f '{{.Image}}' "$CONTAINER")"
-docker exec "$CONTAINER" python - <<'PY'
+docker exec -i "$CONTAINER" python - <<'PY'
 from pathlib import Path
 text=Path("/app/app/services/dashboard_service.py").read_text()
 assert "_attach_canonical_asset_lineage" in text
