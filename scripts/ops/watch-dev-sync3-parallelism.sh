@@ -24,18 +24,27 @@ for N in $(seq 1 "$SAMPLES"); do
   echo "===== $(date -u +%H:%M:%S) UTC | sample=$N/$SAMPLES ====="
 
   echo "--- CORE FUSION ---"
-  docker exec desifaces-db bash -lc '
-    psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "
-      select coalesce(string_agg(status || '''=''' || n::text, ''' ''' order by status), '''no_recent_fusion_jobs''')
-      from (
-        select status, count(*) as n
-        from public.studio_jobs
-        where studio_type='''fusion'''
-          and created_at > now() - interval '''20 minutes'''
-        group by status
-      ) q;
-    "
-  ' 2>/dev/null || echo "core_fusion_query_failed"
+  docker exec -i df-svc-fusion python - <<'PY' 2>/dev/null || echo "core_fusion_query_failed"
+import asyncio
+from app.db import get_pool
+
+async def main():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select status, count(*) as n
+            from public.studio_jobs
+            where studio_type='fusion'
+              and created_at > now() - interval '20 minutes'
+            group by status
+            order by status
+            """
+        )
+    print(" ".join(f"{row['status']}={row['n']}" for row in rows) or "no_recent_fusion_jobs")
+
+asyncio.run(main())
+PY
 
   echo "--- SYNC PROVIDER ACTIVITY ---"
   ACTIVE="$(
