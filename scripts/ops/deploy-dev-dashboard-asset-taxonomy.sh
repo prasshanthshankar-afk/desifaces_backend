@@ -7,6 +7,27 @@ TARGET_SHA="${TARGET_SHA:-}"
 
 REPO_ROOT="${REPO_ROOT:-$HOME/workspace/desifaces-v3}"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$HOME/workspace/desifaces-runtime}"
+RUNTIME_ENV="${RUNTIME_ENV:-}"
+if [[ -z "$RUNTIME_ENV" ]]; then
+  if [[ -f "$RUNTIME_ROOT/infra/.env" ]]; then
+    RUNTIME_ENV="$RUNTIME_ROOT/infra/.env"
+  elif [[ -f "$RUNTIME_ROOT/.env" ]]; then
+    RUNTIME_ENV="$RUNTIME_ROOT/.env"
+  else
+    echo "FAIL: runtime env file not found under $RUNTIME_ROOT/infra/.env or $RUNTIME_ROOT/.env"
+    exit 2
+  fi
+fi
+[[ -f "$RUNTIME_ENV" ]] || { echo "FAIL: runtime env file missing: $RUNTIME_ENV"; exit 2; }
+
+for key in DATABASE_URL REDIS_URL JWT_SECRET AZURE_STORAGE_CONNECTION_STRING; do
+  grep -Eq "^[[:space:]]*${key}=" "$RUNTIME_ENV" || {
+    echo "FAIL: required runtime key missing from env file: $key"
+    exit 2
+  }
+done
+
+COMPOSE=(docker compose --env-file "$RUNTIME_ENV")
 SERVICE="svc-dashboard"
 CONTAINER="df-svc-dashboard"
 NETWORK="df-net"
@@ -34,6 +55,7 @@ echo "============================================================"
 echo "target_sha=$TARGET_SHA"
 echo "target_service=$SERVICE"
 echo "network=$NETWORK"
+echo "runtime_env=$(basename "$RUNTIME_ENV")"
 echo "production=UNTOUCHED"
 
 docker inspect "$CONTAINER" >/dev/null 2>&1 || { echo "FAIL: $CONTAINER missing"; exit 1; }
@@ -109,7 +131,7 @@ echo
 echo "===== 6. CUTOVER ====="
 docker tag "$IMAGE" "$CURRENT_IMAGE_REF"
 cd "$RUNTIME_ROOT"
-docker compose up -d --no-deps --force-recreate --no-build "$SERVICE" >/dev/null
+"${COMPOSE[@]}" up -d --no-deps --force-recreate --no-build "$SERVICE" >/dev/null
 
 LIVE_OK=0
 for _ in $(seq 1 40); do
@@ -125,7 +147,7 @@ if [[ "$LIVE_OK" != "1" ]]; then
   docker logs --tail 160 "$CONTAINER" || true
   echo "ROLLBACK_START=YES"
   docker tag "$OLD_IMAGE_ID" "$CURRENT_IMAGE_REF"
-  docker compose up -d --no-deps --force-recreate --no-build "$SERVICE" >/dev/null 2>&1 || true
+  "${COMPOSE[@]}" up -d --no-deps --force-recreate --no-build "$SERVICE" >/dev/null 2>&1 || true
   echo "ROLLBACK_COMPLETE=YES"
   exit 1
 fi
