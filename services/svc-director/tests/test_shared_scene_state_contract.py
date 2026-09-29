@@ -58,3 +58,11 @@ def test_legacy_approved_snapshot_is_repaired_before_group_photo_progression():
     assert "shared_scene_people_snapshot_repair_requires_complete_profiles" in state
     assert "The first explicit" in state
     assert "post-approval source command atomically freezes" in state
+
+
+def test_group_photo_generation_input_honors_face_prompt_limit():
+    state = (ROOT / "shared_scene_state_routes.py").read_text(encoding="utf-8")
+
+    assert "max_face_prompt_chars = 1500" in state
+    assert "trim only" in state
+    assert "shared_scene_group_photo_face_prompt_contract_exceeded" in state
