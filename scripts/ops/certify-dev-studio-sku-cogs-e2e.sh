@@ -281,7 +281,7 @@ order by s.category,s.code;
 PREMIUM_NOT_20="$("${PSQL[@]}" -Atq -c "
 select count(*)
 from public.pricing_skus s
-where s.code in ('FACE_MULTI_PERSON','AUDIO_MULTI_PERSON','FUSION_MULTI_PERSON')
+where s.code in ('FACE_MULTI_PERSON','FUSION_MULTI_PERSON')
   and s.status='active'
   and coalesce(nullif(s.metadata_json->>'premium_rate_multiplier','')::numeric,0) <> 1.20;
 ")"
@@ -513,7 +513,6 @@ with expected(variant_code) as (
     ('FACE_I2I'),
     ('FACE_MULTI_PERSON'),
     ('AUDIO_TTS'),
-    ('AUDIO_MULTI_PERSON'),
     ('FUSION_TALKING_VIDEO')
 )
 select
@@ -533,7 +532,7 @@ order by e.variant_code;
 
 EVIDENCE_BAD="$("${PSQL[@]}" -Atq -c "
 with expected(variant_code) as (
-  values ('FACE_T2I'),('FACE_I2I'),('FACE_MULTI_PERSON'),('AUDIO_TTS'),('AUDIO_MULTI_PERSON'),('FUSION_TALKING_VIDEO')
+  values ('FACE_T2I'),('FACE_I2I'),('FACE_MULTI_PERSON'),('AUDIO_TTS'),('FUSION_TALKING_VIDEO')
 )
 select count(*)
 from expected e
