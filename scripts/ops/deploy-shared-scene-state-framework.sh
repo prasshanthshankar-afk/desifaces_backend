@@ -6,6 +6,7 @@ set -Eeuo pipefail
 ROOT="$HOME/workspace/desifaces-runtime"
 ENV_FILE="${RUNTIME_ENV_FILE:-$ROOT/infra/.env}"
 REF="${SOURCE_REF:-fix/next3-shared-scene-profile-lock-fix-20260928}"
+SOURCE_SHA="$(gh api "repos/prasshanthshankar-afk/desifaces_backend/commits/$REF" --jq .sha)"
 LIVE="df-svc-director"
 SERVICE="svc-director"
 NETWORK="df-net"
@@ -25,6 +26,7 @@ echo "============================================================"
 echo " desifaces DEV — SHARED-SCENE STATE FRAMEWORK"
 echo "============================================================"
 echo "source_ref=$REF"
+echo "source_sha=$SOURCE_SHA"
 echo "production=UNTOUCHED"
 
 [[ -f "$ROOT/docker-compose.yml" ]] || fail "canonical compose missing"
@@ -43,7 +45,7 @@ trap 'rm -rf "$PATCH_DIR"' EXIT
 echo
 echo "===== 1. FETCH + COMPILE TARGET FILES ====="
 for name in "${FILES[@]}"; do
-  gh api     "repos/prasshanthshankar-afk/desifaces_backend/contents/services/svc-director/app/app/${name}?ref=$REF"     --jq .content | base64 -d > "$PATCH_DIR/$name"
+  gh api     "repos/prasshanthshankar-afk/desifaces_backend/contents/services/svc-director/app/app/${name}?ref=$SOURCE_SHA"     --jq .content | base64 -d > "$PATCH_DIR/$name"
   python3 -m py_compile "$PATCH_DIR/$name"
   echo "SOURCE_OK=$name"
 done
@@ -54,7 +56,11 @@ grep -q '/shared-scene-group-photo-spec' "$PATCH_DIR/shared_scene_state_routes.p
 grep -q '/shared-scene-draft' "$PATCH_DIR/shared_scene_routes.py"
 grep -q 'shared_scene_people_snapshot' "$PATCH_DIR/studio_preflight_routes.py"
 grep -q 'shared_scene_state_routes' "$PATCH_DIR/studio_routes_runtime.py"
+grep -q 'snapshot_status' "$PATCH_DIR/shared_scene_state_routes.py"
+grep -q 'shared_scene_people_snapshot_repair_requires_complete_profiles' "$PATCH_DIR/shared_scene_state_routes.py"
+grep -q 'post-approval source command atomically freezes' "$PATCH_DIR/shared_scene_state_routes.py"
 echo "SOURCE_CONTRACT=PASS"
+echo "LEGACY_SNAPSHOT_REPAIR_SOURCE=PASS"
 
 echo
 echo "===== 2. TARGET DIFF ====="
@@ -77,7 +83,7 @@ docker create --name "$PREP" "$OLD_ID" >/dev/null
 for name in "${FILES[@]}"; do
   docker cp "$PATCH_DIR/$name" "$PREP:/app/app/$name"
 done
-docker commit "$PREP" "$CANDIDATE" >/dev/null
+docker commit --change "LABEL org.opencontainers.image.revision=$SOURCE_SHA" "$PREP" "$CANDIDATE" >/dev/null
 docker rm "$PREP" >/dev/null
 
 NEW_ID="$(docker image inspect "$CANDIDATE" --format '{{.Id}}')"
@@ -121,7 +127,13 @@ required={
 }
 missing=sorted(required-paths)
 assert not missing, missing
+from pathlib import Path
+source=Path("/app/app/shared_scene_state_routes.py").read_text(encoding="utf-8")
+assert "snapshot_status" in source
+assert "shared_scene_people_snapshot_repair_requires_complete_profiles" in source
+assert "post-approval source command atomically freezes" in source
 print("CANONICAL_SHARED_SCENE_ROUTES=PASS")
+print("LEGACY_SNAPSHOT_REPAIR_CANARY=PASS")
 PY
 
 echo "CANARY_HEALTH=PASS"
@@ -164,7 +176,13 @@ required={
  "/api/director/studio-workflows/{workflow_id}/stage-runs/{stage_run_id}/shared-scene-draft",
 }
 assert required.issubset(paths)
+from pathlib import Path
+source=Path("/app/app/shared_scene_state_routes.py").read_text(encoding="utf-8")
+assert "snapshot_status" in source
+assert "shared_scene_people_snapshot_repair_requires_complete_profiles" in source
+assert "post-approval source command atomically freezes" in source
 print("LIVE_SHARED_SCENE_STATE_FRAMEWORK=PASS")
+print("LIVE_LEGACY_SNAPSHOT_REPAIR=PASS")
 PY
 
 BAD_C="$(docker ps -a --format '{{.Names}}' | grep -Ei 'v3|next3' || true)"
@@ -177,7 +195,10 @@ trap - ERR
 echo
 echo "============================================================"
 echo " SHARED_SCENE_STATE_FRAMEWORK_DEPLOY=PASS"
+REV="$(docker image inspect "$NEW_ID" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+[[ "$REV" == "$SOURCE_SHA" ]] || fail "image source revision mismatch"
 echo " running_image=$NEW_ID"
+echo " source_sha=$SOURCE_SHA"
 echo " canonical_network=$NETWORK"
 echo " production=UNTOUCHED"
 echo "============================================================"
