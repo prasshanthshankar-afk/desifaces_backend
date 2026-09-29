@@ -1302,14 +1302,30 @@ async def _attach_canonical_asset_lineage(
                 or len(subjects) >= 2
             )
             if is_multi_person_face:
+                participant_roles = [
+                    _clean_text(subject.get("relationship_role")).lower()
+                    for subject in subjects
+                    if isinstance(subject, dict)
+                ]
+                generated_group_photo_contract = bool(
+                    composition == "two_people"
+                    and len(subjects) >= 2
+                    and len(participant_roles) >= 2
+                    and all(role == "conversation participant" for role in participant_roles[:2])
+                )
                 classification = {
-                    "asset_role": "participant_face",
-                    "asset_class": "multi_person_face",
+                    "workflow_kind": "group_photo_conversation" if generated_group_photo_contract else None,
+                    "conversation_kind": "group_photo_conversation" if generated_group_photo_contract else None,
+                    "conversation_mode": "shared_scene" if generated_group_photo_contract else None,
+                    "asset_role": "group_image" if generated_group_photo_contract else "participant_face",
+                    "asset_class": "group_photo" if generated_group_photo_contract else "multi_person_face",
                     "participant_count": len(subjects) or None,
                 }
                 item.update({k: v for k, v in classification.items() if v not in (None, "")})
                 reuse = _coerce_json(item.get("reuse_payload_json")) or {}
                 reuse.update({k: v for k, v in classification.items() if v not in (None, "")})
+                if generated_group_photo_contract:
+                    reuse["intended_reuse"] = "group_photo_conversation"
                 item["reuse_payload_json"] = reuse
                 meta["canonical_asset_classification"] = {
                     k: v for k, v in classification.items() if v not in (None, "")
