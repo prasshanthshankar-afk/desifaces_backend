@@ -1088,6 +1088,7 @@ async def _attach_canonical_asset_lineage(
 
     lineage_by_media: Dict[str, Dict[str, Any]] = {}
     lineage_by_job: Dict[str, Dict[str, Any]] = {}
+    shared_scene_face_jobs: Dict[str, Dict[str, Any]] = {}
 
     if media_ids:
         rows = await conn.fetch(
@@ -1221,10 +1222,101 @@ async def _attach_canonical_asset_lineage(
             if key and key not in lineage_by_job:
                 lineage_by_job[key] = dict(row)
 
+        # A generated Group Photo job can emit multiple Face variants, but only the
+        # chosen variant is persisted as shared_scene_media_id. Classify the whole
+        # Face job from that authoritative selection so sibling variants never leak
+        # back into the standalone "Faces ready to reuse" carousel.
+        rows = await conn.fetch(
+            """
+            with speaker_counts as (
+              select
+                s.workflow_id,
+                count(distinct dt.speaker_participant_id)::int as speaker_count
+              from public.v3_studio_stage_runs s
+              left join public.v3_dialogue_turns dt on dt.turn_id=s.dialogue_turn_id
+              where s.stage_type='audio'
+                and s.scope_type='dialogue_turn'
+                and dt.speaker_participant_id is not null
+              group by s.workflow_id
+            )
+            select distinct on (fjo.job_id)
+              fjo.job_id::text as source_job_id,
+              w.workflow_id,
+              w.story_id,
+              coalesce(sc.speaker_count,0) as speaker_count,
+              s.updated_at
+            from public.face_job_outputs fjo
+            join public.v3_studio_stage_runs s
+              on s.stage_type='fusion'
+             and (
+               nullif(s.metadata_json->>'shared_scene_media_id','') = fjo.output_asset_id::text
+               or nullif(s.metadata_json->>'shared_scene_draft_media_id','') = fjo.output_asset_id::text
+             )
+            join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
+            left join speaker_counts sc on sc.workflow_id=s.workflow_id
+            where fjo.job_id::text = any($1::text[])
+              and coalesce(w.metadata_json->>'conversation_mode','')='shared_scene'
+            order by fjo.job_id,s.updated_at desc
+            """,
+            source_job_ids,
+        )
+        for row in rows:
+            key = _clean_text(row["source_job_id"])
+            if key:
+                shared_scene_face_jobs[key] = dict(row)
+
     for item in items:
         media_id = _clean_text(item.get("media_asset_id"))
         source_job_id = _clean_text(item.get("source_job_id"))
+        studio = _clean_text(item.get("studio")).lower()
         lineage = lineage_by_media.get(media_id) or lineage_by_job.get(source_job_id)
+
+        # Generated shared-scene group photos are Face jobs. Since one job may
+        # produce multiple variants and only one gets selected into the workflow,
+        # promote every sibling output from that same job to Group Images.
+        if studio == "face" and source_job_id in shared_scene_face_jobs:
+            gp = shared_scene_face_jobs[source_job_id]
+            lineage = {
+                "stage_type": "face",
+                "workflow_id": gp.get("workflow_id"),
+                "story_id": gp.get("story_id"),
+                "conversation_mode": "shared_scene",
+                "speaker_count": gp.get("speaker_count"),
+                "is_group_photo": True,
+            }
+
+        # A Face Studio multi-person output that is not linked to a shared-scene
+        # workflow must still stay out of the standalone Faces library. Use the
+        # persisted pricing/composition contract, never visual guessing.
+        if not lineage and studio == "face":
+            meta = _coerce_json(item.get("metadata_json")) or {}
+            job_payload = _coerce_json(meta.get("job_payload")) or {}
+            job_meta = _coerce_json(meta.get("job_meta")) or {}
+            pricing = _coerce_json(job_payload.get("pricing")) or _coerce_json(job_meta.get("pricing")) or {}
+            pricing_variant = _clean_text(pricing.get("variant_code") or pricing.get("sku_code")).upper()
+            composition = _clean_text(job_payload.get("subject_composition_code")).lower()
+            subjects = job_payload.get("subjects") if isinstance(job_payload.get("subjects"), list) else []
+            is_multi_person_face = bool(
+                pricing_variant == "FACE_MULTI_PERSON"
+                or composition in {"two_people", "couple", "group", "multi_person", "multi-person"}
+                or len(subjects) >= 2
+            )
+            if is_multi_person_face:
+                classification = {
+                    "asset_role": "participant_face",
+                    "asset_class": "multi_person_face",
+                    "participant_count": len(subjects) or None,
+                }
+                item.update({k: v for k, v in classification.items() if v not in (None, "")})
+                reuse = _coerce_json(item.get("reuse_payload_json")) or {}
+                reuse.update({k: v for k, v in classification.items() if v not in (None, "")})
+                item["reuse_payload_json"] = reuse
+                meta["canonical_asset_classification"] = {
+                    k: v for k, v in classification.items() if v not in (None, "")
+                }
+                item["metadata_json"] = meta
+            continue
+
         if not lineage:
             continue
 
@@ -1245,7 +1337,6 @@ async def _attach_canonical_asset_lineage(
 
         stage_type = _clean_text(lineage.get("stage_type")).lower()
         is_group_photo = bool(lineage.get("is_group_photo"))
-        studio = _clean_text(item.get("studio")).lower()
 
         if is_group_photo:
             asset_role = "group_image"
