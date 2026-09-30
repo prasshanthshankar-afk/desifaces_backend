@@ -31,13 +31,10 @@ class MultiPersonPricingSelection:
 
     @property
     def billable_units(self) -> int:
-        # Face identity stages already execute independently per participant, so
-        # their natural units already represent the actual face workload. Audio
-        # likewise captures workload through aggregate generated characters.
-        # Fusion is the coordinated multi-person operation and therefore scales
-        # duration by participant count (participant-minutes).
-        if self.studio == "fusion":
-            return max(1, self.natural_units * self.participant_count)
+        # Participant count is commercial metadata only. The premium is expressed
+        # in the selected SKU unit rate, never by multiplying natural workload.
+        # This keeps multi-person pricing exactly baseline × premium multiplier:
+        # Face -> generated images, Audio -> aggregate 1K chars, Fusion -> minutes.
         return max(1, self.natural_units)
 
     @property
@@ -47,9 +44,9 @@ class MultiPersonPricingSelection:
     @property
     def metadata(self) -> dict[str, Any]:
         participant_scaling = {
-            "face": "per_character_natural_usage",
+            "face": "natural_usage_premium_rate_only",
             "audio": "aggregate_natural_usage",
-            "fusion": "natural_units_x_participants",
+            "fusion": "natural_usage_premium_rate_only",
         }[self.studio]
         return {
             "multi_person": True,
