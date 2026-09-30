@@ -3,13 +3,15 @@ set -Eeuo pipefail
 
 [[ "$(hostname -s)" == "desifaces-dev" ]] || { echo "FAIL: DEV host required"; exit 2; }
 TARGET_SHA="${TARGET_SHA:?TARGET_SHA is required}"
-SHORT="${TARGET_SHA:0:12}"
+APP_SHA="${APP_SHA:-b04e11025008586a6e90c6520d0e556dcac7744f}"
+SHORT="${APP_SHA:0:12}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 echo "============================================================"
 echo " desifaces DEV — RESUME COMMERCIAL V4 AFTER DB ALIGNMENT"
 echo "============================================================"
 echo "target_sha=$TARGET_SHA"
+echo "candidate_app_sha=$APP_SHA"
 echo "db_migration=ALREADY_APPLIED"
 echo "generation_workflows=FROZEN"
 echo "production=UNTOUCHED"
@@ -29,6 +31,18 @@ trap cleanup EXIT
 
 AUDIT="$WT/scripts/ops/certify-dev-narrow-launch-sku-cogs-v4.sh"
 [[ -f "$AUDIT" ]] || { echo "FAIL: pinned audit missing"; exit 2; }
+
+# TARGET_SHA may contain resume-script-only hardening after the application
+# candidates were built. Reuse the already-certified APP_SHA images only when
+# the delta contains no application/runtime/migration changes.
+git -C "$REPO" fetch origin "$APP_SHA" >/dev/null 2>&1 || true
+APP_DELTA="$(git -C "$REPO" diff --name-only "$APP_SHA" "$TARGET_SHA" --   services migrations ':(exclude)scripts/ops/resume-dev-commercial-alignment-v4-after-db.sh' 2>/dev/null || true)"
+[[ -z "$APP_DELTA" ]] || {
+  echo "FAIL: target contains application/migration delta after candidate build"
+  printf '%s\n' "$APP_DELTA"
+  exit 2
+}
+echo "CANDIDATE_APP_DELTA=NONE"
 
 FACE_IMG="df-commercial-v4-face:$SHORT"
 FUSION_IMG="df-commercial-v4-fusion:$SHORT"
