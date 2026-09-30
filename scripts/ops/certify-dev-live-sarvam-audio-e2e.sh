@@ -3,12 +3,47 @@ set -Eeuo pipefail
 
 [[ "$(hostname -s)" == "desifaces-dev" ]] || { echo "FAIL: DEV host required"; exit 2; }
 
-CORE_URL="${CORE_URL:-http://127.0.0.1:8000}"
-AUDIO_URL="${AUDIO_URL:-http://127.0.0.1:8004}"
+CORE_CONTAINER="${CORE_CONTAINER:-df-svc-core}"
+AUDIO_API="${AUDIO_API:-df-svc-audio}"
+
+discover_host_url() {
+  local container="$1"
+  local container_port="$2"
+  local explicit="$3"
+
+  if [[ -n "$explicit" ]]; then
+    printf '%s' "$explicit"
+    return 0
+  fi
+
+  docker inspect "$container" >/dev/null 2>&1 || {
+    echo "FAIL: missing container $container" >&2
+    return 1
+  }
+
+  local binding host port
+  binding="$(docker port "$container" "$container_port/tcp" 2>/dev/null | head -1 || true)"
+  [[ -n "$binding" ]] || {
+    echo "FAIL: no host binding for $container:$container_port" >&2
+    return 1
+  }
+
+  host="${binding%:*}"
+  port="${binding##*:}"
+  host="${host#0.0.0.0}"
+  host="${host#[::]}"
+  [[ -n "$host" ]] || host="127.0.0.1"
+  [[ "$host" == "::" ]] && host="127.0.0.1"
+
+  printf 'http://%s:%s' "$host" "$port"
+}
+
+CORE_URL="$(discover_host_url "$CORE_CONTAINER" 8000 "${CORE_URL:-}")"
+AUDIO_URL="$(discover_host_url "$AUDIO_API" 8004 "${AUDIO_URL:-}")"
+
 DF_EMAIL="${DF_EMAIL:-user2@desifaces.ai}"
 DF_PASSWORD="${DF_PASSWORD:-password2}"
 DB_CONTAINER="${DB_CONTAINER:-desifaces-db}"
-AUDIO_API="${AUDIO_API:-df-svc-audio}"
 MAX_POLLS="${MAX_POLLS:-80}"
 POLL_SECS="${POLL_SECS:-2}"
 
@@ -29,8 +64,15 @@ echo "face_video_workflows=FROZEN"
 for cmd in curl python3 docker; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "FAIL: missing command $cmd"; exit 2; }
 done
+docker inspect "$CORE_CONTAINER" >/dev/null 2>&1 || { echo "FAIL: missing $CORE_CONTAINER"; exit 2; }
 docker inspect "$AUDIO_API" >/dev/null 2>&1 || { echo "FAIL: missing $AUDIO_API"; exit 2; }
 docker inspect "$DB_CONTAINER" >/dev/null 2>&1 || { echo "FAIL: missing $DB_CONTAINER"; exit 2; }
+
+CORE_HEALTH="$(curl -sS -o /dev/null -w '%{http_code}' "$CORE_URL/api/health" || true)"
+AUDIO_HEALTH="$(curl -sS -o /dev/null -w '%{http_code}' "$AUDIO_URL/api/health" || true)"
+[[ "$CORE_HEALTH" =~ ^2 ]] || { echo "FAIL: core endpoint unreachable url=$CORE_URL http=$CORE_HEALTH"; exit 2; }
+[[ "$AUDIO_HEALTH" =~ ^2 ]] || { echo "FAIL: audio endpoint unreachable url=$AUDIO_URL http=$AUDIO_HEALTH"; exit 2; }
+echo "DEV_ENDPOINT_DISCOVERY=PASS core=$CORE_URL audio=$AUDIO_URL"
 
 json_value() {
   python3 - "$1" "$2" <<'PY'
