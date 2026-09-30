@@ -41,8 +41,8 @@ discover_host_url() {
 CORE_URL="$(discover_host_url "$CORE_CONTAINER" 8000 "${CORE_URL:-}")"
 AUDIO_URL="$(discover_host_url "$AUDIO_API" 8004 "${AUDIO_URL:-}")"
 
-DF_EMAIL="${DF_EMAIL:-user2@desifaces.ai}"
-DF_PASSWORD="${DF_PASSWORD:-password2}"
+DF_EMAIL="${DF_EMAIL:-}"
+DF_PASSWORD="${DF_PASSWORD:-}"
 DB_CONTAINER="${DB_CONTAINER:-desifaces-db}"
 MAX_POLLS="${MAX_POLLS:-80}"
 POLL_SECS="${POLL_SECS:-2}"
@@ -57,7 +57,7 @@ echo " ACTUAL PROVIDER CALLS / PRICING / ARTIFACT VERIFICATION"
 echo "============================================================"
 echo "core_url=$CORE_URL"
 echo "audio_url=$AUDIO_URL"
-echo "email=$DF_EMAIL"
+echo "identity_mode=$([[ -n "$DF_EMAIL" && -n "$DF_PASSWORD" ]] && echo supplied_credentials || echo temporary_dev_smoke_user)"
 echo "production=UNTOUCHED"
 echo "face_video_workflows=FROZEN"
 
@@ -94,27 +94,107 @@ PY
 }
 
 echo
-echo "===== 1. LOGIN ====="
+echo "===== 1. AUTH / TEST IDENTITY ====="
 LOGIN="$OUT_DIR/login.json"
-HTTP="$(curl -sS -o "$LOGIN" -w '%{http_code}'   -X POST "$CORE_URL/api/auth/login"   -H 'Content-Type: application/json'   --data "$(python3 - "$DF_EMAIL" "$DF_PASSWORD" <<'PY'
+TOKEN=""
+USER_ID=""
+TEST_EMAIL="$DF_EMAIL"
+TEST_PASSWORD="$DF_PASSWORD"
+
+if [[ -n "$TEST_EMAIL" && -n "$TEST_PASSWORD" ]]; then
+  HTTP="$(curl -sS -o "$LOGIN" -w '%{http_code}' \
+    -X POST "$CORE_URL/api/auth/login" \
+    -H 'Content-Type: application/json' \
+    --data "$(python3 - "$TEST_EMAIL" "$TEST_PASSWORD" <<'PY'
 import json,sys
 print(json.dumps({"email":sys.argv[1],"password":sys.argv[2],"device_id":"dev-sarvam-cert","client_type":"web"}))
 PY
 )")"
-[[ "$HTTP" == "200" ]] || { echo "FAIL: login HTTP=$HTTP"; cat "$LOGIN"; exit 3; }
+  if [[ "$HTTP" == "200" ]]; then
+    TOKEN="$(json_value "$LOGIN" access_token)"
+    USER_ID="$(json_value "$LOGIN" user.id)"
+    echo "AUTH_MODE=SUPPLIED_CREDENTIALS"
+  else
+    echo "WARN: supplied DEV credentials rejected HTTP=$HTTP; falling back to temporary DEV smoke user"
+    TEST_EMAIL=""
+    TEST_PASSWORD=""
+  fi
+fi
 
-TOKEN="$(json_value "$LOGIN" access_token)"
-USER_ID="$(json_value "$LOGIN" user_id)"
-if [[ -z "$USER_ID" ]]; then
+if [[ -z "$TOKEN" ]]; then
+  TAG="$(date -u +%s)-$RANDOM"
+  TEST_EMAIL="sarvam-smoke-$TAG@desifaces.ai"
+  TEST_PASSWORD="DevSmoke!$TAG-Aa9"
+
+  REGISTER="$OUT_DIR/register.json"
+  VERIFY="$OUT_DIR/verify.json"
+
+  HTTP="$(curl -sS -o "$REGISTER" -w '%{http_code}' \
+    -X POST "$CORE_URL/api/auth/register" \
+    -H 'Content-Type: application/json' \
+    --data "$(python3 - "$TEST_EMAIL" "$TEST_PASSWORD" <<'PY'
+import json,sys
+print(json.dumps({
+  "email":sys.argv[1],
+  "password":sys.argv[2],
+  "full_name":"DEV Sarvam Certification",
+  "country_code":"US"
+}))
+PY
+)")"
+  [[ "$HTTP" == "200" || "$HTTP" == "201" ]] || {
+    echo "FAIL: temporary DEV registration HTTP=$HTTP"
+    cat "$REGISTER"
+    exit 3
+  }
+
+  CHALLENGE_ID="$(json_value "$REGISTER" challenge_id)"
+  OTP="$(json_value "$REGISTER" dev_email_otp_code)"
+  [[ -n "$CHALLENGE_ID" ]] || { echo "FAIL: registration missing challenge_id"; cat "$REGISTER"; exit 3; }
+  [[ -n "$OTP" ]] || {
+    echo "FAIL: DEV does not return registration OTP. Re-run with valid DF_EMAIL and DF_PASSWORD."
+    exit 3
+  }
+
+  HTTP="$(curl -sS -o "$VERIFY" -w '%{http_code}' \
+    -X POST "$CORE_URL/api/auth/register/verify-email" \
+    -H 'Content-Type: application/json' \
+    --data "$(python3 - "$CHALLENGE_ID" "$OTP" <<'PY'
+import json,sys
+print(json.dumps({
+  "challenge_id":sys.argv[1],
+  "code":sys.argv[2],
+  "device_id":"dev-sarvam-cert",
+  "client_type":"web"
+}))
+PY
+)")"
+  [[ "$HTTP" == "200" ]] || {
+    echo "FAIL: temporary DEV email verification HTTP=$HTTP"
+    cat "$VERIFY"
+    exit 3
+  }
+
+  TOKEN="$(json_value "$VERIFY" access_token)"
+  USER_ID="$(json_value "$VERIFY" user.id)"
+  echo "AUTH_MODE=TEMPORARY_DEV_SMOKE_USER"
+  echo "TEST_EMAIL=$TEST_EMAIL"
+fi
+
+if [[ -z "$USER_ID" && -n "$TOKEN" ]]; then
   USER_ID="$(python3 - "$TOKEN" <<'PY'
 import base64,json,sys
-p=sys.argv[1].split(".")[1]
-p += "="*(-len(p)%4)
-print(json.loads(base64.urlsafe_b64decode(p)).get("sub",""))
+try:
+    p=sys.argv[1].split(".")[1]
+    p += "="*(-len(p)%4)
+    print(json.loads(base64.urlsafe_b64decode(p)).get("sub",""))
+except Exception:
+    print("")
 PY
 )"
 fi
-[[ -n "$TOKEN" && -n "$USER_ID" ]] || { echo "FAIL: login token/user missing"; exit 3; }
+
+[[ -n "$TOKEN" && -n "$USER_ID" ]] || { echo "FAIL: auth token/user missing"; exit 3; }
 echo "LOGIN=PASS user_id=$USER_ID"
 
 DB_URL="$(docker exec "$AUDIO_API" sh -lc 'printf "%s" "$DATABASE_URL"')"
@@ -258,14 +338,23 @@ PY
 
   IFS='|' read -r ACTUAL_PROVIDER ACTUAL_MODEL ACTUAL_VOICE BYTES DB_PRICE_STATE FINAL_AMOUNT BILLED_UNITS <<< "$DB_ROW"
 
-  [[ "$ACTUAL_PROVIDER" == "$expected_provider" ]] || {
-    echo "FAIL: $name provider expected=$expected_provider actual=$ACTUAL_PROVIDER"
-    exit 15
-  }
-  [[ "$ACTUAL_MODEL" == "$expected_model" ]] || {
-    echo "FAIL: $name model expected=$expected_model actual=$ACTUAL_MODEL"
-    exit 15
-  }
+  if [[ "$expected_provider" == "NOT_SARVAM" ]]; then
+    [[ "$ACTUAL_PROVIDER" != "sarvam" && -n "$ACTUAL_PROVIDER" ]] || {
+      echo "FAIL: $name expected global non-Sarvam provider actual=$ACTUAL_PROVIDER"
+      exit 15
+    }
+  else
+    [[ "$ACTUAL_PROVIDER" == "$expected_provider" ]] || {
+      echo "FAIL: $name provider expected=$expected_provider actual=$ACTUAL_PROVIDER"
+      exit 15
+    }
+  fi
+  if [[ "$expected_model" != "*" ]]; then
+    [[ "$ACTUAL_MODEL" == "$expected_model" ]] || {
+      echo "FAIL: $name model expected=$expected_model actual=$ACTUAL_MODEL"
+      exit 15
+    }
+  fi
   [[ "${BYTES:-0}" =~ ^[0-9]+$ && "${BYTES:-0}" -gt 0 ]] || {
     echo "FAIL: $name artifact bytes=$BYTES"
     exit 16
