@@ -163,6 +163,29 @@ TEST_EMAIL="$(json_value "$AUTH_JSON" email)"
   exit 3
 }
 chmod 600 "$AUTH_JSON"
+
+deactivate_dev_fixture() {
+  if [[ -n "${USER_ID:-}" ]]; then
+    docker exec -i "$CORE_CONTAINER" python - "$USER_ID" <<'PY' >/dev/null 2>&1 || true
+import asyncio, os, sys
+import asyncpg
+
+async def main():
+    conn=await asyncpg.connect(os.environ["DATABASE_URL"])
+    try:
+        await conn.execute(
+            "update core.users set is_active=false, updated_at=now() where id=$1::uuid",
+            sys.argv[1],
+        )
+    finally:
+        await conn.close()
+
+asyncio.run(main())
+PY
+  fi
+}
+trap deactivate_dev_fixture EXIT
+
 echo "AUTH_MODE=TEMPORARY_ACTIVE_DEV_FIXTURE"
 echo "TEST_EMAIL=$TEST_EMAIL"
 echo "LOGIN=PASS user_id=$USER_ID"
