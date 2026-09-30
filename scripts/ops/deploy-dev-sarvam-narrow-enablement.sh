@@ -277,22 +277,20 @@ async def main():
     assert eligible is False
     print("SARVAM_GLOBAL_EXCLUSION=PASS")
 
-    # Character remains strict even for an otherwise eligible Sarvam voice.
+    # Character remains strict. Existing planner semantics may fall back from
+    # an incompatible explicit voice to a compatible provider/voice; preserve
+    # that behavior rather than requiring a terminal failure.
     eligible=await svc._is_explicit_sarvam_voice_eligible(voice="shubh",target_locale="hi-IN")
     assert eligible is True
     req_style=bool("Character") and not relax("Character",sarvam_voice_eligible=eligible)
     assert req_style is True
-    failed=False
-    try:
-        await planner.resolve(TTSResolutionPlanRequest(
-            requested_locale="hi-IN",text_length=100,output_format="mp3",
-            requested_voice="shubh",requested_gender="male",
-            requires_style=req_style,requires_emotion=False,requires_streaming=False,
-        ))
-    except Exception:
-        failed=True
-    assert failed is True
-    print("CHARACTER_EXISTING_STRICT_GATE=PASS")
+    p=await planner.resolve(TTSResolutionPlanRequest(
+        requested_locale="hi-IN",text_length=100,output_format="mp3",
+        requested_voice="shubh",requested_gender="male",
+        requires_style=req_style,requires_emotion=False,requires_streaming=False,
+    ))
+    assert p.provider_code != "sarvam",(p.provider_code,p.model_code,p.voice_name)
+    print(f"CHARACTER_EXISTING_FALLBACK_BEHAVIOR=PASS provider={p.provider_code} model={p.model_code}")
 
     await pool.close()
 
