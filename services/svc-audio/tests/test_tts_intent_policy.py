@@ -1,21 +1,64 @@
-from app.services.tts_intent_policy import requires_provider_native_style
+from app.services.tts_intent_policy import (
+    relax_native_style_only_for_eligible_sarvam_voice,
+)
 
 
-def test_empty_style_does_not_require_provider_native_style():
-    assert requires_provider_native_style(None) is False
-    assert requires_provider_native_style("") is False
+def test_non_sarvam_requests_keep_existing_style_semantics():
+    assert (
+        relax_native_style_only_for_eligible_sarvam_voice(
+            "Conversational",
+            sarvam_voice_eligible=False,
+        )
+        is False
+    )
+    assert (
+        relax_native_style_only_for_eligible_sarvam_voice(
+            "Narration",
+            sarvam_voice_eligible=False,
+        )
+        is False
+    )
 
 
-def test_conversational_and_narration_are_product_intents():
-    assert requires_provider_native_style("Conversational") is False
-    assert requires_provider_native_style(" conversational ") is False
-    assert requires_provider_native_style("Narration") is False
-    assert requires_provider_native_style("narration") is False
+def test_only_eligible_sarvam_conversational_and_narration_relax():
+    assert (
+        relax_native_style_only_for_eligible_sarvam_voice(
+            "Conversational",
+            sarvam_voice_eligible=True,
+        )
+        is True
+    )
+    assert (
+        relax_native_style_only_for_eligible_sarvam_voice(
+            "Narration",
+            sarvam_voice_eligible=True,
+        )
+        is True
+    )
 
 
-def test_character_still_requires_provider_native_style():
-    assert requires_provider_native_style("Character") is True
+def test_character_and_unknown_styles_stay_strict_even_for_sarvam():
+    assert (
+        relax_native_style_only_for_eligible_sarvam_voice(
+            "Character",
+            sarvam_voice_eligible=True,
+        )
+        is False
+    )
+    assert (
+        relax_native_style_only_for_eligible_sarvam_voice(
+            "cheerful",
+            sarvam_voice_eligible=True,
+        )
+        is False
+    )
 
 
-def test_unknown_explicit_style_fails_safe_as_native_requirement():
-    assert requires_provider_native_style("cheerful") is True
+def test_empty_style_never_needs_relaxation():
+    assert (
+        relax_native_style_only_for_eligible_sarvam_voice(
+            None,
+            sarvam_voice_eligible=True,
+        )
+        is False
+    )
