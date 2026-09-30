@@ -46,12 +46,19 @@ done
 echo
 echo "===== 2. COMMERCIAL CONTRACT ====="
 AUDIT=""
-for p in   "$HOME/workspace/desifaces-v3/scripts/ops/certify-dev-narrow-launch-sku-cogs-v4.sh"   "$HOME/workspace/desifaces_backend/scripts/ops/certify-dev-narrow-launch-sku-cogs-v4.sh"   "$HOME/workspace/desifaces-runtime/scripts/ops/certify-dev-narrow-launch-sku-cogs-v4.sh"; do
+for p in \
+  "$HOME/workspace/desifaces-v3/scripts/ops/certify-dev-narrow-launch-sku-cogs-v4.sh" \
+  "$HOME/workspace/desifaces_backend/scripts/ops/certify-dev-narrow-launch-sku-cogs-v4.sh" \
+  "$HOME/workspace/desifaces-runtime/scripts/ops/certify-dev-narrow-launch-sku-cogs-v4.sh"; do
   [[ -f "$p" ]] && { AUDIT="$p"; break; }
 done
 if [[ -z "$AUDIT" ]]; then
-  echo "FAIL: V4 commercial audit script not found in workspace"
-  exit 4
+  command -v gh >/dev/null 2>&1 || { echo "FAIL: V4 audit unavailable and gh missing"; exit 4; }
+  AUDIT="/tmp/certify-dev-narrow-launch-sku-cogs-v4.sh"
+  gh api \
+    "repos/prasshanthshankar-afk/desifaces_backend/contents/scripts/ops/certify-dev-narrow-launch-sku-cogs-v4.sh?ref=fix/dev-commercial-alignment-v2-20260929" \
+    --jq .content | base64 -d > "$AUDIT"
+  chmod +x "$AUDIT"
 fi
 bash "$AUDIT"
 echo "LAUNCH_COMMERCIAL_CONTRACT=PASS"
@@ -148,22 +155,31 @@ order by w.category;
 "
 
 echo
-echo "===== 5. SUCCESSFUL MEDIA EVIDENCE ====="
+echo "===== 5. SUCCESSFUL MEDIA EVIDENCE BY ACTUAL JOB PRICING VARIANT ====="
 "${PSQL[@]}" -P pager=off -c "
 with media as (
   select
-    sj.id job_id,
     sj.created_at,
-    sj.status,
-    sj.studio_type,
-    sj.payload_json,
-    sj.meta_json job_meta,
     a.kind,
-    a.meta_json artifact_meta,
-    a.bytes,
-    coalesce(a.meta_json->>'asset_class',sj.meta_json->>'asset_class',sj.payload_json->>'asset_class','') asset_class,
-    coalesce(a.meta_json->>'provider_code',sj.payload_json->'tts_meta'->>'provider_code','') provider_code,
-    coalesce(a.meta_json->>'model_code',sj.payload_json->'tts_meta'->>'model_code','') model_code
+    coalesce(
+      a.meta_json->>'asset_class',
+      sj.meta_json->>'asset_class',
+      sj.payload_json->>'asset_class',''
+    ) asset_class,
+    coalesce(
+      sj.payload_json->'pricing'->>'variant_code',
+      sj.meta_json->'pricing'->>'variant_code',
+      sj.payload_json->'pricing'->>'sku_code',
+      sj.meta_json->'pricing'->>'sku_code',''
+    ) job_pricing_variant,
+    coalesce(
+      a.meta_json->>'provider_code',
+      sj.payload_json->'tts_meta'->>'provider_code',''
+    ) provider_code,
+    coalesce(
+      a.meta_json->>'model_code',
+      sj.payload_json->'tts_meta'->>'model_code',''
+    ) model_code
   from public.studio_jobs sj
   join public.artifacts a on a.job_id=sj.id
   where sj.status='succeeded'
@@ -171,118 +187,143 @@ with media as (
     and coalesce(a.bytes,0)>0
 )
 select
-  case
-    when kind='image' and asset_class='group_photo' then 'GROUP_PHOTO_IMAGE'
-    when kind='image' and asset_class='multi_person_face' then 'MULTI_PERSON_FACE_IMAGE'
-    when kind='image' then 'FACE_IMAGE'
-    when kind='audio' and asset_class='group_audio' then 'GROUP_AUDIO'
-    when kind='audio' and asset_class='multi_person_audio' then 'MULTI_PERSON_AUDIO'
-    when kind='audio' then 'AUDIO'
-    when kind='video' and asset_class='group_video' then 'GROUP_VIDEO'
-    when kind='video' and asset_class='multi_person_video' then 'MULTI_PERSON_VIDEO'
-    when kind='video' then 'VIDEO'
-    else upper(kind)
-  end media_category,
+  kind,
+  coalesce(nullif(asset_class,''),'UNCLASSIFIED') asset_class,
+  coalesce(nullif(job_pricing_variant,''),'NO_JOB_PRICING_VARIANT') job_pricing_variant,
   count(*) artifacts,
   max(created_at) last_success,
   string_agg(distinct nullif(provider_code,''),',' order by nullif(provider_code,'')) providers,
   string_agg(distinct nullif(model_code,''),',' order by nullif(model_code,'')) models
 from media
-group by 1
-order by 1;
+group by 1,2,3
+order by 1,2,3;
 "
 
 echo
-echo "===== 6. END-TO-END CATEGORY MATRIX ====="
+echo "===== 6. END-TO-END CUSTOMER-VISIBLE CATEGORY MATRIX ====="
 "${PSQL[@]}" -P pager=off -c "
-with wanted(category,variant_code,kind,asset_class,allow_generic) as (
+with wanted(category,pricing_variant,kind,asset_class,job_variants) as (
   values
-    ('FACE_SINGLE_T2I','FACE_T2I','image','',true),
-    ('FACE_SINGLE_I2I','FACE_I2I','image','',true),
-    ('FACE_MULTI_T2I','FACE_MULTI_PERSON','image','multi_person_face',false),
-    ('FACE_MULTI_I2I','FACE_MULTI_PERSON_I2I','image','multi_person_face',false),
-    ('AUDIO_SINGLE','AUDIO_TTS','audio','',true),
-    ('AUDIO_MULTI','AUDIO_MULTI_PERSON','audio','multi_person_audio',false),
-    ('VIDEO_SINGLE','FUSION_TALKING_VIDEO','video','',true),
-    ('VIDEO_MULTI_GROUP','FUSION_MULTI_PERSON','video','',true)
+    ('FACE_SINGLE_T2I','FACE_T2I','image','',array['FACE_T2I','face.creator.generate.t2i']::text[]),
+    ('FACE_SINGLE_I2I','FACE_I2I','image','',array['FACE_I2I','face.creator.generate.i2i']::text[]),
+    ('GROUP_PHOTO_IMAGE','FACE_MULTI_PERSON','image','group_photo',array['FACE_MULTI_PERSON']::text[]),
+    ('MULTI_PERSON_FACE_IMAGE','FACE_MULTI_PERSON','image','multi_person_face',array['FACE_MULTI_PERSON','FACE_MULTI_PERSON_I2I']::text[]),
+    ('AUDIO_SINGLE','AUDIO_TTS','audio','',array['AUDIO_TTS']::text[]),
+    ('GROUP_AUDIO','AUDIO_MULTI_PERSON','audio','group_audio',array['AUDIO_MULTI_PERSON']::text[]),
+    ('MULTI_PERSON_AUDIO','AUDIO_MULTI_PERSON','audio','multi_person_audio',array['AUDIO_MULTI_PERSON']::text[]),
+    ('VIDEO_SINGLE','FUSION_TALKING_VIDEO','video','',array['FUSION_TALKING_VIDEO']::text[]),
+    ('GROUP_VIDEO','FUSION_MULTI_PERSON','video','group_video',array['FUSION_MULTI_PERSON']::text[]),
+    ('MULTI_PERSON_VIDEO','FUSION_MULTI_PERSON','video','multi_person_video',array['FUSION_MULTI_PERSON']::text[])
 ),
 pricing as (
   select
     coalesce(r.quote_json->>'variant_code',r.quote_json->>'sku_code','') variant_code,
-    count(*) filter (where r.status='committed') committed_count,
-    max(r.created_at) filter (where r.status='committed') last_commit
+    count(*) filter(where r.status='committed') n,
+    max(r.created_at) filter(where r.status='committed') last_commit
   from public.pricing_credit_reservations r
   where r.created_at>=now()-interval '45 days'
   group by 1
 ),
 media as (
   select
+    sj.created_at,
     a.kind,
-    coalesce(a.meta_json->>'asset_class',sj.meta_json->>'asset_class',sj.payload_json->>'asset_class','') asset_class,
-    count(*) count_success,
-    max(sj.created_at) last_success
+    coalesce(
+      a.meta_json->>'asset_class',
+      sj.meta_json->>'asset_class',
+      sj.payload_json->>'asset_class',''
+    ) asset_class,
+    coalesce(
+      sj.payload_json->'pricing'->>'variant_code',
+      sj.meta_json->'pricing'->>'variant_code',
+      sj.payload_json->'pricing'->>'sku_code',
+      sj.meta_json->'pricing'->>'sku_code',''
+    ) job_pricing_variant
   from public.studio_jobs sj
   join public.artifacts a on a.job_id=sj.id
   where sj.status='succeeded'
     and sj.created_at>=now()-interval '45 days'
     and coalesce(a.bytes,0)>0
-  group by 1,2
 ),
 matrix as (
-  select
-    w.category,w.variant_code,
-    coalesce(p.committed_count,0) pricing_commits,
-    p.last_commit,
-    coalesce(sum(m.count_success) filter (
-      where m.kind=w.kind
-        and (
-          (w.asset_class<>'' and m.asset_class=w.asset_class)
-          or
-          (w.allow_generic and (m.asset_class='' or m.asset_class is null
-            or m.asset_class not in ('group_photo','group_audio','group_video','multi_person_face','multi_person_audio','multi_person_video')))
-          or
-          (w.category='VIDEO_MULTI_GROUP' and m.asset_class in ('group_video','multi_person_video'))
-        )
-    ),0) successful_artifacts,
-    max(m.last_success) filter (
-      where m.kind=w.kind
-        and (
-          (w.asset_class<>'' and m.asset_class=w.asset_class)
-          or
-          (w.allow_generic and (m.asset_class='' or m.asset_class is null
-            or m.asset_class not in ('group_photo','group_audio','group_video','multi_person_face','multi_person_audio','multi_person_video')))
-          or
-          (w.category='VIDEO_MULTI_GROUP' and m.asset_class in ('group_video','multi_person_video'))
-        )
-    ) last_success
-  from wanted w
-  left join pricing p on p.variant_code=w.variant_code
-  left join media m on true
-  group by w.category,w.variant_code,p.committed_count,p.last_commit
+ select
+   w.category,w.pricing_variant,
+   coalesce(p.n,0) pricing_commits,p.last_commit,
+   count(m.*) filter(
+     where m.kind=w.kind
+       and (
+         (w.asset_class<>'' and m.asset_class=w.asset_class)
+         or
+         (w.asset_class='' and coalesce(m.asset_class,'') not in (
+           'group_photo','group_audio','group_video',
+           'multi_person_face','multi_person_audio','multi_person_video'
+         ))
+       )
+       and (
+         m.job_pricing_variant=any(w.job_variants)
+         or (w.category in ('GROUP_VIDEO','MULTI_PERSON_VIDEO') and m.asset_class=w.asset_class)
+       )
+   ) successful_artifacts,
+   max(m.created_at) filter(
+     where m.kind=w.kind
+       and (
+         (w.asset_class<>'' and m.asset_class=w.asset_class)
+         or
+         (w.asset_class='' and coalesce(m.asset_class,'') not in (
+           'group_photo','group_audio','group_video',
+           'multi_person_face','multi_person_audio','multi_person_video'
+         ))
+       )
+       and (
+         m.job_pricing_variant=any(w.job_variants)
+         or (w.category in ('GROUP_VIDEO','MULTI_PERSON_VIDEO') and m.asset_class=w.asset_class)
+       )
+   ) last_success
+ from wanted w
+ left join pricing p on p.variant_code=w.pricing_variant
+ left join media m on true
+ group by w.category,w.pricing_variant,p.n,p.last_commit
 )
-select
-  category,
-  variant_code,
-  pricing_commits,
-  last_commit,
-  successful_artifacts,
-  last_success,
-  case when pricing_commits>0 and successful_artifacts>0 then 'PASS' else 'NEEDS_TARGETED_PROOF' end launch_gate
+select category,pricing_variant,pricing_commits,last_commit,
+       successful_artifacts,last_success,
+       case when pricing_commits>0 and successful_artifacts>0
+            then 'PASS' else 'NEEDS_TARGETED_PROOF' end launch_gate
 from matrix
 order by category;
 "
 
-MISSING="$("${PSQL[@]}" -AtF ',' -c "
-with wanted(category,variant_code,kind,asset_class,allow_generic) as (
+SARVAM_ACTUAL="$("${PSQL[@]}" -Atq -c "
+select count(*)
+from public.studio_jobs sj
+join public.artifacts a on a.job_id=sj.id
+where sj.status='succeeded'
+  and a.kind='audio'
+  and coalesce(a.bytes,0)>0
+  and sj.created_at>=now()-interval '45 days'
+  and lower(coalesce(
+    a.meta_json->>'provider_code',
+    sj.payload_json->'tts_meta'->>'provider_code',''
+  ))='sarvam';
+")"
+if [[ "${SARVAM_ACTUAL:-0}" -gt 0 ]]; then
+  echo "AUDIO_SARVAM_ACTUAL=PASS successful_artifacts=$SARVAM_ACTUAL"
+else
+  echo "AUDIO_SARVAM_ACTUAL=NEEDS_TARGETED_PROOF successful_artifacts=0"
+fi
+
+MISSING="$("${PSQL[@]}" -Atq -c "
+with wanted(category,pricing_variant,kind,asset_class,job_variants) as (
   values
-    ('FACE_SINGLE_T2I','FACE_T2I','image','',true),
-    ('FACE_SINGLE_I2I','FACE_I2I','image','',true),
-    ('FACE_MULTI_T2I','FACE_MULTI_PERSON','image','multi_person_face',false),
-    ('FACE_MULTI_I2I','FACE_MULTI_PERSON_I2I','image','multi_person_face',false),
-    ('AUDIO_SINGLE','AUDIO_TTS','audio','',true),
-    ('AUDIO_MULTI','AUDIO_MULTI_PERSON','audio','multi_person_audio',false),
-    ('VIDEO_SINGLE','FUSION_TALKING_VIDEO','video','',true),
-    ('VIDEO_MULTI_GROUP','FUSION_MULTI_PERSON','video','',true)
+    ('FACE_SINGLE_T2I','FACE_T2I','image','',array['FACE_T2I','face.creator.generate.t2i']::text[]),
+    ('FACE_SINGLE_I2I','FACE_I2I','image','',array['FACE_I2I','face.creator.generate.i2i']::text[]),
+    ('GROUP_PHOTO_IMAGE','FACE_MULTI_PERSON','image','group_photo',array['FACE_MULTI_PERSON']::text[]),
+    ('MULTI_PERSON_FACE_IMAGE','FACE_MULTI_PERSON','image','multi_person_face',array['FACE_MULTI_PERSON','FACE_MULTI_PERSON_I2I']::text[]),
+    ('AUDIO_SINGLE','AUDIO_TTS','audio','',array['AUDIO_TTS']::text[]),
+    ('GROUP_AUDIO','AUDIO_MULTI_PERSON','audio','group_audio',array['AUDIO_MULTI_PERSON']::text[]),
+    ('MULTI_PERSON_AUDIO','AUDIO_MULTI_PERSON','audio','multi_person_audio',array['AUDIO_MULTI_PERSON']::text[]),
+    ('VIDEO_SINGLE','FUSION_TALKING_VIDEO','video','',array['FUSION_TALKING_VIDEO']::text[]),
+    ('GROUP_VIDEO','FUSION_MULTI_PERSON','video','group_video',array['FUSION_MULTI_PERSON']::text[]),
+    ('MULTI_PERSON_VIDEO','FUSION_MULTI_PERSON','video','multi_person_video',array['FUSION_MULTI_PERSON']::text[])
 ),
 pricing as (
   select coalesce(r.quote_json->>'variant_code',r.quote_json->>'sku_code','') variant_code,
@@ -292,32 +333,50 @@ pricing as (
   group by 1
 ),
 media as (
-  select a.kind,
+  select sj.created_at,a.kind,
          coalesce(a.meta_json->>'asset_class',sj.meta_json->>'asset_class',sj.payload_json->>'asset_class','') asset_class,
-         count(*) n
+         coalesce(
+           sj.payload_json->'pricing'->>'variant_code',
+           sj.meta_json->'pricing'->>'variant_code',
+           sj.payload_json->'pricing'->>'sku_code',
+           sj.meta_json->'pricing'->>'sku_code',''
+         ) job_pricing_variant
   from public.studio_jobs sj
   join public.artifacts a on a.job_id=sj.id
-  where sj.status='succeeded' and sj.created_at>=now()-interval '45 days' and coalesce(a.bytes,0)>0
-  group by 1,2
+  where sj.status='succeeded'
+    and sj.created_at>=now()-interval '45 days'
+    and coalesce(a.bytes,0)>0
 ),
 matrix as (
- select w.category,
-        coalesce(p.n,0) pricing_n,
-        coalesce(sum(m.n) filter(where m.kind=w.kind and (
-          (w.asset_class<>'' and m.asset_class=w.asset_class)
-          or (w.allow_generic and (m.asset_class='' or m.asset_class is null
-             or m.asset_class not in ('group_photo','group_audio','group_video','multi_person_face','multi_person_audio','multi_person_video')))
-          or (w.category='VIDEO_MULTI_GROUP' and m.asset_class in ('group_video','multi_person_video'))
-        )),0) media_n
+ select w.category,coalesce(p.n,0) pricing_n,
+        count(m.*) filter(
+          where m.kind=w.kind
+            and (
+              (w.asset_class<>'' and m.asset_class=w.asset_class)
+              or
+              (w.asset_class='' and coalesce(m.asset_class,'') not in (
+                'group_photo','group_audio','group_video',
+                'multi_person_face','multi_person_audio','multi_person_video'
+              ))
+            )
+            and (
+              m.job_pricing_variant=any(w.job_variants)
+              or (w.category in ('GROUP_VIDEO','MULTI_PERSON_VIDEO') and m.asset_class=w.asset_class)
+            )
+        ) media_n
  from wanted w
- left join pricing p on p.variant_code=w.variant_code
+ left join pricing p on p.variant_code=w.pricing_variant
  left join media m on true
  group by w.category,p.n
 )
 select category from matrix where pricing_n=0 or media_n=0 order by category;
 ")"
 
-echo
+if [[ "${SARVAM_ACTUAL:-0}" -eq 0 ]]; then
+  [[ -z "$MISSING" ]] || MISSING="$MISSING"$'\n'
+  MISSING="${MISSING}AUDIO_SARVAM_ACTUAL"
+fi
+
 echo "===== 7. ARTIFACT TAXONOMY SAFETY ====="
 TAX_BAD="$("${PSQL[@]}" -Atq -c "
 select count(*)
