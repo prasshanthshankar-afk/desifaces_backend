@@ -78,18 +78,24 @@ assert s.variant_params=={"minutes":"2"}
 print("FUSION_NATURAL_UNITS_NO_PARTICIPANT_MULTIPLIER=PASS")
 PY
 
-docker run --rm "$FACE_IMG" sh -lc '
-  grep -q "FACE_MULTI_PERSON_I2I" /app/app/services/multi_person_pricing_policy.py &&
-  grep -q "provider="openai"" /app/app/services/creator_orchestrator.py
-'
-echo "FACE_SELECTOR_IMAGE=PASS"
+docker run --rm -i "$FACE_IMG" python - <<'PY'
+from pathlib import Path
+policy = Path("/app/app/services/multi_person_pricing_policy.py").read_text()
+orch = Path("/app/app/services/creator_orchestrator.py").read_text()
+assert "FACE_MULTI_PERSON_I2I" in policy
+assert 'provider="openai"' in orch
+print("FACE_SELECTOR_IMAGE=PASS")
+PY
 
-docker run --rm "$EXT_IMG" sh -lc '
-  grep -q "_VARIANT_CODE = "FUSION_MULTI_PERSON"" /app/app/api/routes/v3_scene_pricing.py &&
-  grep -q "_PROVIDER = "provider-neutral"" /app/app/api/routes/v3_scene_pricing.py &&
-  grep -q "PREMIUM_CREDITS_PER_SECOND = 15" /app/app/services/premium_actual_seconds_pricing.py
-'
-echo "FUSION_PARENT_SELECTOR_IMAGE=PASS"
+docker run --rm -i "$EXT_IMG" python - <<'PY'
+from pathlib import Path
+route = Path("/app/app/api/routes/v3_scene_pricing.py").read_text()
+premium = Path("/app/app/services/premium_actual_seconds_pricing.py").read_text()
+assert '_VARIANT_CODE = "FUSION_MULTI_PERSON"' in route
+assert '_PROVIDER = "provider-neutral"' in route
+assert "PREMIUM_CREDITS_PER_SECOND = 15" in premium
+print("FUSION_PARENT_SELECTOR_IMAGE=PASS")
+PY
 
 echo
 echo "===== 4. DB PREFLIGHT — ROLLBACK ONLY ====="
@@ -224,12 +230,15 @@ s=select_multi_person_pricing(studio="fusion",participant_count_value=3,natural_
 assert s and s.billable_units==2
 print("LIVE_FUSION_NATURAL_UNITS=PASS")
 PY
-docker exec df-svc-fusion-extension sh -lc '
-  grep -q "_VARIANT_CODE = "FUSION_MULTI_PERSON"" /app/app/api/routes/v3_scene_pricing.py &&
-  grep -q "_PROVIDER = "provider-neutral"" /app/app/api/routes/v3_scene_pricing.py &&
-  grep -q "PREMIUM_CREDITS_PER_SECOND = 15" /app/app/services/premium_actual_seconds_pricing.py
-'
-echo "LIVE_COMMERCIAL_V4_SOURCE_CONTRACT=PASS"
+docker exec -i df-svc-fusion-extension python - <<'PY'
+from pathlib import Path
+route = Path("/app/app/api/routes/v3_scene_pricing.py").read_text()
+premium = Path("/app/app/services/premium_actual_seconds_pricing.py").read_text()
+assert '_VARIANT_CODE = "FUSION_MULTI_PERSON"' in route
+assert '_PROVIDER = "provider-neutral"' in route
+assert "PREMIUM_CREDITS_PER_SECOND = 15" in premium
+print("LIVE_COMMERCIAL_V4_SOURCE_CONTRACT=PASS")
+PY
 
 echo
 echo "===== 9. NARROW LAUNCH SKU / COGS CERTIFICATION ====="
