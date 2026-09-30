@@ -24,6 +24,7 @@ from app.services.tts_resolution_planner import (
 )
 from app.services.tts_provider_executor import TTSProviderExecutor
 from app.services.tts_provider_adapter import TTSProviderAdapterError
+from app.services.tts_intent_policy import requires_provider_native_style
 from gender_translation import (
     GenderTranslationError,
     normalize_gender,
@@ -316,7 +317,7 @@ class TTSService:
                         ),
                         requested_voice=voice,
                         requested_gender=planner_gender,
-                        requires_style=bool(style),
+                        requires_style=requires_provider_native_style(style),
                         requires_emotion=bool(emotion),
                     )
                 )
