@@ -41,8 +41,6 @@ discover_host_url() {
 CORE_URL="$(discover_host_url "$CORE_CONTAINER" 8000 "${CORE_URL:-}")"
 AUDIO_URL="$(discover_host_url "$AUDIO_API" 8004 "${AUDIO_URL:-}")"
 
-DF_EMAIL="${DF_EMAIL:-}"
-DF_PASSWORD="${DF_PASSWORD:-}"
 DB_CONTAINER="${DB_CONTAINER:-desifaces-db}"
 MAX_POLLS="${MAX_POLLS:-80}"
 POLL_SECS="${POLL_SECS:-2}"
@@ -57,7 +55,7 @@ echo " ACTUAL PROVIDER CALLS / PRICING / ARTIFACT VERIFICATION"
 echo "============================================================"
 echo "core_url=$CORE_URL"
 echo "audio_url=$AUDIO_URL"
-echo "identity_mode=$([[ -n "$DF_EMAIL" && -n "$DF_PASSWORD" ]] && echo supplied_credentials || echo temporary_dev_smoke_user)"
+echo "identity_mode=temporary_active_dev_fixture"
 echo "production=UNTOUCHED"
 echo "face_video_workflows=FROZEN"
 
@@ -94,107 +92,79 @@ PY
 }
 
 echo
-echo "===== 1. AUTH / TEST IDENTITY ====="
-LOGIN="$OUT_DIR/login.json"
-TOKEN=""
-USER_ID=""
-TEST_EMAIL="$DF_EMAIL"
-TEST_PASSWORD="$DF_PASSWORD"
+echo "===== 1. DEV TEST IDENTITY ====="
+AUTH_JSON="$OUT_DIR/dev_identity.json"
 
-if [[ -n "$TEST_EMAIL" && -n "$TEST_PASSWORD" ]]; then
-  HTTP="$(curl -sS -o "$LOGIN" -w '%{http_code}' \
-    -X POST "$CORE_URL/api/auth/login" \
-    -H 'Content-Type: application/json' \
-    --data "$(python3 - "$TEST_EMAIL" "$TEST_PASSWORD" <<'PY'
-import json,sys
-print(json.dumps({"email":sys.argv[1],"password":sys.argv[2],"device_id":"dev-sarvam-cert","client_type":"web"}))
+docker exec -i "$CORE_CONTAINER" python - <<'PY' > "$AUTH_JSON"
+import asyncio, json, os, time
+import asyncpg
+from app.security import hash_password, mint_access_jwt
+
+async def main():
+    db=os.environ["DATABASE_URL"]
+    conn=await asyncpg.connect(db)
+    try:
+        tag=str(int(time.time()))
+        email=f"sarvam-smoke-{tag}@desifaces.ai"
+        password_hash=hash_password(f"DevSmoke-{tag}-Aa9!")
+        row=await conn.fetchrow(
+            """
+            insert into core.users(
+              email,password_hash,full_name,is_active,country_code,email_verified_at
+            )
+            values($1,$2,$3,true,'US',now())
+            returning id::text,email,coalesce(tier,'free') tier
+            """,
+            email,password_hash,"DEV Sarvam Certification"
+        )
+        await conn.execute(
+            """
+            insert into core.user_roles(user_id,role_id)
+            select $1::uuid,r.id
+            from core.roles r
+            where r.role_key='user'
+            on conflict do nothing
+            """,
+            row["id"]
+        )
+        roles=[r["role_key"] for r in await conn.fetch(
+            """
+            select r.role_key
+            from core.user_roles ur
+            join core.roles r on r.id=ur.role_id
+            where ur.user_id=$1::uuid
+            """,
+            row["id"]
+        )]
+        token=mint_access_jwt(
+            user_id=row["id"],
+            email=row["email"],
+            tier=row["tier"] or "free",
+            roles=roles,
+            country_code="US",
+        )
+        print(json.dumps({
+            "user_id":row["id"],
+            "email":row["email"],
+            "access_token":token,
+            "tier":row["tier"] or "free",
+        }))
+    finally:
+        await conn.close()
+
+asyncio.run(main())
 PY
-)")"
-  if [[ "$HTTP" == "200" ]]; then
-    TOKEN="$(json_value "$LOGIN" access_token)"
-    USER_ID="$(json_value "$LOGIN" user.id)"
-    echo "AUTH_MODE=SUPPLIED_CREDENTIALS"
-  else
-    echo "WARN: supplied DEV credentials rejected HTTP=$HTTP; falling back to temporary DEV smoke user"
-    TEST_EMAIL=""
-    TEST_PASSWORD=""
-  fi
-fi
 
-if [[ -z "$TOKEN" ]]; then
-  TAG="$(date -u +%s)-$RANDOM"
-  TEST_EMAIL="sarvam-smoke-$TAG@desifaces.ai"
-  TEST_PASSWORD="DevSmoke!$TAG-Aa9"
-
-  REGISTER="$OUT_DIR/register.json"
-  VERIFY="$OUT_DIR/verify.json"
-
-  HTTP="$(curl -sS -o "$REGISTER" -w '%{http_code}' \
-    -X POST "$CORE_URL/api/auth/register" \
-    -H 'Content-Type: application/json' \
-    --data "$(python3 - "$TEST_EMAIL" "$TEST_PASSWORD" <<'PY'
-import json,sys
-print(json.dumps({
-  "email":sys.argv[1],
-  "password":sys.argv[2],
-  "full_name":"DEV Sarvam Certification",
-  "country_code":"US"
-}))
-PY
-)")"
-  [[ "$HTTP" == "200" || "$HTTP" == "201" ]] || {
-    echo "FAIL: temporary DEV registration HTTP=$HTTP"
-    cat "$REGISTER"
-    exit 3
-  }
-
-  CHALLENGE_ID="$(json_value "$REGISTER" challenge_id)"
-  OTP="$(json_value "$REGISTER" dev_email_otp_code)"
-  [[ -n "$CHALLENGE_ID" ]] || { echo "FAIL: registration missing challenge_id"; cat "$REGISTER"; exit 3; }
-  [[ -n "$OTP" ]] || {
-    echo "FAIL: DEV does not return registration OTP. Re-run with valid DF_EMAIL and DF_PASSWORD."
-    exit 3
-  }
-
-  HTTP="$(curl -sS -o "$VERIFY" -w '%{http_code}' \
-    -X POST "$CORE_URL/api/auth/register/verify-email" \
-    -H 'Content-Type: application/json' \
-    --data "$(python3 - "$CHALLENGE_ID" "$OTP" <<'PY'
-import json,sys
-print(json.dumps({
-  "challenge_id":sys.argv[1],
-  "code":sys.argv[2],
-  "device_id":"dev-sarvam-cert",
-  "client_type":"web"
-}))
-PY
-)")"
-  [[ "$HTTP" == "200" ]] || {
-    echo "FAIL: temporary DEV email verification HTTP=$HTTP"
-    cat "$VERIFY"
-    exit 3
-  }
-
-  TOKEN="$(json_value "$VERIFY" access_token)"
-  USER_ID="$(json_value "$VERIFY" user.id)"
-  echo "AUTH_MODE=TEMPORARY_DEV_SMOKE_USER"
-  echo "TEST_EMAIL=$TEST_EMAIL"
-fi
-
-if [[ -z "$USER_ID" && -n "$TOKEN" ]]; then
-  USER_ID="$(python3 - "$TOKEN" <<'PY'
-import base64,json,sys
-try:
-    p=sys.argv[1].split(".")[1]
-    p += "="*(-len(p)%4)
-    print(json.loads(base64.urlsafe_b64decode(p)).get("sub",""))
-except Exception:
-    print("")
-PY
-)"
-fi
-
-[[ -n "$TOKEN" && -n "$USER_ID" ]] || { echo "FAIL: auth token/user missing"; exit 3; }
+TOKEN="$(json_value "$AUTH_JSON" access_token)"
+USER_ID="$(json_value "$AUTH_JSON" user_id)"
+TEST_EMAIL="$(json_value "$AUTH_JSON" email)"
+[[ -n "$TOKEN" && -n "$USER_ID" && -n "$TEST_EMAIL" ]] || {
+  echo "FAIL: could not create DEV smoke identity"
+  exit 3
+}
+chmod 600 "$AUTH_JSON"
+echo "AUTH_MODE=TEMPORARY_ACTIVE_DEV_FIXTURE"
+echo "TEST_EMAIL=$TEST_EMAIL"
 echo "LOGIN=PASS user_id=$USER_ID"
 
 DB_URL="$(docker exec "$AUDIO_API" sh -lc 'printf "%s" "$DATABASE_URL"')"
