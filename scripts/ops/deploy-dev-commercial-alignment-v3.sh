@@ -57,7 +57,7 @@ echo "FUSION_EXTENSION_BUILD=PASS image=$EXT_IMG"
 
 echo
 echo "===== 3. IN-IMAGE PRICING CERTIFICATION ====="
-docker run --rm "$FUSION_IMG" python - <<'PY'
+docker run --rm -i "$FUSION_IMG" python - <<'PY'
 from desifaces_shared.pricing.multi_person import select_multi_person_pricing
 s = select_multi_person_pricing(studio="fusion", participant_count_value=3, natural_units=2)
 assert s is not None
@@ -217,7 +217,7 @@ echo "COMMERCIAL_RUNTIME_CUTOVER=PASS"
 echo
 echo "===== 8. LIVE SOURCE CONTRACT ====="
 docker exec df-svc-face sh -lc 'grep -q "FACE_MULTI_PERSON_I2I" /app/app/services/multi_person_pricing_policy.py'
-docker exec df-svc-fusion python - <<'PY'
+docker exec -i df-svc-fusion python - <<'PY'
 from desifaces_shared.pricing.multi_person import select_multi_person_pricing
 s=select_multi_person_pricing(studio="fusion",participant_count_value=3,natural_units=2)
 assert s and s.billable_units==2
