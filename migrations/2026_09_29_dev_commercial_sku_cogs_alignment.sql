@@ -34,7 +34,7 @@ BEGIN
     WHERE is_active = true
       AND effective_from <= now()
       AND (effective_to IS NULL OR effective_to > now())
-      AND COALESCE(multiplier,0) <= 0
+      AND COALESCE(multiplier,1) <= 0
   ) THEN
     RAISE EXCEPTION 'active pricing pricebook multiplier must be > 0';
   END IF;
@@ -321,7 +321,7 @@ INSERT INTO public.pricing_sku_prices(
 SELECT
   pb.id,
   p.sku_code,
-  CEIL(p.target_credits / pb.multiplier)::bigint,
+  CEIL(p.target_credits / COALESCE(pb.multiplier,1))::bigint,
   NULL,
   CASE WHEN p.sku_code IN ('FACE_MULTI_PERSON','FACE_MULTI_PERSON_I2I','AUDIO_MULTI_PERSON','FUSION_MULTI_PERSON') THEN 1 ELSE NULL END,
   NULL,
@@ -357,11 +357,11 @@ WITH pairs(multi_sku,base_sku) AS (
 base_effective AS (
   SELECT
     pb.id pricebook_id,
-    pb.multiplier,
+    COALESCE(pb.multiplier,1) AS multiplier,
     p.multi_sku,
     CEIL(
       COALESCE(bp.unit_credits_override,b.default_unit_credits)::numeric
-      * pb.multiplier
+      * COALESCE(pb.multiplier,1)
     )::bigint base_credits
   FROM public.pricing_pricebooks pb
   CROSS JOIN pairs p
@@ -554,8 +554,8 @@ BEGIN
     SELECT
       pb.id,
       p.multi_sku,
-      CEIL(COALESCE(bsp.unit_credits_override,b.default_unit_credits)::numeric*pb.multiplier)::bigint base_credits,
-      CEIL(COALESCE(msp.unit_credits_override,m.default_unit_credits)::numeric*pb.multiplier)::bigint multi_credits
+      CEIL(COALESCE(bsp.unit_credits_override,b.default_unit_credits)::numeric*COALESCE(pb.multiplier,1))::bigint base_credits,
+      CEIL(COALESCE(msp.unit_credits_override,m.default_unit_credits)::numeric*COALESCE(pb.multiplier,1))::bigint multi_credits
     FROM public.pricing_pricebooks pb
     CROSS JOIN pairs p
     JOIN public.pricing_skus b ON b.code=p.base_sku
