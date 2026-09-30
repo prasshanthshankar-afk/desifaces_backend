@@ -52,8 +52,8 @@ INSERT INTO _commercial_prices(sku_code,target_credits) VALUES
   ('FACE_MULTI_PERSON', 48),
   ('FACE_MULTI_PERSON_I2I', 60),
   ('AUDIO_MULTI_PERSON', 4),
-  ('FUSION_TALK_MIN', 2100),
-  ('FUSION_MULTI_PERSON', 2520),
+  ('FUSION_TALK_MIN', 2500),
+  ('FUSION_MULTI_PERSON', 3000),
   ('LONGFORM_CINEMATIC_MIN', 4000),
   ('LONGFORM_TALK_MIN', 2100),
   ('LONGFORM_TALK_ECONOMY_10S', 150),
@@ -254,7 +254,7 @@ WHERE code='AUDIO_MULTI_PERSON';
 -- Base video and dedicated multi/group video.
 UPDATE public.pricing_skus
 SET provider_hint='provider-neutral',
-    default_unit_credits=2100,
+    default_unit_credits=2500,
     metadata_json=COALESCE(metadata_json,'{}'::jsonb) || jsonb_build_object(
       'provider_neutral',true,
       'pricing_owner','svc-pricing',
@@ -265,7 +265,7 @@ WHERE code='FUSION_TALK_MIN';
 
 UPDATE public.pricing_skus
 SET provider_hint='provider-neutral',
-    default_unit_credits=2520,
+    default_unit_credits=3000,
     metadata_json=COALESCE(metadata_json,'{}'::jsonb) || jsonb_build_object(
       'multi_person',true,
       'premium',true,
@@ -432,8 +432,8 @@ INSERT INTO _commercial_costs VALUES
    'Azure standard neural TTS per 1K characters'),
   ('FUSION_TALK_MIN','talking_provider_public_upper_bound',9.60000000,
    'USD 0.16/sec x 60 sec conservative one-attempt talking-provider bound'),
-  ('FUSION_MULTI_PERSON','observed_parent_retry_failover_upper_bound',16.20000000,
-   'rounded above exact observed max parent provider COGS USD 16.185 for one billed minute'),
+  ('FUSION_MULTI_PERSON','one_full_retry_conservative_bound',19.20000000,
+   'USD 0.16/sec x 60 sec x 2 attempts; conservative one-full-retry/fallback bound'),
   ('LONGFORM_CINEMATIC_MIN','cinematic_provider_bundle_conservative',21.60000000,
    'conservative presenter USD 0.16/sec plus 720p cinematic background USD 0.20/sec for 60 sec'),
   ('LONGFORM_TALK_MIN','talking_provider_public_upper_bound',9.60000000,
