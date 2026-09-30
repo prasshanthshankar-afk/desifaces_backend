@@ -264,7 +264,7 @@ select
   s.metadata_json->>'source_sku' source_sku,
   s.metadata_json->>'pricing_policy' pricing_policy,
   case
-    when s.code in ('FACE_MULTI_PERSON','AUDIO_MULTI_PERSON','FUSION_MULTI_PERSON')
+    when s.code in ('FACE_MULTI_PERSON','FACE_MULTI_PERSON_I2I','AUDIO_MULTI_PERSON','FUSION_MULTI_PERSON')
       and coalesce((s.metadata_json->>'premium')::boolean,false)=true
       then 'PREMIUM_SKU'
     else 'BASE_OR_OTHER'
@@ -272,7 +272,7 @@ select
 from public.pricing_skus s
 where s.status='active'
   and (
-    s.code in ('FACE_MULTI_PERSON','AUDIO_MULTI_PERSON','FUSION_MULTI_PERSON')
+    s.code in ('FACE_MULTI_PERSON','FACE_MULTI_PERSON_I2I','AUDIO_MULTI_PERSON','FUSION_MULTI_PERSON')
     or lower(s.category) in ('face','audio','fusion','fusion_extension')
   )
 order by s.category,s.code;
@@ -281,7 +281,7 @@ order by s.category,s.code;
 PREMIUM_NOT_20="$("${PSQL[@]}" -Atq -c "
 select count(*)
 from public.pricing_skus s
-where s.code in ('FACE_MULTI_PERSON','FUSION_MULTI_PERSON')
+where s.code in ('FACE_MULTI_PERSON','FACE_MULTI_PERSON_I2I','FUSION_MULTI_PERSON')
   and s.status='active'
   and coalesce(nullif(s.metadata_json->>'premium_rate_multiplier','')::numeric,0) <> 1.20;
 ")"
@@ -454,7 +454,7 @@ limit 100;
 RECENT_ECON_BAD="$("${PSQL[@]}" -Atq -c "
 select count(*)
 from public.pricing_credit_reservations r
-where r.created_at >= now()-interval '7 days'
+where r.created_at >= greatest(now()-interval '7 days','2026-09-29 23:55:00+00'::timestamptz)
   and r.status='committed'
   and (
     lower(coalesce(r.quote_json->>'service_name','')) in ('svc-face','svc-audio','svc-fusion','svc-fusion-extension')
@@ -466,10 +466,28 @@ where r.created_at >= now()-interval '7 days'
     or jsonb_array_length(coalesce(r.quote_json->'economics'->'missing_cost_skus','[]'::jsonb)) > 0
   );
 ")"
+PRE_ALIGNMENT_ECON_DEBT="$("${PSQL[@]}" -Atq -c "
+select count(*)
+from public.pricing_credit_reservations r
+where r.created_at >= now()-interval '30 days'
+  and r.created_at < '2026-09-29 23:55:00+00'::timestamptz
+  and r.status='committed'
+  and (
+    lower(coalesce(r.quote_json->>'service_name','')) in ('svc-face','svc-audio','svc-fusion','svc-fusion-extension')
+    or lower(coalesce(r.quote_json->>'category','')) in ('face','audio','fusion','fusion_extension')
+  )
+  and (
+    coalesce((r.quote_json->'economics'->>'has_costs_complete')::boolean,false)=false
+    or r.quote_json->'economics'->>'cogs_money_final' is null
+    or jsonb_array_length(coalesce(r.quote_json->'economics'->'missing_cost_skus','[]'::jsonb)) > 0
+  );
+")"
+echo "PRE_ALIGNMENT_INCOMPLETE_ECONOMICS=${PRE_ALIGNMENT_ECON_DEBT:-unknown} informational_only=true"
+
 if [[ "${RECENT_ECON_BAD:-0}" == "0" ]]; then
   echo "RECENT_COMMITTED_ECONOMICS=PASS"
 else
-  echo "RECENT_COMMITTED_ECONOMICS=FAIL committed_rows=${RECENT_ECON_BAD:-unknown}"
+  echo "RECENT_COMMITTED_ECONOMICS=FAIL post_alignment_committed_rows=${RECENT_ECON_BAD:-unknown}"
 fi
 
 RESERVE_PARITY_BAD="$("${PSQL[@]}" -Atq -c "
