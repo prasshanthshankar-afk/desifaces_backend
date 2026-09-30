@@ -57,6 +57,20 @@ echo "FUSION_EXTENSION_BUILD=PASS image=$EXT_IMG"
 
 echo
 echo "===== 3. IN-IMAGE PRICING CERTIFICATION ====="
+docker run --rm "$FACE_IMG" python -m py_compile \
+  /app/app/services/multi_person_pricing_policy.py \
+  /app/desifaces_shared/pricing/multi_person.py
+echo "FACE_PRICING_PYCOMPILE=PASS"
+
+docker run --rm "$FUSION_IMG" python -m py_compile \
+  /app/desifaces_shared/pricing/multi_person.py
+echo "FUSION_PRICING_PYCOMPILE=PASS"
+
+docker run --rm "$EXT_IMG" python -m py_compile \
+  /app/app/api/routes/v3_scene_pricing.py \
+  /app/app/services/premium_actual_seconds_pricing.py
+echo "FUSION_EXTENSION_PRICING_PYCOMPILE=PASS"
+
 docker run --rm -i "$FUSION_IMG" python - <<'PY'
 from desifaces_shared.pricing.multi_person import select_multi_person_pricing
 s = select_multi_person_pricing(studio="fusion", participant_count_value=3, natural_units=2)
@@ -154,7 +168,7 @@ compose_recreate() {
   local IFS=','
   read -ra fs <<< "$files"
   for f in "${fs[@]}"; do args+=(-f "$f"); done
-  ( cd "$wd" && docker compose "${args[@]}" up -d --no-deps --force-recreate --pull never "$service" )
+  ( cd "$wd" && docker compose "${args[@]}" up -d --no-deps --force-recreate --pull never --no-build "$service" )
 }
 
 health_wait() {
