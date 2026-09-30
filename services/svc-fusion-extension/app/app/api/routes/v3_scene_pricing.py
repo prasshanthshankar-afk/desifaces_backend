@@ -38,9 +38,9 @@ router = APIRouter(prefix="/api/longform/v3/scene-pricing", tags=["longform-v3-s
 
 _SERVICE_NAME = "svc-fusion"
 _SERVICE_ACTION = "fusion.video.generate"
-_VARIANT_CODE = "FUSION_TALKING_VIDEO"
-_LEAF_SKU_CODE = "FUSION_TALK_MIN"
-_PROVIDER = "veed_fabric"
+_VARIANT_CODE = "FUSION_MULTI_PERSON"
+_LEAF_SKU_CODE = "FUSION_MULTI_PERSON"
+_PROVIDER = "provider-neutral"
 _PRICING_KEY = "fusion_parent_pricing"
 _MAX_PROBE_CONCURRENCY = 8
 
