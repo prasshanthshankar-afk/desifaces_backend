@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Literal
 from uuid import UUID
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from redis.asyncio import Redis
 
 from .config import settings
@@ -12,7 +13,7 @@ from .context import ContextResolver
 from .db import close_pool, open_business_pool
 from .llm import AssistantLLM
 from .retrieval import SafeKnowledgeRetriever
-from .schemas import AssistantChatIn, AssistantChatOut
+from .schemas import AssistantChatIn, AssistantChatOut, AssistantContextLocator
 from .security import AssistantAuthContext, get_assistant_auth
 from .service import AssistantService
 from .session_store import SessionStore
@@ -31,9 +32,11 @@ async def lifespan(app: FastAPI):
     app.state.http = http
     app.state.retriever = retriever
     app.state.llm = llm
+    context_resolver = ContextResolver(http, pool)
+    app.state.context_resolver = context_resolver
     app.state.service = AssistantService(
         sessions=SessionStore(redis),
-        context_resolver=ContextResolver(http, pool),
+        context_resolver=context_resolver,
         retriever=retriever,
         llm=llm,
     )
@@ -70,11 +73,31 @@ async def health():
         "knowledge_files_skipped": app.state.retriever.skipped_file_count,
         "knowledge_skipped_files": list(app.state.retriever.skipped_files),
         "knowledge_ready": knowledge_ready,
-        "live_context": "dashboard+user_scoped_generation+director_story",
+        "live_context": "dashboard+pricing_spending+saved_work+user_scoped_generation+director_story",
         "privacy_guard": "deterministic_pre_and_post_llm",
         "support_route": "support@desifaces.ai",
         "runtime_ready": redis_ok and llm_ready and knowledge_ready,
     }
+
+
+@app.get("/api/assistant/context")
+async def assistant_context_snapshot(
+    surface: Literal["mobile", "web"] = Query(default="web"),
+    screen: str = Query(default="dashboard", min_length=1, max_length=80),
+    auth: AssistantAuthContext = Depends(get_assistant_auth),
+):
+    """Return the same privacy-projected live context supplied to piku.
+
+    This is intentionally read-only and user-scoped. It is primarily useful for
+    product diagnostics and client-side context awareness; raw identifiers,
+    signed media URLs and payment credentials are removed by ContextResolver.
+    """
+    locator = AssistantContextLocator(surface=surface, screen=screen)
+    return await app.state.context_resolver.resolve(
+        locator,
+        token=auth.token,
+        user_id=auth.user_id,
+    )
 
 
 @app.post("/api/assistant/chat", response_model=AssistantChatOut)
