@@ -315,6 +315,12 @@ def project_safe_live_context(
     studio_jobs: list[dict[str, Any]],
     longform_jobs: list[dict[str, Any]],
     locator: AssistantContextLocator,
+    *,
+    library: Any = None,
+    spending: Any = None,
+    billing: Any = None,
+    notifications: Any = None,
+    stories: Any = None,
 ) -> dict[str, Any]:
     """Project account-wide safe state.
 
@@ -344,12 +350,29 @@ def project_safe_live_context(
         for index, item in enumerate(all_jobs[:20], start=1)
     ]
 
+    account_context = {
+        "billing": _safe_pricing(billing),
+        "spending": _safe_spending(spending),
+        "library": project_safe_library_context(library),
+        "notifications": project_safe_notifications_context(notifications),
+        "stories": project_safe_recent_stories_context(stories),
+    }
+
     return {
         "surface": locator.surface,
         "screen": locator.screen,
         "context_scope": "live_user_application_state",
         "context_policy": "account_wide_screen_is_hint",
-        "live_context_available": bool(home or generation),
+        "context_freshness": "request_time_read_only",
+        "live_context_available": bool(
+            home
+            or generation
+            or account_context["library"]["total_visible"]
+            or account_context["notifications"]["unread_count"]
+            or account_context["stories"]["count"]
+            or account_context["spending"]
+            or account_context["billing"]
+        ),
         "dashboard": {
             "recent_face_count": len(list(home.get("face_carousel") or ())[:50]),
             "recent_final_video_count": len(recent_final_videos),
@@ -362,7 +385,16 @@ def project_safe_live_context(
             "summary": _safe_pricing(home.get("pricing_summary")),
             "runway": _safe_pricing(home.get("runway_summary")),
         },
-        "allowed_actions": ["check_price"],
+        "account": account_context,
+        "allowed_actions": [
+            "check_price",
+            "open_saved_work",
+            "open_plans_usage",
+            "open_face_studio",
+            "open_voice_studio",
+            "open_video_studio",
+            "open_multi_person",
+        ],
     }
 
 
