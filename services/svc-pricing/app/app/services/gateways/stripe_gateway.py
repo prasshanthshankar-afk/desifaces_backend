@@ -111,6 +111,11 @@ class StripeGateway:
     async def list_payment_methods(self, *, customer_id: str, method_type: str = "card") -> Dict[str, Any]:
         return await self._request("GET", "/v1/payment_methods", params={"customer": customer_id, "type": method_type})
 
+    async def retrieve_price(self, price_id: str) -> Dict[str, Any]:
+        if not price_id:
+            raise StripeGatewayError("stripe_price_id_missing")
+        return await self._request("GET", f"/v1/prices/{price_id}")
+
     async def create_wallet_topup_checkout_session(
         self,
         *,
