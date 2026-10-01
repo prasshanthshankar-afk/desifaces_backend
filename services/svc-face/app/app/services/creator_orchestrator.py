@@ -164,6 +164,17 @@ def _build_strict_edit_face_identity_contract(request_dict: Dict[str, Any]) -> D
     if not _is_i2i_mode_value(rd.get("mode") or rd.get("generation_mode")):
         return rd
 
+    raw_subjects = rd.get("subjects")
+    subjects = raw_subjects if isinstance(raw_subjects, list) else []
+    pricing_context = rd.get("pricing_context")
+    pricing_context = pricing_context if isinstance(pricing_context, dict) else {}
+    try:
+        declared_participant_count = int(pricing_context.get("participant_count") or 0)
+    except (TypeError, ValueError):
+        declared_participant_count = 0
+    subject_count = max(len(subjects), declared_participant_count)
+    multi_subject = subject_count > 1
+
     locked_identity_features = [
         "identity",
         "same_real_person",
@@ -279,11 +290,21 @@ def _build_strict_edit_face_identity_contract(request_dict: Dict[str, Any]) -> D
     ]
 
     identity_instruction = (
-        "DESIFACES EDIT FACE STRICT IDENTITY LOCK: edit the input photo while preserving the exact same real person. "
-        "Do not create a new portrait, lookalike, beautified version, or AI-polished face. "
-        "Preserve the original face geometry and natural appearance: forehead, hairline, visible hair, eyes, eye spacing, eyelids, eyebrows, nose width and bridge, lips, mouth shape, cheeks, cheek shape, cheek volume, cheek fullness, lower-face width, jawline, jawline definition, chin size, chin shape, facial fullness, skin tone, natural complexion, skin texture, age appearance, gender presentation, facial hair, glasses/eyewear if present, and natural imperfections. "
-        "The user request may change only explicitly requested non-identity areas such as outfit, clothing, jewelry, background, scene, lighting, framing, camera angle, composition, color grade, or style. "
-        "If the prompt conflicts with identity preservation, ignore only the conflicting identity-change portion and preserve source identity."
+        (
+            "DESIFACES EDIT FACE STRICT GROUP IDENTITY LOCK: edit the input photo while preserving every person and each person's exact real identity. "
+            "Do not add, remove, merge, replace, reorder, or swap people or faces. "
+            "For every person, preserve the original face geometry and natural appearance: forehead, hairline, visible hair, eyes, eye spacing, eyelids, eyebrows, nose width and bridge, lips, mouth shape, cheeks, cheek shape, cheek volume, cheek fullness, lower-face width, jawline, jawline definition, chin size, chin shape, facial fullness, skin tone, natural complexion, skin texture, age appearance, gender presentation, facial hair, glasses/eyewear if present, and natural imperfections. "
+            "The user request may change only explicitly requested non-identity areas such as outfit, clothing, jewelry, background, scene, lighting, framing, camera angle, composition, color grade, or style. "
+            "If the prompt conflicts with identity preservation, ignore only the conflicting identity-change portion and preserve every source identity."
+        )
+        if multi_subject
+        else (
+            "DESIFACES EDIT FACE STRICT IDENTITY LOCK: edit the input photo while preserving the exact same real person. "
+            "Do not create a new portrait, lookalike, beautified version, or AI-polished face. "
+            "Preserve the original face geometry and natural appearance: forehead, hairline, visible hair, eyes, eye spacing, eyelids, eyebrows, nose width and bridge, lips, mouth shape, cheeks, cheek shape, cheek volume, cheek fullness, lower-face width, jawline, jawline definition, chin size, chin shape, facial fullness, skin tone, natural complexion, skin texture, age appearance, gender presentation, facial hair, glasses/eyewear if present, and natural imperfections. "
+            "The user request may change only explicitly requested non-identity areas such as outfit, clothing, jewelry, background, scene, lighting, framing, camera angle, composition, color grade, or style. "
+            "If the prompt conflicts with identity preservation, ignore only the conflicting identity-change portion and preserve source identity."
+        )
     )
 
     negative_prompt = (
@@ -294,6 +315,11 @@ def _build_strict_edit_face_identity_contract(request_dict: Dict[str, Any]) -> D
         "changed skin tone, lighter complexion, darker complexion, changed complexion, changed skin texture, airbrushed skin, overly smoothed skin, plastic skin, waxy skin, "
         "beautified face, idealized replacement face, celebrity-like replacement face, AI-generated replacement face, synthetic replacement face, beauty filter that changes identity, identity-altering glamour retouch, face-reshaping studio retouch, "
         "removed glasses, changed glasses, missing eyewear, changed facial hair, changed age, younger face, older face, changed gender presentation"
+        + (
+            ", missing person, added person, extra person, merged people, duplicate people, swapped identities, wrong face-to-person mapping"
+            if multi_subject
+            else ""
+        )
     )
 
     rd["identity_lock"] = True
@@ -308,8 +334,16 @@ def _build_strict_edit_face_identity_contract(request_dict: Dict[str, Any]) -> D
     rd["identity_lock_instructions"] = identity_instruction
     rd["strict_identity_instruction"] = identity_instruction
     rd["strict_i2i_edit_instruction"] = (
-        "REQUEST-ONLY EDITING RULE: modify only the non-identity attributes the user explicitly asks to change. "
-        "Do not infer changes to cheeks, chin, jawline, skin tone, glasses, facial hair, age, gender, or facial structure."
+        (
+            "REQUEST-ONLY GROUP EDITING RULE: modify only the non-identity attributes the user explicitly asks to change. "
+            "Preserve every person, every face-to-person mapping, and every source identity. "
+            "Do not infer changes to cheeks, chin, jawline, skin tone, glasses, facial hair, age, gender, or facial structure."
+        )
+        if multi_subject
+        else (
+            "REQUEST-ONLY EDITING RULE: modify only the non-identity attributes the user explicitly asks to change. "
+            "Do not infer changes to cheeks, chin, jawline, skin tone, glasses, facial hair, age, gender, or facial structure."
+        )
     )
     rd["negative_prompt"] = _merge_csv_terms(
         rd.get("negative_prompt"),
