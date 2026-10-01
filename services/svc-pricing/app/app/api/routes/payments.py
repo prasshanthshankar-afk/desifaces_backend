@@ -2341,6 +2341,53 @@ async def create_wallet_topup_checkout_session(inp: WalletTopupCreateIn, auth: A
         stripe_account_id = str(resolved_pack.get("stripe_account_id") or "") or None
         stripe_mode = str(resolved_pack.get("stripe_mode") or "") or None
 
+        # Fail closed before creating a wallet order or Checkout Session if the
+        # immutable Stripe Price object no longer matches the canonical desifaces
+        # top-up catalog. This prevents UI/catalog drift from charging a customer
+        # a different amount than the amount shown in desifaces.
+        try:
+            stripe_price = await gw.retrieve_price(stripe_price_id)
+        except StripeGatewayError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        stripe_amount_minor = int(stripe_price.get("unit_amount") or -1)
+        stripe_currency = str(stripe_price.get("currency") or "").strip().upper()
+        stripe_active = stripe_price.get("active") is True
+        stripe_one_time = stripe_price.get("recurring") is None
+        expected_livemode = str(settings.STRIPE_SECRET_KEY or "").startswith("sk_live_")
+        stripe_mode_matches = bool(stripe_price.get("livemode")) == expected_livemode
+
+        if (
+            stripe_amount_minor != amount_minor
+            or stripe_currency != currency
+            or not stripe_active
+            or not stripe_one_time
+            or not stripe_mode_matches
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "stripe_topup_price_mismatch",
+                    "message": "The configured Stripe price does not match the current desifaces credit-pack price.",
+                    "pack_code": pack_code,
+                    "stripe_price_id": stripe_price_id,
+                    "expected": {
+                        "amount_minor": amount_minor,
+                        "currency": currency,
+                        "active": True,
+                        "one_time": True,
+                        "livemode": expected_livemode,
+                    },
+                    "actual": {
+                        "amount_minor": stripe_amount_minor,
+                        "currency": stripe_currency,
+                        "active": stripe_active,
+                        "one_time": stripe_one_time,
+                        "livemode": bool(stripe_price.get("livemode")),
+                    },
+                },
+            )
+
         order_metadata = {
             "pack_code": pack_code,
             "stripe_price_id": stripe_price_id,
