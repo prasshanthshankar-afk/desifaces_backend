@@ -389,15 +389,7 @@ def project_safe_live_context(
             "runway": _safe_pricing(home.get("runway_summary")),
         },
         "account": account_context,
-        "allowed_actions": [
-            "check_price",
-            "open_saved_work",
-            "open_plans_usage",
-            "open_face_studio",
-            "open_voice_studio",
-            "open_video_studio",
-            "open_multi_person",
-        ],
+        "allowed_actions": ["check_price"],
     }
 
 
