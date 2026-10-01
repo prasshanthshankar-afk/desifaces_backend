@@ -145,6 +145,13 @@ async def load_fusion_scene_context(
             )
         )
 
+    if shared_scene_mode:
+        shared_speaker_ids = {turn.participant_id for turn in turns}
+        if len(shared_speaker_ids) != 2:
+            raise SceneFusionBridgeError(
+                "shared_scene_video_requires_exactly_two_speakers"
+            )
+
     return FusionSceneContext(
         workflow_id=UUID(str(stage["workflow_id"])),
         stage_run_id=UUID(str(stage["stage_run_id"])),
