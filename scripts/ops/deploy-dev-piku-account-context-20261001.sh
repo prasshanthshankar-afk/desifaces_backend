@@ -5,8 +5,8 @@ set -Eeuo pipefail
 TARGET_SHA="${TARGET_SHA:?TARGET_SHA is required}"
 [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "FAIL: exact TARGET_SHA required"; exit 2; }
 
-CONTAINER="${PIKU_CONTAINER:-df-v3-svc-assistant}"
-CANDIDATE="df-v3-svc-assistant-account-context-candidate"
+CONTAINER="${PIKU_CONTAINER:-df-svc-assistant}"
+CANDIDATE="df-svc-assistant-account-context-candidate"
 SHORT="${TARGET_SHA:0:12}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 WT="/tmp/df-piku-account-context-$SHORT"
@@ -37,7 +37,7 @@ echo "pricing_service=UNTOUCHED"
 echo "production=UNTOUCHED"
 
 REPO=""
-for p in "$HOME/workspace/desifaces-runtime" "$HOME/workspace/desifaces-v3" "$HOME/workspace/desifaces_backend" "$HOME/workspace/desifaces-backend"; do
+for p in "$HOME/workspace/desifaces-runtime" "$HOME/workspace/desifaces_backend" "$HOME/workspace/desifaces-backend"; do
   [[ -d "$p/.git" || -f "$p/.git" ]] || continue
   remote="$(git -C "$p" remote get-url origin 2>/dev/null || true)"
   if [[ "$remote" == *"prasshanthshankar-afk/desifaces_backend"* ]]; then
@@ -121,27 +121,73 @@ ROLLBACK_IMAGE="desifaces-svc-assistant:rollback-$STAMP"
 docker tag "$OLD_IMAGE_ID" "$ROLLBACK_IMAGE"
 docker tag "$CANDIDATE_IMAGE" "$LIVE_REF"
 
-compose_args=(-p "$PROJECT")
-IFS=',' read -ra files <<< "$CONFIG_FILES"
-for file in "${files[@]}"; do
-  compose_args+=(-f "$file")
-done
+compose_with_live_env(){
+  local mode="$1"
+  python3 - "$ENV_FILE" "$WORKDIR" "$PROJECT" "$CONFIG_FILES" "$SERVICE" "$mode" <<'PY'
+import os, subprocess, sys
+
+env_file, workdir, project, config_files, service, mode = sys.argv[1:]
+env = os.environ.copy()
+
+with open(env_file, "r", encoding="utf-8") as f:
+    for raw in f:
+        line = raw.rstrip("\n")
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key] = value
+
+cmd = ["docker", "compose", "-p", project]
+for file in [x.strip() for x in config_files.split(",") if x.strip()]:
+    cmd += ["-f", file]
+
+if mode == "config":
+    probe = subprocess.run(
+        cmd + ["config", "--services"],
+        cwd=workdir,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if probe.returncode != 0:
+        sys.stderr.write(probe.stderr)
+        raise SystemExit(probe.returncode)
+    services = {x.strip() for x in probe.stdout.splitlines() if x.strip()}
+    if service not in services:
+        raise SystemExit(f"compose service missing after interpolation: {service}")
+    print("COMPOSE_LIVE_ENV_INTERPOLATION=PASS")
+elif mode == "up":
+    subprocess.run(
+        cmd + [
+            "up", "-d", "--no-deps", "--force-recreate",
+            "--pull", "never", "--no-build", service
+        ],
+        cwd=workdir,
+        env=env,
+        check=True,
+    )
+else:
+    raise SystemExit(f"unsupported compose mode: {mode}")
+PY
+}
+
+echo "===== 4A. COMPOSE INTERPOLATION WITH LIVE ASSISTANT ENV ====="
+compose_with_live_env config
 
 rollback(){
   rc=$?
+  trap - ERR
   set +e
   echo "PIKU_ACCOUNT_CONTEXT_ROLLBACK=START"
   docker tag "$ROLLBACK_IMAGE" "$LIVE_REF" >/dev/null 2>&1 || true
-  (cd "$WORKDIR" && docker compose "${compose_args[@]}" up -d --no-deps --force-recreate --pull never --no-build "$SERVICE") >/dev/null 2>&1 || true
+  compose_with_live_env up >/dev/null 2>&1 || true
   echo "PIKU_ACCOUNT_CONTEXT_ROLLBACK=COMPLETE"
   exit "$rc"
 }
 trap rollback ERR
 
-(
-  cd "$WORKDIR"
-  docker compose "${compose_args[@]}" up -d --no-deps --force-recreate --pull never --no-build "$SERVICE"
-)
+compose_with_live_env up
 
 LIVE_HTTP=000
 for i in $(seq 1 45); do
