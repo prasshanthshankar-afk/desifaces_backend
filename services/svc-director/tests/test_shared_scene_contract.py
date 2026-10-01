@@ -109,4 +109,18 @@ def test_shared_scene_video_settings_route_persists_pricing_gate():
     assert 'metadata["shared_scene_motion_mode"] = body.motion_mode' in source
     assert 'metadata["shared_scene_video_settings_version"] = 1' in source
     assert "shared_scene_video_settings_requires_approved_group_photo" in source
+    assert "shared_scene_video_requires_exactly_two_speakers" in source
+    assert "len(speaker_targets) != 2" in source
     assert "pricing_ready" in source
+
+
+def test_shared_scene_fusion_fails_closed_for_non_two_person_video():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "fusion_execution.py"
+    ).read_text(encoding="utf-8")
+
+    assert "shared_scene_video_requires_exactly_two_speakers" in source
+    assert "len(shared_speaker_ids) != 2" in source
