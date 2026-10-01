@@ -74,9 +74,8 @@ async def run_loop() -> None:
 
     try:
         while True:
-            # small jitter to avoid stampeding if multiple workers are started together
-            await asyncio.sleep(settings.EXPIRER_POLL_INTERVAL_S + random.uniform(0, settings.EXPIRER_JITTER_S))
-
+            # Process once immediately on startup so stale holds do not survive
+            # until the first poll interval, then continue on the configured cadence.
             async with pool.acquire() as conn:
                 try:
                     n = await _expire_batch(conn)
@@ -86,6 +85,9 @@ async def run_loop() -> None:
                     logger.warning("pricing_credit_reservations table missing (migrations not applied yet)")
                 except Exception as e:
                     logger.exception("expirer loop error: %s", e)
+
+            # small jitter to avoid stampeding if multiple workers are started together
+            await asyncio.sleep(settings.EXPIRER_POLL_INTERVAL_S + random.uniform(0, settings.EXPIRER_JITTER_S))
     finally:
         await close_db_pool()
 
