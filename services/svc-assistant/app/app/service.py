@@ -496,7 +496,9 @@ def operational_account_answer(message: str, context: dict) -> str | None:
             answer += " Recent notification categories include " + ", ".join(active_categories[:4]) + "."
         return answer
 
-    if "story" in text and any(cue in text for cue in ("recent", "review", "attention", "need", "status")):
+    if any(word in text for word in ("story", "stories", "multi-person", "multi person")) and any(
+        cue in text for cue in ("recent", "review", "attention", "need", "status")
+    ):
         stories = account.get("stories") if isinstance(account.get("stories"), dict) else {}
         count = _as_number(stories.get("count"))
         recent = [item for item in list(stories.get("recent") or ()) if isinstance(item, dict)]
