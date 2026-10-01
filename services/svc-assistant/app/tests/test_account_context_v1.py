@@ -108,10 +108,8 @@ def test_account_context_projection_keeps_real_time_facts_and_drops_customer_con
         assert forbidden not in wire
 
 
-def test_account_context_includes_safe_navigation_actions():
+def test_account_context_preserves_existing_safe_action_contract():
     locator = AssistantContextLocator(surface="web", screen="dashboard")
     safe = project_safe_live_context({}, [], [], locator)
 
-    assert "open_saved_work" in safe["allowed_actions"]
-    assert "open_plans_usage" in safe["allowed_actions"]
-    assert "open_multi_person" in safe["allowed_actions"]
+    assert safe["allowed_actions"] == ["check_price"]
