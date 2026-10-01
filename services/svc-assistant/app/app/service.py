@@ -627,8 +627,8 @@ class AssistantService:
         )
 
         deterministic_answer = (
-            operational_credit_answer(safe_message, context)
-            or operational_account_answer(safe_message, context)
+            operational_account_answer(safe_message, context)
+            or operational_credit_answer(safe_message, context)
             or operational_generation_answer(safe_message, context)
         )
         if deterministic_answer is not None:
