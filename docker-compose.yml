@@ -500,6 +500,28 @@ services:
       start_period: 30s
 
   # -------------------------
+  # Pricing reservation expiry worker
+  # -------------------------
+  svc-pricing-reservation-expirer:
+    <<: *python_service
+    container_name: df-svc-pricing-reservation-expirer
+    depends_on:
+      desifaces-db:
+        condition: service_healthy
+    build:
+      context: .
+      dockerfile: services/svc-pricing/app/Dockerfile.v3
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: "/app"
+    healthcheck:
+      disable: true
+    command: ["bash", "-lc", "python -m app.workers.reservation_expirer"]
+
+  # -------------------------
   # Commerce API
   # -------------------------
     image: desifaces-svc-pricing
