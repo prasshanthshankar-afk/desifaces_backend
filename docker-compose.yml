@@ -1722,9 +1722,14 @@ services:
       DF_DIRECTOR_BASE_URL: http://svc-director:8011
       DF_DASHBOARD_BASE_URL: http://svc-dashboard:8005
       DF_PRICING_BASE_URL: http://svc-pricing:8009
+      DF_CORE_BASE_URL: http://svc-core:8000
+      DF_ASSISTANT_LIBRARY_LIMIT: ${DF_ASSISTANT_LIBRARY_LIMIT:-40}
+      DF_ASSISTANT_RECENT_STORIES_LIMIT: ${DF_ASSISTANT_RECENT_STORIES_LIMIT:-10}
+      DF_ASSISTANT_NOTIFICATIONS_LIMIT: ${DF_ASSISTANT_NOTIFICATIONS_LIMIT:-20}
     depends_on:
       - desifaces-db
       - desifaces-redis
+      - svc-core
       - svc-director
       - svc-dashboard
     networks:
