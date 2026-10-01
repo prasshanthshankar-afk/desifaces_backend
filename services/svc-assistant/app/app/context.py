@@ -15,8 +15,11 @@ from .schemas import AssistantContextLocator
 # out of model context. The Assistant receives workflow facts, not raw customer data.
 _SENSITIVE_KEY_FRAGMENTS = (
     "account_id", "project_id", "story_id", "scene_id", "participant_id", "turn_id",
-    "media_id", "url", "uri", "token", "secret", "password", "email", "phone",
-    "address", "card", "payment_method", "customer_id", "receipt", "provider_request",
+    "workflow_id", "job_id", "run_id", "thread_id", "artifact_id", "profile_id",
+    "subscription_id", "invoice_id", "order_id", "checkout", "gateway",
+    "price_id", "product_id", "notification_id", "media_id", "url", "uri",
+    "token", "secret", "password", "email", "phone", "address", "card",
+    "payment_method", "customer_id", "receipt", "provider_request",
     "dob", "birth", "passport", "license", "ssn", "government_id",
 )
 _ALLOWED_GENERATION_KEY_FRAGMENTS = (
