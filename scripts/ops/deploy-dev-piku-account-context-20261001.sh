@@ -62,9 +62,24 @@ NETWORK="$(docker inspect "$CONTAINER" -f '{{range $k,$v := .NetworkSettings.Net
 [[ -n "$NETWORK" ]] || fail "assistant network unavailable"
 [[ "$LIVE_REF" != *@* ]] || fail "digest-only live image ref is unsupported for safe cutover"
 
+COMPOSE_ENV_FILE=""
+for candidate in \
+  "$WORKDIR/infra/.env" \
+  "$WORKDIR/.env" \
+  "$HOME/workspace/desifaces-runtime/infra/.env" \
+  "$HOME/workspace/desifaces-runtime/.env"
+do
+  if [[ -f "$candidate" ]]; then
+    COMPOSE_ENV_FILE="$candidate"
+    break
+  fi
+done
+[[ -n "$COMPOSE_ENV_FILE" ]] || fail "live desifaces-runtime Compose env file not found"
+
 echo "COMPOSE_OWNERSHIP=PASS project=$PROJECT service=$SERVICE"
 echo "assistant_network=$NETWORK"
 echo "live_image_ref=$LIVE_REF"
+echo "compose_env_source=$COMPOSE_ENV_FILE"
 
 git -C "$REPO" fetch --no-tags origin "$TARGET_SHA" >/dev/null 2>&1 || true
 git -C "$REPO" cat-file -e "$TARGET_SHA^{commit}"
@@ -123,13 +138,13 @@ docker tag "$CANDIDATE_IMAGE" "$LIVE_REF"
 
 compose_with_live_env(){
   local mode="$1"
-  python3 - "$ENV_FILE" "$WORKDIR" "$PROJECT" "$CONFIG_FILES" "$SERVICE" "$mode" <<'PY'
+  python3 - "$ENV_FILE" "$COMPOSE_ENV_FILE" "$WORKDIR" "$PROJECT" "$CONFIG_FILES" "$SERVICE" "$mode" <<'PY'
 import os, subprocess, sys
 
-env_file, workdir, project, config_files, service, mode = sys.argv[1:]
+assistant_env_file, compose_env_file, workdir, project, config_files, service, mode = sys.argv[1:]
 env = os.environ.copy()
 
-with open(env_file, "r", encoding="utf-8") as f:
+with open(assistant_env_file, "r", encoding="utf-8") as f:
     for raw in f:
         line = raw.rstrip("\n")
         if not line or "=" not in line:
@@ -137,7 +152,7 @@ with open(env_file, "r", encoding="utf-8") as f:
         key, value = line.split("=", 1)
         env[key] = value
 
-cmd = ["docker", "compose", "-p", project]
+cmd = ["docker", "compose", "--env-file", compose_env_file, "-p", project]
 for file in [x.strip() for x in config_files.split(",") if x.strip()]:
     cmd += ["-f", file]
 
@@ -172,7 +187,7 @@ else:
 PY
 }
 
-echo "===== 4A. COMPOSE INTERPOLATION WITH LIVE ASSISTANT ENV ====="
+echo "===== 4A. COMPOSE INTERPOLATION WITH LIVE RUNTIME + ASSISTANT ENV ====="
 compose_with_live_env config
 
 rollback(){
