@@ -133,8 +133,6 @@ echo "PIKU_ACCOUNT_CONTEXT_CANDIDATE=PASS"
 echo
 echo "===== 4. CUTOVER ONLY ASSISTANT ====="
 ROLLBACK_IMAGE="desifaces-svc-assistant:rollback-$STAMP"
-docker tag "$OLD_IMAGE_ID" "$ROLLBACK_IMAGE"
-docker tag "$CANDIDATE_IMAGE" "$LIVE_REF"
 
 compose_with_live_env(){
   local mode="$1"
@@ -189,6 +187,10 @@ PY
 
 echo "===== 4A. COMPOSE INTERPOLATION WITH LIVE RUNTIME + ASSISTANT ENV ====="
 compose_with_live_env config
+
+echo "===== 4B. TAG CANDIDATE + CUTOVER ====="
+docker tag "$OLD_IMAGE_ID" "$ROLLBACK_IMAGE"
+docker tag "$CANDIDATE_IMAGE" "$LIVE_REF"
 
 rollback(){
   rc=$?
