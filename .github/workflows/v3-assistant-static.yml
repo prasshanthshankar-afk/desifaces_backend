@@ -52,5 +52,12 @@ jobs:
       - name: Run privacy and context tests
         run: python -m pytest -q services/svc-assistant/app/tests
 
-      - name: Validate compose syntax
-        run: docker compose -f docker-compose.assistant.v3.yml config --no-interpolate >/dev/null
+      - name: Validate compose syntax when repository-owned
+        run: |
+          if [[ -f docker-compose.assistant.v3.yml ]]; then
+            docker compose -f docker-compose.assistant.v3.yml config --no-interpolate >/dev/null
+            echo ASSISTANT_COMPOSE_SYNTAX=PASS
+          else
+            echo ASSISTANT_COMPOSE_SYNTAX=NOT_PRESENT
+            echo "Runtime compose ownership is discovered and validated on the DEV host during cutover."
+          fi
