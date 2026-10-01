@@ -173,11 +173,126 @@ def _safe_live_job(item: dict[str, Any], index: int) -> dict[str, Any]:
     }
 
 
+def _safe_library_context(payload: dict[str, Any] | None) -> dict[str, Any]:
+    raw_items = list((payload or {}).get("items") or ())[:50]
+    counts = {
+        "face": 0,
+        "audio": 0,
+        "video": 0,
+        "group_photo": 0,
+        "multi_person_face": 0,
+        "group_audio": 0,
+        "multi_person_audio": 0,
+        "group_video": 0,
+        "multi_person_video": 0,
+    }
+    recent: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_items, start=1):
+        if not isinstance(item, dict):
+            continue
+        studio = str(item.get("studio") or "").strip().lower()
+        asset_class = str(item.get("asset_class") or "").strip().lower()
+        workflow_kind = str(item.get("workflow_kind") or item.get("conversation_kind") or "").strip().lower()
+        if studio in counts:
+            counts[studio] += 1
+        if asset_class in counts:
+            counts[asset_class] += 1
+        recent.append({
+            "alias": f"Saved work item {index}",
+            "studio": studio or "unknown",
+            "asset_class": asset_class or None,
+            "workflow_kind": workflow_kind or None,
+            "status": _safe_scalar(item.get("status")),
+            "created_at": _safe_scalar(item.get("created_at")),
+            "duration_sec": _safe_scalar(item.get("duration_sec")),
+            "participant_count": _safe_scalar(item.get("participant_count")),
+        })
+    return {
+        "visible_item_count": len(raw_items),
+        "total": _safe_scalar((payload or {}).get("total")),
+        "counts": counts,
+        "recent": recent[:20],
+        "partial": bool((payload or {}).get("partial")),
+    }
+
+
+def _safe_spending_context(
+    summary: dict[str, Any] | None,
+    transactions: dict[str, Any] | None,
+) -> dict[str, Any]:
+    summary = summary or {}
+    credits = summary.get("credits") if isinstance(summary.get("credits"), dict) else {}
+    money = summary.get("money") if isinstance(summary.get("money"), dict) else {}
+    comparison = summary.get("comparison") if isinstance(summary.get("comparison"), dict) else {}
+    categories = []
+    for item in list(summary.get("categories") or ())[:20]:
+        if not isinstance(item, dict):
+            continue
+        categories.append({
+            "category": _safe_scalar(item.get("category")),
+            "credits": _safe_scalar(item.get("credits")),
+            "percent": _safe_scalar(item.get("percent")),
+            "transactions": _safe_scalar(item.get("transactions")),
+        })
+
+    recent_transactions = []
+    for index, item in enumerate(list((transactions or {}).get("items") or ())[:20], start=1):
+        if not isinstance(item, dict):
+            continue
+        recent_transactions.append({
+            "alias": f"Recent account transaction {index}",
+            "occurred_at": _safe_scalar(item.get("occurred_at")),
+            "type": _safe_scalar(item.get("type")),
+            "category": _safe_scalar(item.get("category")),
+            "label": _safe_scalar(item.get("label")),
+            "credits": _safe_scalar(item.get("credits")),
+            "money": _safe_scalar(item.get("money")),
+            "currency": _safe_scalar(item.get("currency")),
+            "status": _safe_scalar(item.get("status")),
+            "channel": _safe_scalar(item.get("channel")),
+        })
+
+    return {
+        "period": _safe_scalar(summary.get("period")),
+        "window": {
+            "start": _safe_scalar((summary.get("window") or {}).get("start")) if isinstance(summary.get("window"), dict) else None,
+            "end": _safe_scalar((summary.get("window") or {}).get("end")) if isinstance(summary.get("window"), dict) else None,
+        },
+        "credits": {
+            "consumed": _safe_scalar(credits.get("consumed")),
+            "refunded": _safe_scalar(credits.get("refunded")),
+            "purchased": _safe_scalar(credits.get("purchased")),
+            "available": _safe_scalar(credits.get("available")),
+            "reserved": _safe_scalar(credits.get("reserved")),
+        },
+        "money": {
+            "paid": _safe_scalar(money.get("paid")),
+            "currency": _safe_scalar(money.get("currency")),
+            "credit_purchases": _safe_scalar(money.get("credit_purchases")),
+            "subscriptions": _safe_scalar(money.get("subscriptions")),
+            "invoices": _safe_scalar(money.get("invoices")),
+            "refunds": _safe_scalar(money.get("refunds")),
+        },
+        "comparison": {
+            "credits_consumed_previous": _safe_scalar(comparison.get("credits_consumed_previous")),
+            "credits_consumed_delta_percent": _safe_scalar(comparison.get("credits_consumed_delta_percent")),
+            "money_paid_previous": _safe_scalar(comparison.get("money_paid_previous")),
+            "money_paid_delta_percent": _safe_scalar(comparison.get("money_paid_delta_percent")),
+        },
+        "categories": categories,
+        "recent_transactions": recent_transactions,
+    }
+
+
 def project_safe_live_context(
     home: dict[str, Any],
     studio_jobs: list[dict[str, Any]],
     longform_jobs: list[dict[str, Any]],
     locator: AssistantContextLocator,
+    *,
+    library: dict[str, Any] | None = None,
+    spending: dict[str, Any] | None = None,
+    transactions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Project account-wide safe state.
 
@@ -219,13 +334,15 @@ def project_safe_live_context(
             "recent_final_videos": recent_final_videos,
         },
         "generation": generation,
+        "saved_work": _safe_library_context(library),
+        "spending": _safe_spending_context(spending, transactions),
         "pricing": {
             "plan": _safe_pricing(home.get("plan")),
             "credits": _safe_pricing(home.get("credits")),
             "summary": _safe_pricing(home.get("pricing_summary")),
             "runway": _safe_pricing(home.get("runway_summary")),
         },
-        "allowed_actions": ["check_price"],
+        "allowed_actions": ["check_price", "view_saved_work", "view_plans_usage"],
     }
 
 
@@ -238,6 +355,54 @@ class ContextResolver:
         try:
             response = await self._client.get(
                 f"{settings.DF_DASHBOARD_BASE_URL}/api/dashboard/home",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if response.status_code in {401, 403}:
+                response.raise_for_status()
+            if response.status_code >= 400:
+                return {}
+            raw = response.json()
+            return raw if isinstance(raw, dict) else {}
+        except (httpx.HTTPError, ValueError):
+            return {}
+
+    async def _fetch_dashboard_library(self, *, token: str) -> dict[str, Any]:
+        try:
+            response = await self._client.get(
+                f"{settings.DF_DASHBOARD_BASE_URL}/api/dashboard/library",
+                params={"type": "all", "limit": 50, "offset": 0},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if response.status_code in {401, 403}:
+                response.raise_for_status()
+            if response.status_code >= 400:
+                return {}
+            raw = response.json()
+            return raw if isinstance(raw, dict) else {}
+        except (httpx.HTTPError, ValueError):
+            return {}
+
+    async def _fetch_spending_summary(self, *, token: str) -> dict[str, Any]:
+        try:
+            response = await self._client.get(
+                f"{settings.DF_PRICING_BASE_URL}/api/pricing/me/spending/summary",
+                params={"period": "month"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if response.status_code in {401, 403}:
+                response.raise_for_status()
+            if response.status_code >= 400:
+                return {}
+            raw = response.json()
+            return raw if isinstance(raw, dict) else {}
+        except (httpx.HTTPError, ValueError):
+            return {}
+
+    async def _fetch_spending_transactions(self, *, token: str) -> dict[str, Any]:
+        try:
+            response = await self._client.get(
+                f"{settings.DF_PRICING_BASE_URL}/api/pricing/me/spending/transactions",
+                params={"period": "month", "kind": "all", "limit": 20, "offset": 0},
                 headers={"Authorization": f"Bearer {token}"},
             )
             if response.status_code in {401, 403}:
@@ -357,17 +522,31 @@ class ContextResolver:
         user_id: UUID,
     ) -> dict[str, Any]:
         home_task = self._fetch_dashboard_home(token=token)
+        library_task = self._fetch_dashboard_library(token=token)
+        spending_task = self._fetch_spending_summary(token=token)
+        transactions_task = self._fetch_spending_transactions(token=token)
         studio_task = self._fetch_recent_studio_jobs(user_id)
         longform_task = self._fetch_recent_longform_jobs(user_id)
         story_task = self._fetch_story_context(locator, token=token)
 
-        home, studio_jobs, longform_jobs, story = await asyncio.gather(
+        home, library, spending, transactions, studio_jobs, longform_jobs, story = await asyncio.gather(
             home_task,
+            library_task,
+            spending_task,
+            transactions_task,
             studio_task,
             longform_task,
             story_task,
         )
-        live = project_safe_live_context(home, studio_jobs, longform_jobs, locator)
+        live = project_safe_live_context(
+            home,
+            studio_jobs,
+            longform_jobs,
+            locator,
+            library=library,
+            spending=spending,
+            transactions=transactions,
+        )
 
         if not story:
             return live

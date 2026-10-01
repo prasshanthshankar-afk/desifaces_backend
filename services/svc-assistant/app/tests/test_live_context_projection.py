@@ -123,4 +123,4 @@ def test_live_context_is_account_wide_even_from_audio_studio():
 
     assert len(safe["generation"]) == 3
     assert [item["kind"] for item in safe["generation"]] == ["video", "audio", "face"]
-    assert safe["allowed_actions"] == ["check_price"]
+    assert safe["allowed_actions"] == ["check_price", "view_saved_work", "view_plans_usage"]

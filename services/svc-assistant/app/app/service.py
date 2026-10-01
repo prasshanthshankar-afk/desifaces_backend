@@ -20,6 +20,13 @@ _ACTION_LABELS = {
     "generate_audio": "Continue to Audio generation",
     "generate_scene": "Continue to scene generation",
     "check_price": "Check price",
+    "view_saved_work": "Open Saved work",
+    "view_plans_usage": "Open Plans & usage",
+}
+
+_ACTION_HREFS = {
+    "view_saved_work": "/app/library",
+    "view_plans_usage": "/app/billing",
 }
 
 _OPERATIONAL_CUES = (
@@ -67,6 +74,28 @@ _CREDIT_CUES = (
 )
 _SUCCESS_STATES = {"ready", "succeeded", "success", "complete", "completed", "done"}
 _FAILURE_STATES = {"failed", "failure", "error", "cancelled", "canceled"}
+
+_SPENDING_CUES = (
+    "spent",
+    "spending",
+    "used this month",
+    "credits used",
+    "where did my credits",
+    "money paid",
+    "paid this month",
+    "usage this month",
+    "credit usage",
+)
+_SAVED_WORK_CUES = (
+    "saved work",
+    "saved creations",
+    "what did i create",
+    "what have i created",
+    "recent creations",
+    "recent work",
+    "how many saved",
+)
+
 
 
 def _normalized(value: object) -> str:
@@ -413,6 +442,88 @@ def operational_credit_answer(message: str, context: dict) -> str | None:
     return " ".join(parts)
 
 
+def operational_account_answer(message: str, context: dict) -> str | None:
+    """Answer authenticated account-spending and saved-work questions from live context."""
+    text = message.lower().strip()
+
+    if any(cue in text for cue in _SPENDING_CUES):
+        spending = context.get("spending") if isinstance(context.get("spending"), dict) else {}
+        credits = spending.get("credits") if isinstance(spending.get("credits"), dict) else {}
+        money = spending.get("money") if isinstance(spending.get("money"), dict) else {}
+        categories = [x for x in list(spending.get("categories") or ()) if isinstance(x, dict)]
+        period = _normalized(spending.get("period")) or "current period"
+        consumed = _as_number(credits.get("consumed"))
+        paid = _as_number(money.get("paid"))
+        currency = _normalized(money.get("currency")) or "USD"
+
+        if consumed is None and paid is None:
+            return (
+                "I checked your authenticated desifaces account context, but current spending data is unavailable right now. "
+                "I won't estimate usage or payments that the pricing system did not return."
+            )
+
+        parts: list[str] = []
+        if consumed is not None:
+            parts.append(f"For the **{period}**, you have used **{_format_number(consumed)} credits**.")
+        if paid is not None:
+            parts.append(f"Recorded money paid for the same period is **{currency} {_format_number(paid)}**.")
+        if categories:
+            top = categories[:4]
+            detail = ", ".join(
+                f"{_normalized(item.get('category'))}: {_format_number(item.get('credits'))} credits"
+                for item in top
+                if _normalized(item.get("category")) and _as_number(item.get("credits")) is not None
+            )
+            if detail:
+                parts.append(f"Usage breakdown: **{detail}**.")
+        return " ".join(parts)
+
+    if any(cue in text for cue in _SAVED_WORK_CUES):
+        saved = context.get("saved_work") if isinstance(context.get("saved_work"), dict) else {}
+        total = _as_number(saved.get("total"))
+        visible = _as_number(saved.get("visible_item_count"))
+        counts = saved.get("counts") if isinstance(saved.get("counts"), dict) else {}
+        recent = [x for x in list(saved.get("recent") or ()) if isinstance(x, dict)]
+
+        if total is None and visible is None and not recent:
+            return (
+                "I checked your authenticated desifaces account context, but Saved work is unavailable right now. "
+                "I won't invent creation history."
+            )
+
+        count_value = total if total is not None else visible
+        parts = [f"I can currently see **{_format_number(count_value)} saved work items** for this account."]
+        meaningful = []
+        for key, label in (
+            ("face", "Face"),
+            ("audio", "Audio"),
+            ("video", "Video"),
+            ("group_photo", "Group Photos"),
+            ("multi_person_face", "Multi-Person Faces"),
+            ("group_audio", "Group Audio"),
+            ("multi_person_audio", "Multi-Person Audio"),
+            ("group_video", "Group Videos"),
+            ("multi_person_video", "Multi-Person Videos"),
+        ):
+            value = _as_number(counts.get(key))
+            if value and value > 0:
+                meaningful.append(f"{label}: {_format_number(value)}")
+        if meaningful:
+            parts.append("Current visible categories: **" + ", ".join(meaningful) + "**.")
+        if recent:
+            latest = recent[0]
+            studio = _normalized(latest.get("studio")) or "creation"
+            status = _normalized(latest.get("status")) or "saved"
+            created = _normalized(latest.get("created_at"))
+            latest_line = f"Your most recent visible saved item is a **{studio}** item with status **{status}**"
+            if created:
+                latest_line += f", created **{created}**"
+            parts.append(latest_line + ".")
+        return " ".join(parts)
+
+    return None
+
+
 class AssistantService:
     def __init__(
         self,
@@ -432,7 +543,15 @@ class AssistantService:
         actions = []
         for action in list(context.get("allowed_actions") or ())[:5]:
             label = _ACTION_LABELS.get(str(action), str(action).replace("_", " ").title())
-            actions.append(AssistantAction(type=str(action), label=label, requires_confirmation=True))
+            action_type = str(action)
+            actions.append(
+                AssistantAction(
+                    type=action_type,
+                    label=label,
+                    requires_confirmation=True,
+                    href=_ACTION_HREFS.get(action_type),
+                )
+            )
         return actions
 
     @staticmethod
@@ -508,7 +627,8 @@ class AssistantService:
         )
 
         deterministic_answer = (
-            operational_credit_answer(safe_message, context)
+            operational_account_answer(safe_message, context)
+            or operational_credit_answer(safe_message, context)
             or operational_generation_answer(safe_message, context)
         )
         if deterministic_answer is not None:
