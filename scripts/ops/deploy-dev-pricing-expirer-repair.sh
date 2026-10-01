@@ -27,6 +27,14 @@ git -C "$ROOT" worktree add --detach "$WT" "$TARGET_SHA" >/dev/null
 cleanup(){ git -C "$ROOT" worktree remove --force "$WT" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+# docker-compose.yml also references ./infra/.env relative to the isolated
+# source tree. Link that path to the already-existing live DEV env instead of
+# copying secrets into the worktree.
+mkdir -p "$WT/infra"
+ln -sfn "$ENV_FILE" "$WT/infra/.env"
+[[ -f "$WT/infra/.env" ]] || { echo "FAIL: isolated live-env link unavailable"; exit 2; }
+echo "ISOLATED_LIVE_ENV_LINK=PASS source=$ENV_FILE"
+
 COMPOSE=(docker compose --project-directory "$WT" -p "$PROJECT" --env-file "$ENV_FILE" -f "$WT/docker-compose.yml")
 
 echo "============================================================"
