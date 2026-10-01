@@ -20,6 +20,20 @@ _ACTION_LABELS = {
     "generate_audio": "Continue to Audio generation",
     "generate_scene": "Continue to scene generation",
     "check_price": "Check price",
+    "open_saved_work": "Open Saved work",
+    "open_plans_usage": "Open Plans & usage",
+    "open_face_studio": "Open Face Studio",
+    "open_voice_studio": "Open Voice Studio",
+    "open_video_studio": "Open Video Studio",
+    "open_multi_person": "Open Multi-Person",
+}
+_ACTION_HREFS = {
+    "open_saved_work": "/app/library",
+    "open_plans_usage": "/app/billing",
+    "open_face_studio": "/app/face",
+    "open_voice_studio": "/app/audio",
+    "open_video_studio": "/app/video",
+    "open_multi_person": "/app/multi-person",
 }
 
 _OPERATIONAL_CUES = (
@@ -413,6 +427,126 @@ def operational_credit_answer(message: str, context: dict) -> str | None:
     return " ".join(parts)
 
 
+def _nested_dict(value: object, *keys: str) -> dict:
+    current = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return {}
+        current = current.get(key)
+    return current if isinstance(current, dict) else {}
+
+
+def operational_account_answer(message: str, context: dict) -> str | None:
+    """Answer common account-specific questions from the safe real-time envelope."""
+    text = message.lower().strip()
+    account = context.get("account") if isinstance(context.get("account"), dict) else {}
+
+    if any(cue in text for cue in ("spend", "spent", "spending", "money paid", "paid this month", "usage this month")):
+        spending = account.get("spending") if isinstance(account.get("spending"), dict) else {}
+        credits = spending.get("credits") if isinstance(spending.get("credits"), dict) else {}
+        money = spending.get("money") if isinstance(spending.get("money"), dict) else {}
+        consumed = _as_number(credits.get("consumed"))
+        paid = _as_number(money.get("paid"))
+        currency = _normalized(money.get("currency")) or "USD"
+        if consumed is None and paid is None:
+            return "I checked your current account spending context, but the spending summary is unavailable right now."
+        parts = ["For your current month:"]
+        if consumed is not None:
+            parts.append(f"you have used **{_format_number(consumed)} credits**")
+        if paid is not None:
+            symbol = "$" if currency.upper() == "USD" else f"{currency.upper()} "
+            parts.append(f"and recorded payments total **{symbol}{_format_number(paid)}**")
+        return " ".join(parts) + "."
+
+    if any(cue in text for cue in ("saved work", "saved creations", "library", "saved face", "saved video", "saved audio")):
+        library = account.get("library") if isinstance(account.get("library"), dict) else {}
+        counts = library.get("counts") if isinstance(library.get("counts"), dict) else {}
+        total = _as_number(library.get("total_visible"))
+        if total is None:
+            return "I checked your Saved work context, but the current library summary is unavailable right now."
+        if not counts:
+            return f"I can currently see **{_format_number(total)} saved items** in your authenticated Saved work view."
+        ordered = [
+            ("face", "Faces"), ("audio", "Audio"), ("video", "Videos"),
+            ("group_photo", "Group Photos"), ("group_audio", "Group Audio"),
+            ("group_video", "Group Videos"), ("multi_person_face", "Multi-Person Faces"),
+            ("multi_person_audio", "Multi-Person Audio"), ("multi_person_video", "Multi-Person Videos"),
+        ]
+        details = [
+            f"**{_format_number(counts.get(key))} {label}**"
+            for key, label in ordered
+            if _as_number(counts.get(key)) not in (None, 0)
+        ]
+        suffix = ", ".join(details[:6])
+        return f"Your current Saved work view contains **{_format_number(total)} items**" + (f": {suffix}." if suffix else ".")
+
+    if "notification" in text or "unread" in text:
+        notifications = account.get("notifications") if isinstance(account.get("notifications"), dict) else {}
+        unread = _as_number(notifications.get("unread_count"))
+        category_counts = notifications.get("category_counts") if isinstance(notifications.get("category_counts"), dict) else {}
+        if unread is None:
+            return "I checked your account notifications, but the unread count is unavailable right now."
+        active_categories = [
+            f"{_format_number(value)} {key}"
+            for key, value in category_counts.items()
+            if (_as_number(value) or 0) > 0
+        ]
+        answer = f"You currently have **{_format_number(unread)} unread notifications**."
+        if active_categories:
+            answer += " Recent notification categories include " + ", ".join(active_categories[:4]) + "."
+        return answer
+
+    if "story" in text and any(cue in text for cue in ("recent", "review", "attention", "need", "status")):
+        stories = account.get("stories") if isinstance(account.get("stories"), dict) else {}
+        count = _as_number(stories.get("count"))
+        recent = [item for item in list(stories.get("recent") or ()) if isinstance(item, dict)]
+        if count is None:
+            return "I checked your recent Multi-Person stories, but that context is unavailable right now."
+        if not recent:
+            return "I do not see any recent Multi-Person stories in your current authenticated account context."
+        needs_review = [
+            item for item in recent
+            if _normalized(item.get("attention_state")).lower() == "awaiting_review"
+        ]
+        failed = [
+            item for item in recent
+            if _normalized(item.get("attention_state")).lower() == "failed"
+        ]
+        answer = f"I can see **{_format_number(count)} recent Multi-Person stories**."
+        if needs_review:
+            answer += f" **{len(needs_review)} need review**."
+        if failed:
+            answer += f" **{len(failed)} currently show a failed attention state**."
+        latest = recent[0]
+        stage = _normalized(latest.get("current_stage"))
+        state = _normalized(latest.get("attention_state")) or _normalized(latest.get("workflow_state")) or _normalized(latest.get("state"))
+        if state:
+            answer += f" Your most recent story is **{state}**"
+            answer += f" at **{stage}**." if stage else "."
+        return answer
+
+    if "plan" in text or "subscription" in text:
+        pricing = context.get("pricing") if isinstance(context.get("pricing"), dict) else {}
+        plan = pricing.get("plan") if isinstance(pricing.get("plan"), dict) else {}
+        billing = account.get("billing") if isinstance(account.get("billing"), dict) else {}
+        current_sub = billing.get("current_subscription") if isinstance(billing.get("current_subscription"), dict) else {}
+        plan_name = (
+            _normalized(plan.get("plan_name"))
+            or _normalized(plan.get("plan_code"))
+            or _normalized(current_sub.get("plan_name"))
+            or _normalized(current_sub.get("plan_code"))
+        )
+        state = _normalized(current_sub.get("subscription_state")) or _normalized(current_sub.get("status"))
+        if not plan_name:
+            return "I checked your authenticated billing context, but your current plan is unavailable right now."
+        answer = f"Your current desifaces plan is **{plan_name}**."
+        if state:
+            answer += f" Subscription state: **{state}**."
+        return answer
+
+    return None
+
+
 class AssistantService:
     def __init__(
         self,
@@ -432,7 +566,15 @@ class AssistantService:
         actions = []
         for action in list(context.get("allowed_actions") or ())[:5]:
             label = _ACTION_LABELS.get(str(action), str(action).replace("_", " ").title())
-            actions.append(AssistantAction(type=str(action), label=label, requires_confirmation=True))
+            href = _ACTION_HREFS.get(str(action))
+            actions.append(
+                AssistantAction(
+                    type=str(action),
+                    label=label,
+                    requires_confirmation=False if href else True,
+                    href=href,
+                )
+            )
         return actions
 
     @staticmethod
@@ -508,7 +650,8 @@ class AssistantService:
         )
 
         deterministic_answer = (
-            operational_credit_answer(safe_message, context)
+            operational_account_answer(safe_message, context)
+            or operational_credit_answer(safe_message, context)
             or operational_generation_answer(safe_message, context)
         )
         if deterministic_answer is not None:
