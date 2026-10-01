@@ -403,20 +403,89 @@ class ContextResolver:
         self._client = client
         self._pool = pool
 
-    async def _fetch_dashboard_home(self, *, token: str) -> dict[str, Any]:
+    async def _get_json(
+        self,
+        url: str,
+        *,
+        token: str,
+        params: dict[str, Any] | None = None,
+        default: Any = None,
+    ) -> Any:
         try:
             response = await self._client.get(
-                f"{settings.DF_DASHBOARD_BASE_URL}/api/dashboard/home",
+                url,
+                params=params,
                 headers={"Authorization": f"Bearer {token}"},
             )
             if response.status_code in {401, 403}:
                 response.raise_for_status()
             if response.status_code >= 400:
-                return {}
-            raw = response.json()
-            return raw if isinstance(raw, dict) else {}
+                return {} if default is None else default
+            return response.json()
         except (httpx.HTTPError, ValueError):
-            return {}
+            return {} if default is None else default
+
+    async def _fetch_dashboard_home(self, *, token: str) -> dict[str, Any]:
+        raw = await self._get_json(
+            f"{settings.DF_DASHBOARD_BASE_URL}/api/dashboard/home",
+            token=token,
+            params={"force": "true"},
+            default={},
+        )
+        return raw if isinstance(raw, dict) else {}
+
+    async def _fetch_dashboard_library(self, *, token: str) -> dict[str, Any]:
+        raw = await self._get_json(
+            f"{settings.DF_DASHBOARD_BASE_URL}/api/dashboard/library",
+            token=token,
+            params={
+                "type": "all",
+                "limit": max(1, min(settings.DF_ASSISTANT_LIBRARY_LIMIT, 100)),
+                "offset": 0,
+            },
+            default={},
+        )
+        return raw if isinstance(raw, dict) else {"items": raw if isinstance(raw, list) else []}
+
+    async def _fetch_spending_summary(self, *, token: str) -> dict[str, Any]:
+        raw = await self._get_json(
+            f"{settings.DF_PRICING_BASE_URL}/api/pricing/me/spending/summary",
+            token=token,
+            params={"period": "month"},
+            default={},
+        )
+        return raw if isinstance(raw, dict) else {}
+
+    async def _fetch_payments_overview(self, *, token: str) -> dict[str, Any]:
+        raw = await self._get_json(
+            f"{settings.DF_PRICING_BASE_URL}/api/payments/overview",
+            token=token,
+            default={},
+        )
+        return raw if isinstance(raw, dict) else {}
+
+    async def _fetch_notifications(self, *, token: str) -> dict[str, Any]:
+        raw = await self._get_json(
+            f"{settings.DF_CORE_BASE_URL}/api/notifications",
+            token=token,
+            params={
+                "limit": max(1, min(settings.DF_ASSISTANT_NOTIFICATIONS_LIMIT, 100)),
+                "offset": 0,
+            },
+            default={},
+        )
+        return raw if isinstance(raw, dict) else {}
+
+    async def _fetch_recent_stories(self, *, token: str) -> list[dict[str, Any]]:
+        raw = await self._get_json(
+            f"{settings.DF_DIRECTOR_BASE_URL}/api/director/stories/recent",
+            token=token,
+            params={
+                "limit": max(1, min(settings.DF_ASSISTANT_RECENT_STORIES_LIMIT, 25)),
+            },
+            default=[],
+        )
+        return [item for item in list(raw or ()) if isinstance(item, dict)] if isinstance(raw, list) else []
 
     async def _fetch_recent_studio_jobs(self, user_id: UUID) -> list[dict[str, Any]]:
         query = r"""
