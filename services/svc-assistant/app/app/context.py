@@ -15,8 +15,11 @@ from .schemas import AssistantContextLocator
 # out of model context. The Assistant receives workflow facts, not raw customer data.
 _SENSITIVE_KEY_FRAGMENTS = (
     "account_id", "project_id", "story_id", "scene_id", "participant_id", "turn_id",
-    "media_id", "url", "uri", "token", "secret", "password", "email", "phone",
-    "address", "card", "payment_method", "customer_id", "receipt", "provider_request",
+    "workflow_id", "job_id", "run_id", "thread_id", "artifact_id", "profile_id",
+    "subscription_id", "invoice_id", "order_id", "checkout", "gateway",
+    "price_id", "product_id", "notification_id", "media_id", "url", "uri",
+    "token", "secret", "password", "email", "phone", "address", "card",
+    "payment_method", "customer_id", "receipt", "provider_request",
     "dob", "birth", "passport", "license", "ssn", "government_id",
 )
 _ALLOWED_GENERATION_KEY_FRAGMENTS = (
@@ -28,7 +31,14 @@ _ALLOWED_PRICING_KEY_FRAGMENTS = (
     "premium", "discount", "balance", "available", "required", "afford", "reserved",
     "used", "included", "wallet", "promo", "billing", "runway", "estimate", "remaining",
     "studio", "mode", "label", "baseline", "variant", "supported", "unsupported",
-    "top_line", "hero_lines", "source_sku",
+    "top_line", "hero_lines", "source_sku", "subscription", "state", "status",
+    "period", "renew", "cancel", "entitlement", "settlement", "interval",
+)
+_ALLOWED_SPENDING_KEY_FRAGMENTS = (
+    "period", "window", "start", "end", "credits", "consumed", "refunded", "purchased",
+    "available", "reserved", "money", "paid", "credit_purchases", "subscriptions",
+    "invoices", "refunds", "currency", "comparison", "previous", "delta", "categories",
+    "category", "trend", "total", "percentage", "percent",
 )
 
 
@@ -83,6 +93,136 @@ def _safe_generation(items: list[dict] | tuple[dict, ...] | None) -> list[dict]:
 def _safe_pricing(value: Any) -> dict[str, Any]:
     projected = _safe_allowlisted_dict(value or {}, allowed_fragments=_ALLOWED_PRICING_KEY_FRAGMENTS)
     return projected if isinstance(projected, dict) else {}
+
+
+def _safe_spending(value: Any) -> dict[str, Any]:
+    projected = _safe_allowlisted_dict(value or {}, allowed_fragments=_ALLOWED_SPENDING_KEY_FRAGMENTS)
+    return projected if isinstance(projected, dict) else {}
+
+
+def _payload_items(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        for key in ("items", "data", "results", "stories"):
+            items = value.get(key)
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+    return []
+
+
+def _safe_library_kind(item: dict[str, Any]) -> str:
+    asset_class = str(item.get("asset_class") or "").strip().lower()
+    workflow_kind = str(item.get("workflow_kind") or item.get("conversation_kind") or "").strip().lower()
+    studio = str(item.get("studio") or item.get("asset_type") or "").strip().lower()
+
+    if asset_class == "group_photo":
+        return "group_photo"
+    if asset_class in {
+        "multi_person_face", "group_audio", "multi_person_audio",
+        "group_video", "multi_person_video",
+    }:
+        return asset_class
+    if workflow_kind == "group_photo_conversation":
+        if "audio" in studio or "voice" in studio:
+            return "group_audio"
+        if "video" in studio or "fusion" in studio:
+            return "group_video"
+        return "group_photo"
+    if workflow_kind == "multi_person_conversation":
+        if "audio" in studio or "voice" in studio:
+            return "multi_person_audio"
+        if "video" in studio or "fusion" in studio:
+            return "multi_person_video"
+        return "multi_person_face"
+    if "audio" in studio or "voice" in studio:
+        return "audio"
+    if "video" in studio or "fusion" in studio:
+        return "video"
+    return "face"
+
+
+def project_safe_library_context(raw: Any) -> dict[str, Any]:
+    items = _payload_items(raw)[:100]
+    counts: dict[str, int] = {}
+    recent: list[dict[str, Any]] = []
+    for index, item in enumerate(items[:20], start=1):
+        kind = _safe_library_kind(item)
+        counts[kind] = counts.get(kind, 0) + 1
+        recent.append({
+            "alias": f"Recent saved {kind.replace('_', ' ')} {index}",
+            "kind": kind,
+            "status": _safe_scalar(item.get("status") or item.get("state") or "saved"),
+            "created_at": _safe_scalar(item.get("created_at")),
+            "updated_at": _safe_scalar(item.get("updated_at")),
+        })
+    for item in items[20:]:
+        kind = _safe_library_kind(item)
+        counts[kind] = counts.get(kind, 0) + 1
+    return {
+        "total_visible": len(items),
+        "counts": counts,
+        "recent": recent,
+    }
+
+
+def project_safe_notifications_context(raw: Any) -> dict[str, Any]:
+    value = raw if isinstance(raw, dict) else {}
+    items = _payload_items(value)[:50]
+    category_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
+    recent: list[dict[str, Any]] = []
+    for index, item in enumerate(items[:20], start=1):
+        category = str(item.get("category") or "other").strip().lower()[:40]
+        priority = str(item.get("priority") or "info").strip().lower()[:40]
+        category_counts[category] = category_counts.get(category, 0) + 1
+        priority_counts[priority] = priority_counts.get(priority, 0) + 1
+        recent.append({
+            "alias": f"Notification {index}",
+            "category": category,
+            "priority": priority,
+            "event_type": _safe_scalar(item.get("event_type")),
+            "created_at": _safe_scalar(item.get("created_at")),
+            "is_read": bool(item.get("is_read")),
+        })
+    unread = value.get("unread_count")
+    try:
+        unread_count = int(unread or 0)
+    except (TypeError, ValueError):
+        unread_count = 0
+    return {
+        "unread_count": max(0, unread_count),
+        "category_counts": category_counts,
+        "priority_counts": priority_counts,
+        "recent": recent,
+    }
+
+
+def project_safe_recent_stories_context(raw: Any) -> dict[str, Any]:
+    items = _payload_items(raw)[:25]
+    recent: list[dict[str, Any]] = []
+    attention_counts: dict[str, int] = {}
+    for index, item in enumerate(items, start=1):
+        attention = str(
+            item.get("attention_state")
+            or item.get("workflow_state")
+            or item.get("state")
+            or "unknown"
+        ).strip().lower()[:60]
+        attention_counts[attention] = attention_counts.get(attention, 0) + 1
+        recent.append({
+            "alias": f"Recent story {index}",
+            "state": _safe_scalar(item.get("state")),
+            "workflow_state": _safe_scalar(item.get("workflow_state")),
+            "current_stage": _safe_scalar(item.get("current_stage")),
+            "attention_state": _safe_scalar(item.get("attention_state")),
+            "updated_at": _safe_scalar(item.get("updated_at")),
+        })
+    return {
+        "count": len(items),
+        "attention_counts": attention_counts,
+        "recent": recent,
+    }
 
 
 def project_safe_story_context(raw: dict[str, Any], locator: AssistantContextLocator) -> dict[str, Any]:
@@ -178,6 +318,12 @@ def project_safe_live_context(
     studio_jobs: list[dict[str, Any]],
     longform_jobs: list[dict[str, Any]],
     locator: AssistantContextLocator,
+    *,
+    library: Any = None,
+    spending: Any = None,
+    billing: Any = None,
+    notifications: Any = None,
+    stories: Any = None,
 ) -> dict[str, Any]:
     """Project account-wide safe state.
 
@@ -207,12 +353,29 @@ def project_safe_live_context(
         for index, item in enumerate(all_jobs[:20], start=1)
     ]
 
+    account_context = {
+        "billing": _safe_pricing(billing),
+        "spending": _safe_spending(spending),
+        "library": project_safe_library_context(library),
+        "notifications": project_safe_notifications_context(notifications),
+        "stories": project_safe_recent_stories_context(stories),
+    }
+
     return {
         "surface": locator.surface,
         "screen": locator.screen,
         "context_scope": "live_user_application_state",
         "context_policy": "account_wide_screen_is_hint",
-        "live_context_available": bool(home or generation),
+        "context_freshness": "request_time_read_only",
+        "live_context_available": bool(
+            home
+            or generation
+            or account_context["library"]["total_visible"]
+            or account_context["notifications"]["unread_count"]
+            or account_context["stories"]["count"]
+            or account_context["spending"]
+            or account_context["billing"]
+        ),
         "dashboard": {
             "recent_face_count": len(list(home.get("face_carousel") or ())[:50]),
             "recent_final_video_count": len(recent_final_videos),
@@ -225,6 +388,7 @@ def project_safe_live_context(
             "summary": _safe_pricing(home.get("pricing_summary")),
             "runway": _safe_pricing(home.get("runway_summary")),
         },
+        "account": account_context,
         "allowed_actions": ["check_price"],
     }
 
@@ -234,20 +398,89 @@ class ContextResolver:
         self._client = client
         self._pool = pool
 
-    async def _fetch_dashboard_home(self, *, token: str) -> dict[str, Any]:
+    async def _get_json(
+        self,
+        url: str,
+        *,
+        token: str,
+        params: dict[str, Any] | None = None,
+        default: Any = None,
+    ) -> Any:
         try:
             response = await self._client.get(
-                f"{settings.DF_DASHBOARD_BASE_URL}/api/dashboard/home",
+                url,
+                params=params,
                 headers={"Authorization": f"Bearer {token}"},
             )
             if response.status_code in {401, 403}:
                 response.raise_for_status()
             if response.status_code >= 400:
-                return {}
-            raw = response.json()
-            return raw if isinstance(raw, dict) else {}
+                return {} if default is None else default
+            return response.json()
         except (httpx.HTTPError, ValueError):
-            return {}
+            return {} if default is None else default
+
+    async def _fetch_dashboard_home(self, *, token: str) -> dict[str, Any]:
+        raw = await self._get_json(
+            f"{settings.DF_DASHBOARD_BASE_URL}/api/dashboard/home",
+            token=token,
+            params={"force": "true"},
+            default={},
+        )
+        return raw if isinstance(raw, dict) else {}
+
+    async def _fetch_dashboard_library(self, *, token: str) -> dict[str, Any]:
+        raw = await self._get_json(
+            f"{settings.DF_DASHBOARD_BASE_URL}/api/dashboard/library",
+            token=token,
+            params={
+                "type": "all",
+                "limit": max(1, min(settings.DF_ASSISTANT_LIBRARY_LIMIT, 100)),
+                "offset": 0,
+            },
+            default={},
+        )
+        return raw if isinstance(raw, dict) else {"items": raw if isinstance(raw, list) else []}
+
+    async def _fetch_spending_summary(self, *, token: str) -> dict[str, Any]:
+        raw = await self._get_json(
+            f"{settings.DF_PRICING_BASE_URL}/api/pricing/me/spending/summary",
+            token=token,
+            params={"period": "month"},
+            default={},
+        )
+        return raw if isinstance(raw, dict) else {}
+
+    async def _fetch_payments_overview(self, *, token: str) -> dict[str, Any]:
+        raw = await self._get_json(
+            f"{settings.DF_PRICING_BASE_URL}/api/payments/overview",
+            token=token,
+            default={},
+        )
+        return raw if isinstance(raw, dict) else {}
+
+    async def _fetch_notifications(self, *, token: str) -> dict[str, Any]:
+        raw = await self._get_json(
+            f"{settings.DF_CORE_BASE_URL}/api/notifications",
+            token=token,
+            params={
+                "limit": max(1, min(settings.DF_ASSISTANT_NOTIFICATIONS_LIMIT, 100)),
+                "offset": 0,
+            },
+            default={},
+        )
+        return raw if isinstance(raw, dict) else {}
+
+    async def _fetch_recent_stories(self, *, token: str) -> list[dict[str, Any]]:
+        raw = await self._get_json(
+            f"{settings.DF_DIRECTOR_BASE_URL}/api/director/stories/recent",
+            token=token,
+            params={
+                "limit": max(1, min(settings.DF_ASSISTANT_RECENT_STORIES_LIMIT, 25)),
+            },
+            default=[],
+        )
+        return [item for item in list(raw or ()) if isinstance(item, dict)] if isinstance(raw, list) else []
 
     async def _fetch_recent_studio_jobs(self, user_id: UUID) -> list[dict[str, Any]]:
         query = r"""
@@ -357,17 +590,47 @@ class ContextResolver:
         user_id: UUID,
     ) -> dict[str, Any]:
         home_task = self._fetch_dashboard_home(token=token)
+        library_task = self._fetch_dashboard_library(token=token)
+        spending_task = self._fetch_spending_summary(token=token)
+        billing_task = self._fetch_payments_overview(token=token)
+        notifications_task = self._fetch_notifications(token=token)
+        stories_task = self._fetch_recent_stories(token=token)
         studio_task = self._fetch_recent_studio_jobs(user_id)
         longform_task = self._fetch_recent_longform_jobs(user_id)
         story_task = self._fetch_story_context(locator, token=token)
 
-        home, studio_jobs, longform_jobs, story = await asyncio.gather(
+        (
+            home,
+            library,
+            spending,
+            billing,
+            notifications,
+            stories,
+            studio_jobs,
+            longform_jobs,
+            story,
+        ) = await asyncio.gather(
             home_task,
+            library_task,
+            spending_task,
+            billing_task,
+            notifications_task,
+            stories_task,
             studio_task,
             longform_task,
             story_task,
         )
-        live = project_safe_live_context(home, studio_jobs, longform_jobs, locator)
+        live = project_safe_live_context(
+            home,
+            studio_jobs,
+            longform_jobs,
+            locator,
+            library=library,
+            spending=spending,
+            billing=billing,
+            notifications=notifications,
+            stories=stories,
+        )
 
         if not story:
             return live

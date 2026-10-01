@@ -24,6 +24,7 @@ class AssistantAction(BaseModel):
     type: str = Field(min_length=1, max_length=100)
     label: str = Field(min_length=1, max_length=160)
     requires_confirmation: bool = True
+    href: str | None = Field(default=None, max_length=500)
 
 
 class AssistantPolicyView(BaseModel):

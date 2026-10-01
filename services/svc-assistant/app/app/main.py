@@ -70,7 +70,7 @@ async def health():
         "knowledge_files_skipped": app.state.retriever.skipped_file_count,
         "knowledge_skipped_files": list(app.state.retriever.skipped_files),
         "knowledge_ready": knowledge_ready,
-        "live_context": "dashboard+user_scoped_generation+director_story",
+        "live_context": "dashboard+library+pricing+spending+notifications+recent_stories+user_scoped_generation+director_story",
         "privacy_guard": "deterministic_pre_and_post_llm",
         "support_route": "support@desifaces.ai",
         "runtime_ready": redis_ok and llm_ready and knowledge_ready,
