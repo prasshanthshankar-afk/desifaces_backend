@@ -28,7 +28,14 @@ _ALLOWED_PRICING_KEY_FRAGMENTS = (
     "premium", "discount", "balance", "available", "required", "afford", "reserved",
     "used", "included", "wallet", "promo", "billing", "runway", "estimate", "remaining",
     "studio", "mode", "label", "baseline", "variant", "supported", "unsupported",
-    "top_line", "hero_lines", "source_sku",
+    "top_line", "hero_lines", "source_sku", "subscription", "state", "status",
+    "period", "renew", "cancel", "entitlement", "settlement", "interval",
+)
+_ALLOWED_SPENDING_KEY_FRAGMENTS = (
+    "period", "window", "start", "end", "credits", "consumed", "refunded", "purchased",
+    "available", "reserved", "money", "paid", "credit_purchases", "subscriptions",
+    "invoices", "refunds", "currency", "comparison", "previous", "delta", "categories",
+    "category", "trend", "total", "percentage", "percent",
 )
 
 
