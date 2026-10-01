@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 from app.services.creator_prompt_service import CreatorPromptService
 
@@ -347,3 +348,83 @@ def test_india_i2i_preserves_source_demographics_and_identity() -> None:
     assert "different person" in negative
     assert "identity drift" in negative
     assert "wrong gender" in negative
+
+
+def test_multi_person_t2i_preserves_full_group_without_single_person_default() -> None:
+    user_prompt = (
+        "Create exactly four distinct people together in one realistic group photo. "
+        "Keep every person visible and do not add or remove anyone."
+    )
+    subjects = [
+        {"gender": "female", "relationship_role": "conversation participant"},
+        {"gender": "male", "relationship_role": "conversation participant"},
+        {"gender": "female", "relationship_role": "conversation participant"},
+        {"gender": "male", "relationship_role": "conversation participant"},
+    ]
+
+    variants, resolved = build(
+        base_request(
+            image_format_code="WIDE",
+            subjects=subjects,
+            pricing_context={"multi_person": True, "participant_count": 4},
+            user_prompt=user_prompt,
+        )
+    )
+
+    prompt = variants[0]["prompt"].lower()
+    negative = variants[0]["negative_prompt"].lower()
+
+    assert "group of 4 distinct people" in prompt
+    assert user_prompt.lower() in prompt
+    assert "female person" not in prompt
+    assert "wrong gender" not in negative
+    assert resolved["subject_count"] == 4
+    assert resolved["multi_subject"] is True
+
+
+def test_multi_person_i2i_preserves_every_person_and_identity() -> None:
+    user_edit = "Change only the background to a warm modern café."
+    subjects = [
+        {"gender": "female"},
+        {"gender": "male"},
+        {"gender": "female"},
+    ]
+
+    variants, resolved = build(
+        base_request(
+            mode="image-to-image",
+            image_format_code="WIDE",
+            subjects=subjects,
+            pricing_context={"multi_person": True, "participant_count": 3},
+            user_prompt=user_edit,
+        )
+    )
+
+    prompt = variants[0]["prompt"].lower()
+    negative = variants[0]["negative_prompt"].lower()
+
+    assert "preserve all people" in prompt
+    assert "keep every person's same face and identity" in prompt
+    assert "do not add, remove, merge, replace, or swap people" in prompt
+    assert prompt.endswith(user_edit.lower())
+    assert "missing person" in negative
+    assert "added person" in negative
+    assert "swapped identities" in negative
+    assert resolved["subject_count"] == 3
+    assert resolved["multi_subject"] is True
+
+
+def test_multi_person_i2i_strict_identity_lock_is_plural_aware() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "services"
+        / "creator_orchestrator.py"
+    ).read_text(encoding="utf-8")
+
+    assert "DESIFACES EDIT FACE STRICT GROUP IDENTITY LOCK" in source
+    assert "preserving every person and each person's exact real identity" in source
+    assert "Do not add, remove, merge, replace, reorder, or swap people or faces." in source
+    assert "REQUEST-ONLY GROUP EDITING RULE" in source
+    assert "wrong face-to-person mapping" in source
