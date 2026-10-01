@@ -50,6 +50,20 @@ import asyncio, json, os
 from decimal import Decimal, ROUND_HALF_UP
 import asyncpg, httpx
 
+def as_dict(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed=json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    try:
+        return dict(value or {})
+    except Exception:
+        return {}
+
 CODES=("PACK_USD_1000","PACK_USD_5000","PACK_USD_15000")
 
 async def main():
@@ -75,7 +89,7 @@ async def main():
     failures=[]
     async with httpx.AsyncClient(timeout=20.0,auth=(key,"")) as client:
         for row in rows:
-            md=dict(row["metadata_json"] or {})
+            md=as_dict(row["metadata_json"])
             price_id=str(md.get("stripe_price_id") or "").strip()
             expected_minor=int((Decimal(str(row["price_money"])) * Decimal("100")).quantize(Decimal("1"),rounding=ROUND_HALF_UP))
             expected_currency=str(row["currency"] or "").lower()
