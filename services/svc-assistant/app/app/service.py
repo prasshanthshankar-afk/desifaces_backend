@@ -20,6 +20,13 @@ _ACTION_LABELS = {
     "generate_audio": "Continue to Audio generation",
     "generate_scene": "Continue to scene generation",
     "check_price": "Check price",
+    "view_saved_work": "Open Saved work",
+    "view_plans_usage": "Open Plans & usage",
+}
+
+_ACTION_HREFS = {
+    "view_saved_work": "/app/library",
+    "view_plans_usage": "/app/billing",
 }
 
 _OPERATIONAL_CUES = (
@@ -536,7 +543,15 @@ class AssistantService:
         actions = []
         for action in list(context.get("allowed_actions") or ())[:5]:
             label = _ACTION_LABELS.get(str(action), str(action).replace("_", " ").title())
-            actions.append(AssistantAction(type=str(action), label=label, requires_confirmation=True))
+            action_type = str(action)
+            actions.append(
+                AssistantAction(
+                    type=action_type,
+                    label=label,
+                    requires_confirmation=True,
+                    href=_ACTION_HREFS.get(action_type),
+                )
+            )
         return actions
 
     @staticmethod
