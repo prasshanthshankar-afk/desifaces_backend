@@ -595,17 +595,47 @@ class ContextResolver:
         user_id: UUID,
     ) -> dict[str, Any]:
         home_task = self._fetch_dashboard_home(token=token)
+        library_task = self._fetch_dashboard_library(token=token)
+        spending_task = self._fetch_spending_summary(token=token)
+        billing_task = self._fetch_payments_overview(token=token)
+        notifications_task = self._fetch_notifications(token=token)
+        stories_task = self._fetch_recent_stories(token=token)
         studio_task = self._fetch_recent_studio_jobs(user_id)
         longform_task = self._fetch_recent_longform_jobs(user_id)
         story_task = self._fetch_story_context(locator, token=token)
 
-        home, studio_jobs, longform_jobs, story = await asyncio.gather(
+        (
+            home,
+            library,
+            spending,
+            billing,
+            notifications,
+            stories,
+            studio_jobs,
+            longform_jobs,
+            story,
+        ) = await asyncio.gather(
             home_task,
+            library_task,
+            spending_task,
+            billing_task,
+            notifications_task,
+            stories_task,
             studio_task,
             longform_task,
             story_task,
         )
-        live = project_safe_live_context(home, studio_jobs, longform_jobs, locator)
+        live = project_safe_live_context(
+            home,
+            studio_jobs,
+            longform_jobs,
+            locator,
+            library=library,
+            spending=spending,
+            billing=billing,
+            notifications=notifications,
+            stories=stories,
+        )
 
         if not story:
             return live
