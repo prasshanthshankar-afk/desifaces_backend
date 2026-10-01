@@ -474,7 +474,9 @@ async def set_shared_scene_conversation(
         },
         "persisted": True,
         "configuration_ready": True,
-        "generation_ready": True,
+        "generation_ready": len(body.speaker_targets) == 2,
+        "video_supported": len(body.speaker_targets) == 2,
+        "video_max_people": 2,
         "fusion_provider": "sync3",
     }
 
@@ -532,6 +534,13 @@ async def set_shared_scene_video_settings(
                 raise HTTPException(
                     status_code=409,
                     detail="shared_scene_video_settings_requires_approved_group_photo",
+                )
+
+            speaker_targets = _metadata(metadata.get("speaker_targets"))
+            if len(speaker_targets) != 2:
+                raise HTTPException(
+                    status_code=422,
+                    detail="shared_scene_video_requires_exactly_two_speakers",
                 )
 
             metadata["shared_scene_motion_mode"] = body.motion_mode

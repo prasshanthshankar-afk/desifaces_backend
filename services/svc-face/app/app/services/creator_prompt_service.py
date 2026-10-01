@@ -316,6 +316,20 @@ class CreatorPromptService:
         )
         translated_prompt = self._as_text(translated_prompt)
 
+        # Multi-person image requests use the explicit subjects list as the
+        # authoritative composition contract. pricing_context is a compatible
+        # fallback for callers that already know the participant count.
+        raw_subjects = request_dict.get("subjects")
+        subjects = raw_subjects if isinstance(raw_subjects, list) else []
+        pricing_context = request_dict.get("pricing_context")
+        pricing_context = pricing_context if isinstance(pricing_context, dict) else {}
+        try:
+            declared_participant_count = int(pricing_context.get("participant_count") or 0)
+        except (TypeError, ValueError):
+            declared_participant_count = 0
+        subject_count = max(len(subjects), declared_participant_count)
+        multi_subject = subject_count > 1
+
         # Track what the user explicitly supplied BEFORE T2I defaulting
         explicit_gender = self._coerce_gender(request_dict.get("gender"))
         explicit_age = self._is_nonempty_code(age_range_code)
@@ -330,13 +344,14 @@ class CreatorPromptService:
         # FACE_VARIANT_GENDER_METADATA_V1: use one resolved gender value for
         # both generation prompting and persisted Face metadata.
         gender = explicit_gender
-        if (not is_i2i) and (not gender):
+        if (not is_i2i) and (not multi_subject) and (not gender):
             gender = self._infer_gender_from_prompt(translated_prompt)
-        if (not is_i2i) and (not gender):
-            gender = "female"  # preserve existing T2I product default
+        if (not is_i2i) and (not multi_subject) and (not gender):
+            gender = "female"  # preserve existing single-person T2I product default
         if (not is_i2i) and gender in {"male", "female"}:
             request_dict["gender"] = gender
-        # I2I: keep empty unless the source/request already supplies it.
+        # Multi-person T2I must never inject one person's default gender across
+        # the entire group. I2I keeps gender empty unless explicitly supplied.
 
         def gender_phrase(g: str) -> Optional[str]:
             g = (g or "").strip().lower()
@@ -351,10 +366,12 @@ class CreatorPromptService:
         # -------------------------
         demographic_parts: List[str] = []
         if not is_i2i:
-            if age_range:
+            if multi_subject:
+                demographic_parts.append(f"group of {subject_count} distinct people")
+            elif age_range:
                 demographic_parts.append(self._as_text(self._get(age_range, "prompt_descriptor")))
 
-            gp = gender_phrase(gender)
+            gp = None if multi_subject else gender_phrase(gender)
             if gp:
                 demographic_parts.append(gp)
 
@@ -501,7 +518,12 @@ class CreatorPromptService:
             if not is_i2i:
                 full_prompt = self._join([demographic_prefix, prompt_instruction, self._join(creative_parts)])
             else:
-                i2i_base = "EDIT THE INPUT PHOTO: keep the SAME person/identity"
+                i2i_base = (
+                    "EDIT THE INPUT PHOTO: preserve ALL people and keep every person's SAME face and identity; "
+                    "do not add, remove, merge, replace, or swap people"
+                    if multi_subject
+                    else "EDIT THE INPUT PHOTO: keep the SAME person/identity"
+                )
                 i2i_parts = [i2i_base]
 
                 # I2I source image owns personal identity and demographics.
@@ -530,6 +552,11 @@ class CreatorPromptService:
                     "different person, different face, identity drift, face morphing",
                     "face swap, wrong identity",
                 ]
+                if multi_subject:
+                    negative.extend([
+                        "missing person, added person, extra person",
+                        "merged people, duplicate people, swapped identities, wrong face-to-person mapping",
+                    ])
 
                 if explicit_gender:
                     negative.append("wrong gender")
@@ -622,5 +649,7 @@ class CreatorPromptService:
             "enable_i2i_variations": enable_i2i_variations,
             "preferred_variations_used": bool(preferred_variations),
             "preferred_variations_n": len(preferred_variations),
+            "subject_count": subject_count,
+            "multi_subject": multi_subject,
         }
         return variants, resolved

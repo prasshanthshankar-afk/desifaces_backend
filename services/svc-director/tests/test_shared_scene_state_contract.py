@@ -27,6 +27,7 @@ def test_shared_scene_state_exposes_one_phase_and_one_next_action():
         '"group_photo_prepare"',
         '"group_photo_map"',
         '"group_photo_approve"',
+        '"group_photo_complete"',
         '"audio"',
         '"video"',
         '"final"',
@@ -35,7 +36,11 @@ def test_shared_scene_state_exposes_one_phase_and_one_next_action():
 
     assert '"next_action": next_action' in state
     assert '"allowed_actions": allowed_actions' in state
-    assert "shared_scene_generate_requires_exactly_two_speakers" in state
+    assert "shared_scene_generate_requires_at_least_two_speakers" in state
+    assert '"generate_supported": len(speakers) >= 2' in state
+    assert '"supported": video_supported' in state
+    assert '"max_people": 2' in state
+    assert '"video_unavailable_for_group_size"' in state
     assert "shared_scene_source_locked_after_photo_selection" in state
 
 
@@ -66,3 +71,5 @@ def test_group_photo_generation_input_honors_face_prompt_limit():
     assert "max_face_prompt_chars = 1500" in state
     assert "trim only" in state
     assert "shared_scene_group_photo_face_prompt_contract_exceeded" in state
+    assert 'if len(speakers) < 2:' in state
+    assert '"participant_count": len(speakers)' in state

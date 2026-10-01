@@ -94,7 +94,7 @@ def _group_photo_generation_input(
         return None
 
     speakers = _approved_people(workflow_meta, live_speakers)
-    if len(speakers) != 2:
+    if len(speakers) < 2:
         return None
 
     participant_lines: list[str] = []
@@ -150,8 +150,14 @@ def _group_photo_generation_input(
         "language": "en",
         "user_prompt": enriched_prompt,
         "prompt": enriched_prompt,
+        # Keep the existing Face schema discriminator for backwards compatibility.
+        # The subjects list is authoritative and may contain 2+ people.
         "subject_composition_code": "two_people",
         "subjects": subjects,
+        "pricing_context": {
+            "multi_person": True,
+            "participant_count": len(speakers),
+        },
         "region_code": _clean(spec.get("scene_region_code")) or None,
         "context_code": _clean(spec.get("context_code")) or None,
         "aspect_ratio": "16:9",
@@ -241,6 +247,7 @@ async def load_shared_scene_state(conn, *, workflow_id: UUID, account_id: UUID) 
     fusion_state = _clean(fusion["state"]).lower() if fusion else ""
     video_settings_saved = bool(fusion_meta.get("shared_scene_video_settings_version"))
     final_ready = bool(workflow["final_media_id"]) or fusion_state == "approved"
+    video_supported = len(speakers) == 2
 
     if not people_approved:
         phase = "people"
@@ -250,7 +257,7 @@ async def load_shared_scene_state(conn, *, workflow_id: UUID, account_id: UUID) 
         phase = "group_photo_source"
         next_action = "choose_group_photo_source"
         allowed_actions = ["choose_upload"]
-        if len(speakers) == 2:
+        if len(speakers) >= 2:
             allowed_actions.insert(0, "choose_generate")
     elif not draft_media_id:
         phase = "group_photo_prepare"
@@ -264,6 +271,13 @@ async def load_shared_scene_state(conn, *, workflow_id: UUID, account_id: UUID) 
         phase = "group_photo_approve"
         next_action = "approve_group_photo"
         allowed_actions = ["approve_group_photo", "replace_group_photo"]
+    elif not video_supported and fusion_state != "approved":
+        # Launch boundary: group images remain valid for 3+ people, but no
+        # paid Audio/Video path is exposed for a group-photo conversation that
+        # cannot yet complete reliable multi-speaker lip-sync.
+        phase = "group_photo_complete"
+        next_action = "video_unavailable_for_group_size"
+        allowed_actions = []
     elif not audio_done:
         phase = "audio"
         next_action = "prepare_audio"
@@ -304,7 +318,7 @@ async def load_shared_scene_state(conn, *, workflow_id: UUID, account_id: UUID) 
         },
         "group_photo": {
             "source_mode": source_mode,
-            "generate_supported": len(speakers) == 2,
+            "generate_supported": len(speakers) >= 2,
             "generation_spec": _dict(workflow_meta.get("shared_scene_group_photo_spec")) or None,
             "generation_input": _group_photo_generation_input(
                 workflow_meta=workflow_meta,
@@ -326,6 +340,9 @@ async def load_shared_scene_state(conn, *, workflow_id: UUID, account_id: UUID) 
             "stage_run_id": str(fusion["stage_run_id"]) if fusion else None,
             "state": fusion_state or None,
             "settings_saved": video_settings_saved,
+            "supported": video_supported,
+            "max_people": 2,
+            "reason": None if video_supported else "shared_scene_video_requires_exactly_two_speakers",
         },
         "final": {
             "ready": final_ready,
@@ -375,7 +392,7 @@ async def set_shared_scene_source_mode(
             ):
                 raise HTTPException(status_code=409, detail="shared_scene_source_locked_after_photo_selection")
             if body.mode == "generate" and not state["group_photo"]["generate_supported"]:
-                raise HTTPException(status_code=422, detail="shared_scene_generate_requires_exactly_two_speakers")
+                raise HTTPException(status_code=422, detail="shared_scene_generate_requires_at_least_two_speakers")
 
             row = await conn.fetchrow(
                 """
@@ -452,7 +469,7 @@ async def set_shared_scene_group_photo_spec(
             if state["group_photo"]["source_mode"] != "generate":
                 raise HTTPException(status_code=409, detail="shared_scene_group_photo_spec_requires_generate_source")
             if not state["group_photo"]["generate_supported"]:
-                raise HTTPException(status_code=422, detail="shared_scene_generate_requires_exactly_two_speakers")
+                raise HTTPException(status_code=422, detail="shared_scene_generate_requires_at_least_two_speakers")
             if state["group_photo"]["draft_media_id"]:
                 raise HTTPException(status_code=409, detail="shared_scene_group_photo_spec_locked_after_photo_selection")
 
