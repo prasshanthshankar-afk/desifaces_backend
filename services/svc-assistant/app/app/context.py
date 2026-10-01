@@ -342,7 +342,7 @@ def project_safe_live_context(
             "summary": _safe_pricing(home.get("pricing_summary")),
             "runway": _safe_pricing(home.get("runway_summary")),
         },
-        "allowed_actions": ["check_price"],
+        "allowed_actions": ["check_price", "view_saved_work", "view_plans_usage"],
     }
 
 
