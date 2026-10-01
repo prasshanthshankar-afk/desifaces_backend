@@ -92,6 +92,136 @@ def _safe_pricing(value: Any) -> dict[str, Any]:
     return projected if isinstance(projected, dict) else {}
 
 
+def _safe_spending(value: Any) -> dict[str, Any]:
+    projected = _safe_allowlisted_dict(value or {}, allowed_fragments=_ALLOWED_SPENDING_KEY_FRAGMENTS)
+    return projected if isinstance(projected, dict) else {}
+
+
+def _payload_items(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        for key in ("items", "data", "results", "stories"):
+            items = value.get(key)
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+    return []
+
+
+def _safe_library_kind(item: dict[str, Any]) -> str:
+    asset_class = str(item.get("asset_class") or "").strip().lower()
+    workflow_kind = str(item.get("workflow_kind") or item.get("conversation_kind") or "").strip().lower()
+    studio = str(item.get("studio") or item.get("asset_type") or "").strip().lower()
+
+    if asset_class == "group_photo":
+        return "group_photo"
+    if asset_class in {
+        "multi_person_face", "group_audio", "multi_person_audio",
+        "group_video", "multi_person_video",
+    }:
+        return asset_class
+    if workflow_kind == "group_photo_conversation":
+        if "audio" in studio or "voice" in studio:
+            return "group_audio"
+        if "video" in studio or "fusion" in studio:
+            return "group_video"
+        return "group_photo"
+    if workflow_kind == "multi_person_conversation":
+        if "audio" in studio or "voice" in studio:
+            return "multi_person_audio"
+        if "video" in studio or "fusion" in studio:
+            return "multi_person_video"
+        return "multi_person_face"
+    if "audio" in studio or "voice" in studio:
+        return "audio"
+    if "video" in studio or "fusion" in studio:
+        return "video"
+    return "face"
+
+
+def project_safe_library_context(raw: Any) -> dict[str, Any]:
+    items = _payload_items(raw)[:100]
+    counts: dict[str, int] = {}
+    recent: list[dict[str, Any]] = []
+    for index, item in enumerate(items[:20], start=1):
+        kind = _safe_library_kind(item)
+        counts[kind] = counts.get(kind, 0) + 1
+        recent.append({
+            "alias": f"Recent saved {kind.replace('_', ' ')} {index}",
+            "kind": kind,
+            "status": _safe_scalar(item.get("status") or item.get("state") or "saved"),
+            "created_at": _safe_scalar(item.get("created_at")),
+            "updated_at": _safe_scalar(item.get("updated_at")),
+        })
+    for item in items[20:]:
+        kind = _safe_library_kind(item)
+        counts[kind] = counts.get(kind, 0) + 1
+    return {
+        "total_visible": len(items),
+        "counts": counts,
+        "recent": recent,
+    }
+
+
+def project_safe_notifications_context(raw: Any) -> dict[str, Any]:
+    value = raw if isinstance(raw, dict) else {}
+    items = _payload_items(value)[:50]
+    category_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
+    recent: list[dict[str, Any]] = []
+    for index, item in enumerate(items[:20], start=1):
+        category = str(item.get("category") or "other").strip().lower()[:40]
+        priority = str(item.get("priority") or "info").strip().lower()[:40]
+        category_counts[category] = category_counts.get(category, 0) + 1
+        priority_counts[priority] = priority_counts.get(priority, 0) + 1
+        recent.append({
+            "alias": f"Notification {index}",
+            "category": category,
+            "priority": priority,
+            "event_type": _safe_scalar(item.get("event_type")),
+            "created_at": _safe_scalar(item.get("created_at")),
+            "is_read": bool(item.get("is_read")),
+        })
+    unread = value.get("unread_count")
+    try:
+        unread_count = int(unread or 0)
+    except (TypeError, ValueError):
+        unread_count = 0
+    return {
+        "unread_count": max(0, unread_count),
+        "category_counts": category_counts,
+        "priority_counts": priority_counts,
+        "recent": recent,
+    }
+
+
+def project_safe_recent_stories_context(raw: Any) -> dict[str, Any]:
+    items = _payload_items(raw)[:25]
+    recent: list[dict[str, Any]] = []
+    attention_counts: dict[str, int] = {}
+    for index, item in enumerate(items, start=1):
+        attention = str(
+            item.get("attention_state")
+            or item.get("workflow_state")
+            or item.get("state")
+            or "unknown"
+        ).strip().lower()[:60]
+        attention_counts[attention] = attention_counts.get(attention, 0) + 1
+        recent.append({
+            "alias": f"Recent story {index}",
+            "state": _safe_scalar(item.get("state")),
+            "workflow_state": _safe_scalar(item.get("workflow_state")),
+            "current_stage": _safe_scalar(item.get("current_stage")),
+            "attention_state": _safe_scalar(item.get("attention_state")),
+            "updated_at": _safe_scalar(item.get("updated_at")),
+        })
+    return {
+        "count": len(items),
+        "attention_counts": attention_counts,
+        "recent": recent,
+    }
+
+
 def project_safe_story_context(raw: dict[str, Any], locator: AssistantContextLocator) -> dict[str, Any]:
     participant_aliases: dict[str, str] = {}
     participants = []
