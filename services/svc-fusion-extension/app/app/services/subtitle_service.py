@@ -40,8 +40,14 @@ def _normalize_caption_text(text: str) -> str:
     return html.unescape(value).strip()
 
 
-def _caption_text_from_row(row: Dict[str, Any]) -> str:
+def _caption_text_from_row(row: Dict[str, Any]) -> Tuple[str, str]:
     script = row.get("script") if isinstance(row.get("script"), dict) else {}
+    speaker = _safe_text(
+        row.get("speaker_name")
+        or row.get("speaker")
+        or row.get("character_name")
+        or script.get("speaker_name")
+    )
     for value in (
         row.get("subtitle_text"),
         row.get("text_chunk"),
@@ -52,14 +58,34 @@ def _caption_text_from_row(row: Dict[str, Any]) -> str:
     ):
         text = _normalize_caption_text(_safe_text(value))
         if text:
-            speaker = _safe_text(
-                row.get("speaker_name")
-                or row.get("speaker")
-                or row.get("character_name")
-                or script.get("speaker_name")
-            )
-            return f"{speaker}: {text}" if speaker else text
-    return ""
+            return speaker, text
+    return speaker, ""
+
+
+def _caption_chunks(text: str, *, max_words: int = 9) -> List[str]:
+    """
+    Keep cues comfortably readable instead of displaying an entire 20–30 second
+    segment as one caption. Prefer sentence boundaries, then split long
+    sentences into small word groups.
+    """
+    normalized = _normalize_caption_text(text)
+    if not normalized:
+        return []
+
+    sentences = [
+        part.strip()
+        for part in re.split(r"(?<=[.!?।！？])\s+", normalized)
+        if part.strip()
+    ]
+    chunks: List[str] = []
+    for sentence in sentences or [normalized]:
+        words = sentence.split()
+        if len(words) <= max_words:
+            chunks.append(sentence)
+            continue
+        for offset in range(0, len(words), max_words):
+            chunks.append(" ".join(words[offset : offset + max_words]))
+    return chunks
 
 
 def build_webvtt(
@@ -83,27 +109,41 @@ def build_webvtt(
     cursor = 0.0
     cue_index = 1
 
-    for raw in rows:
+    for index, raw in enumerate(rows):
         row = dict(raw or {})
-        text = _caption_text_from_row(row)
+        speaker, text = _caption_text_from_row(row)
         duration = max(0.05, _safe_float(row.get("duration_sec"), 0.0))
+        effective_duration = max(0.05, duration - (overlap if index < len(rows) - 1 else 0.0))
 
         if not text:
-            cursor += max(0.0, duration - overlap)
+            cursor += effective_duration
             continue
 
-        start = cursor
-        end = max(start + 0.05, start + duration)
-        cues.extend(
-            [
-                str(cue_index),
-                f"{_format_vtt_time(start)} --> {_format_vtt_time(end)}",
-                text,
-                "",
-            ]
-        )
-        cue_index += 1
-        cursor += max(0.0, duration - overlap)
+        chunks = _caption_chunks(text)
+        word_counts = [max(1, len(chunk.split())) for chunk in chunks]
+        total_words = max(1, sum(word_counts))
+        chunk_start = cursor
+
+        for chunk_index, chunk in enumerate(chunks):
+            if chunk_index == len(chunks) - 1:
+                chunk_end = cursor + effective_duration
+            else:
+                share = effective_duration * (word_counts[chunk_index] / total_words)
+                chunk_end = max(chunk_start + 0.35, chunk_start + share)
+
+            rendered = f"{speaker}: {chunk}" if speaker else chunk
+            cues.extend(
+                [
+                    str(cue_index),
+                    f"{_format_vtt_time(chunk_start)} --> {_format_vtt_time(chunk_end)}",
+                    rendered,
+                    "",
+                ]
+            )
+            cue_index += 1
+            chunk_start = chunk_end
+
+        cursor += effective_duration
 
     return "\n".join(cues).rstrip() + "\n"
 
