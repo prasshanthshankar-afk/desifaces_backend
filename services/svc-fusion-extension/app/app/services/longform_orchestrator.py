@@ -71,6 +71,7 @@ from app.domain.models import (
 from app.repos.longform_jobs_repo import LongformJobsRepo
 from app.repos.longform_segments_repo import LongformSegmentsRepo
 from app.services.stitch_service import compose_timeline, download_to_local, probe_duration_seconds, upload_final_mp4
+from app.services.subtitle_service import write_webvtt, upload_webvtt
 from app.services.premium_actual_seconds_pricing import (
     PREMIUM_ACTUAL_SECONDS_ACTION,
     PREMIUM_ACTUAL_SECONDS_SKU,
