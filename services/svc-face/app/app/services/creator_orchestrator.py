@@ -153,6 +153,25 @@ def _merge_csv_terms(*values: Any) -> str:
     return ", ".join(out)
 
 
+def _group_asset_metadata(request_dict: Dict[str, Any]) -> Dict[str, Any]:
+    rd = dict(request_dict or {})
+    raw_subjects = rd.get("subjects")
+    subjects = raw_subjects if isinstance(raw_subjects, list) else []
+    pricing_context = rd.get("pricing_context")
+    pricing_context = pricing_context if isinstance(pricing_context, dict) else {}
+    try:
+        declared_count = int(pricing_context.get("participant_count") or 0)
+    except (TypeError, ValueError):
+        declared_count = 0
+    participant_count = max(len(subjects), declared_count)
+    if participant_count < 2:
+        return {}
+    return {
+        "asset_class": "group_photo",
+        "participant_count": participant_count,
+    }
+
+
 def _build_strict_edit_face_identity_contract(request_dict: Dict[str, Any]) -> Dict[str, Any]:
     """
     DesiFaces Edit Face contract.
@@ -3851,6 +3870,8 @@ class CreatorOrchestrator:
                 technical["gender"] = gender
                 technical["gender_presentation"] = gender
 
+            group_asset_metadata = _group_asset_metadata(request_dict)
+
             asset_id = await self.assets_repo.create_asset(
                 user_id=user_id,
                 kind="face_image",
@@ -3859,6 +3880,7 @@ class CreatorOrchestrator:
                 size_bytes=file_size or 150000,
                 meta={
                     "job_id": job_id,
+                    **group_asset_metadata,
                     "variant": variant_num,
                     "seed_mode": variant.get("seed_mode"),
                     "job_seed": variant.get("job_seed"),
@@ -3907,6 +3929,7 @@ class CreatorOrchestrator:
                 },
                 meta={
                     "job_id": job_id,
+                    **group_asset_metadata,
                     "variant": variant_num,
                     "seed_mode": variant.get("seed_mode"),
                     "job_seed": variant.get("job_seed"),
