@@ -1846,7 +1846,7 @@ async def get_longform_job(
         tags = _as_dict_loose(row.get("tags"))
         directed = _as_dict_loose(tags.get("directed_plan"))
         intent = _as_dict_loose(directed.get("intent"))
-        timeline = directed.get("timeline") if isinstance(directed.get("timeline"), dict) else None
+        timeline = directed.get("timeline") if isinstance(directed.get("timeline"), dict) else (_as_dict_loose(tags.get("timeline")) or None)
         qc = directed.get("qc") if isinstance(directed.get("qc"), dict) else None
         story_beats = directed.get("story_beats") if isinstance(directed.get("story_beats"), list) else []
 
@@ -1892,6 +1892,10 @@ async def get_longform_job(
             progress=progress_view,
             final_video_url=final_url,
             final_storage_path=row["final_storage_path"],
+            subtitle_track_url=subtitle_track_url,
+            subtitle_storage_path=subtitle_storage_path,
+            subtitles_enabled=bool(subtitle_track_url),
+            subtitle_language=_safe_str(tags.get("subtitle_language")),
             error_code=row["error_code"],
             error_message=row["error_message"],
             created_at=row["created_at"].isoformat(),
