@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Checkout backend candidate
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -38,7 +40,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git diff --name-only HEAD^ HEAD | tee /tmp/changed.txt
+          git fetch origin fix/next3-shared-scene-profile-lock-fix-20260928 --quiet
+          BASE="$(git merge-base origin/fix/next3-shared-scene-profile-lock-fix-20260928 HEAD)"
+          git diff --name-only "$BASE"...HEAD | tee /tmp/changed.txt
           grep -Ev '^(services/svc-director/app/app/shared_scene_state_routes.py|services/svc-director/tests/test_shared_scene_state_contract.py|.github/workflows/shared-scene-draft-persistence-certification.yml)$' /tmp/changed.txt > /tmp/unexpected.txt || true
           test ! -s /tmp/unexpected.txt
           echo DATABASE_MIGRATION=NONE
