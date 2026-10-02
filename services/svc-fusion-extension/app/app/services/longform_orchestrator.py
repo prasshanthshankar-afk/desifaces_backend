@@ -3269,7 +3269,10 @@ async def stitch_if_ready(
 
             if require_subtitles:
                 subtitle_local = os.path.join(td, "captions.vtt")
-                transition_seconds = _safe_float(overlay_meta.get("transition_duration_sec"), 0.5)
+                try:
+                    transition_seconds = float(overlay_meta.get("transition_duration_sec") or 0.5)
+                except Exception:
+                    transition_seconds = 0.5
                 write_webvtt(
                     [dict(r) for r in rows],
                     subtitle_local,
