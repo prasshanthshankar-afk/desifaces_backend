@@ -1,0 +1,49 @@
+name: Group Photo Library Metadata Certification
+
+on:
+  push:
+    branches:
+      - fix/group-photo-library-metadata-20261001
+  pull_request:
+    branches:
+      - fix/shared-scene-draft-state-persistence-20261001
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout backend candidate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Saved Work source contract
+        run: python scripts/test-group-photo-library-metadata.py
+
+      - name: Python compile gate
+        run: |
+          python -m py_compile services/svc-face/app/app/services/creator_orchestrator.py
+          python -m py_compile services/svc-dashboard/app/app/services/dashboard_service.py
+
+      - name: Mutation boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin fix/shared-scene-draft-state-persistence-20261001 --quiet
+          BASE="$(git merge-base origin/fix/shared-scene-draft-state-persistence-20261001 HEAD)"
+          git diff --name-only "$BASE"...HEAD | tee /tmp/changed.txt
+          grep -Ev '^(services/svc-face/app/app/services/creator_orchestrator.py|services/svc-dashboard/app/app/services/dashboard_service.py|scripts/test-group-photo-library-metadata.py|.github/workflows/group-photo-library-metadata-certification.yml)$' /tmp/changed.txt > /tmp/unexpected.txt || true
+          test ! -s /tmp/unexpected.txt
+          echo DATABASE_MIGRATION=NONE
+          echo PRICING_MUTATION=NONE
+          echo GROUP_PHOTO_LIBRARY_METADATA=PASS
