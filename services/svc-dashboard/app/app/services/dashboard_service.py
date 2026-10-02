@@ -1485,6 +1485,16 @@ def _normalize_library_item(
     artifact_id = _clean_text(_pick_first(item, "artifact_id", "face_artifact_id", "audio_artifact_id", "video_artifact_id"))
     media_asset_id = _clean_text(_pick_first(item, "media_asset_id", "face_media_asset_id", "audio_media_asset_id", "video_media_asset_id"))
     face_profile_id = _clean_text(_pick_first(item, "face_profile_id")) or _clean_text(meta.get("face_profile_id"))
+    asset_class = (
+        _clean_text(_pick_first(item, "asset_class"))
+        or _clean_text(reuse.get("asset_class"))
+        or _clean_text(meta.get("asset_class"))
+    )
+    participant_count = (
+        _as_number(_pick_first(item, "participant_count"))
+        or _as_number(reuse.get("participant_count"))
+        or _as_number(meta.get("participant_count"))
+    )
     created_at = _pick_first(item, "created_at", "updated_at")
 
     library_id = _clean_text(_pick_first(item, "library_id", "id"))
@@ -1548,6 +1558,8 @@ def _normalize_library_item(
         "library_id": library_id,
         "studio": studio,
         "asset_type": asset_type,
+        "asset_class": asset_class or None,
+        "participant_count": int(participant_count) if participant_count else None,
         "title": title,
         "status": _clean_text(_pick_first(item, "status")) or "ready",
         "created_at": created_at.isoformat() if isinstance(created_at, datetime) else created_at,
