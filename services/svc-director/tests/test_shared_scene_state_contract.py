@@ -53,6 +53,8 @@ def test_shared_scene_group_photo_spec_and_draft_are_durable_commands():
     assert "generation_input" in state
     assert "/shared-scene-draft" in scene
     assert "shared_scene_draft_media_id" in scene
+    assert '"speaker_targets": targets' in state
+    assert '"dimensions": dimensions or None' in state
 
 
 def test_legacy_approved_snapshot_is_repaired_before_group_photo_progression():
