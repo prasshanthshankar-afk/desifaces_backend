@@ -32,3 +32,14 @@ def test_build_webvtt_supports_speaker_label():
         [{"duration_sec": 2, "text_chunk": "Hi", "speaker_name": "Maya"}]
     )
     assert "Maya: Hi" in body
+
+
+def test_build_webvtt_splits_long_caption_into_readable_cues():
+    body = build_webvtt(
+        [{
+            "duration_sec": 8,
+            "text_chunk": "This is a deliberately longer subtitle sentence that should be split into multiple readable caption cues for viewers.",
+        }]
+    )
+    assert body.count(" --> ") >= 2
+    assert "deliberately longer subtitle" in body
