@@ -3268,28 +3268,41 @@ async def stitch_if_ready(
             subtitle_language = _safe_str(tags.get("subtitle_language")) or _safe_str(_as_dict_loose(tags.get("selected_audio")).get("locale")) or "en"
 
             if require_subtitles:
-                subtitle_local = os.path.join(td, "captions.vtt")
                 try:
-                    transition_seconds = float(overlay_meta.get("transition_duration_sec") or 0.5)
-                except Exception:
-                    transition_seconds = 0.5
-                write_webvtt(
-                    [dict(r) for r in rows],
-                    subtitle_local,
-                    stitch_mode=_safe_str(overlay_meta.get("stitch_mode")) or "concat",
-                    transition_seconds=transition_seconds,
-                )
-                subtitle_storage_path, subtitle_track_url = upload_webvtt(
-                    subtitle_local,
-                    storage_path=f"{storage_path}.vtt",
-                )
-                timeline_patch = _as_dict_loose(tags.get("timeline"))
-                timeline_patch["subtitle_track_url"] = subtitle_track_url
-                tags["timeline"] = timeline_patch
-                tags["subtitle_track_url"] = subtitle_track_url
-                tags["subtitle_storage_path"] = subtitle_storage_path
-                tags["subtitles_enabled"] = True
-                tags["subtitle_language"] = subtitle_language
+                    subtitle_local = os.path.join(td, "captions.vtt")
+                    try:
+                        transition_seconds = float(overlay_meta.get("transition_duration_sec") or 0.5)
+                    except Exception:
+                        transition_seconds = 0.5
+                    write_webvtt(
+                        [dict(r) for r in rows],
+                        subtitle_local,
+                        stitch_mode=_safe_str(overlay_meta.get("stitch_mode")) or "concat",
+                        transition_seconds=transition_seconds,
+                    )
+                    subtitle_storage_path, subtitle_track_url = upload_webvtt(
+                        subtitle_local,
+                        storage_path=f"{storage_path}.vtt",
+                    )
+                    timeline_patch = _as_dict_loose(tags.get("timeline"))
+                    timeline_patch["subtitle_track_url"] = subtitle_track_url
+                    tags["timeline"] = timeline_patch
+                    tags["subtitle_track_url"] = subtitle_track_url
+                    tags["subtitle_storage_path"] = subtitle_storage_path
+                    tags["subtitles_enabled"] = True
+                    tags["subtitle_language"] = subtitle_language
+                    tags.pop("subtitle_error", None)
+                except Exception as subtitle_exc:
+                    # A caption-sidecar failure must never invalidate an already
+                    # completed/paid video. Keep the video final and surface a
+                    # recoverable subtitle status for observability and retry.
+                    logger.exception(
+                        "subtitle_track_generation_failed job_id=%s",
+                        job_id,
+                    )
+                    tags["subtitles_enabled"] = False
+                    tags["subtitle_language"] = subtitle_language
+                    tags["subtitle_error"] = str(subtitle_exc)[:500]
                 await jobs.update_tags(conn, job_id, tags)
 
             refreshed_job_row = await jobs.get_job(conn, job_id)
