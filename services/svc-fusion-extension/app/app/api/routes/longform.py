@@ -1700,6 +1700,8 @@ async def create_longform_job(
             "camera_framing": getattr(req, "camera_framing", None) or job_tags.get("camera_framing"),
             "camera_motion_style": getattr(req, "camera_motion_style", None) or job_tags.get("camera_motion_style"),
             "background_mode": getattr(req, "background_mode", None) or job_tags.get("background_mode") or "fixed",
+            "require_subtitles": bool(getattr(req, "require_subtitles", None) if getattr(req, "require_subtitles", None) is not None else getattr(req.constraints, "require_subtitles", False)),
+            "subtitle_language": _safe_str(job_tags.get("subtitle_language")) or _safe_str(getattr(req.voice_cfg, "locale", None)) or "en",
             "country_code": country_code,
             "billing_country_code": country_code,
             "requested_duration_sec": requested_duration_sec or _extract_requested_duration_sec(planning_payload),
