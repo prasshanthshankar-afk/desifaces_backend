@@ -3260,6 +3260,34 @@ async def stitch_if_ready(
             )
             storage_path, signed_url = upload_final_mp4(final_local)
             await jobs.set_final(conn, job_id, storage_path, signed_url)
+
+            subtitle_track_url = None
+            subtitle_storage_path = None
+            require_subtitles = bool(tags.get("require_subtitles"))
+            subtitle_language = _safe_str(tags.get("subtitle_language")) or _safe_str(_as_dict_loose(tags.get("selected_audio")).get("locale")) or "en"
+
+            if require_subtitles:
+                subtitle_local = os.path.join(td, "captions.vtt")
+                transition_seconds = _safe_float(overlay_meta.get("transition_duration_sec"), 0.5)
+                write_webvtt(
+                    [dict(r) for r in rows],
+                    subtitle_local,
+                    stitch_mode=_safe_str(overlay_meta.get("stitch_mode")) or "concat",
+                    transition_seconds=transition_seconds,
+                )
+                subtitle_storage_path, subtitle_track_url = upload_webvtt(
+                    subtitle_local,
+                    storage_path=f"{storage_path}.vtt",
+                )
+                timeline_patch = _as_dict_loose(tags.get("timeline"))
+                timeline_patch["subtitle_track_url"] = subtitle_track_url
+                tags["timeline"] = timeline_patch
+                tags["subtitle_track_url"] = subtitle_track_url
+                tags["subtitle_storage_path"] = subtitle_storage_path
+                tags["subtitles_enabled"] = True
+                tags["subtitle_language"] = subtitle_language
+                await jobs.update_tags(conn, job_id, tags)
+
             refreshed_job_row = await jobs.get_job(conn, job_id)
             effective_job_row = dict(refreshed_job_row) if refreshed_job_row else dict(job_row)
             refreshed_tags = _job_tags_dict(effective_job_row)
