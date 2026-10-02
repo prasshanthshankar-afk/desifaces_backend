@@ -1,4 +1,4 @@
-# desifaces Video Subtitles v1
+# desifaces Video Subtitles
 
 ## Product contract
 
@@ -44,7 +44,7 @@ CaptionedVideo
 
 ## Timing model
 
-v1 uses the approved script and final segment lineage rather than retranscribing the finished audio.
+The current implementation uses the approved script and final segment lineage rather than retranscribing the finished audio.
 
 - Each final segment contributes its actual/recorded segment duration.
 - Concatenated videos use cumulative segment boundaries.
@@ -57,7 +57,7 @@ A later precision enhancement can consume TTS word-boundary timestamps without c
 
 ## Storage and API
 
-No database schema migration is required in v1.
+No database schema migration is required in this implementation.
 
 The longform job tags persist:
 
