@@ -7,6 +7,10 @@ on:
   pull_request:
     branches:
       - fix/next3-shared-scene-profile-lock-fix-20260928
+    paths:
+      - services/svc-director/app/app/shared_scene_state_routes.py
+      - services/svc-director/tests/test_shared_scene_state_contract.py
+      - .github/workflows/shared-scene-draft-persistence-certification.yml
   workflow_dispatch:
 
 permissions:
