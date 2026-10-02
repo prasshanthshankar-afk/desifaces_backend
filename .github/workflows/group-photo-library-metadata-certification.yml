@@ -1,5 +1,7 @@
 name: Group Photo Library Metadata Certification
 
+# Scoped launch certification for group-photo Saved Work metadata.
+
 on:
   push:
     branches:
