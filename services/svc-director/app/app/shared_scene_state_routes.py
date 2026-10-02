@@ -213,6 +213,7 @@ async def load_shared_scene_state(conn, *, workflow_id: UUID, account_id: UUID) 
     fusion = fusion_rows[0] if fusion_rows else None
     fusion_meta = _dict(fusion["metadata_json"]) if fusion else {}
     targets = _dict(fusion_meta.get("speaker_targets"))
+    dimensions = _dict(fusion_meta.get("shared_scene_dimensions"))
     mapped_count = len([participant_id for participant_id in speaker_ids if participant_id in targets])
     draft_media_id = _clean(
         fusion_meta.get("shared_scene_draft_media_id")
@@ -326,6 +327,8 @@ async def load_shared_scene_state(conn, *, workflow_id: UUID, account_id: UUID) 
             ),
             "draft_media_id": draft_media_id,
             "approved_media_id": approved_media_id,
+            "dimensions": dimensions or None,
+            "speaker_targets": targets,
             "mapped_count": mapped_count,
             "required_mapped_count": len(speakers),
             "approved": group_photo_approved,
