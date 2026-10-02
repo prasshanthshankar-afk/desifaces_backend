@@ -123,13 +123,15 @@ def build_webvtt(
         word_counts = [max(1, len(chunk.split())) for chunk in chunks]
         total_words = max(1, sum(word_counts))
         chunk_start = cursor
+        cumulative_words = 0
 
         for chunk_index, chunk in enumerate(chunks):
-            if chunk_index == len(chunks) - 1:
-                chunk_end = cursor + effective_duration
-            else:
-                share = effective_duration * (word_counts[chunk_index] / total_words)
-                chunk_end = max(chunk_start + 0.35, chunk_start + share)
+            cumulative_words += word_counts[chunk_index]
+            chunk_end = (
+                cursor + effective_duration
+                if chunk_index == len(chunks) - 1
+                else cursor + (effective_duration * cumulative_words / total_words)
+            )
 
             rendered = f"{speaker}: {chunk}" if speaker else chunk
             cues.extend(
