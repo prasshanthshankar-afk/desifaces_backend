@@ -1857,6 +1857,22 @@ async def get_longform_job(
                 settings.FINAL_SAS_TTL_SECONDS,
             )
 
+        subtitle_storage_path = _safe_str(tags.get("subtitle_storage_path"))
+        subtitle_track_url = None
+        if subtitle_storage_path:
+            az = AzureBlobService(settings.AZURE_STORAGE_CONNECTION_STRING)
+            subtitle_track_url = az.sign_read_url(
+                settings.AZURE_VIDEO_OUTPUT_CONTAINER,
+                subtitle_storage_path,
+                settings.FINAL_SAS_TTL_SECONDS,
+            )
+        else:
+            subtitle_track_url = _safe_str(tags.get("subtitle_track_url"))
+
+        if timeline and subtitle_track_url:
+            timeline = dict(timeline)
+            timeline["subtitle_track_url"] = subtitle_track_url
+
         pricing_view, pricing_summary_view = await _load_latest_pricing_view(conn, str(row["id"]), {"tags": tags})
         run_receipt_view = _build_run_receipt_view(pricing_view, pricing_summary_view)
         progress_rows = await segs_repo.list_segments_for_job(conn, str(row["id"]))
