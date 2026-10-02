@@ -3,10 +3,10 @@ name: Group Photo Library Metadata Certification
 on:
   push:
     branches:
-      - fix/group-photo-library-metadata-20261001
+      - fix/group-photo-library-metadata-clean-20261001
   pull_request:
     branches:
-      - fix/shared-scene-draft-state-persistence-20261001
+      - fix/next3-shared-scene-profile-lock-fix-20260928
   workflow_dispatch:
 
 permissions:
@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           git fetch origin fix/shared-scene-draft-state-persistence-20261001 --quiet
-          BASE="$(git merge-base origin/fix/shared-scene-draft-state-persistence-20261001 HEAD)"
+          BASE="$(git merge-base origin/fix/next3-shared-scene-profile-lock-fix-20260928 HEAD)"
           git diff --name-only "$BASE"...HEAD | tee /tmp/changed.txt
           grep -Ev '^(services/svc-face/app/app/services/creator_orchestrator.py|services/svc-dashboard/app/app/services/dashboard_service.py|scripts/test-group-photo-library-metadata.py|.github/workflows/group-photo-library-metadata-certification.yml)$' /tmp/changed.txt > /tmp/unexpected.txt || true
           test ! -s /tmp/unexpected.txt
