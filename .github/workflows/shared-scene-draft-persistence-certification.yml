@@ -1,0 +1,46 @@
+name: Shared Scene Draft Persistence Certification
+
+on:
+  push:
+    branches:
+      - fix/shared-scene-draft-state-persistence-20261001
+  pull_request:
+    branches:
+      - fix/next3-shared-scene-profile-lock-fix-20260928
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout backend candidate
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test runner
+        run: python -m pip install --disable-pip-version-check pytest
+
+      - name: Director shared-scene state contract
+        run: python -m pytest -q services/svc-director/tests/test_shared_scene_state_contract.py
+
+      - name: Python compile gate
+        run: python -m py_compile services/svc-director/app/app/shared_scene_state_routes.py
+
+      - name: Mutation boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --name-only HEAD^ HEAD | tee /tmp/changed.txt
+          grep -Ev '^(services/svc-director/app/app/shared_scene_state_routes.py|services/svc-director/tests/test_shared_scene_state_contract.py|.github/workflows/shared-scene-draft-persistence-certification.yml)$' /tmp/changed.txt > /tmp/unexpected.txt || true
+          test ! -s /tmp/unexpected.txt
+          echo DATABASE_MIGRATION=NONE
+          echo PRICING_MUTATION=NONE
+          echo SHARED_SCENE_DRAFT_PERSISTENCE=PASS
