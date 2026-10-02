@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import html
 import logging
-import os
 import re
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
