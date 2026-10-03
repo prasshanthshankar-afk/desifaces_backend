@@ -386,8 +386,15 @@ class ParentPricedSceneFusionExecutionService(PerformantResilientSceneFusionExec
             context=context,
         )
         parent_pricing = _as_dict(parent.get("pricing"))
-        if _clean(parent_pricing.get("unit_type")).lower() != "minute":
-            raise SceneFusionBridgeError("fusion_parent_pricing_unit_must_be_minute")
+        expected_unit = (
+            "second"
+            if _clean((context.stage_metadata or {}).get("conversation_mode")).casefold() == "shared_scene"
+            else "minute"
+        )
+        if _clean(parent_pricing.get("unit_type")).lower() != expected_unit:
+            raise SceneFusionBridgeError(
+                f"fusion_parent_pricing_unit_must_be_{expected_unit}"
+            )
         if not _clean(parent_pricing.get("quote_id")):
             raise SceneFusionBridgeError("fusion_parent_pricing_quote_required")
         if not _clean(parent_pricing.get("preview_fingerprint")):
