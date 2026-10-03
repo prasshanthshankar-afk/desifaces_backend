@@ -1700,6 +1700,8 @@ async def create_longform_job(
             "camera_framing": getattr(req, "camera_framing", None) or job_tags.get("camera_framing"),
             "camera_motion_style": getattr(req, "camera_motion_style", None) or job_tags.get("camera_motion_style"),
             "background_mode": getattr(req, "background_mode", None) or job_tags.get("background_mode") or "fixed",
+            "require_subtitles": bool(getattr(req, "require_subtitles", None) if getattr(req, "require_subtitles", None) is not None else getattr(req.constraints, "require_subtitles", False)),
+            "subtitle_language": _safe_str(job_tags.get("subtitle_language")) or _safe_str(getattr(req.voice_cfg, "locale", None)) or "en",
             "country_code": country_code,
             "billing_country_code": country_code,
             "requested_duration_sec": requested_duration_sec or _extract_requested_duration_sec(planning_payload),
@@ -1844,7 +1846,7 @@ async def get_longform_job(
         tags = _as_dict_loose(row.get("tags"))
         directed = _as_dict_loose(tags.get("directed_plan"))
         intent = _as_dict_loose(directed.get("intent"))
-        timeline = directed.get("timeline") if isinstance(directed.get("timeline"), dict) else None
+        timeline = directed.get("timeline") if isinstance(directed.get("timeline"), dict) else (_as_dict_loose(tags.get("timeline")) or None)
         qc = directed.get("qc") if isinstance(directed.get("qc"), dict) else None
         story_beats = directed.get("story_beats") if isinstance(directed.get("story_beats"), list) else []
 
@@ -1856,6 +1858,22 @@ async def get_longform_job(
                 row["final_storage_path"],
                 settings.FINAL_SAS_TTL_SECONDS,
             )
+
+        subtitle_storage_path = _safe_str(tags.get("subtitle_storage_path"))
+        subtitle_track_url = None
+        if subtitle_storage_path:
+            az = AzureBlobService(settings.AZURE_STORAGE_CONNECTION_STRING)
+            subtitle_track_url = az.sign_read_url(
+                settings.AZURE_VIDEO_OUTPUT_CONTAINER,
+                subtitle_storage_path,
+                settings.FINAL_SAS_TTL_SECONDS,
+            )
+        else:
+            subtitle_track_url = _safe_str(tags.get("subtitle_track_url"))
+
+        if timeline and subtitle_track_url:
+            timeline = dict(timeline)
+            timeline["subtitle_track_url"] = subtitle_track_url
 
         pricing_view, pricing_summary_view = await _load_latest_pricing_view(conn, str(row["id"]), {"tags": tags})
         run_receipt_view = _build_run_receipt_view(pricing_view, pricing_summary_view)
@@ -1874,6 +1892,10 @@ async def get_longform_job(
             progress=progress_view,
             final_video_url=final_url,
             final_storage_path=row["final_storage_path"],
+            subtitle_track_url=subtitle_track_url,
+            subtitle_storage_path=subtitle_storage_path,
+            subtitles_enabled=bool(subtitle_track_url),
+            subtitle_language=_safe_str(tags.get("subtitle_language")),
             error_code=row["error_code"],
             error_message=row["error_message"],
             created_at=row["created_at"].isoformat(),
