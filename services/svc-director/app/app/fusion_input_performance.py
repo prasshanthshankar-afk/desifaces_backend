@@ -64,7 +64,79 @@ def _assert_conversation_mode_supported(context: FusionSceneContext) -> dict[str
         "image_width": image_width,
         "image_height": image_height,
         "speaker_targets": speaker_targets,
+        "motion_mode": _clean(metadata.get("shared_scene_motion_mode")) or "natural_motion",
+        "video_prompt": _clean(metadata.get("shared_scene_video_prompt")) or None,
     }
+
+
+def _speaker_position_label(shared_scene: dict[str, Any], participant_id) -> str:
+    x, _ = _speaker_coordinates(shared_scene, participant_id)
+    width = max(1, int(shared_scene["image_width"]))
+    ratio = float(x) / float(width)
+    if ratio <= 0.40:
+        return "on the left side of the image"
+    if ratio >= 0.60:
+        return "on the right side of the image"
+    return "near the center of the image"
+
+
+def _shared_scene_performance_prompt(
+    context: FusionSceneContext,
+    shared_scene: dict[str, Any],
+    turn,
+    *,
+    scene_prompt: str | None,
+) -> str:
+    """Build turn-specific acting direction for one Kling shared-scene render."""
+
+    metadata = context.stage_metadata or {}
+    saved_direction = _clean(metadata.get("shared_scene_video_prompt"))
+    active_name = _clean(turn.display_name) or "the active speaker"
+    active_position = _speaker_position_label(shared_scene, turn.participant_id)
+
+    listener = next(
+        (
+            candidate
+            for candidate in context.turns
+            if candidate.participant_id != turn.participant_id
+        ),
+        None,
+    )
+    listener_name = _clean(getattr(listener, "display_name", None)) or "the other person"
+    listener_position = (
+        _speaker_position_label(shared_scene, listener.participant_id)
+        if listener is not None
+        else "elsewhere in the same group photo"
+    )
+
+    emotion = _clean(turn.emotion_code)
+    parts = [
+        saved_direction,
+        scene_prompt,
+        (
+            f"Natural two-person conversation. {active_name}, {active_position}, is the only person speaking "
+            f"during this turn. {listener_name}, {listener_position}, is listening."
+        ),
+        (
+            f"{active_name} should turn eyes and head naturally toward {listener_name}, use believable restrained "
+            "hand gestures, subtle upper-body movement, realistic breathing, and conversational micro-expressions."
+        ),
+        (
+            f"{listener_name} should keep the mouth closed, maintain natural attention toward {active_name}, "
+            "and show subtle listener reactions such as small nods, eye movement, and gentle facial responses."
+        ),
+        (
+            "Preserve both people's identities, clothing, seating/standing positions, lighting, background, and "
+            "overall composition. Keep the camera stable and medium-wide. Do not crop to a single person. "
+            "No exaggerated gestures, no body warping, no face swapping, no extra limbs, and no background deformation."
+        ),
+    ]
+    if emotion:
+        parts.insert(
+            3,
+            f"The active speaker's emotional delivery is {emotion}; express it naturally without exaggeration.",
+        )
+    return " ".join(part.strip() for part in parts if _clean(part))[:2400]
 
 
 def _speaker_coordinates(shared_scene: dict[str, Any], participant_id) -> list[int]:
@@ -161,18 +233,55 @@ async def compile_children_performant(
             video["duration_sec"] = max(1, min(30, int(round(turn.duration_hint_ms / 1000.0))))
         if turn.emotion_code:
             video["emotion"] = turn.emotion_code
-        if prompt:
-            video["prompt"] = prompt
 
         turn_key = str(turn.dialogue_turn_id)
         request_nonce = _clean((request_nonce_by_turn or {}).get(turn_key))
         provider_options: dict[str, Any] = {}
         provider_name = "veed_fabric"
+        performance_prompt = prompt
+        listener = None
         if shared_scene:
-            provider_name = "sync3"
-            provider_options["active_speaker_coordinates"] = _speaker_coordinates(shared_scene, turn.participant_id)
-            provider_options["conversation_mode"] = "shared_scene"
-            provider_options["shared_scene_media_id"] = shared_scene["shared_scene_media_id"]
+            # Launch-quality shared-scene conversations use one provider for both
+            # performance and audio-driven mouth motion. Sync3 remains available as
+            # rollback code, but there is no model-hopping in this execution path.
+            provider_name = "kling"
+            performance_prompt = _shared_scene_performance_prompt(
+                context,
+                shared_scene,
+                turn,
+                scene_prompt=prompt,
+            )
+            listener = next(
+                (
+                    candidate
+                    for candidate in context.turns
+                    if candidate.participant_id != turn.participant_id
+                ),
+                None,
+            )
+            provider_options.update(
+                {
+                    "conversation_mode": "shared_scene",
+                    "shared_scene_media_id": shared_scene["shared_scene_media_id"],
+                    "longform_profile": "talking_video",
+                    "quality_tier": "premium",
+                    "provider_hint": "kling",
+                    "fusion_provider": "kling",
+                    "presenter_provider": "kling",
+                    "aspect_ratio": aspect_ratio,
+                    "prompt": performance_prompt,
+                    # Retain mapped position as durable telemetry for acceptance
+                    # analysis even though Kling Avatar does not consume Sync3's
+                    # active-speaker coordinate option.
+                    "mapped_speaker_coordinates": _speaker_coordinates(
+                        shared_scene,
+                        turn.participant_id,
+                    ),
+                }
+            )
+
+        if performance_prompt:
+            video["prompt"] = performance_prompt
 
         payload: dict[str, Any] = {
             "face_image_url": face_url,
@@ -191,8 +300,24 @@ async def compile_children_performant(
                 "segment_sequence": turn.sequence_no,
                 "aspect_ratio": aspect_ratio,
                 "conversation_mode": "shared_scene" if shared_scene else "ordered_speaker_shots",
+                "provider_hint": "kling" if shared_scene else provider_name,
+                "quality_tier": "premium" if shared_scene else None,
+                "execution_provider_family": "kling_avatar" if shared_scene else None,
+                "shared_scene_motion_mode": (
+                    shared_scene.get("motion_mode") if shared_scene else None
+                ),
+                "active_speaker_name": turn.display_name if shared_scene else None,
+                "listener_name": (
+                    getattr(listener, "display_name", None)
+                    if shared_scene and listener is not None
+                    else None
+                ),
             },
         }
+        if shared_scene:
+            payload["quality_tier"] = "premium"
+            payload["longform_profile"] = "talking_video"
+            payload["performance_prompt"] = performance_prompt
         if request_nonce:
             provider_options["v3_request_nonce"] = request_nonce
         if provider_options:
@@ -219,4 +344,6 @@ __all__ = [
     "_scene_aspect_ratio",
     "_assert_conversation_mode_supported",
     "_speaker_coordinates",
+    "_speaker_position_label",
+    "_shared_scene_performance_prompt",
 ]
