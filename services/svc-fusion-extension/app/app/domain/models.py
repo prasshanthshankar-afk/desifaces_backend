@@ -581,6 +581,10 @@ class LongformJobView(BaseModel):
 
     final_video_url: Optional[str] = None
     final_storage_path: Optional[str] = None
+    subtitle_track_url: Optional[str] = None
+    subtitle_storage_path: Optional[str] = None
+    subtitles_enabled: bool = False
+    subtitle_language: Optional[str] = None
 
     error_code: Optional[str] = None
     error_message: Optional[str] = None
