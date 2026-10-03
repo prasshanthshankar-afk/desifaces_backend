@@ -16,7 +16,7 @@ assert 'metadata.get("shared_scene_video_prompt")' in compiler
 assert '_shared_scene_performance_prompt' in compiler
 assert 'is the only person speaking' in compiler
 assert 'keep the mouth closed' in compiler
-assert 'restrained hand gestures' in compiler
+assert 'hand gestures, subtle upper-body movement' in compiler
 assert '"quality_tier": "premium"' in compiler
 assert '"longform_profile": "talking_video"' in compiler
 assert '"provider_hint": "kling"' in compiler
