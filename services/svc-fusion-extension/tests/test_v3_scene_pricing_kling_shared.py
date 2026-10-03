@@ -26,9 +26,9 @@ def test_non_shared_scene_keeps_existing_minute_contract():
 
     assert '_LEGACY_SERVICE_NAME = "svc-fusion"' in source
     assert '_LEGACY_SERVICE_ACTION = "fusion.video.generate"' in source
-    assert '_LEGACY_VARIANT_CODE = "FUSION_TALKING_VIDEO"' in source
-    assert '_LEGACY_LEAF_SKU_CODE = "FUSION_TALK_MIN"' in source
-    assert '_LEGACY_PROVIDER = "veed_fabric"' in source
+    assert '_LEGACY_VARIANT_CODE = "FUSION_MULTI_PERSON"' in source
+    assert '_LEGACY_LEAF_SKU_CODE = "FUSION_MULTI_PERSON"' in source
+    assert '_LEGACY_PROVIDER = "provider-neutral"' in source
     assert '"unit_type": "minute"' in source
 
 
@@ -39,7 +39,8 @@ def test_shared_scene_pricing_selection_is_conversation_mode_scoped():
     assert 'get("conversation_mode")' in source
     assert '== "shared_scene"' in source
     assert 'return {' in source
-    assert '"provider_neutral"' not in source  # route uses seeded variant; no bespoke rate table
+    assert '_LEGACY_PROVIDER = "provider-neutral"' in source
+    assert '_SHARED_SCENE_PROVIDER = "kling"' in source
 
 
 def test_group_conversation_pricing_migration_is_explicit_20_percent_and_cross_channel():
