@@ -124,3 +124,50 @@ def test_shared_scene_fusion_fails_closed_for_non_two_person_video():
 
     assert "shared_scene_video_requires_exactly_two_speakers" in source
     assert "len(shared_speaker_ids) != 2" in source
+
+
+def test_shared_scene_compiler_routes_single_provider_kling_natural_conversation():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "fusion_input_performance.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'provider_name = "kling"' in source
+    assert 'provider_name = "sync3"' not in source
+    assert '"quality_tier": "premium"' in source
+    assert '"longform_profile": "talking_video"' in source
+    assert '"provider_hint": "kling"' in source
+    assert '"execution_provider_family": "kling_avatar"' in source
+
+
+def test_shared_scene_compiler_consumes_saved_motion_prompt_and_directs_both_people():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "fusion_input_performance.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'metadata.get("shared_scene_video_prompt")' in source
+    assert "_shared_scene_performance_prompt" in source
+    assert "is the only person speaking" in source
+    assert "keep the mouth closed" in source
+    assert "restrained hand gestures" in source
+    assert "No exaggerated gestures" in source
+    assert '"prompt": performance_prompt' in source
+
+
+def test_parent_pricing_requires_seconds_for_shared_scene_only():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "fusion_execution_parent_pricing.py"
+    ).read_text(encoding="utf-8")
+
+    assert '"second"' in source
+    assert '"minute"' in source
+    assert 'get("conversation_mode")' in source
+    assert "fusion_parent_pricing_unit_must_be_" in source
