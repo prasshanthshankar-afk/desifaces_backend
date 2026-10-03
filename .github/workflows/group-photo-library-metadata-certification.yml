@@ -9,6 +9,11 @@ on:
   pull_request:
     branches:
       - fix/next3-shared-scene-profile-lock-fix-20260928
+    paths:
+      - 'services/svc-face/app/app/services/creator_orchestrator.py'
+      - 'services/svc-dashboard/app/app/services/dashboard_service.py'
+      - 'scripts/test-group-photo-library-metadata.py'
+      - '.github/workflows/group-photo-library-metadata-certification.yml'
   workflow_dispatch:
 
 permissions:
