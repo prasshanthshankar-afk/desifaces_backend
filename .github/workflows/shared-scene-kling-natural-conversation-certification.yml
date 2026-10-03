@@ -46,8 +46,15 @@ jobs:
 
       - name: Focused static tests
         run: |
-          python -m pytest -q \
-            services/svc-fusion-extension/tests/test_v3_scene_pricing_kling_shared.py
+          python - <<'PY'
+          import runpy
+          ns = runpy.run_path("services/svc-fusion-extension/tests/test_v3_scene_pricing_kling_shared.py")
+          tests = [value for name, value in ns.items() if name.startswith("test_") and callable(value)]
+          assert tests, "no focused tests discovered"
+          for test in tests:
+              test()
+          print("KLING_SHARED_SCENE_FOCUSED_TESTS=PASS")
+          PY
 
       - name: Mutation boundary
         shell: bash
