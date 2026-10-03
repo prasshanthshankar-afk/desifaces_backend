@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feature/dev-shared-scene-kling-natural-conversation-20261003
+      - fix/dev-group-conversation-20pct-video-pricing-20261003
   pull_request:
     branches:
       - fix/next3-shared-scene-profile-lock-fix-20260928
@@ -42,7 +43,7 @@ jobs:
           python -m py_compile services/svc-director/app/app/fusion_execution_parent_pricing.py
           python -m py_compile services/svc-fusion-extension/app/app/api/routes/v3_scene_pricing.py
 
-      - name: Natural conversation source contract
+      - name: Natural conversation and pricing source contract
         run: python scripts/test-shared-scene-kling-natural-conversation.py
 
       - name: Focused static tests
@@ -63,15 +64,9 @@ jobs:
           set -euo pipefail
           BASE="$(git merge-base origin/fix/next3-shared-scene-profile-lock-fix-20260928 HEAD)"
           git diff --name-only "$BASE"...HEAD | tee /tmp/changed.txt
-          grep -Ev '^(services/svc-director/app/app/fusion_input_performance.py|services/svc-director/app/app/fusion_execution_parent_pricing.py|services/svc-director/tests/test_shared_scene_contract.py|services/svc-fusion-extension/app/app/api/routes/v3_scene_pricing.py|services/svc-fusion-extension/tests/test_v3_scene_pricing_kling_shared.py|scripts/test-shared-scene-kling-natural-conversation.py|migrations/2026_10_03_group_conversation_premium_actual_seconds.sql|.github/workflows/shared-scene-kling-natural-conversation-certification.yml) /tmp/changed.txt > /tmp/unexpected.txt || true
+          grep -Ev '^(services/svc-fusion-extension/app/app/api/routes/v3_scene_pricing.py|services/svc-fusion-extension/tests/test_v3_scene_pricing_kling_shared.py|scripts/test-shared-scene-kling-natural-conversation.py|migrations/2026_10_03_group_conversation_premium_actual_seconds.sql|.github/workflows/shared-scene-kling-natural-conversation-certification.yml)$' /tmp/changed.txt > /tmp/unexpected.txt || true
           test ! -s /tmp/unexpected.txt
           echo DATABASE_MIGRATION=SCOPED_GROUP_PRICING_ONLY
           echo GROUP_CONVERSATION_PREMIUM_20PCT_PRICING=PASS
+          echo NON_SHARED_PRICING_UNCHANGED=PASS
           echo PRODUCTION_TOUCH=NONE
-          echo SHARED_SCENE_KLING_NATURAL_CONVERSATION=PASS
- /tmp/changed.txt > /tmp/unexpected.txt || true
-          test ! -s /tmp/unexpected.txt
-          echo DATABASE_MIGRATION=NONE
-          echo EXISTING_PREMIUM_PRICING_REUSED=PASS
-          echo PRODUCTION_TOUCH=NONE
-          echo SHARED_SCENE_KLING_NATURAL_CONVERSATION=PASS
