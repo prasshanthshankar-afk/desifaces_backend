@@ -529,6 +529,11 @@ async def preview_scene_pricing(
             body=body,
             account_id=account.account_id,
         )
+        contract = _scene_pricing_contract(
+            scene,
+            total_seconds=total,
+            minutes=minutes,
+        )
         if _clean(scene["current_stage"]) != "fusion":
             raise HTTPException(status_code=409, detail="scene_pricing_workflow_not_at_fusion")
         meta = _pricing_meta(
@@ -538,16 +543,17 @@ async def preview_scene_pricing(
             total=total,
             minutes=minutes,
             lineage_hash=lineage_hash,
+            contract=contract,
         )
         request_fingerprint = hashlib.sha256(
             json.dumps(meta, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         spec = PricingPreviewSpec(
             user_id=str(canonical_user_id),
-            service_name=_SERVICE_NAME,
-            service_action=_SERVICE_ACTION,
-            sku_code=_VARIANT_CODE,
-            units=str(minutes),
+            service_name=contract["service_name"],
+            service_action=contract["service_action"],
+            sku_code=contract["variant_code"],
+            units=str(contract["units"]),
             external_ref_type="v3_scene_stage_preview",
             external_ref_id=str(body.stage_run_id),
             idempotency_key=(
@@ -565,17 +571,17 @@ async def preview_scene_pricing(
             ) from exc
         artifact = make_preview_artifact(
             response,
-            service_name=_SERVICE_NAME,
-            service_action=_SERVICE_ACTION,
-            sku_code=_VARIANT_CODE,
+            service_name=contract["service_name"],
+            service_action=contract["service_action"],
+            sku_code=contract["variant_code"],
             meta=meta,
         )
         pricing = _normalize_parent_pricing(
             dict(artifact.get("pricing") or {}),
-            minutes=minutes,
+            contract=contract,
             meta=meta,
         )
-        _validate_pricebook_contract(pricing)
+        _validate_pricebook_contract(pricing, contract)
         if not _clean(pricing.get("quote_id")) or not _clean(pricing.get("preview_fingerprint")):
             raise HTTPException(
                 status_code=409,
@@ -589,6 +595,7 @@ async def preview_scene_pricing(
             total=total,
             minutes=minutes,
             lineage_hash=lineage_hash,
+            contract=contract,
         )
         await _persist_parent_pricing(conn, stage_run_id=body.stage_run_id, record=record)
         return _out(
@@ -600,6 +607,7 @@ async def preview_scene_pricing(
             lineage_hash=lineage_hash,
             pricing=pricing,
             pricing_summary=pricing_summary,
+            contract=contract,
         )
 
 
@@ -617,6 +625,11 @@ async def reserve_scene_pricing(
             body=body,
             account_id=account.account_id,
         )
+        contract = _scene_pricing_contract(
+            scene,
+            total_seconds=total,
+            minutes=minutes,
+        )
         stored = _stored_parent_pricing(scene)
         if (
             _clean(stored.get("state")) in {"reserved", "committed"}
@@ -631,12 +644,13 @@ async def reserve_scene_pricing(
                 lineage_hash=lineage_hash,
                 pricing=_as_dict(stored.get("pricing")),
                 pricing_summary=_as_dict(stored.get("pricing_summary")),
+                contract=contract,
             )
 
         _assert_preview_confirmation(
             stored,
             body=body,
-            minutes=minutes,
+            expected_units=int(contract["units"]),
             lineage_hash=lineage_hash,
             turn_count=len(measured),
         )
@@ -648,10 +662,10 @@ async def reserve_scene_pricing(
         cycle_token = _pricing_cycle_token(stored)
         spec = PricingReserveSpec(
             user_id=str(canonical_user_id),
-            service_name=_SERVICE_NAME,
-            service_action=_SERVICE_ACTION,
-            sku_code=_VARIANT_CODE,
-            units=str(minutes),
+            service_name=contract["service_name"],
+            service_action=contract["service_action"],
+            sku_code=contract["variant_code"],
+            units=str(contract["units"]),
             external_ref_type="v3_scene_stage",
             external_ref_id=str(body.stage_run_id),
             idempotency_key=(
@@ -671,18 +685,18 @@ async def reserve_scene_pricing(
             ) from exc
         artifact = make_reserved_artifact(
             response,
-            service_name=_SERVICE_NAME,
-            service_action=_SERVICE_ACTION,
-            sku_code=_VARIANT_CODE,
-            estimated_units=str(minutes),
+            service_name=contract["service_name"],
+            service_action=contract["service_action"],
+            sku_code=contract["variant_code"],
+            estimated_units=str(contract["units"]),
             estimated_amount=_clean(base_pricing.get("estimated_amount")) or None,
             currency=_clean(base_pricing.get("currency")) or None,
-            unit_type="minute",
+            unit_type=contract["unit_type"],
             meta=meta,
         )
         pricing = _normalize_parent_pricing(
             dict(artifact.get("pricing") or {}),
-            minutes=minutes,
+            contract=contract,
             meta=meta,
         )
         pricing["state"] = "reserved"
@@ -713,6 +727,7 @@ async def reserve_scene_pricing(
             lineage_hash=lineage_hash,
             pricing=pricing,
             pricing_summary=pricing_summary,
+            contract=contract,
         )
 
 
@@ -730,6 +745,11 @@ async def commit_scene_pricing(
             body=body,
             account_id=account.account_id,
         )
+        contract = _scene_pricing_contract(
+            scene,
+            total_seconds=total,
+            minutes=minutes,
+        )
         stored = _stored_parent_pricing(scene)
         if _clean(stored.get("state")) == "committed":
             return _out(
@@ -741,6 +761,7 @@ async def commit_scene_pricing(
                 lineage_hash=lineage_hash,
                 pricing=_as_dict(stored.get("pricing")),
                 pricing_summary=_as_dict(stored.get("pricing_summary")),
+                contract=contract,
             )
         reservation_id = _clean(
             stored.get("reservation_id")
@@ -752,7 +773,7 @@ async def commit_scene_pricing(
                 detail="scene_pricing_commit_requires_reservation",
             )
         if (
-            int(stored.get("estimated_units") or 0) != minutes
+            int(stored.get("estimated_units") or 0) != int(contract["units"])
             or _clean(stored.get("audio_lineage_hash")) != lineage_hash
         ):
             raise HTTPException(status_code=409, detail="scene_pricing_commit_input_changed")
@@ -762,7 +783,7 @@ async def commit_scene_pricing(
         spec = PricingCommitSpec(
             user_id=str(canonical_user_id),
             reservation_id=reservation_id,
-            actual_units=str(minutes),
+            actual_units=str(contract["units"]),
             external_ref_type="v3_scene_stage",
             external_ref_id=str(body.stage_run_id),
             idempotency_key=(
@@ -792,12 +813,12 @@ async def commit_scene_pricing(
         artifact = make_committed_artifact(
             response,
             base_pricing=base_pricing,
-            actual_units=str(minutes),
+            actual_units=str(contract["units"]),
             meta=meta,
         )
         pricing = _normalize_parent_pricing(
             dict(artifact.get("pricing") or {}),
-            minutes=minutes,
+            contract=contract,
             meta=meta,
         )
         pricing["state"] = "committed"
@@ -819,6 +840,7 @@ async def commit_scene_pricing(
             lineage_hash=lineage_hash,
             pricing=pricing,
             pricing_summary=pricing_summary,
+            contract=contract,
         )
 
 
@@ -836,6 +858,11 @@ async def release_scene_pricing(
             body=body,
             account_id=account.account_id,
         )
+        contract = _scene_pricing_contract(
+            scene,
+            total_seconds=total,
+            minutes=minutes,
+        )
         stored = _stored_parent_pricing(scene)
         if _clean(stored.get("state")) == "committed":
             raise HTTPException(
@@ -852,6 +879,7 @@ async def release_scene_pricing(
                 lineage_hash=lineage_hash,
                 pricing=_as_dict(stored.get("pricing")),
                 pricing_summary=_as_dict(stored.get("pricing_summary")),
+                contract=contract,
             )
 
         reservation_id = _clean(
@@ -882,6 +910,7 @@ async def release_scene_pricing(
                 lineage_hash=lineage_hash,
                 pricing=pricing,
                 pricing_summary=summary,
+                contract=contract,
             )
 
         base_pricing = _as_dict(stored.get("pricing"))
@@ -912,7 +941,7 @@ async def release_scene_pricing(
         )
         pricing = _normalize_parent_pricing(
             dict(artifact.get("pricing") or {}),
-            minutes=minutes,
+            contract=contract,
             meta=meta,
         )
         pricing["state"] = "released"
@@ -934,6 +963,7 @@ async def release_scene_pricing(
             lineage_hash=lineage_hash,
             pricing=pricing,
             pricing_summary=pricing_summary,
+            contract=contract,
         )
 
 
