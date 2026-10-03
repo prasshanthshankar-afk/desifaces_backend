@@ -16,6 +16,13 @@ from app.api.deps import get_current_user_id, get_db_pool_dep as get_db_pool
 from app.config import settings
 from app.services.sas_service import AzureBlobService
 from app.services.stitch_service import probe_duration_seconds
+from app.services.premium_actual_seconds_pricing import (
+    PREMIUM_ACTUAL_SECONDS_ACTION,
+    PREMIUM_ACTUAL_SECONDS_SKU,
+    PREMIUM_ACTUAL_SECONDS_VARIANT,
+    premium_actual_seconds_meta,
+    premium_billable_seconds,
+)
 from desifaces_shared.identity import AccountContextNotFound, resolve_account_context
 from desifaces_shared.pricing.client import PricingClientError, SvcPricingClient
 from desifaces_shared.pricing.orchestration import (
@@ -36,11 +43,12 @@ from desifaces_shared.pricing.orchestration import (
 
 router = APIRouter(prefix="/api/longform/v3/scene-pricing", tags=["longform-v3-scene-pricing"])
 
-_SERVICE_NAME = "svc-fusion"
-_SERVICE_ACTION = "fusion.video.generate"
-_VARIANT_CODE = "FUSION_TALKING_VIDEO"
-_LEAF_SKU_CODE = "FUSION_TALK_MIN"
-_PROVIDER = "veed_fabric"
+_LEGACY_SERVICE_NAME = "svc-fusion"
+_LEGACY_SERVICE_ACTION = "fusion.video.generate"
+_LEGACY_VARIANT_CODE = "FUSION_TALKING_VIDEO"
+_LEGACY_LEAF_SKU_CODE = "FUSION_TALK_MIN"
+_LEGACY_PROVIDER = "veed_fabric"
+_SHARED_SCENE_PROVIDER = "kling"
 _PRICING_KEY = "fusion_parent_pricing"
 _MAX_PROBE_CONCURRENCY = 8
 
@@ -98,6 +106,38 @@ def _clean(value: Any) -> str:
 
 def _billable_minutes(total_seconds: float) -> int:
     return max(1, int(math.ceil(max(float(total_seconds), 0.001) / 60.0)))
+
+
+def _scene_pricing_contract(scene, *, total_seconds: float, minutes: int) -> dict[str, Any]:
+    """Select the existing pricing contract without changing non-shared scenes."""
+
+    metadata = _as_dict(scene["metadata_json"])
+    shared_scene = _clean(metadata.get("conversation_mode")).casefold() == "shared_scene"
+    if shared_scene:
+        units = premium_billable_seconds(total_seconds)
+        return {
+            "service_name": "svc-fusion-extension",
+            "service_action": PREMIUM_ACTUAL_SECONDS_ACTION,
+            "variant_code": PREMIUM_ACTUAL_SECONDS_VARIANT,
+            "leaf_sku_code": PREMIUM_ACTUAL_SECONDS_SKU,
+            "provider": _SHARED_SCENE_PROVIDER,
+            "unit_type": "second",
+            "units": int(units),
+            "quality_tier": "premium",
+            "pricing_meta": premium_actual_seconds_meta(total_seconds),
+        }
+
+    return {
+        "service_name": _LEGACY_SERVICE_NAME,
+        "service_action": _LEGACY_SERVICE_ACTION,
+        "variant_code": _LEGACY_VARIANT_CODE,
+        "leaf_sku_code": _LEGACY_LEAF_SKU_CODE,
+        "provider": _LEGACY_PROVIDER,
+        "unit_type": "minute",
+        "units": int(minutes),
+        "quality_tier": None,
+        "pricing_meta": {},
+    }
 
 
 def _parse_expiry(value: Any) -> datetime | None:
@@ -306,11 +346,12 @@ def _pricing_meta(
     total: float,
     minutes: int,
     lineage_hash: str,
+    contract: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "mode": "fusion_scene_parent",
-        "provider": _PROVIDER,
-        "provider_hint": _PROVIDER,
+        "provider": contract["provider"],
+        "provider_hint": contract["provider"],
         "workflow_id": str(body.workflow_id),
         "scene_id": str(scene_id),
         "stage_run_id": str(body.stage_run_id),
@@ -318,43 +359,45 @@ def _pricing_meta(
         "audio_duration_source": "approved_audio_ffprobe",
         "actual_audio_duration_sec": str(total),
         "minutes": str(minutes),
-        "requested_units": str(minutes),
-        "unit_type": "minute",
-        "variant_code": _VARIANT_CODE,
-        "leaf_sku_code": _LEAF_SKU_CODE,
+        "requested_units": str(contract["units"]),
+        "unit_type": contract["unit_type"],
+        "variant_code": contract["variant_code"],
+        "leaf_sku_code": contract["leaf_sku_code"],
+        "quality_tier": contract.get("quality_tier"),
         "child_count": len(measured),
         "audio_lineage_hash": lineage_hash,
         "channel": "service",
+        **dict(contract.get("pricing_meta") or {}),
     }
 
 
 def _normalize_parent_pricing(
     pricing: dict[str, Any],
     *,
-    minutes: int,
+    contract: dict[str, Any],
     meta: dict[str, Any],
 ) -> dict[str, Any]:
     out = dict(pricing or {})
     out.update(
         {
             "enabled": True,
-            "service_name": _SERVICE_NAME,
-            "service_action": _SERVICE_ACTION,
-            "sku_code": _VARIANT_CODE,
-            "variant_code": _VARIANT_CODE,
-            "leaf_sku_code": _LEAF_SKU_CODE,
-            "unit_type": "minute",
-            "estimated_units": str(minutes),
-            "provider": _PROVIDER,
+            "service_name": contract["service_name"],
+            "service_action": contract["service_action"],
+            "sku_code": contract["variant_code"],
+            "variant_code": contract["variant_code"],
+            "leaf_sku_code": contract["leaf_sku_code"],
+            "unit_type": contract["unit_type"],
+            "estimated_units": str(contract["units"]),
+            "provider": contract["provider"],
             "meta": {**_as_dict(out.get("meta")), **meta},
         }
     )
     return out
 
 
-def _validate_pricebook_contract(pricing: dict[str, Any]) -> None:
+def _validate_pricebook_contract(pricing: dict[str, Any], contract: dict[str, Any]) -> None:
     unit = _line_unit(pricing)
-    if unit != "minute":
+    if unit != contract["unit_type"]:
         raise HTTPException(
             status_code=409,
             detail=f"scene_pricing_unit_contract_invalid:{unit or 'missing'}",
@@ -362,7 +405,7 @@ def _validate_pricebook_contract(pricing: dict[str, Any]) -> None:
     stale = {
         hint
         for hint in _provider_hints(pricing)
-        if hint not in {_PROVIDER, "provider-neutral", "neutral"}
+        if hint not in {contract["provider"], "provider-neutral", "neutral"}
     }
     if stale:
         raise HTTPException(
@@ -379,6 +422,7 @@ def _preview_record(
     total: float,
     minutes: int,
     lineage_hash: str,
+    contract: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "state": "quoted",
@@ -386,9 +430,9 @@ def _preview_record(
         "preview_fingerprint": _clean(pricing.get("preview_fingerprint")),
         "quote_expires_at": _clean(pricing.get("quote_expires_at")),
         "reservation_id": None,
-        "estimated_units": str(minutes),
-        "unit_type": "minute",
-        "provider": _PROVIDER,
+        "estimated_units": str(contract["units"]),
+        "unit_type": contract["unit_type"],
+        "provider": contract["provider"],
         "turn_count": len(measured),
         "total_audio_duration_sec": total,
         "audio_lineage_hash": lineage_hash,
@@ -417,7 +461,7 @@ def _assert_preview_confirmation(
     stored: dict[str, Any],
     *,
     body: ScenePricingReserveIn,
-    minutes: int,
+    expected_units: int,
     lineage_hash: str,
     turn_count: int,
 ) -> None:
@@ -428,7 +472,7 @@ def _assert_preview_confirmation(
     expiry = _parse_expiry(stored.get("quote_expires_at"))
     if expiry is None or expiry <= datetime.now(timezone.utc):
         raise HTTPException(status_code=409, detail="scene_pricing_quote_expired")
-    if int(stored.get("estimated_units") or 0) != int(minutes):
+    if int(stored.get("estimated_units") or 0) != int(expected_units):
         raise HTTPException(status_code=409, detail="scene_pricing_units_changed_since_preview")
     if _clean(stored.get("audio_lineage_hash")) != lineage_hash:
         raise HTTPException(status_code=409, detail="scene_pricing_audio_lineage_changed_since_preview")
@@ -453,6 +497,7 @@ def _out(
     lineage_hash: str,
     pricing: dict[str, Any],
     pricing_summary: dict[str, Any],
+    contract: dict[str, Any],
 ) -> ScenePricingOut:
     return ScenePricingOut(
         workflow_id=body.workflow_id,
@@ -463,7 +508,7 @@ def _out(
         total_audio_duration_sec=total,
         billable_minutes=minutes,
         audio_lineage_hash=lineage_hash,
-        provider=_PROVIDER,
+        provider=contract["provider"],
         pricing=pricing,
         pricing_summary=pricing_summary,
         audio_durations=measured,
