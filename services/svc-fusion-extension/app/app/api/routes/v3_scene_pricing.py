@@ -49,6 +49,11 @@ _LEGACY_VARIANT_CODE = "FUSION_TALKING_VIDEO"
 _LEGACY_LEAF_SKU_CODE = "FUSION_TALK_MIN"
 _LEGACY_PROVIDER = "veed_fabric"
 _SHARED_SCENE_PROVIDER = "kling"
+_GROUP_SERVICE_ACTION = "fusion.group_photo_conversation.premium_second"
+_GROUP_VARIANT_CODE = "GROUP_TALKING_VIDEO_PREMIUM_SECOND"
+_GROUP_LEAF_SKU_CODE = "GROUP_TALK_PREMIUM_SECOND"
+_GROUP_CREDITS_PER_SECOND = 18
+_GROUP_SURCHARGE_PCT = 20
 _PRICING_KEY = "fusion_parent_pricing"
 _MAX_PROBE_CONCURRENCY = 8
 
@@ -108,6 +113,20 @@ def _billable_minutes(total_seconds: float) -> int:
     return max(1, int(math.ceil(max(float(total_seconds), 0.001) / 60.0)))
 
 
+def _group_premium_pricing_meta(total_seconds: float) -> dict[str, Any]:
+    meta = dict(premium_actual_seconds_meta(total_seconds))
+    meta.update(
+        {
+            "credits_per_second": _GROUP_CREDITS_PER_SECOND,
+            "base_credits_per_second": 15,
+            "multi_person_surcharge_pct": _GROUP_SURCHARGE_PCT,
+            "pricing_policy": "group_conversation_premium_actual_seconds_v1",
+            "group_photo_conversation": True,
+        }
+    )
+    return meta
+
+
 def _scene_pricing_contract(scene, *, total_seconds: float, minutes: int) -> dict[str, Any]:
     """Select the existing pricing contract without changing non-shared scenes."""
 
@@ -117,14 +136,14 @@ def _scene_pricing_contract(scene, *, total_seconds: float, minutes: int) -> dic
         units = premium_billable_seconds(total_seconds)
         return {
             "service_name": "svc-fusion-extension",
-            "service_action": PREMIUM_ACTUAL_SECONDS_ACTION,
-            "variant_code": PREMIUM_ACTUAL_SECONDS_VARIANT,
-            "leaf_sku_code": PREMIUM_ACTUAL_SECONDS_SKU,
+            "service_action": _GROUP_SERVICE_ACTION,
+            "variant_code": _GROUP_VARIANT_CODE,
+            "leaf_sku_code": _GROUP_LEAF_SKU_CODE,
             "provider": _SHARED_SCENE_PROVIDER,
             "unit_type": "second",
             "units": int(units),
             "quality_tier": "premium",
-            "pricing_meta": premium_actual_seconds_meta(total_seconds),
+            "pricing_meta": _group_premium_pricing_meta(total_seconds),
         }
 
     return {
