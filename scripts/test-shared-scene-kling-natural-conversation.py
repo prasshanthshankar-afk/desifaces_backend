@@ -23,12 +23,14 @@ assert '"provider_hint": "kling"' in compiler
 assert '"execution_provider_family": "kling_avatar"' in compiler
 assert '"prompt": performance_prompt' in compiler
 
-# Shared-scene uses existing premium actual-seconds pricing; non-shared is unchanged.
+# Shared-scene uses the explicit +20% group premium actual-seconds contract;
+# non-shared remains unchanged.
 for marker in (
-    'PREMIUM_ACTUAL_SECONDS_VARIANT',
-    'PREMIUM_ACTUAL_SECONDS_SKU',
-    'PREMIUM_ACTUAL_SECONDS_ACTION',
     'premium_billable_seconds',
+    '_GROUP_VARIANT_CODE = "GROUP_TALKING_VIDEO_PREMIUM_SECOND"',
+    '_GROUP_LEAF_SKU_CODE = "GROUP_TALK_PREMIUM_SECOND"',
+    '_GROUP_CREDITS_PER_SECOND = 18',
+    '_GROUP_SURCHARGE_PCT = 20',
     '_SHARED_SCENE_PROVIDER = "kling"',
     '"unit_type": "second"',
 ):
@@ -51,7 +53,12 @@ assert '"minute"' in parent_pricing
 assert 'fusion_parent_pricing_unit_must_be_' in parent_pricing
 
 print("SHARED_SCENE_KLING_NATURAL_CONVERSATION_SOURCE=PASS")
-print("SHARED_SCENE_KLING_EXISTING_PREMIUM_PRICING=PASS")
+print("SHARED_SCENE_KLING_GROUP_PREMIUM_20PCT_PRICING=PASS")
 print("NON_SHARED_FUSION_CONTRACT_PRESERVED=PASS")
-print("DATABASE_MIGRATION=NONE")
+migration = root / "migrations/2026_10_03_group_conversation_premium_actual_seconds.sql"
+text = migration.read_text(encoding="utf-8")
+assert "'credits_per_second', 18" in text
+assert "'multi_person_surcharge_pct', 20" in text
+assert "pb.channel IN ('web', 'mobile')" in text
+print("DATABASE_MIGRATION=SCOPED_GROUP_PRICING_ONLY")
 print("PRODUCTION_TOUCH=NONE")
