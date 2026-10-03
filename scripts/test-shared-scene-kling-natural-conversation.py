@@ -39,9 +39,9 @@ for marker in (
 for marker in (
     '_LEGACY_SERVICE_NAME = "svc-fusion"',
     '_LEGACY_SERVICE_ACTION = "fusion.video.generate"',
-    '_LEGACY_VARIANT_CODE = "FUSION_TALKING_VIDEO"',
-    '_LEGACY_LEAF_SKU_CODE = "FUSION_TALK_MIN"',
-    '_LEGACY_PROVIDER = "veed_fabric"',
+    '_LEGACY_VARIANT_CODE = "FUSION_MULTI_PERSON"',
+    '_LEGACY_LEAF_SKU_CODE = "FUSION_MULTI_PERSON"',
+    '_LEGACY_PROVIDER = "provider-neutral"',
     '"unit_type": "minute"',
 ):
     assert marker in scene_pricing, marker

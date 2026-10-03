@@ -45,9 +45,9 @@ router = APIRouter(prefix="/api/longform/v3/scene-pricing", tags=["longform-v3-s
 
 _LEGACY_SERVICE_NAME = "svc-fusion"
 _LEGACY_SERVICE_ACTION = "fusion.video.generate"
-_LEGACY_VARIANT_CODE = "FUSION_TALKING_VIDEO"
-_LEGACY_LEAF_SKU_CODE = "FUSION_TALK_MIN"
-_LEGACY_PROVIDER = "veed_fabric"
+_LEGACY_VARIANT_CODE = "FUSION_MULTI_PERSON"
+_LEGACY_LEAF_SKU_CODE = "FUSION_MULTI_PERSON"
+_LEGACY_PROVIDER = "provider-neutral"
 _SHARED_SCENE_PROVIDER = "kling"
 _GROUP_SERVICE_ACTION = "fusion.group_photo_conversation.premium_second"
 _GROUP_VARIANT_CODE = "GROUP_TALKING_VIDEO_PREMIUM_SECOND"
