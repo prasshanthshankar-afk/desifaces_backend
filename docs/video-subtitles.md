@@ -84,7 +84,7 @@ If MP4 generation succeeds but subtitle creation/upload fails:
 
 - Existing longform jobs without subtitle metadata behave exactly as before.
 - Existing saved Voice assets without script metadata remain usable.
-- Pricing and credit accounting are unchanged by v1.
+- Pricing and credit accounting are unchanged by subtitle support.
 - No provider selection or core Fusion contract is changed.
 - Video sharing continues to share the MP4; toggleable captions apply within subtitle-aware players.
 
