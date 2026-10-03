@@ -18,8 +18,8 @@ API_NAME="df-svc-fusion-extension"
 STITCH_NAME="df-svc-fusion-extension-stitch-worker"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 TMP_DIR="$(mktemp -d /tmp/desifaces-subtitles-dev.XXXXXX)"
-API_ROLLBACK="${API_NAME}-rollback-${STAMP}"
-STITCH_ROLLBACK="${STITCH_NAME}-rollback-${STAMP}"
+API_ROLLBACK="${API_NAME}-rollback"
+STITCH_ROLLBACK="${STITCH_NAME}-rollback"
 CUTOVER=0
 
 cleanup(){ rm -rf "$TMP_DIR"; }
@@ -105,6 +105,8 @@ echo "BACKEND_IMAGE_BUILD=PASS"
 
 echo
 echo "===== 3. RETIRE CURRENT RUNTIME ====="
+docker rm -f "$API_ROLLBACK" >/dev/null 2>&1 || true
+docker rm -f "$STITCH_ROLLBACK" >/dev/null 2>&1 || true
 docker stop "$API_CURRENT" >/dev/null
 docker rename "$API_CURRENT" "$API_ROLLBACK"
 docker update --restart=no "$API_ROLLBACK" >/dev/null
