@@ -130,7 +130,7 @@ echo
 echo "===== 6. CERTIFY ====="
 PASS=0
 for i in $(seq 1 40); do
-  if docker exec "$API_NAME" python3 - <<'PY' >/tmp/subtitles-api-health.out 2>&1
+  if docker exec -i "$API_NAME" python3 - <<'PY' >/tmp/subtitles-api-health.out 2>&1
 import urllib.request
 with urllib.request.urlopen("http://127.0.0.1:8006/api/health", timeout=3) as r:
     print(r.status)
@@ -142,7 +142,7 @@ PY
 done
 [[ "$PASS" == "1" ]] || { docker logs --tail 200 "$API_NAME" >&2 || true; fail "Fusion Extension API did not become healthy"; }
 
-docker exec "$API_NAME" python3 - <<'PY'
+docker exec -i "$API_NAME" python3 - <<'PY'
 from app.services.subtitle_service import build_webvtt
 body = build_webvtt([{"duration_sec": 2, "text_chunk": "Subtitle deployment certification."}])
 assert body.startswith("WEBVTT")
