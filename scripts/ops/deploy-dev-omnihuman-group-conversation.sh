@@ -391,6 +391,22 @@ for svc in "${ACTIVE_SERVICES[@]}"; do
   [[ -n "${OLD_ID[$svc]}" && -n "${OLD_REF[$svc]}" ]] || fail "image snapshot failed for $svc"
 done
 
+# Some long-lived DEV compose definitions are build-only and therefore render
+# no explicit services.<name>.image value even though the running container has
+# a stable image reference. Preserve that exact live reference explicitly for
+# this cutover so --no-build recreation selects only the retagged candidate
+# image and never relies on Compose's generated build image naming.
+IMAGE_OVERRIDE="/tmp/desifaces-omnihuman-images-${BACKEND_SHA}.yml"
+{
+  echo "services:"
+  for svc in "${ACTIVE_SERVICES[@]}"; do
+    printf '  %s:\n    image: %s\n' "$svc" "${OLD_REF[$svc]}"
+  done
+} > "$IMAGE_OVERRIDE"
+
+COMPOSE+=(-f "$IMAGE_OVERRIDE")
+echo "COMPOSE_IMAGE_OVERRIDE=PASS"
+
 # Render active compose config and prove it still points at the same image refs
 # used by the running containers. This prevents accidental environment/config
 # cutover from another compose definition.
@@ -474,7 +490,7 @@ rollback(){
   if (( RUNTIME_CHANGED == 1 )); then
     "${COMPOSE[@]}" up -d --no-deps --no-build --force-recreate "${ACTIVE_SERVICES[@]}" >/dev/null 2>&1 || true
   fi
-  rm -f "${RUNTIME_OVERRIDE:-}" "${CONFIG_JSON_FILE:-}"
+  rm -f "${RUNTIME_OVERRIDE:-}" "${IMAGE_OVERRIDE:-}" "${CONFIG_JSON_FILE:-}"
   rm -rf "${BUILD_ROOT:-}"
   echo "DEV_ROLLBACK=ATTEMPTED"
   exit "$rc"
@@ -582,7 +598,7 @@ trap - ERR
 if (( GHCR_LOGGED_IN == 1 )); then
   docker logout ghcr.io >/dev/null 2>&1 || true
 fi
-rm -f "${RUNTIME_OVERRIDE:-}" "${CONFIG_JSON_FILE:-}"
+rm -f "${RUNTIME_OVERRIDE:-}" "${IMAGE_OVERRIDE:-}" "${CONFIG_JSON_FILE:-}"
 rm -rf "${BUILD_ROOT:-}"
 trap - EXIT
 
