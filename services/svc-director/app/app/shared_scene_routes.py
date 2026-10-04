@@ -519,7 +519,7 @@ async def set_shared_scene_conversation(
         "generation_ready": len(body.speaker_targets) == 2,
         "video_supported": len(body.speaker_targets) == 2,
         "video_max_people": 2,
-        "fusion_provider": "omnihuman_v15",
+        "fusion_provider": "omnihuman",
     }
 
 
@@ -585,7 +585,7 @@ async def set_shared_scene_video_settings(
                     detail="shared_scene_video_requires_exactly_two_speakers",
                 )
 
-            metadata["shared_scene_provider"] = "omnihuman_v15"
+            metadata["shared_scene_provider"] = "omnihuman"
             metadata["shared_scene_video_style"] = body.motion_mode
             # Preserve the historical key for old clients/readers while changing
             # its canonical values to static_video/cinematic_video.
@@ -612,7 +612,7 @@ async def set_shared_scene_video_settings(
         "video_style": body.motion_mode,
         "camera_mode": body.camera_mode,
         "video_prompt": body.video_prompt,
-        "fusion_provider": "omnihuman_v15",
+        "fusion_provider": "omnihuman",
         "shared_scene_video_settings_version": 2,
         "pricing_ready": True,
         "persisted": True,
