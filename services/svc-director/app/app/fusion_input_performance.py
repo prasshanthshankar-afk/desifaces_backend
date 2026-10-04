@@ -419,7 +419,7 @@ async def compile_children_performant(
         camera_plan_source = None
 
         if shared_scene:
-            provider_name = "omnihuman_v15"
+            provider_name = "omnihuman"
             listener = next(
                 (
                     candidate
@@ -455,9 +455,9 @@ async def compile_children_performant(
                     "camera_plan_source": camera_plan_source,
                     "longform_profile": "talking_video",
                     "quality_tier": "premium",
-                    "provider_hint": "omnihuman_v15",
-                    "fusion_provider": "omnihuman_v15",
-                    "presenter_provider": "omnihuman_v15",
+                    "provider_hint": "omnihuman",
+                    "fusion_provider": "omnihuman",
+                    "presenter_provider": "omnihuman",
                     "resolution": shared_scene["resolution"],
                     "turbo_mode": False,
                     "aspect_ratio": aspect_ratio,
@@ -490,9 +490,9 @@ async def compile_children_performant(
                 "segment_sequence": turn.sequence_no,
                 "aspect_ratio": aspect_ratio,
                 "conversation_mode": "shared_scene" if shared_scene else "ordered_speaker_shots",
-                "provider_hint": "omnihuman_v15" if shared_scene else provider_name,
+                "provider_hint": "omnihuman" if shared_scene else provider_name,
                 "quality_tier": "premium" if shared_scene else None,
-                "execution_provider_family": "omnihuman_v15" if shared_scene else None,
+                "execution_provider_family": "omnihuman" if shared_scene else None,
                 "shared_scene_video_style": (
                     shared_scene.get("video_style") if shared_scene else None
                 ),
