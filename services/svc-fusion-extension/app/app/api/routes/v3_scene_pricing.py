@@ -650,11 +650,10 @@ async def preview_scene_pricing(
             lineage_hash=lineage_hash,
             contract=contract,
         )
-        await _persist_parent_pricing_for_reservation(
+        await _persist_parent_pricing(
             conn,
             stage_run_id=body.stage_run_id,
             record=record,
-            reservation_id=reservation_id,
         )
         return _out(
             scene_id=UUID(str(scene["scene_id"])),
@@ -889,7 +888,12 @@ async def commit_scene_pricing(
             "pricing_summary": pricing_summary,
             "last_error": None,
         }
-        await _persist_parent_pricing(conn, stage_run_id=body.stage_run_id, record=record)
+        await _persist_parent_pricing_for_reservation(
+            conn,
+            stage_run_id=body.stage_run_id,
+            record=record,
+            reservation_id=reservation_id,
+        )
         return _out(
             scene_id=UUID(str(scene["scene_id"])),
             body=body,
@@ -1012,7 +1016,12 @@ async def release_scene_pricing(
             "pricing_summary": pricing_summary,
             "release_reason": body.reason,
         }
-        await _persist_parent_pricing(conn, stage_run_id=body.stage_run_id, record=record)
+        await _persist_parent_pricing_for_reservation(
+            conn,
+            stage_run_id=body.stage_run_id,
+            record=record,
+            reservation_id=reservation_id,
+        )
         return _out(
             scene_id=UUID(str(scene["scene_id"])),
             body=body,
