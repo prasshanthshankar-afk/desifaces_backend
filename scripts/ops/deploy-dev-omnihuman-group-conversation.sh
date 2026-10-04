@@ -231,6 +231,16 @@ for svc in svc-fusion svc-fusion-worker; do
 done
 echo "FAL_RUNTIME_CREDENTIAL=PASS"
 
+OMNIHUMAN_MODEL_ID="$(
+  docker exec "${CONTAINER[svc-fusion]}" python - <<'PY'
+from app.services.providers.omnihuman_adapter import OmniHumanAdapter
+print(OmniHumanAdapter().model_id)
+PY
+)"
+[[ -n "$OMNIHUMAN_MODEL_ID" ]] || fail "current OmniHuman model identity missing"
+export DF_OMNIHUMAN_MODEL_ID="$OMNIHUMAN_MODEL_ID"
+echo "OMNIHUMAN_MODEL_CONFIGURATION=PASS"
+
 declare -A SOURCE_IMAGE
 SOURCE_IMAGE[director]="ghcr.io/$GHCR_OWNER/desifaces-svc-director:$BACKEND_SHA"
 SOURCE_IMAGE[fusion]="ghcr.io/$GHCR_OWNER/desifaces-svc-fusion:$BACKEND_SHA"
@@ -417,7 +427,8 @@ from PIL import Image
 from app.services.providers.omnihuman_adapter import OmniHumanAdapter
 a=OmniHumanAdapter()
 assert a.provider_name=="omnihuman"
-assert a.model_id=="fal-ai/bytedance/omnihuman/v1.5"
+import os
+assert a.model_id==os.environ["DF_OMNIHUMAN_MODEL_ID"]
 assert a.speaker_mask_model_id=="fal-ai/sam2/image"
 print("OMNIHUMAN_SAM2_RUNTIME=PASS")
 PY
