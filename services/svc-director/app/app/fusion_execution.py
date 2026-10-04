@@ -37,6 +37,24 @@ def _clean(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _dialogue_text(value: Any) -> str:
+    payload = _as_dict(value)
+    for key in (
+        "text",
+        "script_text",
+        "line_text",
+        "line",
+        "dialogue",
+        "utterance",
+        "content",
+        "text_content",
+    ):
+        text = _clean(payload.get(key))
+        if text:
+            return text
+    return ""
+
+
 @dataclass(frozen=True)
 class SceneTurnInput:
     dialogue_turn_id: UUID
@@ -47,6 +65,7 @@ class SceneTurnInput:
     audio_media_id: UUID
     emotion_code: str | None
     duration_hint_ms: int | None
+    dialogue_text: str | None
 
 
 @dataclass(frozen=True)
@@ -102,7 +121,8 @@ async def load_fusion_scene_context(
     turn_rows = await conn.fetch(
         """
         select dt.turn_id,dt.sequence_no,dt.speaker_participant_id,dt.emotion_code,
-               dt.duration_hint_ms,p.display_name,p.primary_face_media_id,
+               dt.duration_hint_ms,to_jsonb(dt) as turn_json,
+               p.display_name,p.primary_face_media_id,
                a.stage_run_id as audio_stage_run_id,ao.media_id as audio_media_id
         from public.v3_dialogue_turns dt
         join public.v3_participants p on p.participant_id=dt.speaker_participant_id
@@ -142,6 +162,7 @@ async def load_fusion_scene_context(
                 audio_media_id=UUID(str(row["audio_media_id"])),
                 emotion_code=_clean(row["emotion_code"]) or None,
                 duration_hint_ms=(int(row["duration_hint_ms"]) if row["duration_hint_ms"] is not None else None),
+                dialogue_text=_dialogue_text(row["turn_json"]) or None,
             )
         )
 
