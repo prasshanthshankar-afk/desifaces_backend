@@ -394,24 +394,49 @@ done
 # Render active compose config and prove it still points at the same image refs
 # used by the running containers. This prevents accidental environment/config
 # cutover from another compose definition.
-CONFIG_JSON="$("${COMPOSE[@]}" config --format json)"
-export CONFIG_JSON
-python3 - "${ACTIVE_SERVICES[@]}" <<'PY'
-import json, os, subprocess, sys
-cfg=json.loads(os.environ["CONFIG_JSON"])
-services=cfg.get("services") or {}
-for svc in sys.argv[1:]:
-    container=subprocess.check_output(
-        ["docker","ps","--filter",f"label=com.docker.compose.service={svc}","--format","{{.Names}}"],
+CONFIG_JSON_FILE="/tmp/desifaces-compose-config-${BACKEND_SHA}.json"
+"${COMPOSE[@]}" config --format json > "$CONFIG_JSON_FILE"
+
+python3 - "$CONFIG_JSON_FILE" "${ACTIVE_SERVICES[@]}" <<'PY'
+import json, subprocess, sys
+
+config_path = sys.argv[1]
+active_services = sys.argv[2:]
+
+with open(config_path, "r", encoding="utf-8") as handle:
+    cfg = json.load(handle)
+
+services = cfg.get("services") or {}
+
+for svc in active_services:
+    container = subprocess.check_output(
+        [
+            "docker",
+            "ps",
+            "--filter",
+            f"label=com.docker.compose.service={svc}",
+            "--format",
+            "{{.Names}}",
+        ],
         text=True,
     ).strip()
-    current=subprocess.check_output(["docker","inspect","-f","{{.Config.Image}}",container],text=True).strip()
-    desired=str((services.get(svc) or {}).get("image") or "").strip()
+
+    current = subprocess.check_output(
+        ["docker", "inspect", "-f", "{{.Config.Image}}", container],
+        text=True,
+    ).strip()
+
+    desired = str((services.get(svc) or {}).get("image") or "").strip()
+
     if desired != current:
-        raise SystemExit(f"compose image drift for {svc}: desired={desired!r} current={current!r}")
+        raise SystemExit(
+            f"compose image drift for {svc}: desired={desired!r} current={current!r}"
+        )
+
 print("COMPOSE_IMAGE_CONTRACT=PASS")
 PY
-unset CONFIG_JSON
+
+rm -f "$CONFIG_JSON_FILE"
 
 for svc in "${ACTIVE_SERVICES[@]}"; do
   docker tag "${SOURCE_IMAGE[${FAMILY[$svc]}]}" "${OLD_REF[$svc]}"
@@ -449,7 +474,8 @@ rollback(){
   if (( RUNTIME_CHANGED == 1 )); then
     "${COMPOSE[@]}" up -d --no-deps --no-build --force-recreate "${ACTIVE_SERVICES[@]}" >/dev/null 2>&1 || true
   fi
-  rm -f "${RUNTIME_OVERRIDE:-}"
+  rm -f "${RUNTIME_OVERRIDE:-}" "${CONFIG_JSON_FILE:-}"
+  rm -rf "${BUILD_ROOT:-}"
   echo "DEV_ROLLBACK=ATTEMPTED"
   exit "$rc"
 }
@@ -556,7 +582,8 @@ trap - ERR
 if (( GHCR_LOGGED_IN == 1 )); then
   docker logout ghcr.io >/dev/null 2>&1 || true
 fi
-rm -f "${RUNTIME_OVERRIDE:-}"
+rm -f "${RUNTIME_OVERRIDE:-}" "${CONFIG_JSON_FILE:-}"
+rm -rf "${BUILD_ROOT:-}"
 trap - EXIT
 
 echo "============================================================"
