@@ -472,6 +472,40 @@ async def _persist_parent_pricing(conn, *, stage_run_id: UUID, record: dict[str,
     )
 
 
+async def _persist_parent_pricing_for_reservation(
+    conn,
+    *,
+    stage_run_id: UUID,
+    record: dict[str, Any],
+    reservation_id: str,
+) -> None:
+    """Persist commit/release state only while this reservation still owns the stage.
+
+    A background coordinator can be finishing an older reservation while the user
+    legitimately obtains a newer one. Never allow that older pass to overwrite the
+    newer canonical reservation pointer.
+    """
+
+    result = await conn.execute(
+        """
+        update public.v3_studio_stage_runs
+        set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $2::jsonb,
+            updated_at=now()
+        where stage_run_id=$1
+          and coalesce(
+                metadata_json #>> '{fusion_parent_pricing,reservation_id}',
+                metadata_json #>> '{fusion_parent_pricing,pricing,reservation_id}',
+                ''
+              )=$3
+        """,
+        stage_run_id,
+        json.dumps({_PRICING_KEY: record}),
+        reservation_id,
+    )
+    if result != "UPDATE 1":
+        raise HTTPException(status_code=409, detail="scene_pricing_reservation_superseded")
+
+
 def _stored_parent_pricing(scene) -> dict[str, Any]:
     return _as_dict(_as_dict(scene["metadata_json"]).get(_PRICING_KEY))
 
@@ -616,7 +650,12 @@ async def preview_scene_pricing(
             lineage_hash=lineage_hash,
             contract=contract,
         )
-        await _persist_parent_pricing(conn, stage_run_id=body.stage_run_id, record=record)
+        await _persist_parent_pricing_for_reservation(
+            conn,
+            stage_run_id=body.stage_run_id,
+            record=record,
+            reservation_id=reservation_id,
+        )
         return _out(
             scene_id=UUID(str(scene["scene_id"])),
             body=body,
@@ -819,10 +858,11 @@ async def commit_scene_pricing(
                 "state": "commit_pending",
                 "last_error": str(exc)[:1200],
             }
-            await _persist_parent_pricing(
+            await _persist_parent_pricing_for_reservation(
                 conn,
                 stage_run_id=body.stage_run_id,
                 record=pending,
+                reservation_id=reservation_id,
             )
             raise HTTPException(
                 status_code=409,
