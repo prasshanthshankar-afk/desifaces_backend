@@ -15,7 +15,7 @@ on:
       - 'services/svc-fusion-extension/app/app/api/routes/v3_scene_stitch.py'
       - 'services/svc-fusion-extension/app/app/workers/v3_scene_coordinator.py'
       - 'services/svc-director/tests/test_shared_scene_contract.py'
-      - 'services/svc-fusion-extension/tests/test_v3_scene_pricing_kling_shared.py'
+      - 'services/svc-fusion-extension/tests/test_v3_scene_pricing_omnihuman_shared.py'
       - 'scripts/test-shared-scene-omnihuman-cinematic.py'
       - 'migrations/2026_10_03_group_conversation_premium_actual_seconds.sql'
       - 'migrations/2026_10_04_group_conversation_omnihuman_cogs.sql'
@@ -58,7 +58,7 @@ jobs:
         run: |
           python - <<'PY'
           import runpy
-          ns = runpy.run_path("services/svc-fusion-extension/tests/test_v3_scene_pricing_kling_shared.py")
+          ns = runpy.run_path("services/svc-fusion-extension/tests/test_v3_scene_pricing_omnihuman_shared.py")
           tests = [value for name, value in ns.items() if name.startswith("test_") and callable(value)]
           assert tests, "no focused pricing tests discovered"
           for test in tests:
