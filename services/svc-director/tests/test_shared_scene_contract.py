@@ -106,7 +106,7 @@ def test_shared_scene_video_settings_route_persists_pricing_gate():
     ).read_text(encoding="utf-8")
 
     assert "/shared-scene-video-settings" in source
-    assert 'metadata["shared_scene_provider"] = "omnihuman_v15"' in source
+    assert 'metadata["shared_scene_provider"] = "omnihuman"' in source
     assert 'metadata["shared_scene_video_style"] = body.motion_mode' in source
     assert 'metadata["shared_scene_motion_mode"] = body.motion_mode' in source
     assert 'metadata["shared_scene_camera_mode"] = body.camera_mode' in source
@@ -137,13 +137,13 @@ def test_shared_scene_compiler_routes_frozen_omnihuman_provider():
         / "fusion_input_performance.py"
     ).read_text(encoding="utf-8")
 
-    assert 'provider_name = "omnihuman_v15"' in source
+    assert 'provider_name = "omnihuman"' in source
     assert 'provider_name = "kling"' not in source
     assert 'provider_name = "sync3"' not in source
     assert '"quality_tier": "premium"' in source
     assert '"longform_profile": "talking_video"' in source
-    assert '"provider_hint": "omnihuman_v15"' in source
-    assert '"execution_provider_family": "omnihuman_v15"' in source
+    assert '"provider_hint": "omnihuman"' in source
+    assert '"execution_provider_family": "omnihuman"' in source
     assert '"active_speaker_coordinates": active_coordinates' in source
     assert '"listener_speaker_coordinates": listener_coordinates' in source
 
