@@ -57,7 +57,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("FAL_QUEUE_BASE_URL", "DF_FAL_QUEUE_BASE_URL"),
     )
     FUSION_PROVIDER: str = Field(
-        default="omnihuman_v15",
+        default="omnihuman",
         validation_alias=AliasChoices("FUSION_PROVIDER", "DF_FUSION_PROVIDER"),
     )
     OMNIHUMAN_MODEL_ID: str = Field(
