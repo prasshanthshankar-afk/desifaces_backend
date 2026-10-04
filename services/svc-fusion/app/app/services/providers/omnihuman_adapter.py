@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 import fal_client
 import httpx
+from PIL import Image, ImageOps
 
 from app.services.providers.base import (
     ProviderClient,
@@ -28,6 +29,9 @@ class OmniHumanAdapterError(RuntimeError):
 
 
 logger = logging.getLogger("fusion.providers.omnihuman")
+
+_SPEAKER_MASK_CACHE: Dict[str, str] = {}
+_SPEAKER_MASK_LOCKS: Dict[str, asyncio.Lock] = {}
 
 
 def _is_downstream_degraded_error(message: Optional[str]) -> bool:
@@ -105,6 +109,9 @@ class OmniHumanAdapter(ProviderClient):
         )
         self.artifact_service = ArtifactService()
         self.input_sas_ttl_hours = int(os.getenv("DF_OMNIHUMAN_INPUT_SAS_HOURS", "4"))
+        self.speaker_mask_model_id = str(
+            os.getenv("DF_OMNIHUMAN_SPEAKER_MASK_MODEL_ID", "fal-ai/sam2/image")
+        ).strip() or "fal-ai/sam2/image"
 
     async def estimate(self, request_payload: Dict[str, Any]) -> ProviderEstimate:
         duration_sec = self._duration_seconds(request_payload)
@@ -156,6 +163,11 @@ class OmniHumanAdapter(ProviderClient):
             face_url = await self._refresh_azure_blob_input_url(source_face_url)
             audio_url = await self._refresh_azure_blob_input_url(source_audio_url)
 
+        mask_url = await self._shared_scene_mask_url(
+            request_payload=request_payload,
+            image_url=face_url,
+        )
+
         request_json: Dict[str, Any] = {
             "image_url": face_url,
             "audio_url": audio_url,
@@ -164,6 +176,8 @@ class OmniHumanAdapter(ProviderClient):
         }
         if prompt:
             request_json["prompt"] = prompt
+        if mask_url:
+            request_json["mask_url"] = mask_url
 
         logger.info(
             "omnihuman.prepare resolved job_id=%s duration_sec=%s resolution=%s turbo_mode=%s source_face_url=%s source_audio_url=%s fal_face_url=%s fal_audio_url=%s",
@@ -194,8 +208,263 @@ class OmniHumanAdapter(ProviderClient):
                 "source_audio_url": source_audio_url,
                 "fal_face_url": face_url,
                 "fal_audio_url": audio_url,
+                "speaker_mask_url_present": bool(mask_url),
+                "speaker_mask_model_id": self.speaker_mask_model_id if mask_url else None,
             },
         )
+
+    @staticmethod
+    def _provider_options(request_payload: Dict[str, Any]) -> Dict[str, Any]:
+        value = request_payload.get("provider_options")
+        return dict(value) if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _coordinate_pair(value: Any, *, field: str) -> list[int]:
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise OmniHumanAdapterError(f"{field}_required")
+        try:
+            x = int(value[0])
+            y = int(value[1])
+        except Exception as exc:
+            raise OmniHumanAdapterError(f"{field}_invalid") from exc
+        if x < 0 or y < 0:
+            raise OmniHumanAdapterError(f"{field}_invalid")
+        return [x, y]
+
+    @staticmethod
+    def _speaker_mask_dimensions(provider_options: Dict[str, Any]) -> tuple[int, int]:
+        raw = provider_options.get("shared_scene_dimensions")
+        if not isinstance(raw, dict):
+            raise OmniHumanAdapterError("OMNIHUMAN_SHARED_SCENE_DIMENSIONS_REQUIRED")
+        try:
+            width = int(raw.get("width"))
+            height = int(raw.get("height"))
+        except Exception as exc:
+            raise OmniHumanAdapterError("OMNIHUMAN_SHARED_SCENE_DIMENSIONS_INVALID") from exc
+        if width < 64 or height < 64:
+            raise OmniHumanAdapterError("OMNIHUMAN_SHARED_SCENE_DIMENSIONS_INVALID")
+        return width, height
+
+    @staticmethod
+    def _speaker_mask_box(
+        active: list[int],
+        listener: list[int],
+        *,
+        width: int,
+        height: int,
+    ) -> Dict[str, int]:
+        midpoint = (active[0] + listener[0]) / 2.0
+        safety = max(32, min(120, int(round(width * 0.07))))
+        if active[0] < listener[0]:
+            x_min = 0
+            x_max = min(width - 1, int(midpoint + safety))
+        else:
+            x_min = max(0, int(midpoint - safety))
+            x_max = width - 1
+        return {
+            "x_min": int(x_min),
+            "y_min": 0,
+            "x_max": int(x_max),
+            "y_max": int(height - 1),
+        }
+
+    @staticmethod
+    def _speaker_mask_cache_key(
+        provider_options: Dict[str, Any],
+        active: list[int],
+        listener: list[int],
+        width: int,
+        height: int,
+    ) -> str:
+        stable = str(
+            provider_options.get("speaker_mask_cache_key")
+            or provider_options.get("shared_scene_media_id")
+            or ""
+        ).strip()
+        return f"{stable}|{width}x{height}|{active[0]},{active[1]}|{listener[0]},{listener[1]}"
+
+    @staticmethod
+    def _mask_result_url(result: Any) -> str:
+        if isinstance(result, dict):
+            image = result.get("image")
+        else:
+            image = getattr(result, "image", None)
+        if isinstance(image, dict):
+            url = image.get("url")
+        else:
+            url = getattr(image, "url", None)
+        return str(url or "").strip()
+
+    async def _normalize_and_upload_mask(
+        self,
+        *,
+        mask_url: str,
+        width: int,
+        height: int,
+        active: list[int],
+        listener: list[int],
+    ) -> str:
+        raw_path: Optional[str] = None
+        final_path: Optional[str] = None
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.input_download_timeout_s,
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(mask_url)
+                response.raise_for_status()
+                data = response.content
+            if not data:
+                raise OmniHumanAdapterError("OMNIHUMAN_SPEAKER_MASK_EMPTY_DOWNLOAD")
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as raw:
+                raw.write(data)
+                raw_path = raw.name
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as final:
+                final_path = final.name
+
+            with Image.open(raw_path) as source:
+                gray = source.convert("L")
+                if gray.size != (width, height):
+                    gray = gray.resize((width, height), Image.Resampling.NEAREST)
+                mask = gray.point(lambda p: 255 if p >= 128 else 0, mode="1").convert("L")
+
+            ax = max(0, min(width - 1, int(active[0])))
+            ay = max(0, min(height - 1, int(active[1])))
+            lx = max(0, min(width - 1, int(listener[0])))
+            ly = max(0, min(height - 1, int(listener[1])))
+
+            # OmniHuman contract: white is the only speaking person.
+            if mask.getpixel((ax, ay)) < 128:
+                mask = ImageOps.invert(mask)
+
+            active_pixel = int(mask.getpixel((ax, ay)))
+            listener_pixel = int(mask.getpixel((lx, ly)))
+            hist = mask.histogram()
+            total = int(hist[0]) + int(hist[255])
+            occupancy = (float(hist[255]) / float(total)) if total else 0.0
+
+            if active_pixel != 255:
+                raise OmniHumanAdapterError("OMNIHUMAN_SPEAKER_MASK_ACTIVE_NOT_WHITE")
+            if listener_pixel != 0:
+                raise OmniHumanAdapterError("OMNIHUMAN_SPEAKER_MASK_LISTENER_NOT_BLACK")
+            if occupancy < 0.05 or occupancy > 0.70:
+                raise OmniHumanAdapterError(
+                    f"OMNIHUMAN_SPEAKER_MASK_OCCUPANCY_INVALID:{occupancy:.4f}"
+                )
+            if not mask.getbbox():
+                raise OmniHumanAdapterError("OMNIHUMAN_SPEAKER_MASK_EMPTY")
+
+            mask.save(final_path, format="PNG")
+            uploaded = await asyncio.to_thread(fal_client.upload_file, final_path)
+            uploaded_url = str(uploaded or "").strip()
+            if not uploaded_url:
+                raise OmniHumanAdapterError("OMNIHUMAN_SPEAKER_MASK_UPLOAD_EMPTY")
+            return uploaded_url
+        finally:
+            for path in (raw_path, final_path):
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+
+    async def _generate_shared_scene_mask(
+        self,
+        *,
+        image_url: str,
+        provider_options: Dict[str, Any],
+        active: list[int],
+        listener: list[int],
+        width: int,
+        height: int,
+    ) -> str:
+        box = self._speaker_mask_box(
+            active,
+            listener,
+            width=width,
+            height=height,
+        )
+        try:
+            result = await asyncio.to_thread(
+                fal_client.subscribe,
+                self.speaker_mask_model_id,
+                arguments={
+                    "image_url": image_url,
+                    "prompts": [
+                        {"label": 1, "x": int(active[0]), "y": int(active[1])},
+                        {"label": 0, "x": int(listener[0]), "y": int(listener[1])},
+                    ],
+                    "box_prompts": [box],
+                    "apply_mask": False,
+                    "output_format": "png",
+                },
+            )
+        except Exception as exc:
+            raise OmniHumanAdapterError(f"OMNIHUMAN_SPEAKER_MASK_GENERATION_FAILED:{exc}") from exc
+
+        raw_mask_url = self._mask_result_url(result)
+        if not raw_mask_url:
+            raise OmniHumanAdapterError("OMNIHUMAN_SPEAKER_MASK_URL_MISSING")
+
+        return await self._normalize_and_upload_mask(
+            mask_url=raw_mask_url,
+            width=width,
+            height=height,
+            active=active,
+            listener=listener,
+        )
+
+    async def _shared_scene_mask_url(
+        self,
+        *,
+        request_payload: Dict[str, Any],
+        image_url: str,
+    ) -> str:
+        provider_options = self._provider_options(request_payload)
+        if str(provider_options.get("conversation_mode") or "").strip().lower() != "shared_scene":
+            return ""
+
+        explicit = str(provider_options.get("mask_url") or "").strip()
+        if explicit:
+            return explicit
+
+        active = self._coordinate_pair(
+            provider_options.get("active_speaker_coordinates"),
+            field="OMNIHUMAN_ACTIVE_SPEAKER_COORDINATES",
+        )
+        listener = self._coordinate_pair(
+            provider_options.get("listener_speaker_coordinates"),
+            field="OMNIHUMAN_LISTENER_SPEAKER_COORDINATES",
+        )
+        width, height = self._speaker_mask_dimensions(provider_options)
+
+        key = self._speaker_mask_cache_key(
+            provider_options,
+            active,
+            listener,
+            width,
+            height,
+        )
+        cached = _SPEAKER_MASK_CACHE.get(key)
+        if cached:
+            return cached
+
+        lock = _SPEAKER_MASK_LOCKS.setdefault(key, asyncio.Lock())
+        async with lock:
+            cached = _SPEAKER_MASK_CACHE.get(key)
+            if cached:
+                return cached
+            generated = await self._generate_shared_scene_mask(
+                image_url=image_url,
+                provider_options=provider_options,
+                active=active,
+                listener=listener,
+                width=width,
+                height=height,
+            )
+            _SPEAKER_MASK_CACHE[key] = generated
+            return generated
 
     async def submit(self, payload: Dict[str, Any], idempotency_key: str) -> ProviderSubmitResult:
         logger.info(
