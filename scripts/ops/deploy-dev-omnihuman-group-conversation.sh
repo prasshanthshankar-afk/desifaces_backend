@@ -537,7 +537,7 @@ done
 echo "IMMUTABLE_IMAGE_PARITY=PASS"
 
 # Source/runtime contracts.
-docker exec "${CONTAINER[svc-director]}" python - <<'PY'
+docker exec -i "${CONTAINER[svc-director]}" python - <<'PY'
 from pathlib import Path
 src=Path("/app/app/fusion_input_performance.py").read_text()
 assert 'provider_name = "omnihuman"' in src
@@ -553,7 +553,7 @@ PY
 
 for svc in svc-fusion svc-fusion-worker; do
   [[ -n "${CONTAINER[$svc]:-}" ]] || continue
-  docker exec "${CONTAINER[$svc]}" python - <<'PY'
+  docker exec -i "${CONTAINER[$svc]}" python - <<'PY'
 from PIL import Image
 from app.services.providers.omnihuman_adapter import OmniHumanAdapter
 a=OmniHumanAdapter()
@@ -574,14 +574,14 @@ for svc in svc-fusion-extension svc-fusion-extension-worker svc-fusion-extension
 done
 echo "FUSION_EXTENSION_RUNTIME_PARITY=PASS"
 
-docker exec "${CONTAINER[svc-fusion-extension]}" python - <<'PY'
+docker exec -i "${CONTAINER[svc-fusion-extension]}" python - <<'PY'
 from app.api.routes.v3_scene_pricing import _SHARED_SCENE_PROVIDER
 assert _SHARED_SCENE_PROVIDER=="omnihuman"
 print("OMNIHUMAN_PARENT_PRICING_PROVIDER=PASS")
 PY
 
 if [[ -n "${CONTAINER[svc-fusion-extension-stitch-worker]:-}" ]]; then
-docker exec "${CONTAINER[svc-fusion-extension-stitch-worker]}" python - <<'PY'
+docker exec -i "${CONTAINER[svc-fusion-extension-stitch-worker]}" python - <<'PY'
 from pathlib import Path
 src=Path("/app/app/workers/v3_scene_coordinator.py").read_text()
 assert 'if not stitched_media_id:' in src
