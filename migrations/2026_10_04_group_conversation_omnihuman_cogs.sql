@@ -20,7 +20,7 @@ INSERT INTO public.pricing_sku_costs (
 )
 VALUES (
   'GROUP_TALK_PREMIUM_SECOND',
-  'fal_omnihuman_v15_variable',
+  'fal_omnihuman_variable',
   'variable',
   'USD',
   0.16000000,
@@ -30,7 +30,7 @@ VALUES (
   '2026-10-04 00:00:00+00',
   NULL,
   jsonb_build_object(
-    'provider', 'omnihuman_v15',
+    'provider', 'omnihuman',
     'provider_model', 'fal-ai/bytedance/omnihuman/v1.5',
     'billing_unit', 'generated_second',
     'source', 'fal_public_rate_2026_10_04',
@@ -57,7 +57,7 @@ BEGIN
     INTO active_cost
   FROM public.pricing_sku_costs
   WHERE sku_code='GROUP_TALK_PREMIUM_SECOND'
-    AND component_code='fal_omnihuman_v15_variable'
+    AND component_code='fal_omnihuman_variable'
     AND is_active=true
     AND effective_from <= now()
     AND (effective_to IS NULL OR effective_to > now())
