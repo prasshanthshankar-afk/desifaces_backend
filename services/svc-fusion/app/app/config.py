@@ -61,7 +61,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("FUSION_PROVIDER", "DF_FUSION_PROVIDER"),
     )
     OMNIHUMAN_MODEL_ID: str = Field(
-        default="fal-ai/bytedance/omnihuman/v1.5",
+        default="",
         validation_alias=AliasChoices("OMNIHUMAN_MODEL_ID", "DF_OMNIHUMAN_MODEL_ID"),
     )
     OMNIHUMAN_MAX_AUDIO_SECONDS: int = Field(
