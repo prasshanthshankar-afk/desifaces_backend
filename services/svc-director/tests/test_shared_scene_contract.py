@@ -106,8 +106,11 @@ def test_shared_scene_video_settings_route_persists_pricing_gate():
     ).read_text(encoding="utf-8")
 
     assert "/shared-scene-video-settings" in source
+    assert 'metadata["shared_scene_provider"] = "omnihuman_v15"' in source
+    assert 'metadata["shared_scene_video_style"] = body.motion_mode' in source
     assert 'metadata["shared_scene_motion_mode"] = body.motion_mode' in source
-    assert 'metadata["shared_scene_video_settings_version"] = 1' in source
+    assert 'metadata["shared_scene_camera_mode"] = body.camera_mode' in source
+    assert 'metadata["shared_scene_video_settings_version"] = 2' in source
     assert "shared_scene_video_settings_requires_approved_group_photo" in source
     assert "shared_scene_video_requires_exactly_two_speakers" in source
     assert "len(speaker_targets) != 2" in source
@@ -126,7 +129,7 @@ def test_shared_scene_fusion_fails_closed_for_non_two_person_video():
     assert "len(shared_speaker_ids) != 2" in source
 
 
-def test_shared_scene_compiler_routes_single_provider_kling_natural_conversation():
+def test_shared_scene_compiler_routes_frozen_omnihuman_provider():
     source = (
         Path(__file__).resolve().parents[1]
         / "app"
@@ -134,12 +137,15 @@ def test_shared_scene_compiler_routes_single_provider_kling_natural_conversation
         / "fusion_input_performance.py"
     ).read_text(encoding="utf-8")
 
-    assert 'provider_name = "kling"' in source
+    assert 'provider_name = "omnihuman_v15"' in source
+    assert 'provider_name = "kling"' not in source
     assert 'provider_name = "sync3"' not in source
     assert '"quality_tier": "premium"' in source
     assert '"longform_profile": "talking_video"' in source
-    assert '"provider_hint": "kling"' in source
-    assert '"execution_provider_family": "kling_avatar"' in source
+    assert '"provider_hint": "omnihuman_v15"' in source
+    assert '"execution_provider_family": "omnihuman_v15"' in source
+    assert '"active_speaker_coordinates": active_coordinates' in source
+    assert '"listener_speaker_coordinates": listener_coordinates' in source
 
 
 def test_shared_scene_compiler_consumes_saved_motion_prompt_and_directs_both_people():
@@ -154,8 +160,9 @@ def test_shared_scene_compiler_consumes_saved_motion_prompt_and_directs_both_peo
     assert "_shared_scene_performance_prompt" in source
     assert "is the only person speaking" in source
     assert "keep the mouth closed" in source
-    assert "restrained hand gestures" in source
-    assert "No exaggerated gestures" in source
+    assert "context-appropriate conversational gestures" in source
+    assert "No face swapping" in source
+    assert 'getattr(turn, "dialogue_text", None)' in source
     assert '"prompt": performance_prompt' in source
 
 
@@ -171,3 +178,40 @@ def test_parent_pricing_requires_seconds_for_shared_scene_only():
     assert '"minute"' in source
     assert 'get("conversation_mode")' in source
     assert "fusion_parent_pricing_unit_must_be_" in source
+
+
+def test_shared_scene_supports_static_and_cinematic_camera_contract():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "fusion_input_performance.py"
+    ).read_text(encoding="utf-8")
+
+    assert '"static_video"' in source
+    assert '"cinematic_video"' in source
+    assert '"director_choice"' in source
+    for camera in (
+        "push_in",
+        "push_out",
+        "arc_left",
+        "arc_right",
+        "angle_shift_low_to_eye",
+        "angle_shift_high_to_eye",
+    ):
+        assert f'"{camera}"' in source
+    assert "creative_director_scene_direction" in source
+    assert "creative_director_contextual_policy_v1" in source
+
+
+def test_shared_scene_turn_context_carries_dialogue_for_performance_planning():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "fusion_execution.py"
+    ).read_text(encoding="utf-8")
+
+    assert "to_jsonb(dt) as turn_json" in source
+    assert "dialogue_text: str | None" in source
+    assert "dialogue_text=_dialogue_text" in source
