@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, HttpUrl, model_validator
 from app.domain.enums import AspectRatio, VoiceMode
 
 FusionProvider = Literal[
-    "omnihuman_v15",
+    "omnihuman",
     "omnihuman",
     "heygen_av4",
     "kling",
@@ -25,14 +25,14 @@ Resolution = Literal["540p", "720p", "1080p"]
 
 
 def _normalize_provider_name(value: Optional[str]) -> str:
-    provider = str(value or "omnihuman_v15").strip().lower()
+    provider = str(value or "omnihuman").strip().lower()
     if provider in {"veed", "veed_fabric", "fabric", "veed/fabric-1.0"}:
         return "veed_fabric"
-    if provider in {"omnihuman", "omnihuman_v15"}:
-        return "omnihuman_v15"
+    if provider in {"omnihuman", "omnihuman"}:
+        return "omnihuman"
     if provider in {"sync3", "sync_3", "sync-3"}:
         return "sync3"
-    return provider or "omnihuman_v15"
+    return provider or "omnihuman"
 
 
 class Consent(BaseModel):
@@ -104,7 +104,7 @@ class FusionJobCreate(BaseModel):
     video: VideoSettings = Field(default_factory=VideoSettings)
     consent: Consent = Field(default_factory=Consent)
 
-    provider: FusionProvider = "omnihuman_v15"
+    provider: FusionProvider = "omnihuman"
     provider_options: Dict[str, Any] = Field(default_factory=dict)
     reference_image_urls: List[str] = Field(default_factory=list)
     reference_image_artifact_ids: List[str] = Field(default_factory=list)
@@ -155,11 +155,11 @@ class FusionJobCreate(BaseModel):
                 raise ValueError(
                     "heygen_av4 requires one of: face_image_url, face_artifact_id, heygen_talking_photo_id, image_key"
                 )
-        elif provider == "omnihuman_v15":
+        elif provider == "omnihuman":
             if not (has_face_url or has_face_artifact):
-                raise ValueError("omnihuman_v15 requires one of: face_image_url or face_artifact_id")
+                raise ValueError("omnihuman requires one of: face_image_url or face_artifact_id")
             if has_tp or has_key:
-                raise ValueError("omnihuman_v15 does not use heygen_talking_photo_id or image_key")
+                raise ValueError("omnihuman does not use heygen_talking_photo_id or image_key")
         elif provider == "veed_fabric":
             if not (has_face_url or has_face_artifact or has_start_image):
                 raise ValueError(
@@ -184,7 +184,7 @@ class FusionJobCreate(BaseModel):
                 raise ValueError("voice_mode=audio forbids voice_tts (set it to null).")
             return self
 
-        if provider in {"omnihuman_v15", "veed_fabric"}:
+        if provider in {"omnihuman", "veed_fabric"}:
             raise ValueError(f"{provider} currently supports voice_mode=audio only")
 
         if self.voice_mode == VoiceMode.tts:
