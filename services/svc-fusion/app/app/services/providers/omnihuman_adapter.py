@@ -59,7 +59,7 @@ def _preview_url(url: Optional[str], keep: int = 96) -> Optional[str]:
 
 class OmniHumanAdapter(ProviderClient):
     """
-    Production-ready OmniHuman v1.5 adapter.
+    Production-ready OmniHuman adapter.
 
     Key behavior:
     - Uses fal_client-backed queue transport through FalQueueClient
