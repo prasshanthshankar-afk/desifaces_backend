@@ -20,7 +20,7 @@ def _normalize_provider_name(value: str | None) -> str:
     provider = str(value or "omnihuman").strip().lower()
     if provider in {"veed", "veed_fabric", "fabric", "veed/fabric-1.0"}:
         return "veed_fabric"
-    if provider in {"omnihuman", "omnihuman"}:
+    if provider == "omnihuman":
         return "omnihuman"
     return provider or "omnihuman"
 
