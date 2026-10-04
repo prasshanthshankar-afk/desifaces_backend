@@ -231,15 +231,36 @@ for svc in svc-fusion svc-fusion-worker; do
 done
 echo "FAL_RUNTIME_CREDENTIAL=PASS"
 
-OMNIHUMAN_MODEL_ID="$(
-  docker exec "${CONTAINER[svc-fusion]}" python - <<'PY'
-from app.services.providers.omnihuman_adapter import OmniHumanAdapter
-print(OmniHumanAdapter().model_id)
-PY
-)"
-[[ -n "$OMNIHUMAN_MODEL_ID" ]] || fail "current OmniHuman model identity missing"
-export DF_OMNIHUMAN_MODEL_ID="$OMNIHUMAN_MODEL_ID"
+MODEL_ID="${DF_OMNIHUMAN_MODEL_ID:-${OMNIHUMAN_MODEL_ID:-}}"
+
+if [[ -z "$MODEL_ID" ]]; then
+  MODEL_ID="$(
+    docker inspect "${CONTAINER[svc-fusion]}"       --format '{{range .Config.Env}}{{println .}}{{end}}' |
+    awk -F= '
+      $1=="DF_OMNIHUMAN_MODEL_ID" && length($2)>0 {print substr($0,index($0,"=")+1); exit}
+      $1=="FAL_OMNIHUMAN_MODEL_ID" && length($2)>0 {print substr($0,index($0,"=")+1); exit}
+    '
+  )"
+fi
+
+[[ -n "$MODEL_ID" ]] || fail "OmniHuman model config missing; set DF_OMNIHUMAN_MODEL_ID in the deployment environment"
+
+export DF_OMNIHUMAN_MODEL_ID="$MODEL_ID"
 echo "OMNIHUMAN_MODEL_CONFIGURATION=PASS"
+
+RUNTIME_OVERRIDE="/tmp/desifaces-omnihuman-runtime-${BACKEND_SHA}.yml"
+cat > "$RUNTIME_OVERRIDE" <<'YAML'
+services:
+  svc-fusion:
+    environment:
+      DF_OMNIHUMAN_MODEL_ID: ${DF_OMNIHUMAN_MODEL_ID:?DF_OMNIHUMAN_MODEL_ID is required}
+  svc-fusion-worker:
+    environment:
+      DF_OMNIHUMAN_MODEL_ID: ${DF_OMNIHUMAN_MODEL_ID:?DF_OMNIHUMAN_MODEL_ID is required}
+YAML
+
+COMPOSE+=(-f "$RUNTIME_OVERRIDE")
+echo "OMNIHUMAN_RUNTIME_CONFIG_OVERRIDE=PASS"
 
 declare -A SOURCE_IMAGE
 SOURCE_IMAGE[director]="ghcr.io/$GHCR_OWNER/desifaces-svc-director:$BACKEND_SHA"
@@ -380,6 +401,7 @@ rollback(){
   if (( RUNTIME_CHANGED == 1 )); then
     "${COMPOSE[@]}" up -d --no-deps --no-build --force-recreate "${ACTIVE_SERVICES[@]}" >/dev/null 2>&1 || true
   fi
+  rm -f "${RUNTIME_OVERRIDE:-}"
   echo "DEV_ROLLBACK=ATTEMPTED"
   exit "$rc"
 }
@@ -486,6 +508,7 @@ trap - ERR
 if (( GHCR_LOGGED_IN == 1 )); then
   docker logout ghcr.io >/dev/null 2>&1 || true
 fi
+rm -f "${RUNTIME_OVERRIDE:-}"
 trap - EXIT
 
 echo "============================================================"
