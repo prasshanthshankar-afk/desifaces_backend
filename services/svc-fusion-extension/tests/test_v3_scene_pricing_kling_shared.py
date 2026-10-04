@@ -16,7 +16,7 @@ def test_shared_scene_uses_existing_premium_actual_seconds_contract():
     assert '_GROUP_SURCHARGE_PCT = 20' in source
     assert '"multi_person_surcharge_pct": _GROUP_SURCHARGE_PCT' in source
     assert '"provider": _SHARED_SCENE_PROVIDER' in source
-    assert '_SHARED_SCENE_PROVIDER = "kling"' in source
+    assert '_SHARED_SCENE_PROVIDER = "omnihuman_v15"' in source
     assert '"unit_type": "second"' in source
     assert '"quality_tier": "premium"' in source
 
@@ -40,7 +40,7 @@ def test_shared_scene_pricing_selection_is_conversation_mode_scoped():
     assert '== "shared_scene"' in source
     assert 'return {' in source
     assert '_LEGACY_PROVIDER = "provider-neutral"' in source
-    assert '_SHARED_SCENE_PROVIDER = "kling"' in source
+    assert '_SHARED_SCENE_PROVIDER = "omnihuman_v15"' in source
 
 
 def test_group_conversation_pricing_migration_is_explicit_20_percent_and_cross_channel():
