@@ -356,40 +356,131 @@ async def _finalize_scene(pool, row: dict[str, Any], children: list[dict[str, An
     if not segment_urls or any(not value for value in segment_urls):
         return
 
-    started_wall = _utc_iso()
-    started = time.perf_counter()
-    await _persist_children(pool, attempt_id=UUID(str(row["attempt_id"])), children=ordered, phase="scene_stitch")
+    attempt_metadata = _as_dict(row.get("attempt_metadata"))
+    stitched_media_id = _clean(attempt_metadata.get("stitched_media_id"))
+    stitched_video_url = _clean(attempt_metadata.get("stitched_video_url"))
+    coordinator_meta = _as_dict(attempt_metadata.get("background_coordinator"))
 
-    stage_metadata = _as_dict(row.get("stage_metadata"))
-    conversation_mode = _clean(stage_metadata.get("conversation_mode")).lower() or None
-    stitch_mode = "hard_cut" if conversation_mode == "shared_scene" else None
-
-    stitch_body = SceneStitchIn(
-        project_id=UUID(str(row["project_id"])),
-        workflow_id=UUID(str(row["workflow_id"])),
-        stage_run_id=UUID(str(row["stage_run_id"])),
-        attempt_id=UUID(str(row["attempt_id"])),
-        segment_urls=segment_urls,
-        stitch_mode=stitch_mode,
-        conversation_mode=conversation_mode,
-    )
+    stitch_started = _clean(coordinator_meta.get("stitch_started_at")) or None
+    stitch_finished = _clean(coordinator_meta.get("stitch_completed_at")) or None
     try:
-        stitched = await stitch_scene(
-            body=stitch_body,
-            user_id=str(row["owner_user_id"]),
-            pool=pool,
-        )
-    except Exception as exc:
-        await _release_failed_scene(
-            pool,
-            row,
-            children=ordered,
-            reason=f"fusion_scene_stitch_failed:{str(exc)[:1200]}",
-        )
-        return
+        stitch_ms = max(0, int(coordinator_meta.get("stitch_ms") or 0))
+    except Exception:
+        stitch_ms = 0
 
-    stitch_ms = max(0, int((time.perf_counter() - started) * 1000))
-    stitch_finished = _utc_iso()
+    # A scene is stitched exactly once per attempt. Pricing retries reuse the
+    # persisted stitched media and never re-enter FFmpeg/provider generation.
+    if not stitched_media_id:
+        started_wall = _utc_iso()
+        started = time.perf_counter()
+        await _persist_children(
+            pool,
+            attempt_id=UUID(str(row["attempt_id"])),
+            children=ordered,
+            phase="scene_stitch",
+        )
+
+        stage_metadata = _as_dict(row.get("stage_metadata"))
+        conversation_mode = _clean(stage_metadata.get("conversation_mode")).lower() or None
+        stitch_mode = "hard_cut" if conversation_mode == "shared_scene" else None
+
+        stitch_body = SceneStitchIn(
+            project_id=UUID(str(row["project_id"])),
+            workflow_id=UUID(str(row["workflow_id"])),
+            stage_run_id=UUID(str(row["stage_run_id"])),
+            attempt_id=UUID(str(row["attempt_id"])),
+            segment_urls=segment_urls,
+            stitch_mode=stitch_mode,
+            conversation_mode=conversation_mode,
+        )
+        try:
+            stitched = await stitch_scene(
+                body=stitch_body,
+                user_id=str(row["owner_user_id"]),
+                pool=pool,
+            )
+        except Exception as exc:
+            await _release_failed_scene(
+                pool,
+                row,
+                children=ordered,
+                reason=f"fusion_scene_stitch_failed:{str(exc)[:1200]}",
+            )
+            return
+
+        stitch_ms = max(0, int((time.perf_counter() - started) * 1000))
+        stitch_started = started_wall
+        stitch_finished = _utc_iso()
+        stitched_media_id = str(stitched.media_id)
+        stitched_video_url = _clean(stitched.video_url)
+
+        # Persist the immutable assembled-media checkpoint before attempting the
+        # credit commit. A transient pricing failure therefore retries pricing
+        # only; it cannot restitch or regenerate already completed speaker clips.
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                update public.v3_studio_stage_attempts
+                set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $2::jsonb,
+                    updated_at=now()
+                where attempt_id=$1
+                """,
+                row["attempt_id"],
+                json.dumps({
+                    "children": ordered,
+                    "stitched_media_id": stitched_media_id,
+                    "stitched_video_url": stitched_video_url,
+                    "parent_pricing_commit_pending": True,
+                    "parent_pricing_commit_error": None,
+                    "background_coordinator": {
+                        "enabled": True,
+                        "phase": "pricing_commit",
+                        "stitch_started_at": stitch_started,
+                        "stitch_completed_at": stitch_finished,
+                        "stitch_ms": stitch_ms,
+                        "last_reconciled_at": _utc_iso(),
+                    },
+                }),
+            )
+    else:
+        # Retry path: reuse the already assembled media. Do not call stitch_scene.
+        async with pool.acquire() as conn:
+            media_exists = await conn.fetchval(
+                """
+                select exists(
+                  select 1 from public.media_assets
+                  where id=$1 and lifecycle_state='active'
+                )
+                """,
+                UUID(stitched_media_id),
+            )
+        if not media_exists:
+            raise RuntimeError("fusion_background_stitched_media_missing")
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                update public.v3_studio_stage_attempts
+                set metadata_json=coalesce(metadata_json,'{}'::jsonb) || $2::jsonb,
+                    updated_at=now()
+                where attempt_id=$1
+                """,
+                row["attempt_id"],
+                json.dumps({
+                    "children": ordered,
+                    "stitched_media_id": stitched_media_id,
+                    "stitched_video_url": stitched_video_url,
+                    "parent_pricing_commit_pending": True,
+                    "background_coordinator": {
+                        "enabled": True,
+                        "phase": "pricing_commit",
+                        "stitch_started_at": stitch_started,
+                        "stitch_completed_at": stitch_finished,
+                        "stitch_ms": stitch_ms,
+                        "reused_stitched_media": True,
+                        "last_reconciled_at": _utc_iso(),
+                    },
+                }),
+            )
 
     pricing_body = ScenePricingKey(
         project_id=UUID(str(row["project_id"])),
@@ -417,21 +508,26 @@ async def _finalize_scene(pool, row: dict[str, Any], children: list[dict[str, An
                 row["attempt_id"],
                 json.dumps({
                     "children": ordered,
+                    "stitched_media_id": stitched_media_id,
+                    "stitched_video_url": stitched_video_url,
                     "parent_pricing_commit_pending": True,
                     "parent_pricing_commit_error": str(exc)[:1200],
                     "background_coordinator": {
                         "enabled": True,
                         "phase": "pricing_commit",
-                        "stitch_started_at": started_wall,
+                        "stitch_started_at": stitch_started,
                         "stitch_completed_at": stitch_finished,
                         "stitch_ms": stitch_ms,
+                        "reused_stitched_media": bool(
+                            _clean(attempt_metadata.get("stitched_media_id"))
+                        ),
                         "last_reconciled_at": _utc_iso(),
                     },
                 }),
             )
         return
 
-    media_id = UUID(str(stitched.media_id))
+    media_id = UUID(stitched_media_id)
     async with pool.acquire() as conn:
         async with conn.transaction():
             media = await conn.fetchrow(
@@ -465,14 +561,15 @@ async def _finalize_scene(pool, row: dict[str, Any], children: list[dict[str, An
                 media_id,
                 json.dumps({
                     "children": ordered,
-                    "stitched_video_url": stitched.video_url,
+                    "stitched_media_id": str(media_id),
+                    "stitched_video_url": stitched_video_url,
                     "parent_pricing": committed_pricing,
                     "parent_pricing_commit_pending": False,
                     "parent_pricing_commit_error": None,
                     "background_coordinator": {
                         "enabled": True,
                         "phase": "ready_for_review",
-                        "stitch_started_at": started_wall,
+                        "stitch_started_at": stitch_started,
                         "stitch_completed_at": stitch_finished,
                         "stitch_ms": stitch_ms,
                         "finalized_at": _utc_iso(),
