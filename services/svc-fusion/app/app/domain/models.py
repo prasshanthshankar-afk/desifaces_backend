@@ -9,7 +9,6 @@ from app.domain.enums import AspectRatio, VoiceMode
 
 FusionProvider = Literal[
     "omnihuman",
-    "omnihuman",
     "heygen_av4",
     "kling",
     "luma",
@@ -28,7 +27,7 @@ def _normalize_provider_name(value: Optional[str]) -> str:
     provider = str(value or "omnihuman").strip().lower()
     if provider in {"veed", "veed_fabric", "fabric", "veed/fabric-1.0"}:
         return "veed_fabric"
-    if provider in {"omnihuman", "omnihuman"}:
+    if provider == "omnihuman":
         return "omnihuman"
     if provider in {"sync3", "sync_3", "sync-3"}:
         return "sync3"
