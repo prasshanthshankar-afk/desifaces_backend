@@ -17,12 +17,12 @@ def _is_uuid(s: str) -> bool:
 
 
 def _normalize_provider_name(value: str | None) -> str:
-    provider = str(value or "omnihuman_v15").strip().lower()
+    provider = str(value or "omnihuman").strip().lower()
     if provider in {"veed", "veed_fabric", "fabric", "veed/fabric-1.0"}:
         return "veed_fabric"
-    if provider in {"omnihuman", "omnihuman_v15"}:
-        return "omnihuman_v15"
-    return provider or "omnihuman_v15"
+    if provider in {"omnihuman", "omnihuman"}:
+        return "omnihuman"
+    return provider or "omnihuman"
 
 
 def validate_fusion_request(req: FusionJobCreate) -> None:
@@ -46,16 +46,16 @@ def validate_fusion_request(req: FusionJobCreate) -> None:
                 detail="Provide one of: face_image_url, face_artifact_id, heygen_talking_photo_id, image_key",
             )
 
-    elif provider == "omnihuman_v15":
+    elif provider == "omnihuman":
         if not bool(req.face_image_url or req.face_artifact_id):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="omnihuman_v15 requires one of: face_image_url or face_artifact_id",
+                detail="omnihuman requires one of: face_image_url or face_artifact_id",
             )
         if bool(req.heygen_talking_photo_id or req.image_key):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="omnihuman_v15 does not use heygen_talking_photo_id or image_key",
+                detail="omnihuman does not use heygen_talking_photo_id or image_key",
             )
 
     elif provider == "veed_fabric":
@@ -103,7 +103,7 @@ def validate_fusion_request(req: FusionJobCreate) -> None:
                 )
         return
 
-    if provider in {"omnihuman_v15", "veed_fabric"}:
+    if provider in {"omnihuman", "veed_fabric"}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"{provider} currently supports voice_mode=audio only",
