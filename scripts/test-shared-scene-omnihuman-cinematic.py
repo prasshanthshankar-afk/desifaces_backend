@@ -15,6 +15,34 @@ coordinator = (extension / "workers/v3_scene_coordinator.py").read_text(encoding
 stitch = (extension / "api/routes/v3_scene_stitch.py").read_text(encoding="utf-8")
 compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
 
+models = (fusion / "domain/models.py").read_text(encoding="utf-8")
+validators = (fusion / "domain/validators.py").read_text(encoding="utf-8")
+orchestrator = (fusion / "services/fusion_orchestrator.py").read_text(encoding="utf-8")
+fusion_routes = (fusion / "api/routes/fusion_jobs.py").read_text(encoding="utf-8")
+fusion_config = (fusion / "config.py").read_text(encoding="utf-8")
+fusion_client = (extension / "http_clients/fusion_client.py").read_text(encoding="utf-8")
+
+# Stable, version-neutral internal provider identity.
+for runtime_source in (
+    compiler,
+    routes,
+    adapter,
+    pricing,
+    models,
+    validators,
+    orchestrator,
+    fusion_routes,
+    fusion_config,
+    fusion_client,
+    compose,
+):
+    assert "omnihuman_v15" not in runtime_source
+    assert "fal-ai/bytedance/omnihuman/v1.5" not in runtime_source
+
+assert 'provider_name = "omnihuman"' in adapter
+assert 'default="omnihuman"' in fusion_config
+assert 'DF_OMNIHUMAN_MODEL_ID is required' in compose
+
 # Frozen shared-scene generation provider.
 assert 'provider_name = "omnihuman"' in compiler
 assert 'provider_name = "kling"' not in compiler
@@ -125,6 +153,12 @@ cogs_migration = (
 assert "'fal_omnihuman_variable'" in cogs_migration
 assert "0.16000000" in cogs_migration
 assert "'customer_billing_unchanged', true" in cogs_migration
+
+identity_migration = (
+    root / "migrations/2026_10_04_omnihuman_provider_identity.sql"
+).read_text(encoding="utf-8")
+assert "LIKE 'omnihuman_%'" in identity_migration
+assert "SET provider='omnihuman'" in identity_migration
 
 for marker in (
     "DF_OMNIHUMAN_MODEL_ID:",
