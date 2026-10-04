@@ -357,8 +357,15 @@ DB_NAME="$(docker inspect "$DB_C" --format '{{range .Config.Env}}{{println .}}{{
 DB_USER="${DB_USER:-postgres}"
 DB_NAME="${DB_NAME:-postgres}"
 
-MIGRATION_URL="https://raw.githubusercontent.com/$OWNER/$REPO/$BACKEND_SHA/migrations/2026_10_04_group_conversation_omnihuman_cogs.sql"
-curl -fsSL "$MIGRATION_URL" | docker exec -i "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" >/tmp/df-omnihuman-cogs.log
+IDENTITY_MIGRATION_URL="https://raw.githubusercontent.com/$OWNER/$REPO/$BACKEND_SHA/migrations/2026_10_04_omnihuman_provider_identity.sql"
+COGS_MIGRATION_URL="https://raw.githubusercontent.com/$OWNER/$REPO/$BACKEND_SHA/migrations/2026_10_04_group_conversation_omnihuman_cogs.sql"
+
+curl -fsSL "$IDENTITY_MIGRATION_URL" |
+  docker exec -i "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME"   >/tmp/df-omnihuman-provider-identity.log
+echo "OMNIHUMAN_PROVIDER_IDENTITY_MIGRATION=PASS"
+
+curl -fsSL "$COGS_MIGRATION_URL" |
+  docker exec -i "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME"   >/tmp/df-omnihuman-cogs.log
 echo "OMNIHUMAN_COGS_MIGRATION=PASS"
 
 RUNTIME_CHANGED=0
