@@ -1,0 +1,80 @@
+name: Shared Scene OmniHuman Cinematic Certification
+
+on:
+  push:
+    branches:
+      - feature/dev-shared-scene-omnihuman-cinematic-20261004
+  pull_request:
+    paths:
+      - 'services/svc-director/app/app/fusion_execution.py'
+      - 'services/svc-director/app/app/fusion_input_performance.py'
+      - 'services/svc-director/app/app/shared_scene_routes.py'
+      - 'services/svc-fusion/app/app/services/providers/omnihuman_adapter.py'
+      - 'services/svc-fusion/app/app/requirements.txt'
+      - 'services/svc-fusion-extension/app/app/api/routes/v3_scene_pricing.py'
+      - 'services/svc-fusion-extension/app/app/api/routes/v3_scene_stitch.py'
+      - 'services/svc-fusion-extension/app/app/workers/v3_scene_coordinator.py'
+      - 'services/svc-director/tests/test_shared_scene_contract.py'
+      - 'services/svc-fusion-extension/tests/test_v3_scene_pricing_kling_shared.py'
+      - 'scripts/test-shared-scene-omnihuman-cinematic.py'
+      - 'migrations/2026_10_03_group_conversation_premium_actual_seconds.sql'
+      - 'migrations/2026_10_04_group_conversation_omnihuman_cogs.sql'
+      - '.github/workflows/shared-scene-omnihuman-cinematic-certification.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout backend candidate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python compile gate
+        run: |
+          python -m py_compile services/svc-director/app/app/fusion_execution.py
+          python -m py_compile services/svc-director/app/app/fusion_input_performance.py
+          python -m py_compile services/svc-director/app/app/shared_scene_routes.py
+          python -m py_compile services/svc-fusion/app/app/services/providers/omnihuman_adapter.py
+          python -m py_compile services/svc-fusion-extension/app/app/api/routes/v3_scene_pricing.py
+          python -m py_compile services/svc-fusion-extension/app/app/api/routes/v3_scene_stitch.py
+          python -m py_compile services/svc-fusion-extension/app/app/workers/v3_scene_coordinator.py
+
+      - name: OmniHuman shared-scene source contract
+        run: python scripts/test-shared-scene-omnihuman-cinematic.py
+
+      - name: Focused pricing source tests
+        run: |
+          python - <<'PY'
+          import runpy
+          ns = runpy.run_path("services/svc-fusion-extension/tests/test_v3_scene_pricing_kling_shared.py")
+          tests = [value for name, value in ns.items() if name.startswith("test_") and callable(value)]
+          assert tests, "no focused pricing tests discovered"
+          for test in tests:
+              test()
+          print("OMNIHUMAN_SHARED_SCENE_PRICING_TESTS=PASS")
+          PY
+
+      - name: No customer pricing regression
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("migrations/2026_10_03_group_conversation_premium_actual_seconds.sql").read_text()
+          assert "'base_credits_per_second', 15" in p
+          assert "'credits_per_second', 18" in p
+          assert "'multi_person_surcharge_pct', 20" in p
+          assert "pb.channel IN ('web', 'mobile')" in p
+          print("GROUP_CUSTOMER_PRICING_18_CREDITS_PER_SECOND=PASS")
+          print("GROUP_MULTI_PERSON_SURCHARGE_20PCT=PASS")
+          PY
