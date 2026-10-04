@@ -81,35 +81,147 @@ for f in "${compose_files[@]}"; do
   COMPOSE+=(-f "$f")
 done
 
-# Do not interrupt an in-flight DEV generation or stitch.
+# Do not interrupt genuine in-flight DEV provider work.
+#
+# Historical V3 rows can remain state='running'/'generating' after earlier failed
+# experiments or interrupted browser workflows. They are not proof of current
+# execution. The guard therefore distinguishes recently updated/live work from
+# stale lifecycle rows while still failing closed for provider jobs and active
+# stitches.
 DIRECTOR_C="${CONTAINER[svc-director]}"
-ACTIVE_WORK="$(
+WORK_ACTIVITY="$(
 docker exec -i "$DIRECTOR_C" python - <<'PY'
 import asyncio, os
 import asyncpg
 
+RECENT = "15 minutes"
+
+async def scalar(conn, sql):
+    try:
+        return int(await conn.fetchval(sql) or 0)
+    except asyncpg.UndefinedTableError:
+        return 0
+
 async def main():
     conn = await asyncpg.connect(os.environ["DATABASE_URL"])
     try:
-        attempts = await conn.fetchval(
-            "select count(*) from public.v3_studio_stage_attempts where state='running'"
+        live_attempts = await scalar(
+            conn,
+            """
+            select count(*)
+            from public.v3_studio_stage_attempts
+            where state='running'
+              and coalesce(updated_at,created_at) >= now() - interval '15 minutes'
+            """,
         )
-        stages = await conn.fetchval(
-            "select count(*) from public.v3_studio_stage_runs where state='generating'"
+        stale_attempts = await scalar(
+            conn,
+            """
+            select count(*)
+            from public.v3_studio_stage_attempts
+            where state='running'
+              and coalesce(updated_at,created_at) < now() - interval '15 minutes'
+            """,
         )
-        stitches = await conn.fetchval(
-            "select count(*) from public.longform_jobs where status='stitching_running'"
+        live_stages = await scalar(
+            conn,
+            """
+            select count(*)
+            from public.v3_studio_stage_runs
+            where state='generating'
+              and coalesce(updated_at,created_at) >= now() - interval '15 minutes'
+            """,
         )
-        print(f"{int(attempts or 0)}|{int(stages or 0)}|{int(stitches or 0)}")
+        stale_stages = await scalar(
+            conn,
+            """
+            select count(*)
+            from public.v3_studio_stage_runs
+            where state='generating'
+              and coalesce(updated_at,created_at) < now() - interval '15 minutes'
+            """,
+        )
+        live_fusion_jobs = await scalar(
+            conn,
+            """
+            select count(*)
+            from public.studio_jobs
+            where studio_type='fusion'
+              and status in ('pricing_pending','queued','running','processing')
+              and coalesce(updated_at,created_at) >= now() - interval '15 minutes'
+            """,
+        )
+        live_provider_runs = await scalar(
+            conn,
+            """
+            select count(*)
+            from public.provider_runs pr
+            join public.studio_jobs j on j.id=pr.job_id
+            where j.studio_type='fusion'
+              and pr.provider_status in ('submitted','processing')
+              and coalesce(pr.updated_at,pr.created_at) >= now() - interval '15 minutes'
+            """,
+        )
+        live_stitches = await scalar(
+            conn,
+            """
+            select count(*)
+            from public.longform_jobs
+            where status='stitching_running'
+              and coalesce(updated_at,created_at) >= now() - interval '20 minutes'
+            """,
+        )
+        stale_stitches = await scalar(
+            conn,
+            """
+            select count(*)
+            from public.longform_jobs
+            where status='stitching_running'
+              and coalesce(updated_at,created_at) < now() - interval '20 minutes'
+            """,
+        )
+
+        print(
+            "|".join(
+                str(v)
+                for v in (
+                    live_attempts,
+                    live_stages,
+                    live_fusion_jobs,
+                    live_provider_runs,
+                    live_stitches,
+                    stale_attempts,
+                    stale_stages,
+                    stale_stitches,
+                )
+            )
+        )
     finally:
         await conn.close()
 
 asyncio.run(main())
 PY
 )"
-echo "active_work=$ACTIVE_WORK"
-[[ "$ACTIVE_WORK" == "0|0|0" ]] || fail "DEV work is active; retry after generations/stitching finish"
+
+IFS='|' read -r   LIVE_ATTEMPTS   LIVE_STAGES   LIVE_FUSION_JOBS   LIVE_PROVIDER_RUNS   LIVE_STITCHES   STALE_ATTEMPTS   STALE_STAGES   STALE_STITCHES <<< "$WORK_ACTIVITY"
+
+echo "live_v3_attempts=$LIVE_ATTEMPTS"
+echo "live_v3_stages=$LIVE_STAGES"
+echo "live_fusion_jobs=$LIVE_FUSION_JOBS"
+echo "live_provider_runs=$LIVE_PROVIDER_RUNS"
+echo "live_stitches=$LIVE_STITCHES"
+echo "stale_v3_attempts=$STALE_ATTEMPTS"
+echo "stale_v3_stages=$STALE_STAGES"
+echo "stale_stitches=$STALE_STITCHES"
+
+[[ "$LIVE_ATTEMPTS" == "0" ]] || fail "recent V3 attempt activity exists"
+[[ "$LIVE_STAGES" == "0" ]] || fail "recent V3 stage generation exists"
+[[ "$LIVE_FUSION_JOBS" == "0" ]] || fail "recent Fusion job activity exists"
+[[ "$LIVE_PROVIDER_RUNS" == "0" ]] || fail "external Fusion provider work is active"
+[[ "$LIVE_STITCHES" == "0" ]] || fail "active longform stitching exists"
+
 echo "ACTIVE_WORK_GUARD=PASS"
+echo "STALE_LIFECYCLE_ROWS_DO_NOT_BLOCK_DEPLOY=PASS"
 
 # FAL is mandatory for OmniHuman + SAM2 in both Fusion API and worker.
 for svc in svc-fusion svc-fusion-worker; do
