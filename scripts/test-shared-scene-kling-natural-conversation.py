@@ -10,7 +10,7 @@ parent_pricing = (director / "fusion_execution_parent_pricing.py").read_text(enc
 scene_pricing = (extension / "api/routes/v3_scene_pricing.py").read_text(encoding="utf-8")
 
 # Single-provider natural conversation execution.
-assert 'provider_name = "kling"' in compiler
+assert 'provider_name = "omnihuman"' in compiler
 assert 'provider_name = "sync3"' not in compiler
 assert 'metadata.get("shared_scene_video_prompt")' in compiler
 assert '_shared_scene_performance_prompt' in compiler
@@ -19,8 +19,8 @@ assert 'keep the mouth closed' in compiler
 assert 'hand gestures, subtle upper-body movement' in compiler
 assert '"quality_tier": "premium"' in compiler
 assert '"longform_profile": "talking_video"' in compiler
-assert '"provider_hint": "kling"' in compiler
-assert '"execution_provider_family": "kling_avatar"' in compiler
+assert '"provider_hint": "omnihuman"' in compiler
+assert '"execution_provider_family": "omnihuman_avatar"' in compiler
 assert '"prompt": performance_prompt' in compiler
 
 # Shared-scene uses the explicit +20% group premium actual-seconds contract;
@@ -31,7 +31,7 @@ for marker in (
     '_GROUP_LEAF_SKU_CODE = "GROUP_TALK_PREMIUM_SECOND"',
     '_GROUP_CREDITS_PER_SECOND = 18',
     '_GROUP_SURCHARGE_PCT = 20',
-    '_SHARED_SCENE_PROVIDER = "kling"',
+    '_SHARED_SCENE_PROVIDER = "omnihuman_v15"',
     '"unit_type": "second"',
 ):
     assert marker in scene_pricing, marker
