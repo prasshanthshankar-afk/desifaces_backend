@@ -16,13 +16,13 @@ stitch = (extension / "api/routes/v3_scene_stitch.py").read_text(encoding="utf-8
 compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
 
 # Frozen shared-scene generation provider.
-assert 'provider_name = "omnihuman_v15"' in compiler
+assert 'provider_name = "omnihuman"' in compiler
 assert 'provider_name = "kling"' not in compiler
 assert 'provider_name = "sync3"' not in compiler
-assert '"provider_hint": "omnihuman_v15"' in compiler
-assert '"execution_provider_family": "omnihuman_v15"' in compiler
-assert 'metadata["shared_scene_provider"] = "omnihuman_v15"' in routes
-assert '"fusion_provider": "omnihuman_v15"' in routes
+assert '"provider_hint": "omnihuman"' in compiler
+assert '"execution_provider_family": "omnihuman"' in compiler
+assert 'metadata["shared_scene_provider"] = "omnihuman"' in routes
+assert '"fusion_provider": "omnihuman"' in routes
 
 # Deterministic speaker separation through OmniHuman mask_url + SAM2.
 for marker in (
@@ -76,7 +76,7 @@ for marker in (
     '_GROUP_LEAF_SKU_CODE = "GROUP_TALK_PREMIUM_SECOND"',
     '_GROUP_CREDITS_PER_SECOND = 18',
     '_GROUP_SURCHARGE_PCT = 20',
-    '_SHARED_SCENE_PROVIDER = "omnihuman_v15"',
+    '_SHARED_SCENE_PROVIDER = "omnihuman"',
     '"unit_type": "second"',
     '"quality_tier": "premium"',
 ):
@@ -122,7 +122,7 @@ for marker in (
 cogs_migration = (
     root / "migrations/2026_10_04_group_conversation_omnihuman_cogs.sql"
 ).read_text(encoding="utf-8")
-assert "'fal_omnihuman_v15_variable'" in cogs_migration
+assert "'fal_omnihuman_variable'" in cogs_migration
 assert "0.16000000" in cogs_migration
 assert "'customer_billing_unchanged', true" in cogs_migration
 
