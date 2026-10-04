@@ -671,7 +671,7 @@ def _preview_meta(req_dict: Dict[str, Any], orch: FusionOrchestrator) -> Dict[st
     reference_image_urls = list(req_dict.get("reference_image_urls") or [])
     reference_image_artifact_ids = list(req_dict.get("reference_image_artifact_ids") or [])
 
-    provider = str(req_dict.get("provider") or orch.default_provider_name or "omnihuman_v15").strip() or "omnihuman_v15"
+    provider = str(req_dict.get("provider") or orch.default_provider_name or "omnihuman").strip() or "omnihuman"
     aspect_ratio = str(video.get("aspect_ratio") or provider_options.get("aspect_ratio") or "9:16")
     resolution = str(video.get("resolution") or provider_options.get("resolution") or "720p")
 
@@ -914,7 +914,7 @@ async def create_job(
         return FusionJobApiView(
             job_id=job_id,
             status="queued",
-            provider=str(getattr(req, "provider", None) or orch.default_provider_name or "omnihuman_v15"),
+            provider=str(getattr(req, "provider", None) or orch.default_provider_name or "omnihuman"),
             pricing=pricing,
             pricing_summary=_pricing_suppressed_summary(pricing) if pricing else None,
         )
@@ -922,7 +922,7 @@ async def create_job(
     out = FusionJobApiView(
         job_id=str(job["id"]),
         status=str(job["status"]),
-        provider=_extract_provider_view(job) or str(getattr(req, "provider", None) or orch.default_provider_name or "omnihuman_v15"),
+        provider=_extract_provider_view(job) or str(getattr(req, "provider", None) or orch.default_provider_name or "omnihuman"),
         error_code=job.get("error_code"),
         error_message=job.get("error_message"),
         pricing=_extract_pricing_view(job),
