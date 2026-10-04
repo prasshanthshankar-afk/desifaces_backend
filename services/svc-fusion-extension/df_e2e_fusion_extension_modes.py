@@ -1132,7 +1132,7 @@ def build_fusion_extension_payload(
     output_profile = str(scenario.get('output_profile') or '').strip()
     quality_tier = _normalize_quality_tier(scenario.get('quality_tier') or 'premium')
     provider_hint = first_present([scenario.get('provider_hint'), scenario.get('provider')])
-    provider_name = first_present([scenario.get('provider'), provider_hint, args.video_provider]) or 'omnihuman_v15'
+    provider_name = first_present([scenario.get('provider'), provider_hint, args.video_provider]) or 'omnihuman'
 
     goal_text = first_present([
         args.video_goal,
@@ -1773,7 +1773,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-output-format", default=os.getenv("AUDIO_OUTPUT_FORMAT", "mp3"))
 
     parser.add_argument("--video-duration-sec", type=int, default=int(os.getenv("VIDEO_DURATION_SEC", os.getenv("FUSION_DURATION_SEC", "10"))))
-    parser.add_argument("--video-provider", default=os.getenv("VIDEO_PROVIDER", os.getenv("FUSION_PROVIDER", "omnihuman_v15")).strip().lower() or "omnihuman_v15")
+    parser.add_argument("--video-provider", default=os.getenv("VIDEO_PROVIDER", os.getenv("FUSION_PROVIDER", "omnihuman")).strip().lower() or "omnihuman")
     parser.add_argument("--video-scenarios", default=os.getenv("VIDEO_SCENARIOS", "talking_video_economy,talking_video_premium,cinematic_fast,cinematic_premium"))
     parser.add_argument("--video-pricing-timeout-seconds", type=int, default=int(os.getenv("VIDEO_PRICING_TIMEOUT_SECONDS", "120")))
     parser.add_argument("--video-title", default=os.getenv("VIDEO_TITLE", "DesiFaces Fusion Studio E2E"))
