@@ -13,6 +13,7 @@ adapter = (fusion / "services/providers/omnihuman_adapter.py").read_text(encodin
 pricing = (extension / "api/routes/v3_scene_pricing.py").read_text(encoding="utf-8")
 coordinator = (extension / "workers/v3_scene_coordinator.py").read_text(encoding="utf-8")
 stitch = (extension / "api/routes/v3_scene_stitch.py").read_text(encoding="utf-8")
+compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
 
 # Frozen shared-scene generation provider.
 assert 'provider_name = "omnihuman_v15"' in compiler
@@ -124,6 +125,14 @@ cogs_migration = (
 assert "'fal_omnihuman_v15_variable'" in cogs_migration
 assert "0.16000000" in cogs_migration
 assert "'customer_billing_unchanged', true" in cogs_migration
+
+for marker in (
+    "DF_OMNIHUMAN_MODEL_ID:",
+    "DF_OMNIHUMAN_SPEAKER_MASK_MODEL_ID:",
+    "DF_OMNIHUMAN_UPLOAD_INPUTS_TO_FAL:",
+    "FAL_KEY:",
+):
+    assert compose.count(marker) >= 2, marker
 
 print("OMNIHUMAN_SHARED_SCENE_PROVIDER_FROZEN=PASS")
 print("OMNIHUMAN_SPEAKER_MASK_CONTRACT=PASS")
