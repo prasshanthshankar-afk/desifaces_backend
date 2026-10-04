@@ -318,7 +318,19 @@ SOURCE_IMAGE[extension]="ghcr.io/$GHCR_OWNER/desifaces-svc-fusion-extension:$BAC
 IMAGE_SOURCE_MODE=""
 GHCR_LOGGED_IN=0
 
-if [[ -n "$GHCR_TOKEN" ]] &&    printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_OWNER" --password-stdin >/dev/null 2>&1; then
+LOCAL_DIRECTOR="desifaces-svc-director-candidate:$BACKEND_SHA"
+LOCAL_FUSION="desifaces-svc-fusion-candidate:$BACKEND_SHA"
+LOCAL_EXTENSION="desifaces-svc-fusion-extension-candidate:$BACKEND_SHA"
+
+if docker image inspect "$LOCAL_DIRECTOR" "$LOCAL_FUSION" "$LOCAL_EXTENSION" >/dev/null 2>&1; then
+  SOURCE_IMAGE[director]="$LOCAL_DIRECTOR"
+  SOURCE_IMAGE[fusion]="$LOCAL_FUSION"
+  SOURCE_IMAGE[extension]="$LOCAL_EXTENSION"
+  IMAGE_SOURCE_MODE="local_existing_exact_sha"
+  echo "REUSE_EXISTING_EXACT_SHA_IMAGES=PASS"
+fi
+
+if [[ -z "$IMAGE_SOURCE_MODE" && -n "$GHCR_TOKEN" ]] &&    printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_OWNER" --password-stdin >/dev/null 2>&1; then
   GHCR_LOGGED_IN=1
   pull_ok=1
   for family in director fusion extension; do
@@ -332,7 +344,7 @@ if [[ -n "$GHCR_TOKEN" ]] &&    printf '%s' "$GHCR_TOKEN" | docker login ghcr.io
   fi
 fi
 
-if [[ "$IMAGE_SOURCE_MODE" != "registry" ]]; then
+if [[ -z "$IMAGE_SOURCE_MODE" ]]; then
   echo "GHCR_PULL=UNAVAILABLE"
   echo "FALLBACK=BUILD_EXACT_CERTIFIED_SOURCE"
 
@@ -411,7 +423,7 @@ echo "COMPOSE_IMAGE_OVERRIDE=PASS"
 # used by the running containers. This prevents accidental environment/config
 # cutover from another compose definition.
 CONFIG_JSON_FILE="/tmp/desifaces-compose-config-${BACKEND_SHA}.json"
-"${COMPOSE[@]}" config --format json > "$CONFIG_JSON_FILE"
+"${COMPOSE[@]}" --profile "*" config --format json > "$CONFIG_JSON_FILE"
 
 python3 - "$CONFIG_JSON_FILE" "${ACTIVE_SERVICES[@]}" <<'PY'
 import json, subprocess, sys
