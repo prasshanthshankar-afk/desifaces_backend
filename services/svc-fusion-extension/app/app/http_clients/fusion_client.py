@@ -129,7 +129,7 @@ async def create_fusion_job(
     audio_artifact_id: Optional[str] = None,
     aspect_ratio: str = "9:16",
     duration_sec: Optional[int] = None,
-    provider: str = "omnihuman_v15",
+    provider: str = "omnihuman",
     provider_options: Optional[Dict[str, Any]] = None,
     reference_image_urls: Optional[List[str]] = None,
     reference_image_artifact_ids: Optional[List[str]] = None,
@@ -146,7 +146,7 @@ async def create_fusion_job(
     if not (face_artifact_id or face_image_url or reference_image_urls or reference_image_artifact_ids):
         raise ValueError("Either face selector or reference image(s) are required for svc-fusion")
 
-    provider_name = str(provider or "omnihuman_v15").strip().lower() or "omnihuman_v15"
+    provider_name = str(provider or "omnihuman").strip().lower() or "omnihuman"
     provider_options = dict(provider_options or {})
     reference_image_urls = [str(x).strip() for x in (reference_image_urls or []) if str(x or "").strip()]
     reference_image_artifact_ids = [str(x).strip() for x in (reference_image_artifact_ids or []) if str(x or "").strip()]
@@ -159,7 +159,7 @@ async def create_fusion_job(
         elif audio_artifact_id:
             voice_audio["audio_artifact_id"] = audio_artifact_id
 
-    if provider_name in {"heygen_av4", "omnihuman_v15", "omnihuman"} and not voice_audio:
+    if provider_name in {"heygen_av4", "omnihuman", "omnihuman"} and not voice_audio:
         raise ValueError(f"{provider_name} requires audio_url or audio_artifact_id")
 
     payload: Dict[str, Any] = {
