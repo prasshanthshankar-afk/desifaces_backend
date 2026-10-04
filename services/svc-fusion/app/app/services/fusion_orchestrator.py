@@ -493,7 +493,7 @@ class FusionOrchestrator:
         raw = str(requested or self.default_provider_name or "omnihuman").strip().lower()
         if raw in {"heygen", "heygen_av4", "heygen_v2", "native"}:
             return "heygen_av4"
-        if raw in {"omnihuman", "omnihuman"}:
+        if raw == "omnihuman":
             return "omnihuman"
         if raw in {"veed", "veed_fabric", "veed_fabric_1", "fabric", "fabric_1_0", "veed/fabric-1.0"}:
             return "veed_fabric"
