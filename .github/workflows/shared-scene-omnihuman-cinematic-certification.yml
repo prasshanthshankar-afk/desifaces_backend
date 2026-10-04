@@ -20,6 +20,7 @@ on:
       - 'scripts/ops/deploy-dev-omnihuman-group-conversation.sh'
       - 'migrations/2026_10_03_group_conversation_premium_actual_seconds.sql'
       - 'migrations/2026_10_04_group_conversation_omnihuman_cogs.sql'
+      - 'migrations/2026_10_04_omnihuman_provider_identity.sql'
       - '.github/workflows/shared-scene-omnihuman-cinematic-certification.yml'
   workflow_dispatch:
 
