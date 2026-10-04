@@ -8,6 +8,50 @@ from .fusion_execution import FusionSceneContext, _clean, _scene_prompt
 
 
 _ALLOWED_ASPECT_RATIOS = frozenset({"9:16", "16:9", "1:1"})
+_SHARED_SCENE_VIDEO_STYLES = frozenset({"static_video", "cinematic_video"})
+_SHARED_SCENE_CAMERA_MODES = frozenset(
+    {
+        "director_choice",
+        "static",
+        "push_in",
+        "push_out",
+        "arc_left",
+        "arc_right",
+        "angle_shift_low_to_eye",
+        "angle_shift_high_to_eye",
+    }
+)
+
+_CAMERA_DIRECTIONS = {
+    "static": (
+        "A static eye-level medium two-shot holds both people naturally in frame throughout. "
+        "There is no camera movement."
+    ),
+    "push_in": (
+        "The camera begins with an eye-level medium two-shot and performs a very slow, smooth push-in, "
+        "ending in a slightly tighter two-shot while keeping both people visible."
+    ),
+    "push_out": (
+        "The camera begins in a slightly tighter eye-level two-shot and slowly, smoothly pulls back to a "
+        "comfortable medium two-shot while keeping both people visible."
+    ),
+    "arc_left": (
+        "The camera makes a very gentle, slow arc a few degrees to the left, creating subtle natural parallax "
+        "while both faces remain continuously visible."
+    ),
+    "arc_right": (
+        "The camera makes a very gentle, slow arc a few degrees to the right, creating subtle natural parallax "
+        "while both faces remain continuously visible."
+    ),
+    "angle_shift_low_to_eye": (
+        "The camera begins from a subtly lower conversational angle and smoothly settles to eye level, "
+        "keeping both people visible without a dramatic perspective change."
+    ),
+    "angle_shift_high_to_eye": (
+        "The camera begins from a subtly higher conversational angle and smoothly settles to eye level, "
+        "keeping both people visible without a dramatic perspective change."
+    ),
+}
 
 
 def _input_concurrency() -> int:
@@ -21,6 +65,42 @@ def _input_concurrency() -> int:
 def _scene_aspect_ratio(context: FusionSceneContext) -> str:
     raw = _clean((context.stage_metadata or {}).get("aspect_ratio") or "9:16")
     return raw if raw in _ALLOWED_ASPECT_RATIOS else "9:16"
+
+
+def _normalize_video_style(value: Any) -> str:
+    raw = _clean(value).casefold()
+    if raw in {"", "natural_motion", "precise_lipsync", "static", "normal"}:
+        return "static_video"
+    if raw in {"cinematic", "cinematic_motion", "cinematic_video"}:
+        return "cinematic_video"
+    if raw not in _SHARED_SCENE_VIDEO_STYLES:
+        raise RuntimeError(f"unsupported_shared_scene_video_style:{raw}")
+    return raw
+
+
+def _normalize_camera_mode(value: Any, *, video_style: str) -> str:
+    raw = _clean(value).casefold()
+    if not raw:
+        return "director_choice" if video_style == "cinematic_video" else "static"
+    aliases = {
+        "pushin": "push_in",
+        "dolly_in": "push_in",
+        "dolly-in": "push_in",
+        "pushout": "push_out",
+        "pull_out": "push_out",
+        "pull-back": "push_out",
+        "orbit_left": "arc_left",
+        "orbit_right": "arc_right",
+        "arc": "arc_right",
+        "low_to_eye": "angle_shift_low_to_eye",
+        "high_to_eye": "angle_shift_high_to_eye",
+    }
+    raw = aliases.get(raw, raw)
+    if video_style == "static_video":
+        return "static"
+    if raw not in _SHARED_SCENE_CAMERA_MODES:
+        raise RuntimeError(f"unsupported_shared_scene_camera_mode:{raw}")
+    return raw
 
 
 def _assert_conversation_mode_supported(context: FusionSceneContext) -> dict[str, Any] | None:
@@ -59,84 +139,26 @@ def _assert_conversation_mode_supported(context: FusionSceneContext) -> dict[str
     if missing:
         raise RuntimeError("shared_scene_speaker_targets_missing:" + ",".join(sorted(set(missing))))
 
+    video_style = _normalize_video_style(
+        metadata.get("shared_scene_video_style")
+        or metadata.get("shared_scene_motion_mode")
+        or "static_video"
+    )
+    camera_mode = _normalize_camera_mode(
+        metadata.get("shared_scene_camera_mode"),
+        video_style=video_style,
+    )
+
     return {
         "shared_scene_media_id": shared_scene_media_id,
         "image_width": image_width,
         "image_height": image_height,
         "speaker_targets": speaker_targets,
-        "motion_mode": _clean(metadata.get("shared_scene_motion_mode")) or "natural_motion",
+        "video_style": video_style,
+        "camera_mode": camera_mode,
         "video_prompt": _clean(metadata.get("shared_scene_video_prompt")) or None,
+        "resolution": _clean(metadata.get("shared_scene_resolution")) or "720p",
     }
-
-
-def _speaker_position_label(shared_scene: dict[str, Any], participant_id) -> str:
-    x, _ = _speaker_coordinates(shared_scene, participant_id)
-    width = max(1, int(shared_scene["image_width"]))
-    ratio = float(x) / float(width)
-    if ratio <= 0.40:
-        return "on the left side of the image"
-    if ratio >= 0.60:
-        return "on the right side of the image"
-    return "near the center of the image"
-
-
-def _shared_scene_performance_prompt(
-    context: FusionSceneContext,
-    shared_scene: dict[str, Any],
-    turn,
-    *,
-    scene_prompt: str | None,
-) -> str:
-    """Build turn-specific acting direction for one Kling shared-scene render."""
-
-    metadata = context.stage_metadata or {}
-    saved_direction = _clean(metadata.get("shared_scene_video_prompt"))
-    active_name = _clean(turn.display_name) or "the active speaker"
-    active_position = _speaker_position_label(shared_scene, turn.participant_id)
-
-    listener = next(
-        (
-            candidate
-            for candidate in context.turns
-            if candidate.participant_id != turn.participant_id
-        ),
-        None,
-    )
-    listener_name = _clean(getattr(listener, "display_name", None)) or "the other person"
-    listener_position = (
-        _speaker_position_label(shared_scene, listener.participant_id)
-        if listener is not None
-        else "elsewhere in the same group photo"
-    )
-
-    emotion = _clean(turn.emotion_code)
-    parts = [
-        saved_direction,
-        scene_prompt,
-        (
-            f"Natural two-person conversation. {active_name}, {active_position}, is the only person speaking "
-            f"during this turn. {listener_name}, {listener_position}, is listening."
-        ),
-        (
-            f"{active_name} should turn eyes and head naturally toward {listener_name}, use believable restrained "
-            "hand gestures, subtle upper-body movement, realistic breathing, and conversational micro-expressions."
-        ),
-        (
-            f"{listener_name} should keep the mouth closed, maintain natural attention toward {active_name}, "
-            "and show subtle listener reactions such as small nods, eye movement, and gentle facial responses."
-        ),
-        (
-            "Preserve both people's identities, clothing, seating/standing positions, lighting, background, and "
-            "overall composition. Keep the camera stable and medium-wide. Do not crop to a single person. "
-            "No exaggerated gestures, no body warping, no face swapping, no extra limbs, and no background deformation."
-        ),
-    ]
-    if emotion:
-        parts.insert(
-            3,
-            f"The active speaker's emotional delivery is {emotion}; express it naturally without exaggeration.",
-        )
-    return " ".join(part.strip() for part in parts if _clean(part))[:2400]
 
 
 def _speaker_coordinates(shared_scene: dict[str, Any], participant_id) -> list[int]:
@@ -177,6 +199,152 @@ def _speaker_coordinates(shared_scene: dict[str, Any], participant_id) -> list[i
     return [center_x, center_y]
 
 
+def _speaker_position_label(shared_scene: dict[str, Any], participant_id) -> str:
+    x, _ = _speaker_coordinates(shared_scene, participant_id)
+    width = max(1, int(shared_scene["image_width"]))
+    ratio = float(x) / float(width)
+    if ratio <= 0.40:
+        return "on the left side of the image"
+    if ratio >= 0.60:
+        return "on the right side of the image"
+    return "near the center of the image"
+
+
+def _scene_camera_hint(context: FusionSceneContext) -> str:
+    return _clean((context.scene_direction or {}).get("camera")).casefold()
+
+
+def _director_camera_mode(
+    context: FusionSceneContext,
+    shared_scene: dict[str, Any],
+    turn,
+) -> tuple[str, str]:
+    """Choose one coherent turn camera treatment for cinematic group conversation.
+
+    Static Video never moves the camera. Cinematic Video first honors explicit
+    Creative Director scene camera language and otherwise derives a restrained
+    dialogue-safe camera treatment from turn emotion and position in the scene.
+    """
+
+    video_style = str(shared_scene.get("video_style") or "static_video")
+    requested = str(shared_scene.get("camera_mode") or "static")
+    if video_style == "static_video":
+        return "static", "static_video"
+
+    if requested != "director_choice":
+        return requested, "explicit_cinematic_setting"
+
+    hint = _scene_camera_hint(context)
+    hint_map = (
+        (("push in", "push-in", "dolly in", "dolly-in", "closer"), "push_in"),
+        (("push out", "push-out", "pull back", "pull-back", "wider"), "push_out"),
+        (("arc left", "orbit left"), "arc_left"),
+        (("arc right", "orbit right", "orbit", "arc"), "arc_right"),
+        (("low angle", "low-angle"), "angle_shift_low_to_eye"),
+        (("high angle", "high-angle"), "angle_shift_high_to_eye"),
+        (("static", "locked", "tripod"), "static"),
+    )
+    for markers, mode in hint_map:
+        if any(marker in hint for marker in markers):
+            return mode, "creative_director_scene_direction"
+
+    emotion = _clean(getattr(turn, "emotion_code", None)).casefold()
+    total_turns = max(1, len(context.turns))
+    sequence = max(1, int(getattr(turn, "sequence_no", 1) or 1))
+
+    if sequence >= total_turns and total_turns > 2:
+        return "push_out", "creative_director_contextual_policy_v1"
+
+    if any(token in emotion for token in ("playful", "excited", "energetic", "celebrat", "animated")):
+        active_x, _ = _speaker_coordinates(shared_scene, turn.participant_id)
+        return (
+            "arc_right" if active_x <= int(shared_scene["image_width"]) // 2 else "arc_left",
+            "creative_director_contextual_policy_v1",
+        )
+
+    if any(token in emotion for token in ("serious", "assertive", "confident", "dramatic")):
+        return "angle_shift_low_to_eye", "creative_director_contextual_policy_v1"
+
+    if any(token in emotion for token in ("reflect", "warm", "sincere", "tender", "reassur", "thoughtful", "sad")):
+        return "push_in", "creative_director_contextual_policy_v1"
+
+    # Dialogue-safe coverage when the Director has no explicit camera cue.
+    cycle = ("push_in", "arc_right", "static", "arc_left")
+    return cycle[(sequence - 1) % len(cycle)], "creative_director_contextual_policy_v1"
+
+
+def _shared_scene_performance_prompt(
+    context: FusionSceneContext,
+    shared_scene: dict[str, Any],
+    turn,
+    *,
+    scene_prompt: str | None,
+    camera_mode: str,
+) -> str:
+    """Build turn-specific OmniHuman acting and camera direction."""
+
+    metadata = context.stage_metadata or {}
+    saved_direction = _clean(metadata.get("shared_scene_video_prompt"))
+    active_name = _clean(turn.display_name) or "the active speaker"
+    active_position = _speaker_position_label(shared_scene, turn.participant_id)
+
+    listener = next(
+        (
+            candidate
+            for candidate in context.turns
+            if candidate.participant_id != turn.participant_id
+        ),
+        None,
+    )
+    listener_name = _clean(getattr(listener, "display_name", None)) or "the other person"
+    listener_position = (
+        _speaker_position_label(shared_scene, listener.participant_id)
+        if listener is not None
+        else "elsewhere in the same group photo"
+    )
+
+    emotion = _clean(turn.emotion_code)
+    dialogue = _clean(getattr(turn, "dialogue_text", None))
+    camera_direction = _CAMERA_DIRECTIONS.get(camera_mode, _CAMERA_DIRECTIONS["static"])
+
+    parts = [
+        camera_direction,
+        saved_direction,
+        scene_prompt,
+        (
+            f"Natural two-person conversation. {active_name}, {active_position}, is the only person speaking "
+            f"during this turn. {listener_name}, {listener_position}, is listening."
+        ),
+    ]
+    if dialogue:
+        parts.append(f'The spoken line is: "{dialogue[:500]}". Let the acting respond naturally to its meaning.')
+    if emotion:
+        parts.append(
+            f"The active speaker's emotional delivery is {emotion}; express it naturally without exaggeration."
+        )
+    parts.extend(
+        [
+            (
+                f"{active_name} should use expressive eyes, believable facial emotion, subtle head movement, "
+                "realistic breathing, restrained upper-body motion, and context-appropriate conversational gestures."
+            ),
+            (
+                f"{listener_name} must remain silent with the mouth closed, maintain natural attention toward "
+                f"{active_name}, and show only subtle listener reactions such as eye movement, a small nod, or "
+                "a restrained facial response."
+            ),
+            (
+                "Preserve both people's identities, facial structure, hairstyle, clothing, body proportions, "
+                "relative position, lighting, and background. Keep their physical boundaries coherent even when "
+                "they are close together. Do not merge faces, hair, shoulders, arms, clothing, or bodies. "
+                "No face swapping, extra limbs, body warping, distorted hands, exaggerated gestures, sudden camera "
+                "motion, or unstable background geometry."
+            ),
+        ]
+    )
+    return " ".join(part.strip() for part in parts if _clean(part))[:3000]
+
+
 async def compile_children_performant(
     *,
     context: FusionSceneContext,
@@ -186,12 +354,8 @@ async def compile_children_performant(
     external_provider_ok: bool,
     request_nonce_by_turn: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Compile canonical child requests with bounded parallel media resolution.
+    """Compile canonical child requests with bounded parallel media resolution."""
 
-    The selected scene aspect ratio is persisted on the Fusion stage before
-    pricing. Both pricing and dispatch reload the same stage metadata, ensuring
-    that 9:16, 16:9 or 1:1 cannot drift between quote and provider execution.
-    """
     shared_scene = _assert_conversation_mode_supported(context)
 
     semaphore = asyncio.Semaphore(_input_concurrency())
@@ -212,7 +376,13 @@ async def compile_children_performant(
         shared_media_id = shared_scene["shared_scene_media_id"]
         await asyncio.gather(
             load_face(shared_media_id),
-            *(load_audio(media_id) for media_id in {str(turn.audio_media_id): turn.audio_media_id for turn in context.turns}.values()),
+            *(
+                load_audio(media_id)
+                for media_id in {
+                    str(turn.audio_media_id): turn.audio_media_id
+                    for turn in context.turns
+                }.values()
+            ),
         )
     else:
         unique_faces = {str(turn.face_media_id): turn.face_media_id for turn in context.turns}
@@ -225,8 +395,13 @@ async def compile_children_performant(
     prompt = _scene_prompt(context)
     aspect_ratio = _scene_aspect_ratio(context)
     children: list[dict[str, Any]] = []
+
     for turn in context.turns:
-        face_url = face_urls[str(shared_scene["shared_scene_media_id"])] if shared_scene else face_urls[str(turn.face_media_id)]
+        face_url = (
+            face_urls[str(shared_scene["shared_scene_media_id"])]
+            if shared_scene
+            else face_urls[str(turn.face_media_id)]
+        )
         audio_url = audio_urls[str(turn.audio_media_id)]
         video: dict[str, Any] = {"aspect_ratio": aspect_ratio}
         if turn.duration_hint_ms and turn.duration_hint_ms > 0:
@@ -240,17 +415,11 @@ async def compile_children_performant(
         provider_name = "veed_fabric"
         performance_prompt = prompt
         listener = None
+        camera_mode = None
+        camera_plan_source = None
+
         if shared_scene:
-            # Launch-quality shared-scene conversations use one provider for both
-            # performance and audio-driven mouth motion. Sync3 remains available as
-            # rollback code, but there is no model-hopping in this execution path.
-            provider_name = "kling"
-            performance_prompt = _shared_scene_performance_prompt(
-                context,
-                shared_scene,
-                turn,
-                scene_prompt=prompt,
-            )
+            provider_name = "omnihuman_v15"
             listener = next(
                 (
                     candidate
@@ -259,23 +428,44 @@ async def compile_children_performant(
                 ),
                 None,
             )
+            if listener is None:
+                raise RuntimeError("shared_scene_listener_required")
+
+            camera_mode, camera_plan_source = _director_camera_mode(context, shared_scene, turn)
+            performance_prompt = _shared_scene_performance_prompt(
+                context,
+                shared_scene,
+                turn,
+                scene_prompt=prompt,
+                camera_mode=camera_mode,
+            )
+            active_coordinates = _speaker_coordinates(shared_scene, turn.participant_id)
+            listener_coordinates = _speaker_coordinates(shared_scene, listener.participant_id)
+
             provider_options.update(
                 {
                     "conversation_mode": "shared_scene",
                     "shared_scene_media_id": shared_scene["shared_scene_media_id"],
+                    "shared_scene_dimensions": {
+                        "width": int(shared_scene["image_width"]),
+                        "height": int(shared_scene["image_height"]),
+                    },
+                    "shared_scene_video_style": shared_scene["video_style"],
+                    "camera_mode": camera_mode,
+                    "camera_plan_source": camera_plan_source,
                     "longform_profile": "talking_video",
                     "quality_tier": "premium",
-                    "provider_hint": "kling",
-                    "fusion_provider": "kling",
-                    "presenter_provider": "kling",
+                    "provider_hint": "omnihuman_v15",
+                    "fusion_provider": "omnihuman_v15",
+                    "presenter_provider": "omnihuman_v15",
+                    "resolution": shared_scene["resolution"],
+                    "turbo_mode": False,
                     "aspect_ratio": aspect_ratio,
                     "prompt": performance_prompt,
-                    # Retain mapped position as durable telemetry for acceptance
-                    # analysis even though Kling Avatar does not consume Sync3's
-                    # active-speaker coordinate option.
-                    "mapped_speaker_coordinates": _speaker_coordinates(
-                        shared_scene,
-                        turn.participant_id,
+                    "active_speaker_coordinates": active_coordinates,
+                    "listener_speaker_coordinates": listener_coordinates,
+                    "speaker_mask_cache_key": (
+                        f"{shared_scene['shared_scene_media_id']}:{turn.participant_id}"
                     ),
                 }
             )
@@ -300,12 +490,14 @@ async def compile_children_performant(
                 "segment_sequence": turn.sequence_no,
                 "aspect_ratio": aspect_ratio,
                 "conversation_mode": "shared_scene" if shared_scene else "ordered_speaker_shots",
-                "provider_hint": "kling" if shared_scene else provider_name,
+                "provider_hint": "omnihuman_v15" if shared_scene else provider_name,
                 "quality_tier": "premium" if shared_scene else None,
-                "execution_provider_family": "kling_avatar" if shared_scene else None,
-                "shared_scene_motion_mode": (
-                    shared_scene.get("motion_mode") if shared_scene else None
+                "execution_provider_family": "omnihuman_v15" if shared_scene else None,
+                "shared_scene_video_style": (
+                    shared_scene.get("video_style") if shared_scene else None
                 ),
+                "shared_scene_camera_mode": camera_mode,
+                "camera_plan_source": camera_plan_source,
                 "active_speaker_name": turn.display_name if shared_scene else None,
                 "listener_name": (
                     getattr(listener, "display_name", None)
@@ -323,17 +515,21 @@ async def compile_children_performant(
         if provider_options:
             payload["provider_options"] = provider_options
 
-        children.append({
-            "dialogue_turn_id": turn_key,
-            "participant_id": str(turn.participant_id),
-            "display_name": turn.display_name,
-            "sequence_no": turn.sequence_no,
-            "face_media_id": str(turn.face_media_id) if turn.face_media_id is not None else None,
-            "shared_scene_media_id": shared_scene["shared_scene_media_id"] if shared_scene else None,
-            "audio_media_id": str(turn.audio_media_id),
-            "aspect_ratio": aspect_ratio,
-            "payload": payload,
-        })
+        children.append(
+            {
+                "dialogue_turn_id": turn_key,
+                "participant_id": str(turn.participant_id),
+                "display_name": turn.display_name,
+                "sequence_no": turn.sequence_no,
+                "face_media_id": str(turn.face_media_id) if turn.face_media_id is not None else None,
+                "shared_scene_media_id": shared_scene["shared_scene_media_id"] if shared_scene else None,
+                "audio_media_id": str(turn.audio_media_id),
+                "aspect_ratio": aspect_ratio,
+                "camera_mode": camera_mode,
+                "camera_plan_source": camera_plan_source,
+                "payload": payload,
+            }
+        )
 
     return children
 
@@ -345,5 +541,6 @@ __all__ = [
     "_assert_conversation_mode_supported",
     "_speaker_coordinates",
     "_speaker_position_label",
+    "_director_camera_mode",
     "_shared_scene_performance_prompt",
 ]
