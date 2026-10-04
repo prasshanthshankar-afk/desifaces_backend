@@ -24,6 +24,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   certify:
@@ -78,3 +79,27 @@ jobs:
           print("GROUP_CUSTOMER_PRICING_18_CREDITS_PER_SECOND=PASS")
           print("GROUP_MULTI_PERSON_SURCHARGE_20PCT=PASS")
           PY
+
+      - name: Login to GHCR
+        if: github.event_name == 'push'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build immutable DEV runtime images
+        if: github.event_name == 'push'
+        run: |
+          set -Eeuo pipefail
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          docker build -f services/svc-director/app/Dockerfile.v3 -t "ghcr.io/${OWNER}/desifaces-svc-director:${GITHUB_SHA}" .
+          docker build -f services/svc-fusion/app/Dockerfile -t "ghcr.io/${OWNER}/desifaces-svc-fusion:${GITHUB_SHA}" .
+          docker build -f services/svc-fusion-extension/app/Dockerfile -t "ghcr.io/${OWNER}/desifaces-svc-fusion-extension:${GITHUB_SHA}" .
+          echo OMNIHUMAN_RUNTIME_IMAGE_BUILD=PASS
+
+      - name: Push immutable DEV runtime images
+        if: github.event_name == 'push'
+        run: |
+          set -Eeuo pipefail
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          for IMAGE in desifaces-svc-director desifaces-svc-fusion desifaces-svc-fusion-extension; do
+            docker push "ghcr.io/${OWNER}/${IMAGE}:${GITHUB_SHA}"
+          done
+          echo OMNIHUMAN_RUNTIME_IMAGE_PUSH=PASS
