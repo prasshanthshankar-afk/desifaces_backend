@@ -75,15 +75,17 @@ class OmniHumanAdapter(ProviderClient):
     """
 
     provider_name = "omnihuman"
-    provider_version = "fal.client.v2"
+    provider_version = "fal.client"
 
     def __init__(self) -> None:
         self.queue = FalQueueClient()
         self.model_id = (
             os.getenv("DF_OMNIHUMAN_MODEL_ID")
             or os.getenv("FAL_OMNIHUMAN_MODEL_ID")
-            or "fal-ai/bytedance/omnihuman/v1.5"
+            or ""
         ).strip()
+        if not self.model_id:
+            raise OmniHumanAdapterError("OMNIHUMAN_MODEL_ID_REQUIRED")
 
         self.default_turbo_mode = str(
             os.getenv("DF_OMNIHUMAN_TURBO_MODE", "0")
