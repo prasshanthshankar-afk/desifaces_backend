@@ -13,9 +13,9 @@ fail(){ echo "FAIL: $*" >&2; exit 1; }
 [[ "$BACKEND_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "exact backend SHA required"
 command -v docker >/dev/null || fail "docker missing"
 command -v curl >/dev/null || fail "curl missing"
+command -v git >/dev/null || fail "git missing"
 
 GHCR_TOKEN="${GHCR_TOKEN:-$(gh auth token 2>/dev/null || true)}"
-[[ -n "$GHCR_TOKEN" ]] || fail "GHCR_TOKEN or authenticated gh required"
 
 echo "============================================================"
 echo " desifaces DEV — OMNIHUMAN GROUP CONVERSATION DEPLOY"
@@ -231,20 +231,68 @@ for svc in svc-fusion svc-fusion-worker; do
 done
 echo "FAL_RUNTIME_CREDENTIAL=PASS"
 
-printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_OWNER" --password-stdin >/dev/null
-trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
-
 declare -A SOURCE_IMAGE
 SOURCE_IMAGE[director]="ghcr.io/$GHCR_OWNER/desifaces-svc-director:$BACKEND_SHA"
 SOURCE_IMAGE[fusion]="ghcr.io/$GHCR_OWNER/desifaces-svc-fusion:$BACKEND_SHA"
 SOURCE_IMAGE[extension]="ghcr.io/$GHCR_OWNER/desifaces-svc-fusion-extension:$BACKEND_SHA"
 
+IMAGE_SOURCE_MODE=""
+GHCR_LOGGED_IN=0
+
+if [[ -n "$GHCR_TOKEN" ]] &&    printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_OWNER" --password-stdin >/dev/null 2>&1; then
+  GHCR_LOGGED_IN=1
+  pull_ok=1
+  for family in director fusion extension; do
+    if ! docker pull "${SOURCE_IMAGE[$family]}" >/dev/null 2>&1; then
+      pull_ok=0
+      break
+    fi
+  done
+  if (( pull_ok == 1 )); then
+    IMAGE_SOURCE_MODE="registry"
+  fi
+fi
+
+if [[ "$IMAGE_SOURCE_MODE" != "registry" ]]; then
+  echo "GHCR_PULL=UNAVAILABLE"
+  echo "FALLBACK=BUILD_EXACT_CERTIFIED_SOURCE"
+
+  if (( GHCR_LOGGED_IN == 1 )); then
+    docker logout ghcr.io >/dev/null 2>&1 || true
+    GHCR_LOGGED_IN=0
+  fi
+
+  BUILD_ROOT="/tmp/desifaces-backend-candidate-$BACKEND_SHA"
+  rm -rf "$BUILD_ROOT"
+  mkdir -p "$BUILD_ROOT"
+
+  git -C "$BUILD_ROOT" init -q
+  git -C "$BUILD_ROOT" remote add origin "https://github.com/$OWNER/$REPO.git"
+  git -C "$BUILD_ROOT" fetch -q --depth=1 origin "$BACKEND_SHA"
+  git -C "$BUILD_ROOT" checkout -q --detach FETCH_HEAD
+
+  [[ "$(git -C "$BUILD_ROOT" rev-parse HEAD)" == "$BACKEND_SHA" ]]     || fail "local exact-source checkout mismatch"
+
+  SOURCE_IMAGE[director]="desifaces-svc-director-candidate:$BACKEND_SHA"
+  SOURCE_IMAGE[fusion]="desifaces-svc-fusion-candidate:$BACKEND_SHA"
+  SOURCE_IMAGE[extension]="desifaces-svc-fusion-extension-candidate:$BACKEND_SHA"
+
+  docker build     -f "$BUILD_ROOT/services/svc-director/app/Dockerfile.v3"     -t "${SOURCE_IMAGE[director]}"     "$BUILD_ROOT"
+
+  docker build     -f "$BUILD_ROOT/services/svc-fusion/app/Dockerfile"     -t "${SOURCE_IMAGE[fusion]}"     "$BUILD_ROOT"
+
+  docker build     -f "$BUILD_ROOT/services/svc-fusion-extension/app/Dockerfile"     -t "${SOURCE_IMAGE[extension]}"     "$BUILD_ROOT"
+
+  IMAGE_SOURCE_MODE="local_exact_sha"
+fi
+
 for family in director fusion extension; do
-  docker pull "${SOURCE_IMAGE[$family]}" >/dev/null
   NEW_ID["$family"]="$(docker image inspect -f '{{.Id}}' "${SOURCE_IMAGE[$family]}")"
-  [[ -n "${NEW_ID[$family]}" ]] || fail "unable to resolve pulled image: $family"
+  [[ -n "${NEW_ID[$family]}" ]] || fail "unable to resolve candidate image: $family"
 done
-echo "IMMUTABLE_IMAGES_PULL=PASS"
+
+echo "IMAGE_SOURCE_MODE=$IMAGE_SOURCE_MODE"
+echo "EXACT_SOURCE_IMAGE_SET=PASS"
 
 family_for_service(){
   case "$1" in
@@ -417,7 +465,9 @@ echo "cogs=$COGS"
 echo "OMNIHUMAN_COGS_RUNTIME=PASS"
 
 trap - ERR
-docker logout ghcr.io >/dev/null 2>&1 || true
+if (( GHCR_LOGGED_IN == 1 )); then
+  docker logout ghcr.io >/dev/null 2>&1 || true
+fi
 trap - EXIT
 
 echo "============================================================"
