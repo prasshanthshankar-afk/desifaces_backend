@@ -3,7 +3,7 @@ BEGIN;
 -- Internal COGS for the frozen Group Photo Conversation provider.
 -- Customer billing remains provider-neutral at 18 credits/actual second (+20%
 -- over the 15-credit premium talking-video base). This row only supplies
--- economics/margin telemetry for OmniHuman 1.5 and never changes customer price.
+-- economics/margin telemetry for OmniHuman and never changes customer price.
 
 INSERT INTO public.pricing_sku_costs (
   sku_code,
@@ -31,7 +31,7 @@ VALUES (
   NULL,
   jsonb_build_object(
     'provider', 'omnihuman',
-    'provider_model', 'fal-ai/bytedance/omnihuman/v1.5',
+    'provider_family', 'omnihuman',
     'billing_unit', 'generated_second',
     'source', 'fal_public_rate_2026_10_04',
     'customer_billing_unchanged', true,
