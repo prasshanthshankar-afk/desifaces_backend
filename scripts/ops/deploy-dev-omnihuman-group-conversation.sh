@@ -83,7 +83,7 @@ done
 
 # Do not interrupt genuine in-flight DEV provider work.
 #
-# Historical V3 rows can remain state='running'/'generating' after earlier failed
+# Historical workflow rows can remain state='running'/'generating' after earlier failed
 # experiments or interrupted browser workflows. They are not proof of current
 # execution. The guard therefore distinguishes recently updated/live work from
 # stale lifecycle rows while still failing closed for provider jobs and active
@@ -205,17 +205,17 @@ PY
 
 IFS='|' read -r   LIVE_ATTEMPTS   LIVE_STAGES   LIVE_FUSION_JOBS   LIVE_PROVIDER_RUNS   LIVE_STITCHES   STALE_ATTEMPTS   STALE_STAGES   STALE_STITCHES <<< "$WORK_ACTIVITY"
 
-echo "live_v3_attempts=$LIVE_ATTEMPTS"
-echo "live_v3_stages=$LIVE_STAGES"
+echo "live_stage_attempts=$LIVE_ATTEMPTS"
+echo "live_generating_stages=$LIVE_STAGES"
 echo "live_fusion_jobs=$LIVE_FUSION_JOBS"
 echo "live_provider_runs=$LIVE_PROVIDER_RUNS"
 echo "live_stitches=$LIVE_STITCHES"
-echo "stale_v3_attempts=$STALE_ATTEMPTS"
-echo "stale_v3_stages=$STALE_STAGES"
+echo "stale_stage_attempts=$STALE_ATTEMPTS"
+echo "stale_generating_stages=$STALE_STAGES"
 echo "stale_stitches=$STALE_STITCHES"
 
-[[ "$LIVE_ATTEMPTS" == "0" ]] || fail "recent V3 attempt activity exists"
-[[ "$LIVE_STAGES" == "0" ]] || fail "recent V3 stage generation exists"
+[[ "$LIVE_ATTEMPTS" == "0" ]] || fail "recent stage-attempt activity exists"
+[[ "$LIVE_STAGES" == "0" ]] || fail "recent stage generation exists"
 [[ "$LIVE_FUSION_JOBS" == "0" ]] || fail "recent Fusion job activity exists"
 [[ "$LIVE_PROVIDER_RUNS" == "0" ]] || fail "external Fusion provider work is active"
 [[ "$LIVE_STITCHES" == "0" ]] || fail "active longform stitching exists"
