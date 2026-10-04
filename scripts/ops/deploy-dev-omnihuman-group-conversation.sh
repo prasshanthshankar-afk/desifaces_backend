@@ -351,7 +351,7 @@ echo "IMMUTABLE_IMAGE_PARITY=PASS"
 docker exec "${CONTAINER[svc-director]}" python - <<'PY'
 from pathlib import Path
 src=Path("/app/app/fusion_input_performance.py").read_text()
-assert 'provider_name = "omnihuman_v15"' in src
+assert 'provider_name = "omnihuman"' in src
 assert 'provider_name = "kling"' not in src
 assert '"static_video"' in src and '"cinematic_video"' in src
 assert '"director_choice"' in src
@@ -368,7 +368,7 @@ for svc in svc-fusion svc-fusion-worker; do
 from PIL import Image
 from app.services.providers.omnihuman_adapter import OmniHumanAdapter
 a=OmniHumanAdapter()
-assert a.provider_name=="omnihuman_v15"
+assert a.provider_name=="omnihuman"
 assert a.model_id=="fal-ai/bytedance/omnihuman/v1.5"
 assert a.speaker_mask_model_id=="fal-ai/sam2/image"
 print("OMNIHUMAN_SAM2_RUNTIME=PASS")
@@ -386,7 +386,7 @@ echo "FUSION_EXTENSION_RUNTIME_PARITY=PASS"
 
 docker exec "${CONTAINER[svc-fusion-extension]}" python - <<'PY'
 from app.api.routes.v3_scene_pricing import _SHARED_SCENE_PROVIDER
-assert _SHARED_SCENE_PROVIDER=="omnihuman_v15"
+assert _SHARED_SCENE_PROVIDER=="omnihuman"
 print("OMNIHUMAN_PARENT_PRICING_PROVIDER=PASS")
 PY
 
@@ -406,14 +406,14 @@ docker exec -i "$DB_C" psql -X -At -F '|' -U "$DB_USER" -d "$DB_NAME" <<'SQL'
 select sku_code,component_code,variable_cost_money
 from public.pricing_sku_costs
 where sku_code='GROUP_TALK_PREMIUM_SECOND'
-  and component_code='fal_omnihuman_v15_variable'
+  and component_code='fal_omnihuman_variable'
   and is_active=true
 order by effective_from desc
 limit 1;
 SQL
 )"
 echo "cogs=$COGS"
-[[ "$COGS" == "GROUP_TALK_PREMIUM_SECOND|fal_omnihuman_v15_variable|0.16000000" ]] || fail "OmniHuman COGS row mismatch"
+[[ "$COGS" == "GROUP_TALK_PREMIUM_SECOND|fal_omnihuman_variable|0.16000000" ]] || fail "OmniHuman COGS row mismatch"
 echo "OMNIHUMAN_COGS_RUNTIME=PASS"
 
 trap - ERR
