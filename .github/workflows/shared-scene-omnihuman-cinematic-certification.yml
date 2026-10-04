@@ -17,6 +17,7 @@ on:
       - 'services/svc-director/tests/test_shared_scene_contract.py'
       - 'services/svc-fusion-extension/tests/test_v3_scene_pricing_omnihuman_shared.py'
       - 'scripts/test-shared-scene-omnihuman-cinematic.py'
+      - 'scripts/ops/deploy-dev-omnihuman-group-conversation.sh'
       - 'migrations/2026_10_03_group_conversation_premium_actual_seconds.sql'
       - 'migrations/2026_10_04_group_conversation_omnihuman_cogs.sql'
       - '.github/workflows/shared-scene-omnihuman-cinematic-certification.yml'
@@ -41,6 +42,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: DEV deploy script syntax
+        run: bash -n scripts/ops/deploy-dev-omnihuman-group-conversation.sh
 
       - name: Python compile gate
         run: |
