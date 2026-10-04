@@ -74,12 +74,60 @@ echo "compose_workdir=$WORKDIR"
 echo "active_services=${ACTIVE_SERVICES[*]}"
 echo "COMPOSE_OWNERSHIP=PASS"
 
-COMPOSE=(docker compose -p "$PROJECT" --project-directory "$WORKDIR")
 IFS=',' read -r -a compose_files <<< "$CONFIG_FILES"
 for f in "${compose_files[@]}"; do
   [[ -f "$f" ]] || fail "active compose file missing: $f"
-  COMPOSE+=(-f "$f")
 done
+
+# Reuse the environment source that owns the currently running DEV compose
+# project. The active project can be started with an explicit --env-file, so a
+# later non-interactive deployment must not assume those values are present in
+# the caller's shell.
+ENV_FILE=""
+ENV_CANDIDATES=(
+  "$WORKDIR/.env"
+  "$WORKDIR/infra/.env"
+  "/home/azureuser/workspace/desifaces-runtime/.env"
+  "/home/azureuser/workspace/desifaces-runtime/infra/.env"
+  "/home/azureuser/workspace/desifaces-v3/infra/.env"
+  "/home/azureuser/workspace/desifaces-v3/.env"
+)
+
+for candidate in "${ENV_CANDIDATES[@]}"; do
+  [[ -f "$candidate" ]] || continue
+
+  TEST_COMPOSE=(docker compose --env-file "$candidate" -p "$PROJECT" --project-directory "$WORKDIR")
+  for f in "${compose_files[@]}"; do
+    TEST_COMPOSE+=(-f "$f")
+  done
+
+  if "${TEST_COMPOSE[@]}" config --format json >/dev/null 2>&1; then
+    ENV_FILE="$candidate"
+    break
+  fi
+done
+
+if [[ -z "$ENV_FILE" ]]; then
+  # Last chance: the caller may already have the complete compose environment.
+  TEST_COMPOSE=(docker compose -p "$PROJECT" --project-directory "$WORKDIR")
+  for f in "${compose_files[@]}"; do
+    TEST_COMPOSE+=(-f "$f")
+  done
+  if "${TEST_COMPOSE[@]}" config --format json >/dev/null 2>&1; then
+    COMPOSE=("${TEST_COMPOSE[@]}")
+    echo "COMPOSE_ENV_SOURCE=caller_environment"
+  else
+    fail "unable to resolve the active DEV compose environment; no candidate env file renders the running project"
+  fi
+else
+  COMPOSE=(docker compose --env-file "$ENV_FILE" -p "$PROJECT" --project-directory "$WORKDIR")
+  for f in "${compose_files[@]}"; do
+    COMPOSE+=(-f "$f")
+  done
+  echo "COMPOSE_ENV_SOURCE=$ENV_FILE"
+fi
+
+echo "COMPOSE_ENVIRONMENT=PASS"
 
 # Do not interrupt genuine in-flight DEV provider work.
 #
