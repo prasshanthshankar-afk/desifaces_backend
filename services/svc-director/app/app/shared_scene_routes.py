@@ -57,17 +57,59 @@ class SharedSceneSpeakerTarget(BaseModel):
 class SharedSceneVideoSettingsIn(BaseModel):
     motion_mode: str = Field(min_length=1, max_length=64)
     video_prompt: str | None = Field(default=None, max_length=2400)
+    camera_mode: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def validate_motion_mode(self):
-        mode = str(self.motion_mode or "").strip().lower()
-        if mode not in {"precise_lipsync", "natural_motion"}:
-            raise ValueError("unsupported_shared_scene_motion_mode")
-        self.motion_mode = mode
+        raw = str(self.motion_mode or "").strip().lower()
+        aliases = {
+            "natural_motion": "static_video",
+            "precise_lipsync": "static_video",
+            "static": "static_video",
+            "normal": "static_video",
+            "cinematic": "cinematic_video",
+            "cinematic_motion": "cinematic_video",
+        }
+        mode = aliases.get(raw, raw)
+        if mode not in {"static_video", "cinematic_video"}:
+            raise ValueError("unsupported_shared_scene_video_style")
+
+        camera = str(self.camera_mode or "").strip().lower()
+        camera_aliases = {
+            "": "director_choice" if mode == "cinematic_video" else "static",
+            "pushin": "push_in",
+            "dolly_in": "push_in",
+            "pushout": "push_out",
+            "pull_out": "push_out",
+            "orbit_left": "arc_left",
+            "orbit_right": "arc_right",
+            "arc": "arc_right",
+            "low_to_eye": "angle_shift_low_to_eye",
+            "high_to_eye": "angle_shift_high_to_eye",
+        }
+        camera = camera_aliases.get(camera, camera)
+        allowed_camera_modes = {
+            "director_choice",
+            "static",
+            "push_in",
+            "push_out",
+            "arc_left",
+            "arc_right",
+            "angle_shift_low_to_eye",
+            "angle_shift_high_to_eye",
+        }
+        if mode == "static_video":
+            camera = "static"
+        elif camera not in allowed_camera_modes:
+            raise ValueError("unsupported_shared_scene_camera_mode")
+
         prompt = str(self.video_prompt or "").strip()
-        if mode == "natural_motion" and not prompt:
-            raise ValueError("natural_motion_video_prompt_required")
-        self.video_prompt = prompt or None
+        if not prompt:
+            raise ValueError("shared_scene_video_prompt_required")
+
+        self.motion_mode = mode
+        self.camera_mode = camera
+        self.video_prompt = prompt
         return self
 
 
@@ -477,7 +519,7 @@ async def set_shared_scene_conversation(
         "generation_ready": len(body.speaker_targets) == 2,
         "video_supported": len(body.speaker_targets) == 2,
         "video_max_people": 2,
-        "fusion_provider": "sync3",
+        "fusion_provider": "omnihuman_v15",
     }
 
 
@@ -543,9 +585,15 @@ async def set_shared_scene_video_settings(
                     detail="shared_scene_video_requires_exactly_two_speakers",
                 )
 
+            metadata["shared_scene_provider"] = "omnihuman_v15"
+            metadata["shared_scene_video_style"] = body.motion_mode
+            # Preserve the historical key for old clients/readers while changing
+            # its canonical values to static_video/cinematic_video.
             metadata["shared_scene_motion_mode"] = body.motion_mode
+            metadata["shared_scene_camera_mode"] = body.camera_mode
             metadata["shared_scene_video_prompt"] = body.video_prompt
-            metadata["shared_scene_video_settings_version"] = 1
+            metadata["shared_scene_resolution"] = "720p"
+            metadata["shared_scene_video_settings_version"] = 2
 
             await conn.execute(
                 """
@@ -561,8 +609,11 @@ async def set_shared_scene_video_settings(
         "workflow_id": str(workflow_id),
         "stage_run_id": str(stage_run_id),
         "motion_mode": body.motion_mode,
+        "video_style": body.motion_mode,
+        "camera_mode": body.camera_mode,
         "video_prompt": body.video_prompt,
-        "shared_scene_video_settings_version": 1,
+        "fusion_provider": "omnihuman_v15",
+        "shared_scene_video_settings_version": 2,
         "pricing_ready": True,
         "persisted": True,
     }
