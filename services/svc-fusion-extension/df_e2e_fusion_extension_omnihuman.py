@@ -52,7 +52,7 @@ POLL_SECONDS = float(os.getenv("POLL_SECONDS", "5"))
 DB_LOOKUP_FIRST = os.getenv("DB_LOOKUP_FIRST", "1").strip().lower() not in {"0", "false", "no"}
 DB_CONTAINER = os.getenv("DB_CONTAINER", "")
 
-FUSION_PROVIDER = os.getenv("FUSION_PROVIDER", "omnihuman_v15").strip().lower() or "omnihuman_v15"
+FUSION_PROVIDER = os.getenv("FUSION_PROVIDER", "omnihuman").strip().lower() or "omnihuman"
 FREE_TIER = os.getenv("FREE_TIER", "0").strip().lower() in {"1", "true", "yes", "y"}
 RESOLUTION = os.getenv("RESOLUTION", "720p" if FREE_TIER else "1080p")
 TURBO_MODE = os.getenv("TURBO_MODE", "0").strip().lower() in {"1", "true", "yes", "y"}
