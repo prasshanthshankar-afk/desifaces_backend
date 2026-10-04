@@ -471,7 +471,7 @@ class FusionOrchestrator:
         self.perfs = DigitalPerformancesRepo(pool)
 
         self.artifact_service = ArtifactService()
-        self.default_provider_name = str(os.getenv("DF_FUSION_PROVIDER", "omnihuman_v15") or "omnihuman_v15").strip().lower()
+        self.default_provider_name = str(os.getenv("DF_FUSION_PROVIDER", "omnihuman") or "omnihuman").strip().lower()
         self.alias_heygen_to_hedra = str(
             os.getenv("DF_FUSION_ALIAS_HEYGEN_TO_HEDRA", "0")
         ).strip().lower() in {"1", "true", "yes", "y"}
@@ -490,11 +490,11 @@ class FusionOrchestrator:
             self.pricing_client = _DisabledPricingClient()
 
     def _resolve_provider_name(self, requested: Optional[str]) -> str:
-        raw = str(requested or self.default_provider_name or "omnihuman_v15").strip().lower()
+        raw = str(requested or self.default_provider_name or "omnihuman").strip().lower()
         if raw in {"heygen", "heygen_av4", "heygen_v2", "native"}:
             return "heygen_av4"
-        if raw in {"omnihuman_v15", "omnihuman"}:
-            return "omnihuman_v15"
+        if raw in {"omnihuman", "omnihuman"}:
+            return "omnihuman"
         if raw in {"veed", "veed_fabric", "veed_fabric_1", "fabric", "fabric_1_0", "veed/fabric-1.0"}:
             return "veed_fabric"
         if raw in {"sync3", "sync_3", "sync-3"}:
@@ -513,7 +513,7 @@ class FusionOrchestrator:
         if cached is not None:
             return cached
 
-        if name == "omnihuman_v15":
+        if name == "omnihuman":
             provider: ProviderClient = OmniHumanAdapter()
         elif name == "veed_fabric":
             provider = VeedFabricAdapter()
@@ -570,7 +570,7 @@ class FusionOrchestrator:
     ) -> Optional[ProviderPollResult]:
         if provider is None or not provider_job_id:
             return None
-        if provider_name != "omnihuman_v15":
+        if provider_name != "omnihuman":
             return None
 
         last_poll: Optional[ProviderPollResult] = None
@@ -616,7 +616,7 @@ class FusionOrchestrator:
             return f"HeyGen provider is not wired correctly: {HEYGEN_IMPORT_ERROR}"
         if provider_name == "heygen_av4" and HeyGenService is None:
             return "HeyGen provider is not wired correctly in this deployment."
-        if provider_name == "omnihuman_v15":
+        if provider_name == "omnihuman":
             return "OmniHuman provider is not wired correctly in this deployment."
         if provider_name == "veed_fabric":
             return "VEED Fabric provider is not wired correctly in this deployment."
