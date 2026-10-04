@@ -74,7 +74,7 @@ class OmniHumanAdapter(ProviderClient):
         DF_OMNIHUMAN_ENFORCE_PRODUCT_30S=1 by default
     """
 
-    provider_name = "omnihuman_v15"
+    provider_name = "omnihuman"
     provider_version = "fal.client.v2"
 
     def __init__(self) -> None:
@@ -135,9 +135,9 @@ class OmniHumanAdapter(ProviderClient):
             bool(spec.resolved_audio_url),
         )
         if not spec.resolved_face_url:
-            raise OmniHumanAdapterError("omnihuman_v15 requires resolved_face_url")
+            raise OmniHumanAdapterError("omnihuman requires resolved_face_url")
         if not spec.resolved_audio_url:
-            raise OmniHumanAdapterError("omnihuman_v15 requires resolved_audio_url")
+            raise OmniHumanAdapterError("omnihuman requires resolved_audio_url")
 
         request_payload = dict(spec.request_payload or {})
         duration_sec = self._duration_seconds(request_payload)
@@ -746,19 +746,19 @@ class OmniHumanAdapter(ProviderClient):
 
         if duration_sec > 60.0:
             raise OmniHumanAdapterError(
-                f"omnihuman_v15_provider_limit_exceeded: duration_sec={duration_sec:.2f}. "
+                f"omnihuman_provider_limit_exceeded: duration_sec={duration_sec:.2f}. "
                 "Provider supports max 60s at 720p."
             )
 
         if self.enforce_product_30s and duration_sec > 30.0:
             raise OmniHumanAdapterError(
-                f"omnihuman_v15_product_cap_exceeded: duration_sec={duration_sec:.2f}. "
+                f"omnihuman_product_cap_exceeded: duration_sec={duration_sec:.2f}. "
                 "Use segmented story mode and stitch."
             )
 
         if resolution == "1080p" and duration_sec > 30.0:
             raise OmniHumanAdapterError(
-                f"omnihuman_v15_1080p_limit_exceeded: duration_sec={duration_sec:.2f}. "
+                f"omnihuman_1080p_limit_exceeded: duration_sec={duration_sec:.2f}. "
                 "1080p supports max 30s."
             )
 
