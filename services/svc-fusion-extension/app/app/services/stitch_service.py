@@ -266,24 +266,38 @@ def _transition_audio_curve() -> str:
     return curve or "qsin"
 
 
+def _shared_dialogue_transition_seconds() -> float:
+    try:
+        value = float(os.getenv("DF_SHARED_SCENE_TRANSITION_SECONDS", "0.12"))
+    except Exception:
+        value = 0.12
+    # Three to five frames at 30 fps is enough to absorb the visible jump
+    # without creating a noticeable dissolve or ghosting independently
+    # generated bodies/faces.
+    return max(0.08, min(0.16, value))
+
+
 def _safe_transition_duration(
     requested_sec: float,
     left_duration_sec: Optional[float],
     right_duration_sec: Optional[float],
+    *,
+    minimum_sec: float = 0.18,
 ) -> float:
-    requested = _seconds(requested_sec, default=0.50, minimum=0.18)
+    minimum = max(0.01, float(minimum_sec))
+    requested = _seconds(requested_sec, default=0.50, minimum=minimum)
 
     limits = [requested, 0.75]
     for value in (left_duration_sec, right_duration_sec):
         try:
             if value is not None and float(value) > 0:
-                limits.append(max(0.18, float(value) * 0.22))
+                limits.append(max(minimum, float(value) * 0.22))
         except Exception:
             logger.exception("stitch_videos xfade duration calculation failed")
             pass
 
     transition = min(limits)
-    return max(0.18, transition)
+    return max(minimum, transition)
 
 
 def download_to_local(url: str, output_path: str, *, timeout_seconds: int = 120) -> str:
@@ -726,6 +740,7 @@ def _xfade_pair(
     *,
     transition_duration_sec: float,
     transition_style_override: Optional[str] = None,
+    minimum_transition_sec: float = 0.18,
 ) -> None:
     _require_nonempty_file(left_mp4)
     _require_nonempty_file(right_mp4)
@@ -742,6 +757,7 @@ def _xfade_pair(
         transition_duration_sec,
         left_duration,
         right_duration,
+        minimum_sec=minimum_transition_sec,
     )
     offset = max(0.0, float(left_duration) - xfade_duration)
     transition_style = str(transition_style_override or _transition_style()).strip() or _transition_style()
@@ -978,7 +994,7 @@ def stitch_videos(
             normalize_segment_mp4(
                 src,
                 norm,
-                edge_fade_override=0.0 if effective_mode in {"concat", "hard_cut"} else None,
+                edge_fade_override=0.0 if effective_mode in {"concat", "hard_cut", "shared_dialogue"} else None,
                 aspect_ratio=aspect_ratio,
             )
 
@@ -1001,6 +1017,45 @@ def stitch_videos(
             return
 
         mode = effective_mode
+        if mode == "shared_dialogue":
+            # Shared group-photo turns use provider-generated silence handles.
+            # Blend only a few frames inside those silent handles. This removes
+            # the visible hard jump while keeping speech non-overlapping and
+            # preserving lip-sync. Fail closed instead of silently falling back
+            # to an abrupt concat if this quality path cannot be produced.
+            running = normalized_files[0]
+            transition = _shared_dialogue_transition_seconds()
+            for idx in range(1, len(normalized_files)):
+                next_input = normalized_files[idx]
+                blended_out = os.path.join(td, f"shared_dialogue_{idx:04d}.mp4")
+                _xfade_pair(
+                    running,
+                    next_input,
+                    blended_out,
+                    transition_duration_sec=transition,
+                    transition_style_override="fade",
+                    minimum_transition_sec=0.08,
+                )
+                running = blended_out
+
+            _run([
+                "ffmpeg",
+                "-y",
+                "-threads", _ffmpeg_threads(),
+                "-i", running,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                out_mp4,
+            ])
+            _require_nonempty_file(out_mp4)
+            logger.info(
+                "stitch_videos shared_dialogue ok out_mp4=%s bytes=%s transition_sec=%.3f",
+                out_mp4,
+                Path(out_mp4).stat().st_size,
+                transition,
+            )
+            return
+
         if mode in {"xfade", "fade"}:
             try:
                 running = normalized_files[0]
