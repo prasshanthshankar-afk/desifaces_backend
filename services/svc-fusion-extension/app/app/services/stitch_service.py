@@ -399,6 +399,7 @@ def normalize_segment_mp4(
     output_path: str,
     *,
     edge_fade_override: Optional[float] = None,
+    audio_edge_fade: bool = True,
     aspect_ratio: Optional[str] = None,
 ) -> None:
     _require_nonempty_file(input_path)
@@ -422,7 +423,7 @@ def normalize_segment_mp4(
         fade_out_start = max(0.0, duration - edge_fade)
         vf_parts.append(f"fade=t=in:st=0:d={edge_fade:.3f}")
         vf_parts.append(f"fade=t=out:st={fade_out_start:.3f}:d={edge_fade:.3f}")
-        if has_audio:
+        if has_audio and audio_edge_fade:
             af_parts.append(f"afade=t=in:st=0:d={edge_fade:.3f}")
             af_parts.append(f"afade=t=out:st={fade_out_start:.3f}:d={edge_fade:.3f}")
 
@@ -1051,10 +1052,16 @@ def stitch_videos(
 
         def _norm_one(item):
             _, src, norm = item
+            shared_dialogue = effective_mode == "shared_dialogue"
             normalize_segment_mp4(
                 src,
                 norm,
-                edge_fade_override=0.0 if effective_mode in {"concat", "hard_cut", "shared_dialogue"} else None,
+                edge_fade_override=(
+                    _shared_dialogue_transition_seconds()
+                    if shared_dialogue
+                    else (0.0 if effective_mode in {"concat", "hard_cut"} else None)
+                ),
+                audio_edge_fade=not shared_dialogue,
                 aspect_ratio=aspect_ratio,
             )
 
@@ -1078,38 +1085,30 @@ def stitch_videos(
 
         mode = effective_mode
         if mode == "shared_dialogue":
-            # Shared group-photo turns use provider-generated silence handles.
-            # Blend only a few frames inside those silent handles. This removes
-            # the visible hard jump while keeping speech non-overlapping and
-            # preserving lip-sync. Fail closed instead of silently falling back
-            # to an abrupt concat if this quality path cannot be produced.
-            running = normalized_files[0]
+            # Shared-scene provider clips already contain the authoritative
+            # lip-synced dialogue timeline. Never overlap, trim, fade, or
+            # otherwise rewrite that audio at a scene boundary. Each normalized
+            # child receives a short VIDEO-ONLY fade-out/fade-in, then the full
+            # clips are concatenated at their natural duration. This preserves
+            # every dialogue sample while removing the visible hard jump.
+            shared_concat_list = os.path.join(td, "shared_dialogue_concat.txt")
+            _write_concat_list(normalized_files, shared_concat_list)
             transition = _shared_dialogue_transition_seconds()
-            for idx in range(1, len(normalized_files)):
-                next_input = normalized_files[idx]
-                blended_out = os.path.join(td, f"shared_dialogue_{idx:04d}.mp4")
-                _xfade_pair(
-                    running,
-                    next_input,
-                    blended_out,
-                    transition_duration_sec=transition,
-                    transition_style_override="fade",
-                    minimum_transition_sec=0.08,
-                )
-                running = blended_out
 
             _run([
                 "ffmpeg",
                 "-y",
                 "-threads", _ffmpeg_threads(),
-                "-i", running,
+                "-f", "concat",
+                "-safe", "0",
+                "-i", shared_concat_list,
                 "-c", "copy",
                 "-movflags", "+faststart",
                 out_mp4,
             ])
             _require_nonempty_file(out_mp4)
             logger.info(
-                "stitch_videos shared_dialogue ok out_mp4=%s bytes=%s transition_sec=%.3f",
+                "stitch_videos shared_dialogue ok out_mp4=%s bytes=%s video_edge_fade_sec=%.3f audio_transition=none",
                 out_mp4,
                 Path(out_mp4).stat().st_size,
                 transition,
