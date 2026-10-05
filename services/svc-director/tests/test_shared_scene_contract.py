@@ -250,3 +250,15 @@ def test_shared_scene_quality_release_enforces_strict_per_turn_lipsync_contract(
     assert "final spoken phoneme" in source
     assert '"lipsync_quality_mode": "strict"' in source
     assert '"speaker_mask_strategy": "protect_listener"' in source
+
+
+def test_shared_scene_ambient_motion_respects_uploaded_source_fidelity():
+    root = Path(__file__).resolve().parents[1] / "app" / "app"
+    routes = (root / "shared_scene_routes.py").read_text(encoding="utf-8")
+    compiler = (root / "fusion_input_performance.py").read_text(encoding="utf-8")
+
+    assert "w.metadata_json as workflow_metadata" in routes
+    assert 'metadata["shared_scene_source_mode"] = source_mode' in routes
+    assert "This is a user-uploaded source photo" in compiler
+    assert "animate only people and environmental elements already visible" in compiler
+    assert "Do not invent new background people, objects, signage, architecture, or scenery." in compiler
