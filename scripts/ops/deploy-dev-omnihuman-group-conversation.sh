@@ -584,6 +584,8 @@ src=Path("/app/app/services/providers/omnihuman_adapter.py").read_text()
 assert "_normalize_shared_scene_audio_to_fal" in src
 assert "silenceremove=" in src
 assert "loudnorm=I=-18:LRA=7:TP=-1.5" in src
+assert "stop_periods=1" not in src
+assert src.count('"areverse,"') >= 2
 assert "positive, negative = listener, active" in src
 
 print("OMNIHUMAN_SAM2_RUNTIME=PASS")
