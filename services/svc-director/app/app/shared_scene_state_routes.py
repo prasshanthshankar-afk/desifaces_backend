@@ -118,6 +118,11 @@ def _group_photo_generation_input(
         f"Scene region code: {_clean(spec.get('scene_region_code'))}" if _clean(spec.get("scene_region_code")) else "",
         f"Scene context code: {_clean(spec.get('context_code'))}" if _clean(spec.get("context_code")) else "",
         f"Background/environment: {_clean(spec.get('background'))}" if _clean(spec.get("background")) else "",
+        (
+            "Environmental realism: if this is a naturally public or active setting, include one to three small "
+            "distant non-speaking background people with indistinct faces and natural spacing; never add another "
+            "foreground subject or make background people visually prominent."
+        ),
     ]
 
     # svc-face CreatorPlatformRequest.user_prompt is capped at 1500 chars.
