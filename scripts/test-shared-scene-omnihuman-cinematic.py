@@ -209,6 +209,10 @@ for marker in (
     'transition_style_override="fade"',
     'minimum_transition_sec=0.08',
     'Fail closed instead of silently falling back',
+    'def _probe_video_dimensions',
+    '_fit_pad_filter(target_width, target_height)',
+    'channel_layouts=stereo',
+    '"-ac", "2"',
 ):
     assert marker in stitch_service, marker
 
