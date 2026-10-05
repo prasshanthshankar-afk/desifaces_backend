@@ -640,7 +640,10 @@ assert "silenceremove=" in src
 assert "loudnorm=I=-18:LRA=7:TP=-1.5" in src
 assert "stop_periods=1" not in src
 assert src.count('"areverse,"') >= 2
-assert "active, listener" in src
+assert '{"label": 1, "x": int(active[0]), "y": int(active[1])}' in src
+assert '{"label": 0, "x": int(listener[0]), "y": int(listener[1])}' in src
+assert "OMNIHUMAN_SPEAKER_MASK_ACTIVE_NOT_WHITE" in src
+assert "OMNIHUMAN_SPEAKER_MASK_LISTENER_NOT_BLACK" in src
 
 print("OMNIHUMAN_SAM2_RUNTIME=PASS")
 print("OMNIHUMAN_ACTIVE_SPEAKER_MASK=PASS")
