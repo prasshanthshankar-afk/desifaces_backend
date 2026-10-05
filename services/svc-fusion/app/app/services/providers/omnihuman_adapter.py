@@ -115,13 +115,7 @@ class OmniHumanAdapter(ProviderClient):
             os.getenv("DF_OMNIHUMAN_SPEAKER_MASK_MODEL_ID", "fal-ai/sam2/image")
         ).strip() or "fal-ai/sam2/image"
 
-        self.shared_scene_mask_strategy = str(
-            os.getenv("DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY", "protect_listener")
-        ).strip().lower() or "protect_listener"
-        if self.shared_scene_mask_strategy not in {"active_only", "protect_listener"}:
-            raise OmniHumanAdapterError(
-                f"OMNIHUMAN_SPEAKER_MASK_STRATEGY_INVALID:{self.shared_scene_mask_strategy}"
-            )
+        self.shared_scene_mask_strategy = "active_only"
 
         self.shared_scene_audio_normalization = str(
             os.getenv("DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION", "1")
@@ -253,10 +247,7 @@ class OmniHumanAdapter(ProviderClient):
                 "fal_audio_url": audio_url,
                 "speaker_mask_url_present": bool(mask_url),
                 "speaker_mask_model_id": self.speaker_mask_model_id if mask_url else None,
-                "speaker_mask_strategy": (
-                    str(provider_options.get("speaker_mask_strategy") or self.shared_scene_mask_strategy)
-                    if mask_url else None
-                ),
+                "speaker_mask_strategy": self.shared_scene_mask_strategy if mask_url else None,
                 "shared_scene_audio_normalized": audio_normalized,
             },
         )
@@ -329,13 +320,7 @@ class OmniHumanAdapter(ProviderClient):
             or provider_options.get("shared_scene_media_id")
             or ""
         ).strip()
-        strategy = str(
-            provider_options.get("speaker_mask_strategy") or "protect_listener"
-        ).strip().lower()
-        return (
-            f"{stable}|{strategy}|{width}x{height}|"
-            f"{active[0]},{active[1]}|{listener[0]},{listener[1]}"
-        )
+        return f"{stable}|{width}x{height}|{active[0]},{active[1]}|{listener[0]},{listener[1]}"
 
     @staticmethod
     def _mask_result_url(result: Any) -> str:
@@ -357,7 +342,6 @@ class OmniHumanAdapter(ProviderClient):
         height: int,
         active: list[int],
         listener: list[int],
-        strategy: str,
     ) -> str:
         raw_path: Optional[str] = None
         final_path: Optional[str] = None
@@ -389,20 +373,12 @@ class OmniHumanAdapter(ProviderClient):
             lx = max(0, min(width - 1, int(listener[0])))
             ly = max(0, min(height - 1, int(listener[1])))
 
-            if strategy == "protect_listener":
-                # SAM2 is asked to segment the listener. Normalize that raw mask
-                # to listener=white first, then invert it so OmniHuman may animate
-                # the active speaker and ambient scene while protecting the
-                # listener's face/body from speech motion.
-                if mask.getpixel((lx, ly)) < 128:
-                    mask = ImageOps.invert(mask)
+            # fal OmniHuman's documented mask contract is speaker selection:
+            # only the person in the white area speaks. Preserve the proven
+            # active-speaker-only mask so ambient scene direction can never
+            # weaken speaker isolation or accidentally select a background face.
+            if mask.getpixel((ax, ay)) < 128:
                 mask = ImageOps.invert(mask)
-                occupancy_min, occupancy_max = 0.30, 0.97
-            else:
-                # Legacy strategy: animate only the active speaker.
-                if mask.getpixel((ax, ay)) < 128:
-                    mask = ImageOps.invert(mask)
-                occupancy_min, occupancy_max = 0.05, 0.70
 
             active_pixel = int(mask.getpixel((ax, ay)))
             listener_pixel = int(mask.getpixel((lx, ly)))
@@ -414,9 +390,9 @@ class OmniHumanAdapter(ProviderClient):
                 raise OmniHumanAdapterError("OMNIHUMAN_SPEAKER_MASK_ACTIVE_NOT_WHITE")
             if listener_pixel != 0:
                 raise OmniHumanAdapterError("OMNIHUMAN_SPEAKER_MASK_LISTENER_NOT_BLACK")
-            if occupancy < occupancy_min or occupancy > occupancy_max:
+            if occupancy < 0.05 or occupancy > 0.70:
                 raise OmniHumanAdapterError(
-                    f"OMNIHUMAN_SPEAKER_MASK_OCCUPANCY_INVALID:{strategy}:{occupancy:.4f}"
+                    f"OMNIHUMAN_SPEAKER_MASK_OCCUPANCY_INVALID:{occupancy:.4f}"
                 )
             if not mask.getbbox():
                 raise OmniHumanAdapterError("OMNIHUMAN_SPEAKER_MASK_EMPTY")
@@ -445,22 +421,9 @@ class OmniHumanAdapter(ProviderClient):
         width: int,
         height: int,
     ) -> str:
-        strategy = str(
-            provider_options.get("speaker_mask_strategy") or self.shared_scene_mask_strategy
-        ).strip().lower()
-        if strategy not in {"active_only", "protect_listener"}:
-            raise OmniHumanAdapterError(
-                f"OMNIHUMAN_SPEAKER_MASK_STRATEGY_INVALID:{strategy}"
-            )
-
-        if strategy == "protect_listener":
-            positive, negative = listener, active
-        else:
-            positive, negative = active, listener
-
         box = self._speaker_mask_box(
-            positive,
-            negative,
+            active,
+            listener,
             width=width,
             height=height,
         )
@@ -471,8 +434,8 @@ class OmniHumanAdapter(ProviderClient):
                 arguments={
                     "image_url": image_url,
                     "prompts": [
-                        {"label": 1, "x": int(positive[0]), "y": int(positive[1])},
-                        {"label": 0, "x": int(negative[0]), "y": int(negative[1])},
+                        {"label": 1, "x": int(active[0]), "y": int(active[1])},
+                        {"label": 0, "x": int(listener[0]), "y": int(listener[1])},
                     ],
                     "box_prompts": [box],
                     "apply_mask": False,
@@ -492,7 +455,6 @@ class OmniHumanAdapter(ProviderClient):
             height=height,
             active=active,
             listener=listener,
-            strategy=strategy,
         )
 
     async def _shared_scene_mask_url(
