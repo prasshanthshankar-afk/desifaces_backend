@@ -352,12 +352,25 @@ services:
       DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY: active_only
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION: "1"
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED: "1"
+      DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS: "120"
+      DF_OMNIHUMAN_DIALOGUE_TAIL_PAD_MS: "180"
   svc-fusion-worker:
     environment:
       DF_OMNIHUMAN_MODEL_ID: "$MODEL_ID_YAML"
       DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY: active_only
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION: "1"
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED: "1"
+      DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS: "120"
+      DF_OMNIHUMAN_DIALOGUE_TAIL_PAD_MS: "180"
+  svc-fusion-extension:
+    environment:
+      DF_SHARED_SCENE_TRANSITION_SECONDS: "0.12"
+  svc-fusion-extension-worker:
+    environment:
+      DF_SHARED_SCENE_TRANSITION_SECONDS: "0.12"
+  svc-fusion-extension-stitch-worker:
+    environment:
+      DF_SHARED_SCENE_TRANSITION_SECONDS: "0.12"
 YAML
 chmod 600 "$RUNTIME_OVERRIDE"
 
@@ -632,12 +645,16 @@ assert a.speaker_mask_model_id=="fal-ai/sam2/image"
 assert a.shared_scene_mask_strategy=="active_only"
 assert a.shared_scene_audio_normalization is True
 assert a.shared_scene_audio_normalization_required is True
+assert a.shared_scene_dialogue_head_pad_ms == 120
+assert a.shared_scene_dialogue_tail_pad_ms == 180
 assert shutil.which("ffmpeg"), "ffmpeg missing from Fusion runtime"
 
 src=Path("/app/app/services/providers/omnihuman_adapter.py").read_text()
 assert "_normalize_shared_scene_audio_to_fal" in src
 assert "silenceremove=" in src
 assert "loudnorm=I=-18:LRA=7:TP=-1.5" in src
+assert "adelay=" in src
+assert "apad=pad_dur=" in src
 assert "stop_periods=1" not in src
 assert src.count('"areverse,"') >= 2
 assert '{"label": 1, "x": int(active[0]), "y": int(active[1])}' in src
@@ -648,6 +665,7 @@ assert "OMNIHUMAN_SPEAKER_MASK_LISTENER_NOT_BLACK" in src
 print("OMNIHUMAN_SAM2_RUNTIME=PASS")
 print("OMNIHUMAN_ACTIVE_SPEAKER_MASK=PASS")
 print("OMNIHUMAN_SHARED_AUDIO_NORMALIZATION=PASS")
+print("OMNIHUMAN_DIALOGUE_HANDLES=PASS")
 PY
 done
 
@@ -668,12 +686,22 @@ PY
 
 if [[ -n "${CONTAINER[svc-fusion-extension-stitch-worker]:-}" ]]; then
 docker exec -i "${CONTAINER[svc-fusion-extension-stitch-worker]}" python - <<'PY'
+import os
 from pathlib import Path
 src=Path("/app/app/workers/v3_scene_coordinator.py").read_text()
+stitch=Path("/app/app/services/stitch_service.py").read_text()
+route=Path("/app/app/api/routes/v3_scene_stitch.py").read_text()
 assert 'if not stitched_media_id:' in src
 assert "Retry path: reuse the already assembled media" in src
 assert '"stitched_media_id": stitched_media_id' in src
+assert 'stitch_mode = "shared_dialogue" if conversation_mode == "shared_scene" else None' in src
+assert 'return "shared_dialogue"' in route
+assert 'mode == "shared_dialogue"' in stitch
+assert '_shared_dialogue_transition_seconds' in stitch
+assert 'minimum_transition_sec=0.08' in stitch
+assert os.environ.get("DF_SHARED_SCENE_TRANSITION_SECONDS") == "0.12"
 print("STITCH_ONCE_PRICING_RETRY_ONLY=PASS")
+print("SHARED_DIALOGUE_MICRO_TRANSITION=PASS")
 PY
 fi
 
