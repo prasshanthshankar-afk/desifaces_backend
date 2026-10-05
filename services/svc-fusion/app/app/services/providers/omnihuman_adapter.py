@@ -130,17 +130,17 @@ class OmniHumanAdapter(ProviderClient):
         try:
             self.shared_scene_dialogue_head_pad_ms = max(
                 80,
-                min(300, int(os.getenv("DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS", "120"))),
+                min(300, int(os.getenv("DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS", "300"))),
             )
         except Exception:
-            self.shared_scene_dialogue_head_pad_ms = 120
+            self.shared_scene_dialogue_head_pad_ms = 300
         try:
             self.shared_scene_dialogue_tail_pad_ms = max(
                 100,
-                min(400, int(os.getenv("DF_OMNIHUMAN_DIALOGUE_TAIL_PAD_MS", "180"))),
+                min(400, int(os.getenv("DF_OMNIHUMAN_DIALOGUE_TAIL_PAD_MS", "400"))),
             )
         except Exception:
-            self.shared_scene_dialogue_tail_pad_ms = 180
+            self.shared_scene_dialogue_tail_pad_ms = 400
 
     async def estimate(self, request_payload: Dict[str, Any]) -> ProviderEstimate:
         duration_sec = self._duration_seconds(request_payload)
