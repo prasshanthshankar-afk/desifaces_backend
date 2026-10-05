@@ -94,6 +94,7 @@ assert 'scene_setting=_as_dict(stage["setting_json"])' in execution
 for marker in (
     "_normalize_shared_scene_audio_to_fal",
     "silenceremove=",
+    "Preserve the approved dialogue head verbatim",
     "loudnorm=I=-18:LRA=7:TP=-1.5",
     "aresample=48000:async=1:first_pts=0",
     "DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS",
@@ -116,6 +117,7 @@ for marker in (
 assert "ffmpeg" in fusion_dockerfile
 assert "protect_listener" not in adapter
 assert "stop_periods=1" not in adapter
+assert "start_periods=1:start_duration=0.12:start_threshold=-52dB" not in adapter
 assert adapter.count('"areverse,"') >= 2
 assert "distant non-speaking background people" in state_routes
 assert "foreground subject or make background people visually prominent" in state_routes
