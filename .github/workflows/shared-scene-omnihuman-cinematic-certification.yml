@@ -9,8 +9,10 @@ on:
       - 'services/svc-director/app/app/fusion_execution.py'
       - 'services/svc-director/app/app/fusion_input_performance.py'
       - 'services/svc-director/app/app/shared_scene_routes.py'
+      - 'services/svc-director/app/app/shared_scene_state_routes.py'
       - 'services/svc-fusion/app/app/services/providers/omnihuman_adapter.py'
       - 'services/svc-fusion/app/app/requirements.txt'
+      - 'services/svc-fusion/app/Dockerfile'
       - 'services/svc-fusion-extension/app/app/api/routes/v3_scene_pricing.py'
       - 'services/svc-fusion-extension/app/app/api/routes/v3_scene_stitch.py'
       - 'services/svc-fusion-extension/app/app/workers/v3_scene_coordinator.py'
@@ -52,6 +54,7 @@ jobs:
           python -m py_compile services/svc-director/app/app/fusion_execution.py
           python -m py_compile services/svc-director/app/app/fusion_input_performance.py
           python -m py_compile services/svc-director/app/app/shared_scene_routes.py
+          python -m py_compile services/svc-director/app/app/shared_scene_state_routes.py
           python -m py_compile services/svc-fusion/app/app/services/providers/omnihuman_adapter.py
           python -m py_compile services/svc-fusion-extension/app/app/api/routes/v3_scene_pricing.py
           python -m py_compile services/svc-fusion-extension/app/app/api/routes/v3_scene_stitch.py
@@ -98,6 +101,28 @@ jobs:
           docker build -f services/svc-fusion/app/Dockerfile -t "ghcr.io/${OWNER}/desifaces-svc-fusion:${GITHUB_SHA}" .
           docker build -f services/svc-fusion-extension/app/Dockerfile -t "ghcr.io/${OWNER}/desifaces-svc-fusion-extension:${GITHUB_SHA}" .
           echo OMNIHUMAN_RUNTIME_IMAGE_BUILD=PASS
+
+      - name: Fusion shared-scene quality runtime smoke
+        if: github.event_name == 'push'
+        run: |
+          set -Eeuo pipefail
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          IMAGE="ghcr.io/${OWNER}/desifaces-svc-fusion:${GITHUB_SHA}"
+
+          docker run --rm --entrypoint ffmpeg "$IMAGE" -version >/dev/null
+
+          docker run --rm             --entrypoint python             -e DF_OMNIHUMAN_MODEL_ID="runtime-configured-model"             "$IMAGE"             -c '
+          from app.services.providers.omnihuman_adapter import OmniHumanAdapter
+          a = OmniHumanAdapter()
+          assert a.provider_name == "omnihuman"
+          assert a.shared_scene_mask_strategy == "protect_listener"
+          assert a.shared_scene_audio_normalization is True
+          assert a.shared_scene_audio_normalization_required is True
+          assert a.model_id == "runtime-configured-model"
+          print("OMNIHUMAN_QUALITY_RUNTIME_SMOKE=PASS")
+          '
+
+          echo FUSION_FFMPEG_RUNTIME=PASS
 
       - name: Push immutable DEV runtime images
         if: github.event_name == 'push'
