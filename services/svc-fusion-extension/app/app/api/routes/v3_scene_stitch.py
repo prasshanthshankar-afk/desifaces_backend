@@ -57,12 +57,13 @@ def _effective_scene_stitch_mode(
 ) -> str | None:
     """Return the deterministic assembly mode for one canonical scene.
 
-    Shared-scene conversations must never cross-fade independently generated
-    active-speaker clips. They all originate from the same group photo, so a
-    hard cut preserves identity/geometry and avoids provider-frame blending.
+    Shared-scene conversations use a very short dialogue transition that runs
+    only inside provider-generated silent head/tail handles. This keeps speech
+    non-overlapping and lip-sync intact while removing the visually abrupt
+    hard-cut jump between independently generated turns.
     """
     if str(conversation_mode or "").strip().lower() == "shared_scene":
-        return "hard_cut"
+        return "shared_dialogue"
     return str(stitch_mode or "").strip().lower() or None
 
 
@@ -147,7 +148,7 @@ async def stitch_scene(
 
     segment_urls = [str(value or "").strip() for value in body.segment_urls if str(value or "").strip()]
     stitch_mode = str(body.stitch_mode or "").strip().lower() or None
-    if stitch_mode not in {None, "xfade", "fade", "concat", "hard_cut"}:
+    if stitch_mode not in {None, "xfade", "fade", "concat", "hard_cut", "shared_dialogue"}:
         raise HTTPException(status_code=422, detail="scene_stitch_mode_invalid")
     requested_conversation_mode = str(body.conversation_mode or "").strip().lower() or None
     if requested_conversation_mode not in {None, "shared_scene", "ordered_speaker_shots"}:
