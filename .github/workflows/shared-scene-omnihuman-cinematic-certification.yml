@@ -47,7 +47,14 @@ jobs:
           python-version: '3.12'
 
       - name: DEV deploy script syntax
-        run: bash -n scripts/ops/deploy-dev-omnihuman-group-conversation.sh
+        run: |
+          bash -n scripts/ops/deploy-dev-omnihuman-group-conversation.sh
+          grep -Fq 'MANAGED_COMPOSE_OVERLAY_RECOVERY=PASS' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
+          grep -Fq '.desifaces-deploy/omnihuman-runtime.yml' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
+          grep -Fq '.desifaces-deploy/omnihuman-images.yml' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
+          grep -Fq 'recoverable_missing_managed_compose_overlay=' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
+          grep -Fq 'OmniHuman model config missing from caller and running DEV Fusion runtime' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
+          echo DEV_COMPOSE_OVERLAY_RECOVERY_CONTRACT=PASS
 
       - name: Python compile gate
         run: |
