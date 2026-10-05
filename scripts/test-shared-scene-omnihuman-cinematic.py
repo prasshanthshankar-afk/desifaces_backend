@@ -106,8 +106,8 @@ for marker in (
     assert marker in adapter, marker
 
 assert "ffmpeg" in fusion_dockerfile
-assert "small distant non-speaking background people" in state_routes
-assert "never add another foreground subject" in state_routes
+assert "distant non-speaking background people" in state_routes
+assert "foreground subject or make background people visually prominent" in state_routes
 
 # Product-facing video styles and Creative Director camera planning.
 for marker in (
