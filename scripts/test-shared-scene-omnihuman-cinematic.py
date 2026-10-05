@@ -92,9 +92,6 @@ assert "sc.setting_json" in execution
 assert 'scene_setting=_as_dict(stage["setting_json"])' in execution
 
 for marker in (
-    'DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY", "active_only"',
-    'DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION", "1"',
-    'DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED", "1"',
     "_normalize_shared_scene_audio_to_fal",
     "silenceremove=",
     "loudnorm=I=-18:LRA=7:TP=-1.5",
@@ -104,6 +101,13 @@ for marker in (
     "mask = ImageOps.invert(mask)",
 ):
     assert marker in adapter, marker
+
+for marker in (
+    "DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY:",
+    "DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION:",
+    "DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED:",
+):
+    assert compose.count(marker) >= 2, marker
 
 assert "ffmpeg" in fusion_dockerfile
 assert "protect_listener" not in adapter
