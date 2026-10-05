@@ -302,13 +302,13 @@ services:
   svc-fusion:
     environment:
       DF_OMNIHUMAN_MODEL_ID: ${DF_OMNIHUMAN_MODEL_ID:?DF_OMNIHUMAN_MODEL_ID is required}
-      DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY: protect_listener
+      DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY: active_only
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION: "1"
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED: "1"
   svc-fusion-worker:
     environment:
       DF_OMNIHUMAN_MODEL_ID: ${DF_OMNIHUMAN_MODEL_ID:?DF_OMNIHUMAN_MODEL_ID is required}
-      DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY: protect_listener
+      DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY: active_only
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION: "1"
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED: "1"
 YAML
@@ -557,7 +557,7 @@ assert "creative_director_scene_direction" in src
 assert 'getattr(turn, "dialogue_text", None)' in src
 assert "def _ambient_motion_plan" in src
 assert "Lip-sync is strict" in src
-assert '"speaker_mask_strategy": "protect_listener"' in src
+assert '"speaker_mask_strategy": "active_only"' in src
 assert '"background_motion_mode": "ambient"' in src
 assert '"quality_contract"' in execution
 assert '"shared_audio_normalization_required"' in execution
@@ -578,7 +578,7 @@ a=OmniHumanAdapter()
 assert a.provider_name=="omnihuman"
 assert a.model_id==os.environ["DF_OMNIHUMAN_MODEL_ID"]
 assert a.speaker_mask_model_id=="fal-ai/sam2/image"
-assert a.shared_scene_mask_strategy=="protect_listener"
+assert a.shared_scene_mask_strategy=="active_only"
 assert a.shared_scene_audio_normalization is True
 assert a.shared_scene_audio_normalization_required is True
 assert shutil.which("ffmpeg"), "ffmpeg missing from Fusion runtime"
@@ -589,10 +589,10 @@ assert "silenceremove=" in src
 assert "loudnorm=I=-18:LRA=7:TP=-1.5" in src
 assert "stop_periods=1" not in src
 assert src.count('"areverse,"') >= 2
-assert "positive, negative = listener, active" in src
+assert "active, listener" in src
 
 print("OMNIHUMAN_SAM2_RUNTIME=PASS")
-print("OMNIHUMAN_PROTECT_LISTENER_MASK=PASS")
+print("OMNIHUMAN_ACTIVE_SPEAKER_MASK=PASS")
 print("OMNIHUMAN_SHARED_AUDIO_NORMALIZATION=PASS")
 PY
 done
