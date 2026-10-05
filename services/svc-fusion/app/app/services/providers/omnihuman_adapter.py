@@ -753,9 +753,16 @@ class OmniHumanAdapter(ProviderClient):
                     "-vn",
                     "-af",
                     (
+                        # Trim only the outer silence. Using a positive
+                        # stop_periods on forward audio can truncate speech at
+                        # the first natural pause, so trim the tail safely by
+                        # reversing, trimming the new head, then reversing back.
                         "silenceremove="
-                        "start_periods=1:start_duration=0.12:start_threshold=-52dB:"
-                        "stop_periods=1:stop_duration=0.20:stop_threshold=-52dB,"
+                        "start_periods=1:start_duration=0.12:start_threshold=-52dB,"
+                        "areverse,"
+                        "silenceremove="
+                        "start_periods=1:start_duration=0.20:start_threshold=-52dB,"
+                        "areverse,"
                         "loudnorm=I=-18:LRA=7:TP=-1.5,"
                         "aresample=48000:async=1:first_pts=0"
                     ),
