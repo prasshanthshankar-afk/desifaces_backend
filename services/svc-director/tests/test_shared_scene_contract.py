@@ -232,8 +232,8 @@ def test_shared_scene_quality_release_preserves_setting_and_adds_ambient_motion(
     assert "do not freeze the world" in compiler
     assert '"background_motion_mode": "ambient"' in compiler
     assert '"ambient_motion_plan": _ambient_motion_plan(context)' in compiler
-    assert "small distant non-speaking background people" in state_routes
-    assert "never add another foreground subject" in state_routes
+    assert "distant non-speaking background people" in state_routes
+    assert "foreground subject or make background people visually prominent" in state_routes
 
 
 def test_shared_scene_quality_release_enforces_strict_per_turn_lipsync_contract():
