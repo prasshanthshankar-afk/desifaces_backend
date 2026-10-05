@@ -81,6 +81,7 @@ class FusionSceneContext:
     stage_metadata: dict[str, Any]
     scene_title: str | None
     scene_summary: str | None
+    scene_setting: dict[str, Any]
     scene_direction: dict[str, Any]
     turns: tuple[SceneTurnInput, ...]
 
@@ -96,7 +97,7 @@ async def load_fusion_scene_context(
         """
         select s.stage_run_id,s.workflow_id,s.stage_type,s.scope_type,s.state,s.scene_id,
                s.metadata_json as stage_metadata,w.account_id,w.owner_user_id,w.project_id,
-               w.story_id,w.current_stage,sc.title,sc.summary,sc.direction_json
+               w.story_id,w.current_stage,sc.title,sc.summary,sc.setting_json,sc.direction_json
         from public.v3_studio_stage_runs s
         join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
         join public.v3_scenes sc on sc.scene_id=s.scene_id
@@ -185,6 +186,7 @@ async def load_fusion_scene_context(
         stage_metadata=stage_metadata,
         scene_title=_clean(stage["title"]) or None,
         scene_summary=_clean(stage["summary"]) or None,
+        scene_setting=_as_dict(stage["setting_json"]),
         scene_direction=_as_dict(stage["direction_json"]),
         turns=tuple(turns),
     )
