@@ -214,6 +214,71 @@ def _scene_camera_hint(context: FusionSceneContext) -> str:
     return _clean((context.scene_direction or {}).get("camera")).casefold()
 
 
+def _ambient_motion_plan(context: FusionSceneContext) -> str:
+    """Return one scene-level ambient-motion plan reused for every dialogue turn.
+
+    Static Video locks the camera, not the world. Background movement stays
+    subtle and continuity-safe so independently rendered speaker turns still
+    feel like one living scene.
+    """
+
+    setting = context.scene_setting or {}
+    direction = context.scene_direction or {}
+    visual = direction.get("visual") if isinstance(direction.get("visual"), dict) else {}
+    performance = direction.get("performance") if isinstance(direction.get("performance"), dict) else {}
+
+    scene_text = " ".join(
+        _clean(value)
+        for value in (
+            context.scene_title,
+            context.scene_summary,
+            *setting.values(),
+            *visual.values(),
+            *performance.values(),
+        )
+        if _clean(value)
+    ).casefold()
+
+    base = (
+        "Ambient scene motion plan: keep the original background layout, landmarks, furniture, lighting direction, "
+        "depth relationships, and perspective stable, but do not freeze the world. Use only subtle, believable "
+        "background movement that remains secondary to the conversation. Background people must never speak, "
+        "approach the foreground, cross in front of either main speaker, or become a new focal subject."
+    )
+
+    outdoor_tokens = (
+        "outdoor", "mountain", "park", "street", "market", "festival", "beach",
+        "terrace", "plaza", "overlook", "garden", "city", "village",
+    )
+    indoor_public_tokens = (
+        "cafe", "restaurant", "workspace", "office", "lobby", "store", "shop",
+        "studio", "station", "airport", "hall",
+    )
+
+    if any(token in scene_text for token in outdoor_tokens):
+        detail = (
+            "Allow small distant non-speaking passersby or already-present background people to walk slowly and "
+            "naturally when consistent with the source scene; keep their faces indistinct. Add gentle motion to "
+            "clouds, foliage, loose fabric, flags, distant traffic, water, or similar naturally movable elements "
+            "when present."
+        )
+    elif any(token in scene_text for token in indoor_public_tokens):
+        detail = (
+            "Allow small distant non-speaking background people to make restrained natural movements when consistent "
+            "with the source scene, such as walking behind the conversation or shifting at a table; keep them soft "
+            "and non-prominent. Screens, steam, window traffic, curtains, plants, or practical lights may move subtly "
+            "when present."
+        )
+    else:
+        detail = (
+            "Animate only naturally movable scene elements with restrained motion. If distant background people are "
+            "already present or contextually appropriate, they may make small non-speaking movements while remaining "
+            "indistinct and visually secondary."
+        )
+
+    return f"{base} {detail}"[:1600]
+
+
 def _director_camera_mode(
     context: FusionSceneContext,
     shared_scene: dict[str, Any],
@@ -306,18 +371,29 @@ def _shared_scene_performance_prompt(
     emotion = _clean(turn.emotion_code)
     dialogue = _clean(getattr(turn, "dialogue_text", None))
     camera_direction = _CAMERA_DIRECTIONS.get(camera_mode, _CAMERA_DIRECTIONS["static"])
+    ambient_motion = _ambient_motion_plan(context)
 
     parts = [
         camera_direction,
+        ambient_motion,
         saved_direction,
         scene_prompt,
         (
             f"Natural two-person conversation. {active_name}, {active_position}, is the only person speaking "
             f"during this turn. {listener_name}, {listener_position}, is listening."
         ),
+        (
+            f"Lip-sync is strict for {active_name}: synchronize visible mouth and jaw articulation precisely to the "
+            "supplied audio. Mouth movement must begin with the first audible speech phoneme, follow the timing and "
+            "cadence of the audio without anticipation or lag, and settle closed immediately after the final spoken "
+            "phoneme. Do not add unscripted pre-speech or post-speech mouth movement."
+        ),
     ]
     if dialogue:
-        parts.append(f'The spoken line is: "{dialogue[:500]}". Let the acting respond naturally to its meaning.')
+        parts.append(
+            f'The spoken line is: "{dialogue[:500]}". Match the supplied audio exactly; use the text only to guide '
+            "meaning, expression, and articulation."
+        )
     if emotion:
         parts.append(
             f"The active speaker's emotional delivery is {emotion}; express it naturally without exaggeration."
@@ -335,10 +411,11 @@ def _shared_scene_performance_prompt(
             ),
             (
                 "Preserve both people's identities, facial structure, hairstyle, clothing, body proportions, "
-                "relative position, lighting, and background. Keep their physical boundaries coherent even when "
-                "they are close together. Do not merge faces, hair, shoulders, arms, clothing, or bodies. "
-                "No face swapping, extra limbs, body warping, distorted hands, exaggerated gestures, sudden camera "
-                "motion, or unstable background geometry."
+                "relative position, lighting, and background geometry. Keep their physical boundaries coherent even "
+                "when they are close together. The environment should feel alive through subtle ambient motion while "
+                "its layout stays stable. Do not merge faces, hair, shoulders, arms, clothing, or bodies. No face "
+                "swapping, extra limbs, body warping, distorted hands, exaggerated gestures, sudden camera motion, "
+                "background morphing, or unstable perspective."
             ),
         ]
     )
@@ -467,6 +544,10 @@ async def compile_children_performant(
                     "speaker_mask_cache_key": (
                         f"{shared_scene['shared_scene_media_id']}:{turn.participant_id}"
                     ),
+                    "speaker_mask_strategy": "protect_listener",
+                    "lipsync_quality_mode": "strict",
+                    "background_motion_mode": "ambient",
+                    "ambient_motion_plan": _ambient_motion_plan(context),
                 }
             )
 
@@ -542,5 +623,6 @@ __all__ = [
     "_speaker_coordinates",
     "_speaker_position_label",
     "_director_camera_mode",
+    "_ambient_motion_plan",
     "_shared_scene_performance_prompt",
 ]
