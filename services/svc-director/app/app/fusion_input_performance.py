@@ -551,7 +551,7 @@ async def compile_children_performant(
                     "speaker_mask_cache_key": (
                         f"{shared_scene['shared_scene_media_id']}:{turn.participant_id}"
                     ),
-                    "speaker_mask_strategy": "protect_listener",
+                    "speaker_mask_strategy": "active_only",
                     "lipsync_quality_mode": "strict",
                     "background_motion_mode": "ambient",
                     "ambient_motion_plan": _ambient_motion_plan(context),
