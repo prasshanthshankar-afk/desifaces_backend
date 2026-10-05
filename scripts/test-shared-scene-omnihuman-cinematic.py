@@ -96,6 +96,10 @@ for marker in (
     "silenceremove=",
     "loudnorm=I=-18:LRA=7:TP=-1.5",
     "aresample=48000:async=1:first_pts=0",
+    "DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS",
+    "DF_OMNIHUMAN_DIALOGUE_TAIL_PAD_MS",
+    "adelay=",
+    "apad=pad_dur=",
     'self.shared_scene_mask_strategy = "active_only"',
     "only the person in the white area speaks",
     "mask = ImageOps.invert(mask)",
@@ -186,14 +190,27 @@ assert "scene_pricing_reservation_superseded" in pricing
 assert "_persist_parent_pricing_for_reservation" in pricing
 assert "reservation_id=reservation_id" in pricing
 
-# Stitch is exactly-once per attempt and shared-scene assembly remains hard-cut.
+# Stitch is exactly-once per attempt. Shared-scene assembly uses a very
+# short dialogue transition inside provider-generated silent handles.
 assert '"stitched_media_id": stitched_media_id' in coordinator
 assert 'phase": "pricing_commit"' in coordinator
 assert "Retry path: reuse the already assembled media" in coordinator
 assert "if not stitched_media_id:" in coordinator
-assert 'stitch_mode = "hard_cut" if conversation_mode == "shared_scene" else None' in coordinator
+assert 'stitch_mode = "shared_dialogue" if conversation_mode == "shared_scene" else None' in coordinator
 assert 'if str(conversation_mode or "").strip().lower() == "shared_scene":' in stitch
-assert 'return "hard_cut"' in stitch
+assert 'return "shared_dialogue"' in stitch
+
+stitch_service = (
+    extension / "services/stitch_service.py"
+).read_text(encoding="utf-8")
+for marker in (
+    'DF_SHARED_SCENE_TRANSITION_SECONDS',
+    'mode == "shared_dialogue"',
+    'transition_style_override="fade"',
+    'minimum_transition_sec=0.08',
+    'Fail closed instead of silently falling back',
+):
+    assert marker in stitch_service, marker
 
 customer_migration = (
     root / "migrations/2026_10_03_group_conversation_premium_actual_seconds.sql"
@@ -225,6 +242,8 @@ for marker in (
     "DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY:",
     "DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION:",
     "DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED:",
+    "DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS:",
+    "DF_OMNIHUMAN_DIALOGUE_TAIL_PAD_MS:",
     "DF_OMNIHUMAN_UPLOAD_INPUTS_TO_FAL:",
     "FAL_KEY:",
 ):
@@ -238,6 +257,8 @@ print("STRICT_LIPSYNC_INPUT_CONTRACT=PASS")
 print("AMBIENT_SCENE_MOTION_CONTRACT=PASS")
 print("ACTIVE_SPEAKER_MASK_CONTRACT=PASS")
 print("SHARED_SCENE_AUDIO_NORMALIZATION_CONTRACT=PASS")
+print("DIALOGUE_HEAD_TAIL_HANDLES_CONTRACT=PASS")
+print("SHARED_DIALOGUE_MICRO_TRANSITION_CONTRACT=PASS")
 print("PRE_GENERATION_QUALITY_OBSERVABILITY=PASS")
 print("GROUP_CONVERSATION_20PCT_PRICING_PRESERVED=PASS")
 print("RESERVATION_OWNERSHIP_CAS=PASS")
