@@ -181,6 +181,39 @@ def probe_duration_seconds(input_path: str) -> Optional[float]:
     return _probe_duration_seconds(input_path)
 
 
+def _probe_video_dimensions(input_path: str) -> tuple[int, int]:
+    p = subprocess.run(
+        [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0:s=x",
+            input_path,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(
+            "ffprobe video dimensions failed:\n"
+            f"{input_path}\n\nSTDERR:\n{p.stderr}"
+        )
+    raw = str(p.stdout or "").strip()
+    try:
+        width_s, height_s = raw.split("x", 1)
+        width, height = int(width_s), int(height_s)
+    except Exception as exc:
+        raise RuntimeError(f"invalid video dimensions for {input_path}: {raw!r}") from exc
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"invalid video dimensions for {input_path}: {width}x{height}")
+    # libx264/yuv420p require even frame geometry.
+    width -= width % 2
+    height -= height % 2
+    return max(2, width), max(2, height)
+
+
 def _ensure_parent_dir(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -417,6 +450,7 @@ def normalize_segment_mp4(
         "-c:a", "aac",
         "-b:a", "192k",
         "-ar", "48000",
+        "-ac", "2",
         "-movflags", "+faststart",
         output_path,
     ])
@@ -753,6 +787,13 @@ def _xfade_pair(
     if right_duration is None:
         raise RuntimeError(f"Unable to probe duration for {right_mp4}")
 
+    left_width, left_height = _probe_video_dimensions(left_mp4)
+    right_width, right_height = _probe_video_dimensions(right_mp4)
+    # Use the already-normalized left/running clip as the canonical scene
+    # geometry. Provider clips can occasionally differ by a few pixels or SAR;
+    # xfade requires the two video links to be identical.
+    target_width, target_height = left_width, left_height
+
     xfade_duration = _safe_transition_duration(
         transition_duration_sec,
         left_duration,
@@ -762,6 +803,17 @@ def _xfade_pair(
     offset = max(0.0, float(left_duration) - xfade_duration)
     transition_style = str(transition_style_override or _transition_style()).strip() or _transition_style()
     audio_curve = _transition_audio_curve()
+    logger.info(
+        "xfade_pair geometry left=%sx%s right=%sx%s target=%sx%s duration=%.3f offset=%.3f",
+        left_width,
+        left_height,
+        right_width,
+        right_height,
+        target_width,
+        target_height,
+        xfade_duration,
+        offset,
+    )
 
     _run([
         "ffmpeg",
@@ -776,11 +828,15 @@ def _xfade_pair(
             # metadata, which can surface as an invalid 1/0 rate inside xfade.
             # Normalize only the transition inputs; the outer stitch fallback remains
             # unchanged and continues to use concat if xfade itself fails.
-            f"[0:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v0];"
-            f"[1:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v1];"
+            f"[0:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,"
+            f"{_fit_pad_filter(target_width, target_height)},format=yuv420p[v0];"
+            f"[1:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,"
+            f"{_fit_pad_filter(target_width, target_height)},format=yuv420p[v1];"
             f"[v0][v1]xfade=transition={transition_style}:duration={xfade_duration:.3f}:offset={offset:.3f}[v];"
-            f"[0:a]aresample=48000,asetpts=PTS-STARTPTS[a0];"
-            f"[1:a]aresample=48000,asetpts=PTS-STARTPTS[a1];"
+            f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+            f"aresample=48000,asetpts=PTS-STARTPTS[a0];"
+            f"[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+            f"aresample=48000,asetpts=PTS-STARTPTS[a1];"
             f"[a0][a1]acrossfade=d={xfade_duration:.3f}:c1={audio_curve}:c2={audio_curve}[a]"
         ),
         "-map", "[v]",
