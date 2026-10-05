@@ -74,10 +74,69 @@ echo "compose_workdir=$WORKDIR"
 echo "active_services=${ACTIVE_SERVICES[*]}"
 echo "COMPOSE_OWNERSHIP=PASS"
 
-IFS=',' read -r -a compose_files <<< "$CONFIG_FILES"
-for f in "${compose_files[@]}"; do
+# Compose records every -f file used to create a container in its labels.
+# Older revisions of this deployer used /tmp overlays and deleted them after a
+# successful cutover. Those paths therefore remain in the running-container
+# labels even though the files no longer exist. Treat only our own known
+# deployment overlays as reconstructable state; any other missing compose file
+# still fails closed.
+IFS=',' read -r -a raw_compose_files <<< "$CONFIG_FILES"
+compose_files=()
+managed_compose_files=()
+
+is_managed_compose_overlay(){
+  local f="$1"
+  local base
+  base="$(basename "$f")"
+
+  if [[ "$f" == /tmp/* ]] && [[ "$base" =~ ^desifaces-omnihuman-(runtime|images)-[0-9a-f]{40}\.yml$ ]]; then
+    return 0
+  fi
+
+  if [[ "$f" == "$WORKDIR/.desifaces-deploy/omnihuman-runtime.yml" ]]; then
+    return 0
+  fi
+  if [[ "$f" == "$WORKDIR/.desifaces-deploy/omnihuman-images.yml" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+for f in "${raw_compose_files[@]}"; do
+  [[ -n "$f" ]] || continue
+  if is_managed_compose_overlay "$f"; then
+    managed_compose_files+=("$f")
+    if [[ ! -f "$f" ]]; then
+      echo "recoverable_missing_managed_compose_overlay=$f"
+    fi
+    continue
+  fi
   [[ -f "$f" ]] || fail "active compose file missing: $f"
+  compose_files+=("$f")
 done
+
+(( ${#compose_files[@]} > 0 )) || fail "no persistent base compose files remain after managed-overlay recovery"
+echo "PERSISTENT_COMPOSE_FILES=${compose_files[*]}"
+echo "MANAGED_COMPOSE_OVERLAY_RECOVERY=PASS"
+
+# Resolve the already-running external model configuration before rendering the
+# base compose. The base compose intentionally requires this value, and a stale
+# deleted runtime overlay must never be the only place from which it can be
+# recovered.
+MODEL_ID="${DF_OMNIHUMAN_MODEL_ID:-${OMNIHUMAN_MODEL_ID:-}}"
+if [[ -z "$MODEL_ID" ]]; then
+  MODEL_ID="$(
+    docker inspect "${CONTAINER[svc-fusion]}" \
+      --format '{{range .Config.Env}}{{println .}}{{end}}' |
+    awk -F= '
+      $1=="DF_OMNIHUMAN_MODEL_ID" && length($2)>0 {print substr($0,index($0,"=")+1); exit}
+      $1=="FAL_OMNIHUMAN_MODEL_ID" && length($2)>0 {print substr($0,index($0,"=")+1); exit}
+    '
+  )"
+fi
+[[ -n "$MODEL_ID" ]] || fail "OmniHuman model config missing from caller and running DEV Fusion runtime"
+export DF_OMNIHUMAN_MODEL_ID="$MODEL_ID"
+echo "OMNIHUMAN_MODEL_CONFIGURATION=PASS"
 
 # Reuse the environment source that owns the currently running DEV compose
 # project. The active project can be started with an explicit --env-file, so a
@@ -279,42 +338,32 @@ for svc in svc-fusion svc-fusion-worker; do
 done
 echo "FAL_RUNTIME_CREDENTIAL=PASS"
 
-MODEL_ID="${DF_OMNIHUMAN_MODEL_ID:-${OMNIHUMAN_MODEL_ID:-}}"
+DEPLOY_STATE_DIR="$WORKDIR/.desifaces-deploy"
+mkdir -p "$DEPLOY_STATE_DIR"
+chmod 700 "$DEPLOY_STATE_DIR"
 
-if [[ -z "$MODEL_ID" ]]; then
-  MODEL_ID="$(
-    docker inspect "${CONTAINER[svc-fusion]}"       --format '{{range .Config.Env}}{{println .}}{{end}}' |
-    awk -F= '
-      $1=="DF_OMNIHUMAN_MODEL_ID" && length($2)>0 {print substr($0,index($0,"=")+1); exit}
-      $1=="FAL_OMNIHUMAN_MODEL_ID" && length($2)>0 {print substr($0,index($0,"=")+1); exit}
-    '
-  )"
-fi
-
-[[ -n "$MODEL_ID" ]] || fail "OmniHuman model config missing; set DF_OMNIHUMAN_MODEL_ID in the deployment environment"
-
-export DF_OMNIHUMAN_MODEL_ID="$MODEL_ID"
-echo "OMNIHUMAN_MODEL_CONFIGURATION=PASS"
-
-RUNTIME_OVERRIDE="/tmp/desifaces-omnihuman-runtime-${BACKEND_SHA}.yml"
-cat > "$RUNTIME_OVERRIDE" <<'YAML'
+RUNTIME_OVERRIDE="$DEPLOY_STATE_DIR/omnihuman-runtime.yml"
+MODEL_ID_YAML="${MODEL_ID//\"/\\\"}"
+cat > "$RUNTIME_OVERRIDE" <<YAML
 services:
   svc-fusion:
     environment:
-      DF_OMNIHUMAN_MODEL_ID: ${DF_OMNIHUMAN_MODEL_ID:?DF_OMNIHUMAN_MODEL_ID is required}
+      DF_OMNIHUMAN_MODEL_ID: "$MODEL_ID_YAML"
       DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY: active_only
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION: "1"
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED: "1"
   svc-fusion-worker:
     environment:
-      DF_OMNIHUMAN_MODEL_ID: ${DF_OMNIHUMAN_MODEL_ID:?DF_OMNIHUMAN_MODEL_ID is required}
+      DF_OMNIHUMAN_MODEL_ID: "$MODEL_ID_YAML"
       DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY: active_only
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION: "1"
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED: "1"
 YAML
+chmod 600 "$RUNTIME_OVERRIDE"
 
 COMPOSE+=(-f "$RUNTIME_OVERRIDE")
 echo "OMNIHUMAN_RUNTIME_CONFIG_OVERRIDE=PASS"
+echo "PERSISTENT_RUNTIME_OVERRIDE=$RUNTIME_OVERRIDE"
 
 declare -A SOURCE_IMAGE
 SOURCE_IMAGE[director]="ghcr.io/$GHCR_OWNER/desifaces-svc-director:$BACKEND_SHA"
@@ -414,16 +463,18 @@ done
 # a stable image reference. Preserve that exact live reference explicitly for
 # this cutover so --no-build recreation selects only the retagged candidate
 # image and never relies on Compose's generated build image naming.
-IMAGE_OVERRIDE="/tmp/desifaces-omnihuman-images-${BACKEND_SHA}.yml"
+IMAGE_OVERRIDE="$DEPLOY_STATE_DIR/omnihuman-images.yml"
 {
   echo "services:"
   for svc in "${ACTIVE_SERVICES[@]}"; do
     printf '  %s:\n    image: %s\n' "$svc" "${OLD_REF[$svc]}"
   done
 } > "$IMAGE_OVERRIDE"
+chmod 600 "$IMAGE_OVERRIDE"
 
 COMPOSE+=(-f "$IMAGE_OVERRIDE")
 echo "COMPOSE_IMAGE_OVERRIDE=PASS"
+echo "PERSISTENT_IMAGE_OVERRIDE=$IMAGE_OVERRIDE"
 
 # Render active compose config and prove it still points at the same image refs
 # used by the running containers. This prevents accidental environment/config
@@ -508,7 +559,7 @@ rollback(){
   if (( RUNTIME_CHANGED == 1 )); then
     "${COMPOSE[@]}" up -d --no-deps --no-build --force-recreate "${ACTIVE_SERVICES[@]}" >/dev/null 2>&1 || true
   fi
-  rm -f "${RUNTIME_OVERRIDE:-}" "${IMAGE_OVERRIDE:-}" "${CONFIG_JSON_FILE:-}"
+  rm -f "${CONFIG_JSON_FILE:-}"
   rm -rf "${BUILD_ROOT:-}"
   echo "DEV_ROLLBACK=ATTEMPTED"
   exit "$rc"
@@ -642,7 +693,7 @@ trap - ERR
 if (( GHCR_LOGGED_IN == 1 )); then
   docker logout ghcr.io >/dev/null 2>&1 || true
 fi
-rm -f "${RUNTIME_OVERRIDE:-}" "${IMAGE_OVERRIDE:-}" "${CONFIG_JSON_FILE:-}"
+rm -f "${CONFIG_JSON_FILE:-}"
 rm -rf "${BUILD_ROOT:-}"
 trap - EXIT
 
