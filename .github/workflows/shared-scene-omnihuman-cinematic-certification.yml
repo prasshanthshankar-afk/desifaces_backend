@@ -155,6 +155,53 @@ jobs:
           print("SHARED_DIALOGUE_TRANSITION_RUNTIME_SMOKE=PASS")
           '
 
+          docker run --rm \
+            --entrypoint python \
+            -e DATABASE_URL="postgresql://ci:ci@localhost:5432/ci" \
+            -e JWT_SECRET="ci-runtime-smoke-only" \
+            -e AZURE_STORAGE_CONNECTION_STRING="UseDevelopmentStorage=true" \
+            -e DF_SHARED_SCENE_TRANSITION_SECONDS="0.12" \
+            "ghcr.io/${OWNER}/desifaces-svc-fusion-extension:${GITHUB_SHA}" \
+            -c '
+          import os, subprocess, tempfile
+          from app.services.stitch_service import _xfade_pair, _probe_video_dimensions, _probe_has_audio
+
+          with tempfile.TemporaryDirectory() as td:
+              left = os.path.join(td, "left.mp4")
+              right = os.path.join(td, "right.mp4")
+              out = os.path.join(td, "out.mp4")
+
+              subprocess.run([
+                  "ffmpeg","-y","-loglevel","error",
+                  "-f","lavfi","-i","color=c=blue:s=640x360:r=30:d=2.8",
+                  "-f","lavfi","-i","sine=frequency=440:sample_rate=48000:duration=2.8",
+                  "-map","0:v:0","-map","1:a:0",
+                  "-c:v","libx264","-pix_fmt","yuv420p","-r","30",
+                  "-c:a","aac","-ar","48000","-ac","1","-shortest",left
+              ], check=True)
+
+              subprocess.run([
+                  "ffmpeg","-y","-loglevel","error",
+                  "-f","lavfi","-i","color=c=red:s=642x362:r=30:d=2.6",
+                  "-f","lavfi","-i","sine=frequency=660:sample_rate=48000:duration=2.6",
+                  "-map","0:v:0","-map","1:a:0",
+                  "-c:v","libx264","-pix_fmt","yuv420p","-r","30",
+                  "-c:a","aac","-ar","48000","-ac","2","-shortest",right
+              ], check=True)
+
+              _xfade_pair(
+                  left, right, out,
+                  transition_duration_sec=0.12,
+                  transition_style_override="fade",
+                  minimum_transition_sec=0.08,
+              )
+
+              assert os.path.getsize(out) > 0
+              assert _probe_video_dimensions(out) == (640, 360)
+              assert _probe_has_audio(out)
+              print("SHARED_DIALOGUE_GEOMETRY_AUDIO_XFADE_RUNTIME=PASS")
+          '
+
           echo FUSION_FFMPEG_RUNTIME=PASS
           echo DIALOGUE_HANDLE_RUNTIME=PASS
 
