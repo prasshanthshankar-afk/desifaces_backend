@@ -164,7 +164,21 @@ jobs:
             "ghcr.io/${OWNER}/desifaces-svc-fusion-extension:${GITHUB_SHA}" \
             -c '
           import os, subprocess, tempfile
-          from app.services.stitch_service import _xfade_pair, _probe_video_dimensions, _probe_has_audio
+          from pathlib import Path
+          from app.services.stitch_service import (
+              stitch_videos,
+              _probe_duration_seconds,
+              _probe_video_dimensions,
+              _probe_has_audio,
+          )
+
+          src = Path("/app/app/services/stitch_service.py").read_text()
+          shared = src.split('if mode == "shared_dialogue":', 1)[1].split(
+              'if mode in {"xfade", "fade"}:', 1
+          )[0]
+          assert "_xfade_pair(" not in shared
+          assert "acrossfade" not in shared
+          assert "audio_edge_fade=not shared_dialogue" in src
 
           with tempfile.TemporaryDirectory() as td:
               left = os.path.join(td, "left.mp4")
@@ -189,17 +203,28 @@ jobs:
                   "-c:a","aac","-ar","48000","-ac","2","-shortest",right
               ], check=True)
 
-              _xfade_pair(
-                  left, right, out,
-                  transition_duration_sec=0.12,
-                  transition_style_override="fade",
-                  minimum_transition_sec=0.08,
+              stitch_videos(
+                  [left, right],
+                  out,
+                  stitch_mode_override="shared_dialogue",
+                  aspect_ratio="16:9",
               )
 
               assert os.path.getsize(out) > 0
-              assert _probe_video_dimensions(out) == (640, 360)
+              assert _probe_video_dimensions(out) == (1920, 1080)
               assert _probe_has_audio(out)
-              print("SHARED_DIALOGUE_GEOMETRY_AUDIO_XFADE_RUNTIME=PASS")
+              final_duration = float(_probe_duration_seconds(out) or 0.0)
+              assert 5.34 <= final_duration <= 5.60, final_duration
+
+              audio_duration = float(subprocess.check_output([
+                  "ffprobe","-v","error","-select_streams","a:0",
+                  "-show_entries","stream=duration",
+                  "-of","default=noprint_wrappers=1:nokey=1",out
+              ], text=True).strip())
+              assert 5.34 <= audio_duration <= 5.60, audio_duration
+              print("SHARED_DIALOGUE_VISUAL_ONLY_TRANSITION_RUNTIME=PASS")
+              print("SHARED_DIALOGUE_AUDIO_IMMUTABILITY_RUNTIME=PASS")
+              print("SHARED_DIALOGUE_FULL_DURATION_RUNTIME=PASS")
           '
 
           echo FUSION_FFMPEG_RUNTIME=PASS
