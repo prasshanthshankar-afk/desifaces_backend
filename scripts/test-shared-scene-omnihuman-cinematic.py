@@ -190,8 +190,8 @@ assert "scene_pricing_reservation_superseded" in pricing
 assert "_persist_parent_pricing_for_reservation" in pricing
 assert "reservation_id=reservation_id" in pricing
 
-# Stitch is exactly-once per attempt. Shared-scene assembly uses a very
-# short dialogue transition inside provider-generated silent handles.
+# Stitch is exactly-once per attempt. Shared-scene assembly preserves the
+# provider-authored dialogue timeline and applies transition treatment to video only.
 assert '"stitched_media_id": stitched_media_id' in coordinator
 assert 'phase": "pricing_commit"' in coordinator
 assert "Retry path: reuse the already assembled media" in coordinator
@@ -206,15 +206,23 @@ stitch_service = (
 for marker in (
     'DF_SHARED_SCENE_TRANSITION_SECONDS',
     'mode == "shared_dialogue"',
-    'transition_style_override="fade"',
-    'minimum_transition_sec=0.08',
-    'Fail closed instead of silently falling back',
+    'audio_edge_fade=not shared_dialogue',
+    'VIDEO-ONLY fade-out/fade-in',
+    '"shared_dialogue_concat.txt"',
+    '"-c", "copy"',
+    'audio_transition=none',
     'def _probe_video_dimensions',
     '_fit_pad_filter(target_width, target_height)',
     'channel_layouts=stereo',
     '"-ac", "2"',
 ):
     assert marker in stitch_service, marker
+
+shared_dialogue_block = stitch_service.split('if mode == "shared_dialogue":', 1)[1].split(
+    'if mode in {"xfade", "fade"}:', 1
+)[0]
+assert "_xfade_pair(" not in shared_dialogue_block
+assert "acrossfade" not in shared_dialogue_block
 
 customer_migration = (
     root / "migrations/2026_10_03_group_conversation_premium_actual_seconds.sql"
@@ -262,7 +270,8 @@ print("AMBIENT_SCENE_MOTION_CONTRACT=PASS")
 print("ACTIVE_SPEAKER_MASK_CONTRACT=PASS")
 print("SHARED_SCENE_AUDIO_NORMALIZATION_CONTRACT=PASS")
 print("DIALOGUE_HEAD_TAIL_HANDLES_CONTRACT=PASS")
-print("SHARED_DIALOGUE_MICRO_TRANSITION_CONTRACT=PASS")
+print("SHARED_DIALOGUE_VISUAL_ONLY_TRANSITION_CONTRACT=PASS")
+print("SHARED_DIALOGUE_AUDIO_IMMUTABILITY_CONTRACT=PASS")
 print("PRE_GENERATION_QUALITY_OBSERVABILITY=PASS")
 print("GROUP_CONVERSATION_20PCT_PRICING_PRESERVED=PASS")
 print("RESERVATION_OWNERSHIP_CAS=PASS")
