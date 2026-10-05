@@ -142,6 +142,9 @@ jobs:
 
           docker run --rm \
             --entrypoint python \
+            -e DATABASE_URL="postgresql://ci:ci@localhost:5432/ci" \
+            -e JWT_SECRET="ci-runtime-smoke-only" \
+            -e AZURE_STORAGE_CONNECTION_STRING="UseDevelopmentStorage=true" \
             -e DF_SHARED_SCENE_TRANSITION_SECONDS="0.12" \
             "ghcr.io/${OWNER}/desifaces-svc-fusion-extension:${GITHUB_SHA}" \
             -c '
