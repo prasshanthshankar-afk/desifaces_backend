@@ -76,7 +76,7 @@ for marker in (
 
 # Production-quality shared-scene quality controls.
 for marker in (
-    '"speaker_mask_strategy": "protect_listener"',
+    '"speaker_mask_strategy": "active_only"',
     '"lipsync_quality_mode": "strict"',
     '"background_motion_mode": "ambient"',
     '"ambient_motion_plan": _ambient_motion_plan(context)',
@@ -92,15 +92,15 @@ assert "sc.setting_json" in execution
 assert 'scene_setting=_as_dict(stage["setting_json"])' in execution
 
 for marker in (
-    'DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY", "protect_listener"',
+    'DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY", "active_only"',
     'DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION", "1"',
     'DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED", "1"',
     "_normalize_shared_scene_audio_to_fal",
     "silenceremove=",
     "loudnorm=I=-18:LRA=7:TP=-1.5",
     "aresample=48000:async=1:first_pts=0",
-    'strategy == "protect_listener"',
-    "positive, negative = listener, active",
+    'strategy == "active_only"',
+    "active, listener",
     "mask = ImageOps.invert(mask)",
 ):
     assert marker in adapter, marker
@@ -231,7 +231,7 @@ print("STATIC_CINEMATIC_CAMERA_CONTRACT=PASS")
 print("DIALOGUE_EMOTION_PERFORMANCE_CONTEXT=PASS")
 print("STRICT_LIPSYNC_INPUT_CONTRACT=PASS")
 print("AMBIENT_SCENE_MOTION_CONTRACT=PASS")
-print("PROTECT_LISTENER_MASK_CONTRACT=PASS")
+print("ACTIVE_SPEAKER_MASK_CONTRACT=PASS")
 print("SHARED_SCENE_AUDIO_NORMALIZATION_CONTRACT=PASS")
 print("PRE_GENERATION_QUALITY_OBSERVABILITY=PASS")
 print("GROUP_CONVERSATION_20PCT_PRICING_PRESERVED=PASS")
