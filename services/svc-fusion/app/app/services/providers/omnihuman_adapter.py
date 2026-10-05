@@ -115,6 +115,21 @@ class OmniHumanAdapter(ProviderClient):
             os.getenv("DF_OMNIHUMAN_SPEAKER_MASK_MODEL_ID", "fal-ai/sam2/image")
         ).strip() or "fal-ai/sam2/image"
 
+        self.shared_scene_mask_strategy = str(
+            os.getenv("DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY", "protect_listener")
+        ).strip().lower() or "protect_listener"
+        if self.shared_scene_mask_strategy not in {"active_only", "protect_listener"}:
+            raise OmniHumanAdapterError(
+                f"OMNIHUMAN_SPEAKER_MASK_STRATEGY_INVALID:{self.shared_scene_mask_strategy}"
+            )
+
+        self.shared_scene_audio_normalization = str(
+            os.getenv("DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION", "1")
+        ).strip().lower() in {"1", "true", "yes", "y"}
+        self.shared_scene_audio_normalization_required = str(
+            os.getenv("DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED", "1")
+        ).strip().lower() in {"1", "true", "yes", "y"}
+
     async def estimate(self, request_payload: Dict[str, Any]) -> ProviderEstimate:
         duration_sec = self._duration_seconds(request_payload)
         estimated_units = str(max(1, int(math.ceil(duration_sec / 60.0)))) if duration_sec else "1"
@@ -151,18 +166,44 @@ class OmniHumanAdapter(ProviderClient):
 
         source_face_url = spec.resolved_face_url
         source_audio_url = spec.resolved_audio_url
+        provider_options = self._provider_options(request_payload)
+        shared_scene = (
+            str(provider_options.get("conversation_mode") or "").strip().lower()
+            == "shared_scene"
+        )
 
         if self.upload_inputs_to_fal:
             face_url = await self._upload_remote_file_to_fal(
                 source_face_url,
                 suffix_hint=self._suffix_from_url(source_face_url, ".png"),
             )
+        else:
+            face_url = await self._refresh_azure_blob_input_url(source_face_url)
+
+        audio_normalized = False
+        if shared_scene and self.shared_scene_audio_normalization:
+            try:
+                audio_url = await self._normalize_shared_scene_audio_to_fal(source_audio_url)
+                audio_normalized = True
+            except Exception as exc:
+                if self.shared_scene_audio_normalization_required:
+                    raise OmniHumanAdapterError(
+                        f"OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_FAILED:{exc}"
+                    ) from exc
+                logger.exception(
+                    "omnihuman.shared_audio_normalization_failed_fallback source_audio_url=%s",
+                    _preview_url(source_audio_url),
+                )
+                audio_url = await self._upload_remote_file_to_fal(
+                    source_audio_url,
+                    suffix_hint=self._suffix_from_url(source_audio_url, ".mp3"),
+                )
+        elif self.upload_inputs_to_fal:
             audio_url = await self._upload_remote_file_to_fal(
                 source_audio_url,
                 suffix_hint=self._suffix_from_url(source_audio_url, ".mp3"),
             )
         else:
-            face_url = await self._refresh_azure_blob_input_url(source_face_url)
             audio_url = await self._refresh_azure_blob_input_url(source_audio_url)
 
         mask_url = await self._shared_scene_mask_url(
@@ -212,6 +253,11 @@ class OmniHumanAdapter(ProviderClient):
                 "fal_audio_url": audio_url,
                 "speaker_mask_url_present": bool(mask_url),
                 "speaker_mask_model_id": self.speaker_mask_model_id if mask_url else None,
+                "speaker_mask_strategy": (
+                    str(provider_options.get("speaker_mask_strategy") or self.shared_scene_mask_strategy)
+                    if mask_url else None
+                ),
+                "shared_scene_audio_normalized": audio_normalized,
             },
         )
 
@@ -283,7 +329,13 @@ class OmniHumanAdapter(ProviderClient):
             or provider_options.get("shared_scene_media_id")
             or ""
         ).strip()
-        return f"{stable}|{width}x{height}|{active[0]},{active[1]}|{listener[0]},{listener[1]}"
+        strategy = str(
+            provider_options.get("speaker_mask_strategy") or "protect_listener"
+        ).strip().lower()
+        return (
+            f"{stable}|{strategy}|{width}x{height}|"
+            f"{active[0]},{active[1]}|{listener[0]},{listener[1]}"
+        )
 
     @staticmethod
     def _mask_result_url(result: Any) -> str:
@@ -305,6 +357,7 @@ class OmniHumanAdapter(ProviderClient):
         height: int,
         active: list[int],
         listener: list[int],
+        strategy: str,
     ) -> str:
         raw_path: Optional[str] = None
         final_path: Optional[str] = None
@@ -336,9 +389,20 @@ class OmniHumanAdapter(ProviderClient):
             lx = max(0, min(width - 1, int(listener[0])))
             ly = max(0, min(height - 1, int(listener[1])))
 
-            # OmniHuman contract: white is the only speaking person.
-            if mask.getpixel((ax, ay)) < 128:
+            if strategy == "protect_listener":
+                # SAM2 is asked to segment the listener. Normalize that raw mask
+                # to listener=white first, then invert it so OmniHuman may animate
+                # the active speaker and ambient scene while protecting the
+                # listener's face/body from speech motion.
+                if mask.getpixel((lx, ly)) < 128:
+                    mask = ImageOps.invert(mask)
                 mask = ImageOps.invert(mask)
+                occupancy_min, occupancy_max = 0.30, 0.97
+            else:
+                # Legacy strategy: animate only the active speaker.
+                if mask.getpixel((ax, ay)) < 128:
+                    mask = ImageOps.invert(mask)
+                occupancy_min, occupancy_max = 0.05, 0.70
 
             active_pixel = int(mask.getpixel((ax, ay)))
             listener_pixel = int(mask.getpixel((lx, ly)))
@@ -350,9 +414,9 @@ class OmniHumanAdapter(ProviderClient):
                 raise OmniHumanAdapterError("OMNIHUMAN_SPEAKER_MASK_ACTIVE_NOT_WHITE")
             if listener_pixel != 0:
                 raise OmniHumanAdapterError("OMNIHUMAN_SPEAKER_MASK_LISTENER_NOT_BLACK")
-            if occupancy < 0.05 or occupancy > 0.70:
+            if occupancy < occupancy_min or occupancy > occupancy_max:
                 raise OmniHumanAdapterError(
-                    f"OMNIHUMAN_SPEAKER_MASK_OCCUPANCY_INVALID:{occupancy:.4f}"
+                    f"OMNIHUMAN_SPEAKER_MASK_OCCUPANCY_INVALID:{strategy}:{occupancy:.4f}"
                 )
             if not mask.getbbox():
                 raise OmniHumanAdapterError("OMNIHUMAN_SPEAKER_MASK_EMPTY")
@@ -381,9 +445,22 @@ class OmniHumanAdapter(ProviderClient):
         width: int,
         height: int,
     ) -> str:
+        strategy = str(
+            provider_options.get("speaker_mask_strategy") or self.shared_scene_mask_strategy
+        ).strip().lower()
+        if strategy not in {"active_only", "protect_listener"}:
+            raise OmniHumanAdapterError(
+                f"OMNIHUMAN_SPEAKER_MASK_STRATEGY_INVALID:{strategy}"
+            )
+
+        if strategy == "protect_listener":
+            positive, negative = listener, active
+        else:
+            positive, negative = active, listener
+
         box = self._speaker_mask_box(
-            active,
-            listener,
+            positive,
+            negative,
             width=width,
             height=height,
         )
@@ -394,8 +471,8 @@ class OmniHumanAdapter(ProviderClient):
                 arguments={
                     "image_url": image_url,
                     "prompts": [
-                        {"label": 1, "x": int(active[0]), "y": int(active[1])},
-                        {"label": 0, "x": int(listener[0]), "y": int(listener[1])},
+                        {"label": 1, "x": int(positive[0]), "y": int(positive[1])},
+                        {"label": 0, "x": int(negative[0]), "y": int(negative[1])},
                     ],
                     "box_prompts": [box],
                     "apply_mask": False,
@@ -415,6 +492,7 @@ class OmniHumanAdapter(ProviderClient):
             height=height,
             active=active,
             listener=listener,
+            strategy=strategy,
         )
 
     async def _shared_scene_mask_url(
@@ -624,6 +702,123 @@ class OmniHumanAdapter(ProviderClient):
                 _preview_url(source_url),
             )
             return source_url
+
+    async def _normalize_shared_scene_audio_to_fal(self, url: str) -> str:
+        """Normalize approved dialogue audio before a shared-scene provider call.
+
+        The goal is not to alter speech content. It removes only sustained edge
+        silence, rebases timestamps, normalizes level, forces mono 48 kHz PCM,
+        and therefore gives OmniHuman a consistent timing signal for lip-sync.
+        """
+
+        source_url = str(url or "").strip()
+        if not source_url:
+            raise OmniHumanAdapterError("OMNIHUMAN_SHARED_AUDIO_URL_REQUIRED")
+
+        candidate_urls: List[str] = [source_url]
+        refreshed_url = await self._refresh_azure_blob_input_url(source_url)
+        if refreshed_url and refreshed_url != source_url:
+            candidate_urls.insert(0, refreshed_url)
+
+        input_path: Optional[str] = None
+        output_path: Optional[str] = None
+        last_error: Optional[Exception] = None
+
+        for attempt_index, candidate_url in enumerate(candidate_urls, start=1):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self.input_download_timeout_s,
+                    follow_redirects=True,
+                ) as client:
+                    response = await client.get(candidate_url)
+                    response.raise_for_status()
+                    data = response.content
+
+                if not data:
+                    raise OmniHumanAdapterError("OMNIHUMAN_SHARED_AUDIO_EMPTY_DOWNLOAD")
+
+                suffix = self._suffix_from_url(candidate_url, ".audio")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as src:
+                    src.write(data)
+                    input_path = src.name
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as dst:
+                    output_path = dst.name
+
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-y",
+                    "-i", input_path,
+                    "-vn",
+                    "-af",
+                    (
+                        "silenceremove="
+                        "start_periods=1:start_duration=0.12:start_threshold=-52dB:"
+                        "stop_periods=1:stop_duration=0.20:stop_threshold=-52dB,"
+                        "loudnorm=I=-18:LRA=7:TP=-1.5,"
+                        "aresample=48000:async=1:first_pts=0"
+                    ),
+                    "-ac", "1",
+                    "-ar", "48000",
+                    "-c:a", "pcm_s16le",
+                    output_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=max(30, self.input_download_timeout_s),
+                )
+                if proc.returncode != 0:
+                    raise OmniHumanAdapterError(
+                        "OMNIHUMAN_SHARED_AUDIO_FFMPEG_FAILED:"
+                        + (stderr.decode("utf-8", errors="replace")[-1200:] if stderr else "")
+                    )
+                if not output_path or not os.path.exists(output_path) or os.path.getsize(output_path) <= 44:
+                    raise OmniHumanAdapterError("OMNIHUMAN_SHARED_AUDIO_NORMALIZED_EMPTY")
+
+                uploaded = await asyncio.to_thread(fal_client.upload_file, output_path)
+                uploaded_url = str(uploaded or "").strip()
+                if not uploaded_url:
+                    raise OmniHumanAdapterError("OMNIHUMAN_SHARED_AUDIO_UPLOAD_EMPTY")
+
+                logger.info(
+                    "omnihuman.shared_audio_normalized source_url=%s candidate_url=%s attempt=%s/%s "
+                    "source_bytes=%s normalized_bytes=%s fal_url=%s",
+                    _preview_url(source_url),
+                    _preview_url(candidate_url),
+                    attempt_index,
+                    len(candidate_urls),
+                    len(data),
+                    os.path.getsize(output_path),
+                    _preview_url(uploaded_url),
+                )
+                return uploaded_url
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "omnihuman.shared_audio_normalization_attempt_failed source_url=%s "
+                    "candidate_url=%s attempt=%s/%s error=%s",
+                    _preview_url(source_url),
+                    _preview_url(candidate_url),
+                    attempt_index,
+                    len(candidate_urls),
+                    str(exc)[:1000],
+                )
+            finally:
+                for path in (input_path, output_path):
+                    if path and os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+                input_path = None
+                output_path = None
+
+        raise OmniHumanAdapterError(
+            f"OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_EXHAUSTED:{last_error}"
+        ) from last_error
 
     async def _upload_remote_file_to_fal(self, url: str, *, suffix_hint: str) -> str:
         logger.info(
