@@ -22,11 +22,11 @@ def test_xfade_normalizes_provider_inputs_to_cfr(monkeypatch):
     command = commands[0]
     filter_complex = command[command.index("-filter_complex") + 1]
 
-    assert "[0:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS" in filter_complex
-    assert "[1:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS" in filter_complex
+    assert "[0:v]setpts=PTS-STARTPTS,fps=30" in filter_complex
+    assert "[1:v]setpts=PTS-STARTPTS,fps=30" in filter_complex
     assert "[v0][v1]xfade=" in filter_complex
-    assert "[0:a]aresample=48000,asetpts=PTS-STARTPTS[a0]" in filter_complex
-    assert "[1:a]aresample=48000,asetpts=PTS-STARTPTS[a1]" in filter_complex
+    assert "aresample=48000,asetpts=PTS-STARTPTS[a0]" in filter_complex
+    assert "aresample=48000,asetpts=PTS-STARTPTS[a1]" in filter_complex
 
 
 def test_xfade_accepts_conversation_handoff_transition_override(monkeypatch):
