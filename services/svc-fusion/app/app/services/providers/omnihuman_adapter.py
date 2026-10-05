@@ -739,12 +739,12 @@ class OmniHumanAdapter(ProviderClient):
                     "-vn",
                     "-af",
                     (
-                        # Trim only the outer silence. Using a positive
-                        # stop_periods on forward audio can truncate speech at
-                        # the first natural pause, so trim the tail safely by
-                        # reversing, trimming the new head, then reversing back.
-                        "silenceremove="
-                        "start_periods=1:start_duration=0.12:start_threshold=-52dB,"
+                        # Preserve the approved dialogue head verbatim.
+                        # Forward silence trimming can classify a quiet initial
+                        # fricative/breath-led consonant as silence and permanently
+                        # remove the first phoneme before OmniHuman sees the audio.
+                        # Clean up only the tail by reversing it, trimming the
+                        # reversed head, then restoring the original direction.
                         "areverse,"
                         "silenceremove="
                         "start_periods=1:start_duration=0.20:start_threshold=-52dB,"
