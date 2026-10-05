@@ -106,6 +106,8 @@ for marker in (
     assert marker in adapter, marker
 
 assert "ffmpeg" in fusion_dockerfile
+assert "stop_periods=1" not in adapter
+assert adapter.count('"areverse,"') >= 2
 assert "distant non-speaking background people" in state_routes
 assert "foreground subject or make background people visually prominent" in state_routes
 
