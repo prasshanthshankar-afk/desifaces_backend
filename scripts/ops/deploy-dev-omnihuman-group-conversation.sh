@@ -546,6 +546,7 @@ echo "IMMUTABLE_IMAGE_PARITY=PASS"
 docker exec -i "${CONTAINER[svc-director]}" python - <<'PY'
 from pathlib import Path
 src=Path("/app/app/fusion_input_performance.py").read_text()
+execution=Path("/app/app/fusion_execution.py").read_text()
 assert 'provider_name = "omnihuman"' in src
 assert 'provider_name = "kling"' not in src
 assert '"static_video"' in src and '"cinematic_video"' in src
@@ -558,6 +559,8 @@ assert "def _ambient_motion_plan" in src
 assert "Lip-sync is strict" in src
 assert '"speaker_mask_strategy": "protect_listener"' in src
 assert '"background_motion_mode": "ambient"' in src
+assert '"quality_contract"' in execution
+assert '"shared_audio_normalization_required"' in execution
 print("DIRECTOR_OMNIHUMAN_CAMERA_CONTRACT=PASS")
 print("DIRECTOR_STRICT_LIPSYNC_AMBIENT_MOTION=PASS")
 PY
