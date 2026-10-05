@@ -173,8 +173,8 @@ jobs:
           )
 
           src = Path("/app/app/services/stitch_service.py").read_text()
-          shared = src.split('if mode == "shared_dialogue":', 1)[1].split(
-              'if mode in {"xfade", "fade"}:', 1
+          shared = src.split("if mode == \"shared_dialogue\":", 1)[1].split(
+              "if mode in {\"xfade\", \"fade\"}:", 1
           )[0]
           assert "_xfade_pair(" not in shared
           assert "acrossfade" not in shared
