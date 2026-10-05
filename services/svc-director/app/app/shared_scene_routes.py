@@ -308,7 +308,7 @@ async def set_shared_scene_conversation(
             stage = await conn.fetchrow(
                 """
                 select s.stage_run_id,s.state,s.scene_id,s.metadata_json,
-                       w.project_id,w.owner_user_id
+                       w.project_id,w.owner_user_id,w.metadata_json as workflow_metadata
                 from public.v3_studio_stage_runs s
                 join public.v3_studio_workflows w on w.workflow_id=s.workflow_id
                 where s.stage_run_id=$1 and s.workflow_id=$2 and w.account_id=$3
@@ -466,6 +466,10 @@ async def set_shared_scene_conversation(
                 for item in body.speaker_targets
             }
             metadata["shared_scene_target_source"] = "user_confirmed"
+            workflow_metadata = _metadata(stage["workflow_metadata"])
+            source_mode = str(workflow_metadata.get("shared_scene_source_mode") or "").strip().lower()
+            if source_mode in {"generate", "upload"}:
+                metadata["shared_scene_source_mode"] = source_mode
             metadata["shared_scene_validation"] = {
                 "status": str(validation.get("status") or "PASS").upper(),
                 "expected_speakers": int(validation.get("expected_speakers") or len(speaking_ids)),
