@@ -352,16 +352,16 @@ services:
       DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY: active_only
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION: "1"
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED: "1"
-      DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS: "120"
-      DF_OMNIHUMAN_DIALOGUE_TAIL_PAD_MS: "180"
+      DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS: "300"
+      DF_OMNIHUMAN_DIALOGUE_TAIL_PAD_MS: "400"
   svc-fusion-worker:
     environment:
       DF_OMNIHUMAN_MODEL_ID: "$MODEL_ID_YAML"
       DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY: active_only
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION: "1"
       DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED: "1"
-      DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS: "120"
-      DF_OMNIHUMAN_DIALOGUE_TAIL_PAD_MS: "180"
+      DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS: "300"
+      DF_OMNIHUMAN_DIALOGUE_TAIL_PAD_MS: "400"
   svc-fusion-extension:
     environment:
       DF_SHARED_SCENE_TRANSITION_SECONDS: "0.12"
@@ -645,8 +645,8 @@ assert a.speaker_mask_model_id=="fal-ai/sam2/image"
 assert a.shared_scene_mask_strategy=="active_only"
 assert a.shared_scene_audio_normalization is True
 assert a.shared_scene_audio_normalization_required is True
-assert a.shared_scene_dialogue_head_pad_ms == 120
-assert a.shared_scene_dialogue_tail_pad_ms == 180
+assert a.shared_scene_dialogue_head_pad_ms == 300
+assert a.shared_scene_dialogue_tail_pad_ms == 400
 assert shutil.which("ffmpeg"), "ffmpeg missing from Fusion runtime"
 
 src=Path("/app/app/services/providers/omnihuman_adapter.py").read_text()
