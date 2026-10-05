@@ -111,6 +111,11 @@ assert adapter.count('"areverse,"') >= 2
 assert "distant non-speaking background people" in state_routes
 assert "foreground subject or make background people visually prominent" in state_routes
 
+assert 'w.metadata_json as workflow_metadata' in routes
+assert 'metadata["shared_scene_source_mode"] = source_mode' in routes
+assert '" This is a user-uploaded source photo: animate only people and environmental elements already visible "' in compiler
+assert "Do not invent new background people, objects, signage, architecture, or scenery." in compiler
+
 # Product-facing video styles and Creative Director camera planning.
 for marker in (
     '"static_video"',
