@@ -302,9 +302,15 @@ services:
   svc-fusion:
     environment:
       DF_OMNIHUMAN_MODEL_ID: ${DF_OMNIHUMAN_MODEL_ID:?DF_OMNIHUMAN_MODEL_ID is required}
+      DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY: protect_listener
+      DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION: "1"
+      DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED: "1"
   svc-fusion-worker:
     environment:
       DF_OMNIHUMAN_MODEL_ID: ${DF_OMNIHUMAN_MODEL_ID:?DF_OMNIHUMAN_MODEL_ID is required}
+      DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY: protect_listener
+      DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION: "1"
+      DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED: "1"
 YAML
 
 COMPOSE+=(-f "$RUNTIME_OVERRIDE")
@@ -548,20 +554,41 @@ assert '"push_in"' in src and '"push_out"' in src
 assert '"arc_left"' in src and '"arc_right"' in src
 assert "creative_director_scene_direction" in src
 assert 'getattr(turn, "dialogue_text", None)' in src
+assert "def _ambient_motion_plan" in src
+assert "Lip-sync is strict" in src
+assert '"speaker_mask_strategy": "protect_listener"' in src
+assert '"background_motion_mode": "ambient"' in src
 print("DIRECTOR_OMNIHUMAN_CAMERA_CONTRACT=PASS")
+print("DIRECTOR_STRICT_LIPSYNC_AMBIENT_MOTION=PASS")
 PY
 
 for svc in svc-fusion svc-fusion-worker; do
   [[ -n "${CONTAINER[$svc]:-}" ]] || continue
   docker exec -i "${CONTAINER[$svc]}" python - <<'PY'
+import os
+import shutil
+from pathlib import Path
 from PIL import Image
 from app.services.providers.omnihuman_adapter import OmniHumanAdapter
+
 a=OmniHumanAdapter()
 assert a.provider_name=="omnihuman"
-import os
 assert a.model_id==os.environ["DF_OMNIHUMAN_MODEL_ID"]
 assert a.speaker_mask_model_id=="fal-ai/sam2/image"
+assert a.shared_scene_mask_strategy=="protect_listener"
+assert a.shared_scene_audio_normalization is True
+assert a.shared_scene_audio_normalization_required is True
+assert shutil.which("ffmpeg"), "ffmpeg missing from Fusion runtime"
+
+src=Path("/app/app/services/providers/omnihuman_adapter.py").read_text()
+assert "_normalize_shared_scene_audio_to_fal" in src
+assert "silenceremove=" in src
+assert "loudnorm=I=-18:LRA=7:TP=-1.5" in src
+assert "positive, negative = listener, active" in src
+
 print("OMNIHUMAN_SAM2_RUNTIME=PASS")
+print("OMNIHUMAN_PROTECT_LISTENER_MASK=PASS")
+print("OMNIHUMAN_SHARED_AUDIO_NORMALIZATION=PASS")
 PY
 done
 
