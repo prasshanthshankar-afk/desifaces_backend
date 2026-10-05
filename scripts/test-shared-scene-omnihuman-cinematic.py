@@ -137,6 +137,16 @@ assert "dialogue_text: str | None" in execution
 assert 'getattr(turn, "dialogue_text", None)' in compiler
 assert "emotion_code" in compiler
 
+for marker in (
+    '"quality_contract"',
+    '"speaker_mask_strategy"',
+    '"lipsync_quality_mode"',
+    '"background_motion_mode"',
+    '"ambient_motion_planned"',
+    '"shared_audio_normalization_required"',
+):
+    assert marker in execution, marker
+
 # Customer pricing remains the existing +20% group actual-second contract.
 for marker in (
     '_GROUP_VARIANT_CODE = "GROUP_TALKING_VIDEO_PREMIUM_SECOND"',
@@ -218,6 +228,7 @@ print("STRICT_LIPSYNC_INPUT_CONTRACT=PASS")
 print("AMBIENT_SCENE_MOTION_CONTRACT=PASS")
 print("PROTECT_LISTENER_MASK_CONTRACT=PASS")
 print("SHARED_SCENE_AUDIO_NORMALIZATION_CONTRACT=PASS")
+print("PRE_GENERATION_QUALITY_OBSERVABILITY=PASS")
 print("GROUP_CONVERSATION_20PCT_PRICING_PRESERVED=PASS")
 print("RESERVATION_OWNERSHIP_CAS=PASS")
 print("STITCH_ONCE_PRICING_RETRY_ONLY=PASS")
