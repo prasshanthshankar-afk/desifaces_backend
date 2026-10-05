@@ -505,6 +505,29 @@ class SceneFusionExecutionService:
                     "pricing": preview.get("pricing") or {},
                     "pricing_summary": preview.get("pricing_summary") or {},
                     "message": preview.get("message"),
+                    "quality_contract": {
+                        "provider": _clean(child["payload"].get("provider")),
+                        "camera_mode": _clean(child.get("camera_mode")),
+                        "camera_plan_source": _clean(child.get("camera_plan_source")),
+                        "speaker_mask_strategy": _clean(
+                            _as_dict(child["payload"].get("provider_options")).get("speaker_mask_strategy")
+                        ),
+                        "lipsync_quality_mode": _clean(
+                            _as_dict(child["payload"].get("provider_options")).get("lipsync_quality_mode")
+                        ),
+                        "background_motion_mode": _clean(
+                            _as_dict(child["payload"].get("provider_options")).get("background_motion_mode")
+                        ),
+                        "ambient_motion_planned": bool(
+                            _clean(_as_dict(child["payload"].get("provider_options")).get("ambient_motion_plan"))
+                        ),
+                        "shared_audio_normalization_required": (
+                            _clean(child["payload"].get("provider")) == "omnihuman"
+                            and _clean(
+                                _as_dict(child["payload"].get("provider_options")).get("conversation_mode")
+                            ).casefold() == "shared_scene"
+                        ),
+                    },
                 }
             )
         return context, quotes
