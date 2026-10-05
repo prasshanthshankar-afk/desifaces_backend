@@ -690,7 +690,12 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from app.services.stitch_service import _probe_has_audio, _probe_video_dimensions, _xfade_pair
+from app.services.stitch_service import (
+    stitch_videos,
+    _probe_duration_seconds,
+    _probe_has_audio,
+    _probe_video_dimensions,
+)
 
 src=Path("/app/app/workers/v3_scene_coordinator.py").read_text()
 stitch=Path("/app/app/services/stitch_service.py").read_text()
@@ -702,10 +707,16 @@ assert 'stitch_mode = "shared_dialogue" if conversation_mode == "shared_scene" e
 assert 'return "shared_dialogue"' in route
 assert 'mode == "shared_dialogue"' in stitch
 assert '_shared_dialogue_transition_seconds' in stitch
-assert 'minimum_transition_sec=0.08' in stitch
+assert 'audio_edge_fade=not shared_dialogue' in stitch
+assert 'VIDEO-ONLY fade-out/fade-in' in stitch
+assert '"shared_dialogue_concat.txt"' in stitch
+assert 'audio_transition=none' in stitch
+shared = stitch.split('if mode == "shared_dialogue":', 1)[1].split(
+    'if mode in {"xfade", "fade"}:', 1
+)[0]
+assert "_xfade_pair(" not in shared
+assert "acrossfade" not in shared
 assert 'def _probe_video_dimensions' in stitch
-assert '_fit_pad_filter(target_width, target_height)' in stitch
-assert 'channel_layouts=stereo' in stitch
 assert os.environ.get("DF_SHARED_SCENE_TRANSITION_SECONDS") == "0.12"
 
 # Exercise the exact FFmpeg transition path with intentionally mismatched
@@ -731,20 +742,28 @@ with tempfile.TemporaryDirectory(prefix="df_shared_dialogue_smoke_") as td:
         "-c:v","libx264","-pix_fmt","yuv420p","-r","30",
         "-c:a","aac","-ar","48000","-ac","2","-shortest",right
     ], check=True)
-    _xfade_pair(
-        left,
-        right,
+    stitch_videos(
+        [left, right],
         out,
-        transition_duration_sec=0.12,
-        transition_style_override="fade",
-        minimum_transition_sec=0.08,
+        stitch_mode_override="shared_dialogue",
+        aspect_ratio="16:9",
     )
     assert os.path.getsize(out) > 0
-    assert _probe_video_dimensions(out) == (640, 360)
+    assert _probe_video_dimensions(out) == (1920, 1080)
     assert _probe_has_audio(out)
+    final_duration = float(_probe_duration_seconds(out) or 0.0)
+    assert 5.34 <= final_duration <= 5.60, final_duration
+    audio_duration = float(subprocess.check_output([
+        "ffprobe","-v","error","-select_streams","a:0",
+        "-show_entries","stream=duration",
+        "-of","default=noprint_wrappers=1:nokey=1",out
+    ], text=True).strip())
+    assert 5.34 <= audio_duration <= 5.60, audio_duration
 
 print("STITCH_ONCE_PRICING_RETRY_ONLY=PASS")
-print("SHARED_DIALOGUE_MICRO_TRANSITION=PASS")
+print("SHARED_DIALOGUE_VISUAL_ONLY_TRANSITION=PASS")
+print("SHARED_DIALOGUE_AUDIO_IMMUTABILITY=PASS")
+print("SHARED_DIALOGUE_FULL_DURATION=PASS")
 print("SHARED_DIALOGUE_FFMPEG_RUNTIME=PASS")
 PY
 fi
