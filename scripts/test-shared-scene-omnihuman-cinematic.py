@@ -99,13 +99,14 @@ for marker in (
     "silenceremove=",
     "loudnorm=I=-18:LRA=7:TP=-1.5",
     "aresample=48000:async=1:first_pts=0",
-    'strategy == "active_only"',
-    "active, listener",
+    'self.shared_scene_mask_strategy = "active_only"',
+    "only the person in the white area speaks",
     "mask = ImageOps.invert(mask)",
 ):
     assert marker in adapter, marker
 
 assert "ffmpeg" in fusion_dockerfile
+assert "protect_listener" not in adapter
 assert "stop_periods=1" not in adapter
 assert adapter.count('"areverse,"') >= 2
 assert "distant non-speaking background people" in state_routes
