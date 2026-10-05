@@ -9,7 +9,9 @@ extension = root / "services/svc-fusion-extension/app/app"
 compiler = (director / "fusion_input_performance.py").read_text(encoding="utf-8")
 execution = (director / "fusion_execution.py").read_text(encoding="utf-8")
 routes = (director / "shared_scene_routes.py").read_text(encoding="utf-8")
+state_routes = (director / "shared_scene_state_routes.py").read_text(encoding="utf-8")
 adapter = (fusion / "services/providers/omnihuman_adapter.py").read_text(encoding="utf-8")
+fusion_dockerfile = (root / "services/svc-fusion/app/Dockerfile").read_text(encoding="utf-8")
 pricing = (extension / "api/routes/v3_scene_pricing.py").read_text(encoding="utf-8")
 coordinator = (extension / "workers/v3_scene_coordinator.py").read_text(encoding="utf-8")
 stitch = (extension / "api/routes/v3_scene_stitch.py").read_text(encoding="utf-8")
@@ -71,6 +73,41 @@ for marker in (
     "OMNIHUMAN_SPEAKER_MASK_LISTENER_NOT_BLACK",
 ):
     assert marker in adapter, marker
+
+# Production-quality shared-scene quality controls.
+for marker in (
+    '"speaker_mask_strategy": "protect_listener"',
+    '"lipsync_quality_mode": "strict"',
+    '"background_motion_mode": "ambient"',
+    '"ambient_motion_plan": _ambient_motion_plan(context)',
+    "Lip-sync is strict",
+    "first audible speech phoneme",
+    "do not freeze the world",
+    "background geometry",
+):
+    assert marker in compiler, marker
+
+assert "scene_setting: dict[str, Any]" in execution
+assert "sc.setting_json" in execution
+assert 'scene_setting=_as_dict(stage["setting_json"])' in execution
+
+for marker in (
+    'DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY", "protect_listener"',
+    'DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION", "1"',
+    'DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED", "1"',
+    "_normalize_shared_scene_audio_to_fal",
+    "silenceremove=",
+    "loudnorm=I=-18:LRA=7:TP=-1.5",
+    "aresample=48000:async=1:first_pts=0",
+    'strategy == "protect_listener"',
+    "positive, negative = listener, active",
+    "mask = ImageOps.invert(mask)",
+):
+    assert marker in adapter, marker
+
+assert "ffmpeg" in fusion_dockerfile
+assert "small distant non-speaking background people" in state_routes
+assert "never add another foreground subject" in state_routes
 
 # Product-facing video styles and Creative Director camera planning.
 for marker in (
@@ -163,6 +200,9 @@ assert "SET provider='omnihuman'" in identity_migration
 for marker in (
     "DF_OMNIHUMAN_MODEL_ID:",
     "DF_OMNIHUMAN_SPEAKER_MASK_MODEL_ID:",
+    "DF_OMNIHUMAN_SPEAKER_MASK_STRATEGY:",
+    "DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION:",
+    "DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED:",
     "DF_OMNIHUMAN_UPLOAD_INPUTS_TO_FAL:",
     "FAL_KEY:",
 ):
@@ -172,6 +212,10 @@ print("OMNIHUMAN_SHARED_SCENE_PROVIDER_FROZEN=PASS")
 print("OMNIHUMAN_SPEAKER_MASK_CONTRACT=PASS")
 print("STATIC_CINEMATIC_CAMERA_CONTRACT=PASS")
 print("DIALOGUE_EMOTION_PERFORMANCE_CONTEXT=PASS")
+print("STRICT_LIPSYNC_INPUT_CONTRACT=PASS")
+print("AMBIENT_SCENE_MOTION_CONTRACT=PASS")
+print("PROTECT_LISTENER_MASK_CONTRACT=PASS")
+print("SHARED_SCENE_AUDIO_NORMALIZATION_CONTRACT=PASS")
 print("GROUP_CONVERSATION_20PCT_PRICING_PRESERVED=PASS")
 print("RESERVATION_OWNERSHIP_CAS=PASS")
 print("STITCH_ONCE_PRICING_RETRY_ONLY=PASS")
