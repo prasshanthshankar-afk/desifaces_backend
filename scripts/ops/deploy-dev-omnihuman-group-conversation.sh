@@ -652,6 +652,8 @@ assert shutil.which("ffmpeg"), "ffmpeg missing from Fusion runtime"
 src=Path("/app/app/services/providers/omnihuman_adapter.py").read_text()
 assert "_normalize_shared_scene_audio_to_fal" in src
 assert "silenceremove=" in src
+assert "Preserve the approved dialogue head verbatim" in src
+assert "start_periods=1:start_duration=0.12:start_threshold=-52dB" not in src
 assert "loudnorm=I=-18:LRA=7:TP=-1.5" in src
 assert "adelay=" in src
 assert "apad=pad_dur=" in src
