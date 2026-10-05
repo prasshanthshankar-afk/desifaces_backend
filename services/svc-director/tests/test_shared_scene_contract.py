@@ -215,3 +215,38 @@ def test_shared_scene_turn_context_carries_dialogue_for_performance_planning():
     assert "to_jsonb(dt) as turn_json" in source
     assert "dialogue_text: str | None" in source
     assert "dialogue_text=_dialogue_text" in source
+
+
+def test_shared_scene_quality_release_preserves_setting_and_adds_ambient_motion():
+    root = Path(__file__).resolve().parents[1] / "app" / "app"
+    execution = (root / "fusion_execution.py").read_text(encoding="utf-8")
+    compiler = (root / "fusion_input_performance.py").read_text(encoding="utf-8")
+    state_routes = (root / "shared_scene_state_routes.py").read_text(encoding="utf-8")
+
+    assert "scene_setting: dict[str, Any]" in execution
+    assert "sc.setting_json" in execution
+    assert 'scene_setting=_as_dict(stage["setting_json"])' in execution
+
+    assert "def _ambient_motion_plan" in compiler
+    assert "Static Video locks the camera, not the world" in compiler
+    assert "do not freeze the world" in compiler
+    assert '"background_motion_mode": "ambient"' in compiler
+    assert '"ambient_motion_plan": _ambient_motion_plan(context)' in compiler
+    assert "small distant non-speaking background people" in state_routes
+    assert "never add another foreground subject" in state_routes
+
+
+def test_shared_scene_quality_release_enforces_strict_per_turn_lipsync_contract():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "app"
+        / "fusion_input_performance.py"
+    ).read_text(encoding="utf-8")
+
+    assert "Lip-sync is strict" in source
+    assert "first audible speech phoneme" in source
+    assert "without anticipation or lag" in source
+    assert "final spoken phoneme" in source
+    assert '"lipsync_quality_mode": "strict"' in source
+    assert '"speaker_mask_strategy": "protect_listener"' in source
