@@ -239,12 +239,19 @@ def _ambient_motion_plan(context: FusionSceneContext) -> str:
         if _clean(value)
     ).casefold()
 
+    source_mode = _clean((context.stage_metadata or {}).get("shared_scene_source_mode")).casefold()
+
     base = (
         "Ambient scene motion plan: keep the original background layout, landmarks, furniture, lighting direction, "
         "depth relationships, and perspective stable, but do not freeze the world. Use only subtle, believable "
         "background movement that remains secondary to the conversation. Background people must never speak, "
         "approach the foreground, cross in front of either main speaker, or become a new focal subject."
     )
+    if source_mode == "upload":
+        base += (
+            " This is a user-uploaded source photo: animate only people and environmental elements already visible "
+            "in the source. Do not invent new background people, objects, signage, architecture, or scenery."
+        )
 
     outdoor_tokens = (
         "outdoor", "mountain", "park", "street", "market", "festival", "beach",
