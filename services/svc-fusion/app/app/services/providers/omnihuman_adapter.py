@@ -124,6 +124,24 @@ class OmniHumanAdapter(ProviderClient):
             os.getenv("DF_OMNIHUMAN_SHARED_AUDIO_NORMALIZATION_REQUIRED", "1")
         ).strip().lower() in {"1", "true", "yes", "y"}
 
+        # Dialogue handles give OmniHuman time to settle into and out of each
+        # speaking turn. They are provider-only execution padding: customer
+        # pricing continues to use the approved dialogue duration.
+        try:
+            self.shared_scene_dialogue_head_pad_ms = max(
+                80,
+                min(300, int(os.getenv("DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS", "120"))),
+            )
+        except Exception:
+            self.shared_scene_dialogue_head_pad_ms = 120
+        try:
+            self.shared_scene_dialogue_tail_pad_ms = max(
+                100,
+                min(400, int(os.getenv("DF_OMNIHUMAN_DIALOGUE_TAIL_PAD_MS", "180"))),
+            )
+        except Exception:
+            self.shared_scene_dialogue_tail_pad_ms = 180
+
     async def estimate(self, request_payload: Dict[str, Any]) -> ProviderEstimate:
         duration_sec = self._duration_seconds(request_payload)
         estimated_units = str(max(1, int(math.ceil(duration_sec / 60.0)))) if duration_sec else "1"
@@ -249,6 +267,12 @@ class OmniHumanAdapter(ProviderClient):
                 "speaker_mask_model_id": self.speaker_mask_model_id if mask_url else None,
                 "speaker_mask_strategy": self.shared_scene_mask_strategy if mask_url else None,
                 "shared_scene_audio_normalized": audio_normalized,
+                "dialogue_head_pad_ms": (
+                    self.shared_scene_dialogue_head_pad_ms if shared_scene and audio_normalized else 0
+                ),
+                "dialogue_tail_pad_ms": (
+                    self.shared_scene_dialogue_tail_pad_ms if shared_scene and audio_normalized else 0
+                ),
             },
         )
 
@@ -726,7 +750,9 @@ class OmniHumanAdapter(ProviderClient):
                         "start_periods=1:start_duration=0.20:start_threshold=-52dB,"
                         "areverse,"
                         "loudnorm=I=-18:LRA=7:TP=-1.5,"
-                        "aresample=48000:async=1:first_pts=0"
+                        "aresample=48000:async=1:first_pts=0,"
+                        f"adelay={self.shared_scene_dialogue_head_pad_ms}:all=1,"
+                        f"apad=pad_dur={self.shared_scene_dialogue_tail_pad_ms / 1000.0:.3f}"
                     ),
                     "-ac", "1",
                     "-ar", "48000",
@@ -754,13 +780,15 @@ class OmniHumanAdapter(ProviderClient):
 
                 logger.info(
                     "omnihuman.shared_audio_normalized source_url=%s candidate_url=%s attempt=%s/%s "
-                    "source_bytes=%s normalized_bytes=%s fal_url=%s",
+                    "source_bytes=%s normalized_bytes=%s head_pad_ms=%s tail_pad_ms=%s fal_url=%s",
                     _preview_url(source_url),
                     _preview_url(candidate_url),
                     attempt_index,
                     len(candidate_urls),
                     len(data),
                     os.path.getsize(output_path),
+                    self.shared_scene_dialogue_head_pad_ms,
+                    self.shared_scene_dialogue_tail_pad_ms,
                     _preview_url(uploaded_url),
                 )
                 return uploaded_url
