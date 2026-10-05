@@ -828,9 +828,13 @@ def _xfade_pair(
             # metadata, which can surface as an invalid 1/0 rate inside xfade.
             # Normalize only the transition inputs; the outer stitch fallback remains
             # unchanged and continues to use concat if xfade itself fails.
-            f"[0:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,"
+            # FFmpeg 7.1's xfade sees frame_rate=1/0 when setpts is
+            # applied *after* fps (and when settb=AVTB is inserted). Rebase PTS
+            # first, then force CFR. The following order is runtime-certified
+            # against the same FFmpeg major used by the production image.
+            f"[0:v]setpts=PTS-STARTPTS,fps=30,"
             f"{_fit_pad_filter(target_width, target_height)},format=yuv420p[v0];"
-            f"[1:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,"
+            f"[1:v]setpts=PTS-STARTPTS,fps=30,"
             f"{_fit_pad_filter(target_width, target_height)},format=yuv420p[v1];"
             f"[v0][v1]xfade=transition={transition_style}:duration={xfade_duration:.3f}:offset={offset:.3f}[v];"
             f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
