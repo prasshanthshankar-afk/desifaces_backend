@@ -382,7 +382,7 @@ async def _finalize_scene(pool, row: dict[str, Any], children: list[dict[str, An
 
         stage_metadata = _as_dict(row.get("stage_metadata"))
         conversation_mode = _clean(stage_metadata.get("conversation_mode")).lower() or None
-        stitch_mode = "hard_cut" if conversation_mode == "shared_scene" else None
+        stitch_mode = "shared_dialogue" if conversation_mode == "shared_scene" else None
 
         stitch_body = SceneStitchIn(
             project_id=UUID(str(row["project_id"])),
