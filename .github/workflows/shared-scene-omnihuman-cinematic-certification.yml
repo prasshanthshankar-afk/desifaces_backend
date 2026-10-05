@@ -134,8 +134,8 @@ jobs:
           assert a.shared_scene_mask_strategy == "active_only"
           assert a.shared_scene_audio_normalization is True
           assert a.shared_scene_audio_normalization_required is True
-          assert a.shared_scene_dialogue_head_pad_ms == 120
-          assert a.shared_scene_dialogue_tail_pad_ms == 180
+          assert a.shared_scene_dialogue_head_pad_ms == 300
+          assert a.shared_scene_dialogue_tail_pad_ms == 400
           assert a.model_id == "runtime-configured-model"
           print("OMNIHUMAN_QUALITY_RUNTIME_SMOKE=PASS")
           '
