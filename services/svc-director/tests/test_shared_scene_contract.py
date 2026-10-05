@@ -249,7 +249,7 @@ def test_shared_scene_quality_release_enforces_strict_per_turn_lipsync_contract(
     assert "without anticipation or lag" in source
     assert "final spoken phoneme" in source
     assert '"lipsync_quality_mode": "strict"' in source
-    assert '"speaker_mask_strategy": "protect_listener"' in source
+    assert '"speaker_mask_strategy": "active_only"' in source
 
 
 def test_shared_scene_ambient_motion_respects_uploaded_source_fidelity():
