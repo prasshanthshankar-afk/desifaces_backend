@@ -543,7 +543,7 @@ async def compile_children_performant(
                     "fusion_provider": "omnihuman",
                     "presenter_provider": "omnihuman",
                     "resolution": shared_scene["resolution"],
-                    "turbo_mode": False,
+                    "turbo_mode": True,  # Shared-scene Group Conversation only; DEV-certified Turbo.
                     "aspect_ratio": aspect_ratio,
                     "prompt": performance_prompt,
                     "active_speaker_coordinates": active_coordinates,
