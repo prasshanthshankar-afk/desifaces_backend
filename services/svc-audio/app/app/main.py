@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from fastapi import FastAPI
+from desifaces_shared.pricing.request_context import PricingCountryContextMiddleware
 from app.api import build_router
 from app.services.multi_person_pricing_policy import install_multi_person_pricing_policy
 
@@ -27,6 +28,9 @@ def create_app() -> FastAPI:
         redoc_url=os.getenv("REDOC_URL", "/redoc"),
         openapi_url=os.getenv("OPENAPI_URL", "/openapi.json"),
     )
+
+    # LOCATION_AWARE_PRICING_CONTEXT_V2
+    app.add_middleware(PricingCountryContextMiddleware)
 
     app.include_router(build_router())
 

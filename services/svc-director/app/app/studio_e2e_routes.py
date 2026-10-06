@@ -74,7 +74,23 @@ def _forward_auth(request: Request) -> dict[str, str]:
     value = str(request.headers.get("authorization") or "").strip()
     if not value:
         raise HTTPException(status_code=401, detail="authorization_header_required")
-    return {"Authorization": value}
+    headers = {"Authorization": value}
+
+    # LOCATION_AWARE_PRICING_E2E_FORWARD_V1
+    # Preserve trusted pricing geography when Director delegates
+    # Multi-Person Face / Audio / Fusion work to owner services.
+    pricing_country = str(
+        request.headers.get("x-pricing-country-code") or ""
+    ).strip().upper()
+
+    if (
+        len(pricing_country) == 2
+        and pricing_country.isalpha()
+        and pricing_country not in {"XX", "T1"}
+    ):
+        headers["X-Pricing-Country-Code"] = pricing_country
+
+    return headers
 
 
 @router.post(

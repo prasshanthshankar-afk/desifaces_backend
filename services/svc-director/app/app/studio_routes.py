@@ -47,9 +47,34 @@ class StoryWorkflowCreateIn(BaseModel):
 
 def _forward_auth(request: Request) -> dict[str, str]:
     value = str(request.headers.get("authorization") or "").strip()
+
     if not value:
-        raise HTTPException(status_code=401, detail="authorization_header_required")
-    return {"Authorization": value}
+        raise HTTPException(
+            status_code=401,
+            detail="authorization_header_required",
+        )
+
+    headers = {
+        "Authorization": value,
+    }
+
+    # LOCATION_AWARE_PRICING_DIRECTOR_FORWARD_V2
+    pricing_country = str(
+        request.headers.get(
+            "x-pricing-country-code"
+        )
+        or ""
+    ).strip().upper()
+
+    if (
+        len(pricing_country) == 2
+        and pricing_country.isalpha()
+    ):
+        headers[
+            "X-Pricing-Country-Code"
+        ] = pricing_country
+
+    return headers
 
 
 async def _advance_after_face_cohort_if_complete(conn, *, workflow_id: UUID, account_id: UUID) -> StudioWorkflowView:

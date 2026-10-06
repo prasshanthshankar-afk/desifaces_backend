@@ -8,6 +8,8 @@ from typing import Optional, Type, TypeVar
 import httpx
 from pydantic import BaseModel
 
+from .request_context import get_pricing_country_code
+
 from .models import (
     PricingCommitRequest,
     PricingCommitResponse,
@@ -95,6 +97,13 @@ class SvcPricingClient:
             headers["X-User-Id"] = str(user_id)
         if self.config.bearer_token:
             headers["Authorization"] = f"Bearer {self.config.bearer_token}"
+
+        # LOCATION_AWARE_PRICING_COUNTRY_V2
+        pricing_country = get_pricing_country_code()
+
+        if pricing_country:
+            headers["X-Pricing-Country-Code"] = pricing_country
+
         return headers
 
     async def _post(

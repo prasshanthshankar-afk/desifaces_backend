@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Sequence
 from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Query
+from desifaces_shared.pricing.request_context import get_pricing_country_code
 from pydantic import BaseModel, Field
 
 from app.api.deps import PoolDep
@@ -862,8 +863,21 @@ async def preview_reservation(
     user_uuid = UUID(str(req.user_id))
     meta = _as_dict_loose(req.meta)
     channel = _first_non_empty(meta.get("channel"), "service")
-    country_code = _norm_country(meta.get("country_code"))
-    currency = _norm_currency(meta.get("currency"))
+    # LOCATION_AWARE_RESERVATION_COUNTRY_V1
+    pricing_country_code = _norm_country(get_pricing_country_code())
+    country_code = _norm_country(
+        pricing_country_code or meta.get("country_code")
+    )
+
+    # LOCATION_DERIVED_RESERVATION_CURRENCY_V1
+    # Trusted current location owns customer-facing currency:
+    # India -> INR; every other country -> USD.
+    # When no trusted pricing-country exists, preserve legacy/internal behavior.
+    currency = (
+        ("INR" if pricing_country_code == "IN" else "USD")
+        if pricing_country_code
+        else _norm_currency(meta.get("currency"))
+    )
 
     requested_units = _to_units_str(req.units, "1")
     params = {
@@ -1101,8 +1115,20 @@ async def reserve_reservation(
     user_uuid = UUID(str(req.user_id))
     meta = _as_dict_loose(req.meta)
     channel = _first_non_empty(meta.get("channel"), "service")
-    country_code = _norm_country(meta.get("country_code"))
-    currency = _norm_currency(meta.get("currency"))
+    pricing_country_code = _norm_country(get_pricing_country_code())
+    country_code = _norm_country(
+        pricing_country_code or meta.get("country_code")
+    )
+
+    # LOCATION_DERIVED_RESERVATION_CURRENCY_V1
+    # Trusted current location owns customer-facing currency:
+    # India -> INR; every other country -> USD.
+    # When no trusted pricing-country exists, preserve legacy/internal behavior.
+    currency = (
+        ("INR" if pricing_country_code == "IN" else "USD")
+        if pricing_country_code
+        else _norm_currency(meta.get("currency"))
+    )
 
     params = {
         **meta,
@@ -1502,7 +1528,7 @@ async def release_reservation(
     reservation_uuid = UUID(str(req.reservation_id))
     meta = _as_dict_loose(req.meta)
     channel = _first_non_empty(meta.get("channel"), "service")
-    country_code = _norm_country(meta.get("country_code"))
+    country_code = _norm_country(get_pricing_country_code() or meta.get("country_code"))
 
     async with pool.acquire() as conn:
         row_before = await _fetch_reservation_row(conn, user_uuid, reservation_uuid)

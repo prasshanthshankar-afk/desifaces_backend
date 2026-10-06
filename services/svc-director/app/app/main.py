@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from desifaces_shared.pricing.request_context import PricingCountryContextMiddleware
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg import Error as PsycopgError
 from pydantic import BaseModel, Field
@@ -168,6 +169,9 @@ async def lifespan(app: FastAPI):
 install_director_face_pricing_context()
 
 app = FastAPI(title="desifaces V3 Creative Director", version="3.0", lifespan=lifespan)
+# LOCATION_AWARE_PRICING_CONTEXT_V2
+app.add_middleware(PricingCountryContextMiddleware)
+
 app.include_router(studio_router)
 
 

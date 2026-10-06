@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 
 from fastapi import FastAPI
+from desifaces_shared.pricing.request_context import PricingCountryContextMiddleware
 
 from app.api import build_router
 from app.db import close_pool, get_pool
@@ -33,6 +34,9 @@ def create_app() -> FastAPI:
     )
 
     # Mount all API routes, including the live face_jobs router.
+    # LOCATION_AWARE_PRICING_CONTEXT_V2
+    app.add_middleware(PricingCountryContextMiddleware)
+
     app.include_router(build_router())
 
     # V3 adapter certification is an additive, read-only dev/runtime probe. It is

@@ -46,6 +46,7 @@ async def get_auth_context(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
     x_country_code: Optional[str] = Header(default="", alias="X-Country-Code"),
+    x_pricing_country_code: Optional[str] = Header(default="", alias="X-Pricing-Country-Code"),
 ) -> AuthContext:
     if settings.REQUIRE_AUTH:
         if not authorization or not authorization.lower().startswith("bearer "):
@@ -79,6 +80,13 @@ async def get_auth_context(
     if header_cc and (len(header_cc) != 2 or not header_cc.isalpha()):
         raise HTTPException(status_code=400, detail="invalid X-Country-Code")
 
+    pricing_cc = (x_pricing_country_code or "").strip().upper()
+    if pricing_cc and (len(pricing_cc) != 2 or not pricing_cc.isalpha()):
+        raise HTTPException(
+            status_code=400,
+            detail="invalid X-Pricing-Country-Code",
+        )
+
     # CANONICAL_LOGIN_COUNTRY_V1: once authentication succeeds, country/currency
     # comes from core.users. A header may bootstrap older accounts only when the
     # canonical DB value is still empty; it cannot override an existing value.
@@ -97,7 +105,18 @@ async def get_auth_context(
         if cc and (len(cc) != 2 or not cc.isalpha()):
             raise HTTPException(status_code=500, detail="invalid_canonical_country_code")
 
-    return AuthContext(user_id=uid, bearer_token=bearer, country_code=cc)
+    # LOCATION_AWARE_PRICING_COUNTRY_V1
+    #
+    # The canonical account/profile country above remains persistent.
+    # A trusted pricing-country header overrides it only for this pricing
+    # request. It is deliberately NOT persisted into core.users.
+    effective_country_code = pricing_cc or cc
+
+    return AuthContext(
+        user_id=uid,
+        bearer_token=bearer,
+        country_code=effective_country_code,
+    )
 
 
 AuthDep = Depends(get_auth_context)

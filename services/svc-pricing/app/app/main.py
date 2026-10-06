@@ -7,6 +7,7 @@ import os
 from typing import Optional
 
 from fastapi import FastAPI
+from desifaces_shared.pricing.request_context import PricingCountryContextMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
@@ -143,6 +144,9 @@ def create_app() -> FastAPI:
             await close_db_pool()
         except Exception:
             logger.exception("Failed to close DB pool cleanly")
+
+    # LOCATION_AWARE_PRICING_CONTEXT_V2
+    app.add_middleware(PricingCountryContextMiddleware)
 
     app.include_router(health_router)
     app.include_router(pricing_router)

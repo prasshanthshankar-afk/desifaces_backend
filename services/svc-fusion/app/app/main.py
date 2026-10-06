@@ -5,6 +5,7 @@ import contextlib
 import logging
 import os
 from fastapi import FastAPI
+from desifaces_shared.pricing.request_context import PricingCountryContextMiddleware
 from app.api import build_router
 from app.api.routes.internal_child_pricing_runtime import install_internal_child_pricing_runtime
 from app.config import settings
@@ -70,6 +71,9 @@ def create_app() -> FastAPI:
     # parent-billing contract even when a persisted job contains a stale truthy
     # pricing snapshot from older orchestration code.
     install_internal_child_pricing_runtime()
+
+    # LOCATION_AWARE_PRICING_CONTEXT_V2
+    app.add_middleware(PricingCountryContextMiddleware)
 
     app.include_router(build_router())
 

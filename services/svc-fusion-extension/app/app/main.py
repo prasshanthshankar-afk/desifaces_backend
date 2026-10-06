@@ -1,5 +1,6 @@
 import asyncio
 from fastapi import FastAPI
+from desifaces_shared.pricing.request_context import PricingCountryContextMiddleware
 
 from app.logging import setup_logging
 from app.db import init_db
@@ -18,6 +19,9 @@ install_longform_pricing_confirmation_policy()
 
 def create_app() -> FastAPI:
     app = FastAPI(title="desifaces-service", version="dev")
+    # LOCATION_AWARE_PRICING_CONTEXT_V2
+    app.add_middleware(PricingCountryContextMiddleware)
+
     app.include_router(health_router)
     app.include_router(longform_router)
     app.include_router(v3_scene_pricing_router)
