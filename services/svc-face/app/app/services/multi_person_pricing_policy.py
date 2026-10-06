@@ -37,15 +37,25 @@ def install_multi_person_pricing_policy() -> None:
         if selection is None:
             return pricing
 
+        # Keep T2I and I2I commercial identities separate. Generation behavior is
+        # unchanged; this selector only chooses the correct pricing variant.
+        base_variant = str(pricing.get("variant_code") or "").strip().upper()
+        base_action = str(pricing.get("service_action") or "").strip().lower()
+        target_code = (
+            "FACE_MULTI_PERSON_I2I"
+            if base_variant == "FACE_I2I" or base_action.endswith(".i2i")
+            else selection.sku_code
+        )
+
         # svc-pricing expands pricing.meta into variant params. Keep the existing
-        # Face metadata and add the exact quantity key expected by FACE_MULTI_PERSON.
+        # Face metadata and add the exact quantity key expected by the multi-person variant.
         meta = dict(pricing.get("meta") or {})
         meta.update(selection.metadata)
         meta.update(selection.variant_params)
         pricing.update(
             {
-                "sku_code": selection.sku_code,
-                "variant_code": selection.variant_code,
+                "sku_code": target_code,
+                "variant_code": target_code,
                 "estimated_units": str(selection.natural_units),
                 "variant_params": selection.variant_params,
                 "meta": meta,
