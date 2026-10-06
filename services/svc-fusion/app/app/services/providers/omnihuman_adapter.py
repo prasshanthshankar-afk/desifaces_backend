@@ -406,6 +406,38 @@ class OmniHumanAdapter(ProviderClient):
 
             active_pixel = int(mask.getpixel((ax, ay)))
             listener_pixel = int(mask.getpixel((lx, ly)))
+
+            # SAM2 can occasionally return a connected foreground region that
+            # spills across both people in a close two-person group photo.
+            # Preserve every already-valid mask unchanged. Only repair the
+            # invalid case where the listener point is still white by clipping
+            # the mask at the geometric midpoint between the mapped speakers.
+            # Use the axis with the greatest speaker separation so side-by-side
+            # and vertically arranged pairs are both deterministic.
+            if active_pixel == 255 and listener_pixel != 0:
+                dx = abs(ax - lx)
+                dy = abs(ay - ly)
+                if dx >= dy and ax != lx:
+                    split_x = max(0, min(width - 1, int(round((ax + lx) / 2.0))))
+                    if ax < lx:
+                        mask.paste(0, (split_x, 0, width, height))
+                    else:
+                        mask.paste(0, (0, 0, min(width, split_x + 1), height))
+                elif ay != ly:
+                    split_y = max(0, min(height - 1, int(round((ay + ly) / 2.0))))
+                    if ay < ly:
+                        mask.paste(0, (0, split_y, width, height))
+                    else:
+                        mask.paste(0, (0, 0, width, min(height, split_y + 1)))
+
+                active_pixel = int(mask.getpixel((ax, ay)))
+                listener_pixel = int(mask.getpixel((lx, ly)))
+                logger.info(
+                    "omnihuman.speaker_mask_listener_exclusion_repair "
+                    "active=(%s,%s) listener=(%s,%s) active_pixel=%s listener_pixel=%s",
+                    ax, ay, lx, ly, active_pixel, listener_pixel,
+                )
+
             hist = mask.histogram()
             total = int(hist[0]) + int(hist[255])
             occupancy = (float(hist[255]) / float(total)) if total else 0.0
