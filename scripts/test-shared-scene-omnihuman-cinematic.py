@@ -71,6 +71,9 @@ for marker in (
     '"apply_mask": False',
     "OMNIHUMAN_SPEAKER_MASK_ACTIVE_NOT_WHITE",
     "OMNIHUMAN_SPEAKER_MASK_LISTENER_NOT_BLACK",
+    "omnihuman.speaker_mask_listener_exclusion_repair",
+    "split_x",
+    "split_y",
 ):
     assert marker in adapter, marker
 
