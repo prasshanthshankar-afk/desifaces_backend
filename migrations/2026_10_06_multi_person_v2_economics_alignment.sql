@@ -303,7 +303,7 @@ ON CONFLICT (pricebook_id,sku_code) DO UPDATE SET
   max_qty=NULL,
   metadata_json=EXCLUDED.metadata_json;
 
-DO $
+DO $$
 DECLARE
   active_pricebooks integer;
   target_rows integer;
@@ -363,7 +363,7 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'multi-person active pricebook value certification failed';
   END IF;
-END $;
+END $$;
 
 -- ---------------------------------------------------------------------------
 -- Canonical multi-person COGS from DEV.
