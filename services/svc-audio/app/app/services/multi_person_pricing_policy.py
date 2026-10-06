@@ -39,7 +39,7 @@ def _multi_person_meta(meta: Any, *, count: int, units: Any = None) -> Dict[str,
             "participant_count": int(count),
             "participant_count_in_sku": False,
             "participant_scaling": "aggregate_natural_usage",
-            "pricing_policy": "multi_person_workload_v1",
+            "pricing_policy": "multi_person_workload_v2",
         }
     )
     return out
