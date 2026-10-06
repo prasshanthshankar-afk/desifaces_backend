@@ -82,6 +82,7 @@ for marker in (
     '"speaker_mask_strategy": "active_only"',
     '"lipsync_quality_mode": "strict"',
     '"background_motion_mode": "ambient"',
+    '"turbo_mode": True,',
     '"ambient_motion_plan": _ambient_motion_plan(context)',
     "Lip-sync is strict",
     "first audible speech phoneme",

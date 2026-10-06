@@ -143,6 +143,7 @@ def test_shared_scene_compiler_routes_frozen_omnihuman_provider():
     assert '"quality_tier": "premium"' in source
     assert '"longform_profile": "talking_video"' in source
     assert '"provider_hint": "omnihuman"' in source
+    assert '"turbo_mode": True' in source
     assert '"execution_provider_family": "omnihuman"' in source
     assert '"active_speaker_coordinates": active_coordinates' in source
     assert '"listener_speaker_coordinates": listener_coordinates' in source
