@@ -244,8 +244,11 @@ VALUES
   ('FUSION_MULTI_PERSON','FUSION_MULTI_PERSON','param',NULL,'minutes','{"pricing_policy":"multi_person_workload_v2"}'::jsonb);
 
 -- ---------------------------------------------------------------------------
--- Active web/mobile multi-person pricebook rows. Credits are canonical and
--- currency-neutral; money overrides remain NULL as in DEV.
+-- Active web/mobile multi-person pricebook rows. Every active customer
+-- pricebook must carry every multi-person target row, even when the underlying
+-- source SKU relies on its default credits and therefore has no source
+-- pricebook row. This is required for DEV/PROD catalog parity.
+-- Credits are canonical and currency-neutral; money overrides remain NULL.
 -- ---------------------------------------------------------------------------
 
 WITH target(sku_code,source_sku,credits,multiplier) AS (
@@ -254,13 +257,19 @@ WITH target(sku_code,source_sku,credits,multiplier) AS (
     ('FACE_MULTI_PERSON_I2I','FACE_EDIT_PREMIUM_RUN',56::bigint,1.20::numeric),
     ('AUDIO_MULTI_PERSON','AUDIO_TTS_1K_CHARS',16::bigint,1.00::numeric),
     ('FUSION_MULTI_PERSON','FUSION_TALK_MIN',1730::bigint,1.20::numeric)
+),
+active_customer_pricebooks AS (
+  SELECT id
+  FROM public.pricing_pricebooks
+  WHERE is_active=true
+    AND channel IN ('web','mobile')
 )
 INSERT INTO public.pricing_sku_prices (
   pricebook_id,sku_code,unit_credits_override,unit_money_override,
   min_qty,max_qty,metadata_json
 )
 SELECT
-  src.pricebook_id,
+  pb.id,
   t.sku_code,
   t.credits,
   NULL,
@@ -286,16 +295,75 @@ SELECT
       )
   END
 FROM target t
-JOIN public.pricing_sku_prices src ON src.sku_code=t.source_sku
-JOIN public.pricing_pricebooks pb ON pb.id=src.pricebook_id
-WHERE pb.is_active=true
-  AND pb.channel IN ('web','mobile')
+CROSS JOIN active_customer_pricebooks pb
 ON CONFLICT (pricebook_id,sku_code) DO UPDATE SET
   unit_credits_override=EXCLUDED.unit_credits_override,
   unit_money_override=NULL,
   min_qty=1,
   max_qty=NULL,
   metadata_json=EXCLUDED.metadata_json;
+
+DO $
+DECLARE
+  active_pricebooks integer;
+  target_rows integer;
+BEGIN
+  SELECT count(*) INTO active_pricebooks
+  FROM public.pricing_pricebooks
+  WHERE is_active=true
+    AND channel IN ('web','mobile');
+
+  SELECT count(*) INTO target_rows
+  FROM public.pricing_sku_prices sp
+  JOIN public.pricing_pricebooks pb ON pb.id=sp.pricebook_id
+  WHERE pb.is_active=true
+    AND pb.channel IN ('web','mobile')
+    AND sp.sku_code IN (
+      'FACE_MULTI_PERSON',
+      'FACE_MULTI_PERSON_I2I',
+      'AUDIO_MULTI_PERSON',
+      'FUSION_MULTI_PERSON'
+    );
+
+  IF target_rows <> active_pricebooks * 4 THEN
+    RAISE EXCEPTION
+      'multi-person pricebook coverage mismatch: expected %, got %',
+      active_pricebooks * 4, target_rows;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.pricing_sku_prices sp
+    JOIN public.pricing_pricebooks pb ON pb.id=sp.pricebook_id
+    WHERE pb.is_active=true
+      AND pb.channel IN ('web','mobile')
+      AND (
+        (sp.sku_code='FACE_MULTI_PERSON'
+         AND sp.unit_credits_override IS DISTINCT FROM 41)
+        OR
+        (sp.sku_code='FACE_MULTI_PERSON_I2I'
+         AND sp.unit_credits_override IS DISTINCT FROM 56)
+        OR
+        (sp.sku_code='AUDIO_MULTI_PERSON'
+         AND sp.unit_credits_override IS DISTINCT FROM 16)
+        OR
+        (sp.sku_code='FUSION_MULTI_PERSON'
+         AND sp.unit_credits_override IS DISTINCT FROM 1730)
+        OR
+        (
+          sp.sku_code IN (
+            'FACE_MULTI_PERSON',
+            'FACE_MULTI_PERSON_I2I',
+            'AUDIO_MULTI_PERSON',
+            'FUSION_MULTI_PERSON'
+          )
+          AND sp.unit_money_override IS NOT NULL
+        )
+      )
+  ) THEN
+    RAISE EXCEPTION 'multi-person active pricebook value certification failed';
+  END IF;
+END $;
 
 -- ---------------------------------------------------------------------------
 -- Canonical multi-person COGS from DEV.
