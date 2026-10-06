@@ -1,0 +1,61 @@
+name: Production OmniHuman Backend Cutover Certification
+
+on:
+  push:
+    branches:
+      - ops/prod-launch-omnihuman-20261006
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout ops branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Frozen runtime source proof
+        run: |
+          set -Eeuo pipefail
+          FROZEN="d96006947648dc8546135c00d5c90bccff99bf50"
+          git cat-file -e "$FROZEN^{commit}"
+          git diff --exit-code "$FROZEN"..HEAD --             services/svc-director             services/svc-fusion             services/svc-fusion-extension             migrations
+          echo FROZEN_RUNTIME_SOURCE_UNCHANGED=PASS
+
+      - name: Production deploy script syntax
+        run: |
+          set -Eeuo pipefail
+          S="scripts/ops/deploy-prod-omnihuman-group-conversation.sh"
+          test -s "$S"
+          bash -n "$S"
+          grep -Fq 'EXPECTED_HOST="desifaces-gpu"' "$S"
+          grep -Fq 'fal-ai/bytedance/omnihuman/v1.5' "$S"
+          grep -Fq 'DF_FUSION_WORKER_CONCURRENCY: "8"' "$S"
+          grep -Fq 'DF_OMNIHUMAN_TURBO_MODE: "0"' "$S"
+          grep -Fq 'DF_OMNIHUMAN_DIALOGUE_HEAD_PAD_MS: "300"' "$S"
+          grep -Fq 'DF_OMNIHUMAN_DIALOGUE_TAIL_PAD_MS: "400"' "$S"
+          grep -Fq 'DF_SHARED_SCENE_TRANSITION_SECONDS: "0.12"' "$S"
+          grep -Fq 'PROD_GROUP_PRICING_CONTRACT=PASS' "$S"
+          grep -Fq 'ACTIVE_WORK_GUARD=PASS' "$S"
+          grep -Fq 'PROD_WEB_PRESERVE_GUARD=PASS' "$S"
+          grep -Fq 'PROD_WEB_UNTOUCHED=PASS' "$S"
+          grep -Fq 'PROD_ROLLBACK=ATTEMPTED' "$S"
+          grep -Fq 'OMNIHUMAN GROUP CONVERSATION BACKEND PROD DEPLOY=PASS' "$S"
+          grep -Fq 'PRODUCTION_TOUCH=BACKEND_ONLY' "$S"
+          echo PROD_DEPLOY_SCRIPT_CONTRACT=PASS
+
+      - name: Frozen candidate contract markers
+        run: |
+          set -Eeuo pipefail
+          grep -Fq 'provider_name = "omnihuman"' services/svc-fusion/app/app/services/providers/omnihuman_adapter.py
+          grep -Fq 'omnihuman.speaker_mask_listener_exclusion_repair' services/svc-fusion/app/app/services/providers/omnihuman_adapter.py
+          grep -Fq 'Preserve the approved dialogue head verbatim' services/svc-fusion/app/app/services/providers/omnihuman_adapter.py
+          grep -Fq 'DF_FUSION_WORKER_CONCURRENCY' services/svc-fusion/app/app/workers/fusion_worker.py
+          grep -Fq 'asyncio.create_task' services/svc-fusion/app/app/workers/fusion_worker.py
+          grep -Fq 'mode == "shared_dialogue"' services/svc-fusion-extension/app/app/services/stitch_service.py
+          echo FROZEN_CANDIDATE_CONTRACT=PASS
