@@ -600,16 +600,19 @@ IFS='|' read -r PRICE_CREDITS PRICE_ROWS PRICE_CHANNELS COGS_RATE <<< "$LAUNCH_P
 [[ "$COGS_RATE" == "0.16000000" ]] || fail "production OmniHuman COGS missing"
 echo "PROD_GROUP_PRICING_CONTRACT=PASS"
 
-IDENTITY_MIGRATION_URL="https://raw.githubusercontent.com/$OWNER/$REPO/$BACKEND_SHA/migrations/2026_10_04_omnihuman_provider_identity.sql"
-COGS_MIGRATION_URL="https://raw.githubusercontent.com/$OWNER/$REPO/$BACKEND_SHA/migrations/2026_10_04_group_conversation_omnihuman_cogs.sql"
-
-curl -fsSL "$IDENTITY_MIGRATION_URL" |
-  docker exec -i "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME"   >/tmp/df-omnihuman-provider-identity.log
-echo "OMNIHUMAN_PROVIDER_IDENTITY_MIGRATION=PASS"
-
-curl -fsSL "$COGS_MIGRATION_URL" |
-  docker exec -i "$DB_C" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME"   >/tmp/df-omnihuman-cogs.log
-echo "OMNIHUMAN_COGS_MIGRATION=PASS"
+# DATA SAFETY GATE: application cutover is database-immutable.
+DB_CONTAINER_ID_BEFORE="$(docker inspect -f '{{.Id}}' "$DB_C")"
+DB_IMAGE_ID_BEFORE="$(docker inspect -f '{{.Image}}' "$DB_C")"
+DB_VOLUME_BEFORE="$(
+  docker inspect "$DB_C"     --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}'
+)"
+[[ -n "$DB_CONTAINER_ID_BEFORE" && -n "$DB_IMAGE_ID_BEFORE" && -n "$DB_VOLUME_BEFORE" ]]   || fail "unable to capture production DB identity"
+[[ "$DB_VOLUME_BEFORE" == "desifaces_df_pgdata" ]]   || fail "unexpected production PostgreSQL volume: $DB_VOLUME_BEFORE"
+if [[ " ${ACTIVE_SERVICES[*]} " == *" desifaces-db "* ]]; then
+  fail "database service entered application cutover set"
+fi
+echo "PROD_DB_PRESERVE_GUARD=PASS"
+echo "PROD_DB_MIGRATIONS_DURING_CUTOVER=NONE"
 
 PROD_WEB_ID_BEFORE="$(docker inspect -f '{{.Image}}' df-web-prod 2>/dev/null || true)"
 [[ -n "$PROD_WEB_ID_BEFORE" ]] || fail "production web container missing before backend cutover"
@@ -856,6 +859,18 @@ fi
 rm -f "${CONFIG_JSON_FILE:-}"
 rm -rf "${BUILD_ROOT:-}"
 trap - EXIT
+
+DB_CONTAINER_ID_AFTER="$(docker inspect -f '{{.Id}}' "$DB_C")"
+DB_IMAGE_ID_AFTER="$(docker inspect -f '{{.Image}}' "$DB_C")"
+DB_VOLUME_AFTER="$(
+  docker inspect "$DB_C"     --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}'
+)"
+[[ "$DB_CONTAINER_ID_AFTER" == "$DB_CONTAINER_ID_BEFORE" ]]   || fail "production database container changed during backend cutover"
+[[ "$DB_IMAGE_ID_AFTER" == "$DB_IMAGE_ID_BEFORE" ]]   || fail "production database image changed during backend cutover"
+[[ "$DB_VOLUME_AFTER" == "$DB_VOLUME_BEFORE" ]]   || fail "production database volume changed during backend cutover"
+echo "PROD_DB_CONTAINER_UNCHANGED=PASS"
+echo "PROD_DB_IMAGE_UNCHANGED=PASS"
+echo "PROD_DB_VOLUME_UNCHANGED=PASS"
 
 PROD_WEB_ID_AFTER="$(docker inspect -f '{{.Image}}' df-web-prod)"
 [[ "$PROD_WEB_ID_AFTER" == "$PROD_WEB_ID_BEFORE" ]] || fail "production web changed during backend cutover"
