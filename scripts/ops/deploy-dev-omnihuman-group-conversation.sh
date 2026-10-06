@@ -124,18 +124,29 @@ echo "MANAGED_COMPOSE_OVERLAY_RECOVERY=PASS"
 # deleted runtime overlay must never be the only place from which it can be
 # recovered.
 MODEL_ID="${DF_OMNIHUMAN_MODEL_ID:-${OMNIHUMAN_MODEL_ID:-}}"
+MODEL_SOURCE="caller"
 if [[ -z "$MODEL_ID" ]]; then
-  MODEL_ID="$(
-    docker inspect "${CONTAINER[svc-fusion]}" \
-      --format '{{range .Config.Env}}{{println .}}{{end}}' |
-    awk -F= '
-      $1=="DF_OMNIHUMAN_MODEL_ID" && length($2)>0 {print substr($0,index($0,"=")+1); exit}
-      $1=="FAL_OMNIHUMAN_MODEL_ID" && length($2)>0 {print substr($0,index($0,"=")+1); exit}
-    '
-  )"
+  MODEL_SOURCE=""
+  for svc in svc-fusion svc-fusion-worker; do
+    [[ -n "${CONTAINER[$svc]:-}" ]] || continue
+    candidate="$(
+      docker inspect "${CONTAINER[$svc]}" \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' |
+      awk -F= '
+        $1=="DF_OMNIHUMAN_MODEL_ID" && length($2)>0 {print substr($0,index($0,"=")+1); exit}
+        $1=="FAL_OMNIHUMAN_MODEL_ID" && length($2)>0 {print substr($0,index($0,"=")+1); exit}
+      '
+    )"
+    if [[ -n "$candidate" ]]; then
+      MODEL_ID="$candidate"
+      MODEL_SOURCE="$svc"
+      break
+    fi
+  done
 fi
-[[ -n "$MODEL_ID" ]] || fail "OmniHuman model config missing from caller and running DEV Fusion runtime"
+[[ -n "$MODEL_ID" ]] || fail "OmniHuman model config missing from caller, DEV Fusion API, and DEV Fusion worker"
 export DF_OMNIHUMAN_MODEL_ID="$MODEL_ID"
+echo "OMNIHUMAN_MODEL_SOURCE=${MODEL_SOURCE:-unknown}"
 echo "OMNIHUMAN_MODEL_CONFIGURATION=PASS"
 
 # Reuse the environment source that owns the currently running DEV compose
