@@ -54,7 +54,9 @@ jobs:
           grep -Fq '.desifaces-deploy/omnihuman-runtime.yml' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
           grep -Fq '.desifaces-deploy/omnihuman-images.yml' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
           grep -Fq 'recoverable_missing_managed_compose_overlay=' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
-          grep -Fq 'OmniHuman model config missing from caller and running DEV Fusion runtime' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
+          grep -Fq 'OmniHuman model config missing from caller, DEV Fusion API, and DEV Fusion worker' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
+          grep -Fq 'for svc in svc-fusion svc-fusion-worker' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
+          grep -Fq 'OMNIHUMAN_MODEL_SOURCE=' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
           grep -Fq '{"label": 1, "x": int(active[0]), "y": int(active[1])}' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
           grep -Fq '{"label": 0, "x": int(listener[0]), "y": int(listener[1])}' scripts/ops/deploy-dev-omnihuman-group-conversation.sh
           if grep -Fq 'assert "active, listener" in src' scripts/ops/deploy-dev-omnihuman-group-conversation.sh; then
