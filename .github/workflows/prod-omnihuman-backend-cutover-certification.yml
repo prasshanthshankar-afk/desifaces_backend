@@ -42,11 +42,20 @@ jobs:
           grep -Fq 'DF_SHARED_SCENE_TRANSITION_SECONDS: "0.12"' "$S"
           grep -Fq 'PROD_GROUP_PRICING_CONTRACT=PASS' "$S"
           grep -Fq 'ACTIVE_WORK_GUARD=PASS' "$S"
+          grep -Fq 'PROD_DB_PRESERVE_GUARD=PASS' "$S"
+          grep -Fq 'PROD_DB_MIGRATIONS_DURING_CUTOVER=NONE' "$S"
+          grep -Fq 'PROD_DB_CONTAINER_UNCHANGED=PASS' "$S"
+          grep -Fq 'PROD_DB_IMAGE_UNCHANGED=PASS' "$S"
+          grep -Fq 'PROD_DB_VOLUME_UNCHANGED=PASS' "$S"
           grep -Fq 'PROD_WEB_PRESERVE_GUARD=PASS' "$S"
           grep -Fq 'PROD_WEB_UNTOUCHED=PASS' "$S"
           grep -Fq 'PROD_ROLLBACK=ATTEMPTED' "$S"
           grep -Fq 'OMNIHUMAN GROUP CONVERSATION BACKEND PROD DEPLOY=PASS' "$S"
           grep -Fq 'PRODUCTION_TOUCH=BACKEND_ONLY' "$S"
+          if grep -Fq 'IDENTITY_MIGRATION_URL=' "$S" || grep -Fq 'COGS_MIGRATION_URL=' "$S"; then
+            echo 'FAIL: application cutover must not run DB migrations'
+            exit 1
+          fi
           echo PROD_DEPLOY_SCRIPT_CONTRACT=PASS
 
       - name: Frozen candidate contract markers
