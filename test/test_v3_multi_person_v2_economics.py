@@ -59,3 +59,14 @@ def test_multi_person_v2_migration_has_canonical_dev_economics() -> None:
         "'multi_person_workload_v2'",
     ):
         assert marker in source
+
+
+def test_multi_person_v2_migration_seeds_every_active_customer_pricebook() -> None:
+    source = (
+        ROOT / "migrations/2026_10_06_multi_person_v2_economics_alignment.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "active_customer_pricebooks AS" in source
+    assert "CROSS JOIN active_customer_pricebooks pb" in source
+    assert "target_rows <> active_pricebooks * 4" in source
+    assert "multi-person pricebook coverage mismatch" in source
