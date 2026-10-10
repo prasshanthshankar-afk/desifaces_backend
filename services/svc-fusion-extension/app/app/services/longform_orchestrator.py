@@ -591,6 +591,14 @@ def _economy_effective_duration_seconds(payload: Dict[str, Any], tags: Optional[
     return min(provider_limit, estimate_longform_duration_seconds(payload))
 
 
+def _talking_required_duration_seconds(payload: Dict[str, Any], tags: Optional[Dict[str, Any]] = None) -> int:
+    tags = tags or {}
+    requested = _requested_duration_hint_seconds(payload, tags)
+    audio = _safe_int(_effective_voice_audio_source(payload).get("duration_sec"), 0)
+    script = 0 if audio > 0 else _estimate_text_duration_seconds(_script_text_from_payload(payload))
+    return max(1, requested, audio, script)
+
+
 def _economy_segment_plan_seconds(total_duration_sec: Any, *, segment_limit_sec: int = 30) -> List[int]:
     total = max(1, _safe_int(total_duration_sec, 0))
     limit = max(10, _safe_int(segment_limit_sec, 30))
@@ -1094,6 +1102,7 @@ def build_longform_pricing_preview_spec(user_id: str, payload: Dict[str, Any]) -
             or requested_duration_sec
             or _economy_pricing_duration_seconds(payload, tags)
         )
+        requested_for_pricing = max(requested_for_pricing, _talking_required_duration_seconds(payload, tags))
 
         pricing_duration_sec = min(provider_limit_sec, max(1, requested_for_pricing))
         segmented = requested_for_pricing > provider_limit_sec
@@ -1361,6 +1370,7 @@ async def reserve_longform_pricing_for_job(conn, *, user_id: str, job_id: str, p
             or requested_duration_sec
             or _economy_pricing_duration_seconds(payload, tags)
         )
+        requested_for_pricing = max(requested_for_pricing, _talking_required_duration_seconds(payload, tags))
 
         pricing_duration_sec = min(provider_limit_sec, max(1, requested_for_pricing))
         segmented = requested_for_pricing > provider_limit_sec
@@ -2702,7 +2712,13 @@ def build_talking_video_segment_payloads(payload: Dict[str, Any]) -> Dict[str, A
             estimate_longform_duration_seconds(payload),
         )
     else:
-        total_duration_sec = _economy_effective_duration_seconds(payload, payload_tags)
+        # The provider cap limits each child, never the complete narration.
+        # Retain short-form buffer behavior, but plan every second of supplied
+        # audio or estimated script before creating provider-safe windows.
+        total_duration_sec = max(
+            _economy_effective_duration_seconds(payload, payload_tags),
+            _talking_required_duration_seconds(payload, payload_tags),
+        )
 
     provider_cap_sec = _single_segment_provider_cap_seconds(payload)
     segment_target_sec = min(provider_cap_sec, _safe_segment_seconds(payload))

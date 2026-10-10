@@ -94,24 +94,42 @@ for FILE in longform_orchestrator.py talking_video_finish.py; do
 done
 gh api "repos/prasshanthshankar-afk/desifaces_backend/contents/services/svc-fusion-extension/tests/test_talking_video_finish.py?ref=$SOURCE_SHA" --jq .content |
   base64 -d > "$STATE/test_talking_video_finish.py"
+gh api "repos/prasshanthshankar-afk/desifaces_backend/contents/services/svc-fusion-extension/tests/test_talking_video_full_audio_plan.py?ref=$SOURCE_SHA" --jq .content |
+  base64 -d > "$STATE/test_talking_video_full_audio_plan.py"
+gh api "repos/prasshanthshankar-afk/desifaces_backend/contents/services/svc-fusion-extension/app/app/services/longform_orchestrator.py?ref=8e3911ca7fa8bf08a97083e7a3302f51511e4061" --jq .content |
+  base64 -d > "$STATE/expected_original.py"
 python3 - "$STATE" "$EXPECTED_BASE" <<'PY'
-import hashlib, sys
+import ast, hashlib, sys
 from pathlib import Path
 p = Path(sys.argv[1])
 s = (p / 'longform_orchestrator.py').read_text()
-a = s.index('            if should_finish_single_person(tags, len(rows)):')
-b = s.index('            storage_path, signed_url = upload_final_mp4(final_local)', a)
-base = (s[:a] + s[b:]).replace('from app.services.talking_video_finish import finish_single_person_video, should_finish_single_person\n', '')
-assert hashlib.sha256((base.rstrip()+'\n').encode()).hexdigest() == sys.argv[2], 'candidate changes outside approved scope'
+original = (p / 'expected_original.py').read_text()
+assert hashlib.sha256(original.encode()).hexdigest() == sys.argv[2], 'baseline mismatch'
+allowed = {'stitch_if_ready', '_talking_required_duration_seconds', 'build_talking_video_segment_payloads',
+           'build_longform_pricing_preview_spec', 'reserve_longform_pricing_for_job'}
+def unchanged_nodes(source):
+    nodes = []
+    for node in ast.parse(source).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in allowed:
+            continue
+        if isinstance(node, ast.ImportFrom) and node.module == 'app.services.talking_video_finish':
+            continue
+        nodes.append(ast.dump(node, include_attributes=False))
+    return nodes
+assert unchanged_nodes(original) == unchanged_nodes(s), 'candidate changes outside approved scope'
 t = (p / 'test_talking_video_finish.py').read_text().replace(
     'MODULE = Path(__file__).parents[1] / "app/app/services/talking_video_finish.py"',
     'MODULE = Path("/app/app/services/talking_video_finish.py")')
 (p / 'runtime_test.py').write_text(t)
+plan_test = (p / 'test_talking_video_full_audio_plan.py').read_text().replace(
+    'SOURCE = Path(__file__).parents[1] / "app/app/services/longform_orchestrator.py"',
+    'SOURCE = Path("/app/app/services/longform_orchestrator.py")')
+(p / 'runtime_plan_test.py').write_text(plan_test)
 print('SOURCE_MUTATION_BOUNDARY=PASS')
 PY
 
 mkdir -p "$STATE/build"
-cp "$STATE/longform_orchestrator.py" "$STATE/talking_video_finish.py" "$STATE/runtime_test.py" "$STATE/build/"
+cp "$STATE/longform_orchestrator.py" "$STATE/talking_video_finish.py" "$STATE/runtime_test.py" "$STATE/runtime_plan_test.py" "$STATE/build/"
 for I in "${!CONTAINERS[@]}"; do
   C="${CONTAINERS[$I]}"
   IMAGE_ID="$(docker inspect -f '{{.Image}}' "$C")"
@@ -121,10 +139,13 @@ for I in "${!CONTAINERS[@]}"; do
 FROM $BASE_TAG
 COPY longform_orchestrator.py talking_video_finish.py /app/app/services/
 COPY runtime_test.py /opt/desifaces-ending-certification.py
+COPY runtime_plan_test.py /opt/desifaces-full-audio-certification.py
 EOF
   docker build -t "desifaces-ending-${SERVICES[$I]}:$SOURCE_SHA" "$STATE/build"
   docker run --rm --network none --entrypoint python \
     "desifaces-ending-${SERVICES[$I]}:$SOURCE_SHA" /opt/desifaces-ending-certification.py
+  docker run --rm --network none --entrypoint python \
+    "desifaces-ending-${SERVICES[$I]}:$SOURCE_SHA" /opt/desifaces-full-audio-certification.py
 done
 
 python3 - "$STATE" "$SOURCE_SHA" <<'PY'

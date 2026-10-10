@@ -20,7 +20,18 @@ jobs:
       - name: Install media tools
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Speech preservation, closing pause, billing and isolation tests
-        run: python services/svc-fusion-extension/tests/test_talking_video_finish.py
+        run: |
+          python services/svc-fusion-extension/tests/test_talking_video_finish.py
+          python services/svc-fusion-extension/tests/test_talking_video_full_audio_plan.py
+      - name: Debian FFmpeg 7 runtime compatibility
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work:ro" -w /work python:3.11-slim bash -ec '
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends ffmpeg
+            ffmpeg -version | head -n 1
+            python services/svc-fusion-extension/tests/test_talking_video_finish.py
+            python services/svc-fusion-extension/tests/test_talking_video_full_audio_plan.py
+          '
       - name: Compile modified service modules
         run: python -m py_compile services/svc-fusion-extension/app/app/services/talking_video_finish.py services/svc-fusion-extension/app/app/services/longform_orchestrator.py
       - name: DEV deployment script syntax
