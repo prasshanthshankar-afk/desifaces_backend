@@ -57,8 +57,10 @@ def finish_single_person_video(video_path: str, audio_path: str, output_path: st
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-i", video_path, "-i", audio_path,
         "-filter_complex",
-        "[0:v:0]setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop=-1[v];"
-        "[1:a:0]asetpts=PTS-STARTPTS,apad[a]",
+        # FFmpeg 7 can expose an unknown input frame rate to tpad. Normalize it
+        # explicitly so the finite closing hold has a valid frame time base.
+        f"[0:v:0]fps=30,setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={output_duration - video_duration:.9f}[v];"
+        f"[1:a:0]asetpts=PTS-STARTPTS,apad=pad_dur={output_duration - audio_duration:.9f}[a]",
         "-map", "[v]", "-map", "[a]", "-t", f"{output_duration:.9f}",
         "-c:v", "libx264", "-preset", "superfast", "-crf", "18",
         "-threads", "2", "-pix_fmt", "yuv420p",
