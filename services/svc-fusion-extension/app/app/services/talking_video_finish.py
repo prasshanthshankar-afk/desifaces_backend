@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -53,14 +54,32 @@ def finish_single_person_video(video_path: str, audio_path: str, output_path: st
     output_duration = max(video_duration, audio_duration) + closing_pause
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     # No audio fade, speed change, speech trimming, or use of provider audio.
-    subprocess.run([
+    with tempfile.TemporaryDirectory(prefix="talking-finish-") as folder:
+        frame = str(Path(folder) / "last.png")
+        tail = str(Path(folder) / "tail.mp4")
+        # Decode only the final second; reverse selects the actual last frame.
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-sseof", "-1", "-i", video_path, "-an", "-vf", "reverse",
+            "-frames:v", "1", "-update", "1", frame,
+        ], capture_output=True, text=True, check=True, timeout=60)
+        # Materialize a finite closing clip instead of relying on tpad, whose
+        # EOF behavior differs on the deployed Debian FFmpeg 7 build.
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-loop", "1", "-framerate", "30", "-i", frame,
+            "-t", f"{output_duration - video_duration:.9f}", "-an",
+            "-c:v", "libx264", "-preset", "superfast", "-crf", "18",
+            "-threads", "2", "-pix_fmt", "yuv420p", tail,
+        ], capture_output=True, text=True, check=True, timeout=60)
+        subprocess.run([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", video_path, "-i", audio_path,
+        "-i", video_path, "-i", tail, "-i", audio_path,
         "-filter_complex",
-        # FFmpeg 7 can expose an unknown input frame rate to tpad. Normalize it
-        # explicitly so the finite closing hold has a valid frame time base.
-        f"[0:v:0]fps=30,setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={output_duration - video_duration:.9f}[v];"
-        f"[1:a:0]asetpts=PTS-STARTPTS,apad=pad_dur={output_duration - audio_duration:.9f}[a]",
+        "[0:v:0]fps=30,setpts=PTS-STARTPTS[v0];"
+        "[1:v:0]fps=30,setpts=PTS-STARTPTS[v1];"
+        "[v0][v1]concat=n=2:v=1:a=0[v];"
+        f"[2:a:0]asetpts=PTS-STARTPTS,apad=pad_dur={output_duration - audio_duration:.9f}[a]",
         "-map", "[v]", "-map", "[a]", "-t", f"{output_duration:.9f}",
         "-c:v", "libx264", "-preset", "superfast", "-crf", "18",
         "-threads", "2", "-pix_fmt", "yuv420p",
