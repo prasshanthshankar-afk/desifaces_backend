@@ -71,6 +71,7 @@ from app.domain.models import (
 from app.repos.longform_jobs_repo import LongformJobsRepo
 from app.repos.longform_segments_repo import LongformSegmentsRepo
 from app.services.stitch_service import compose_timeline, download_to_local, probe_duration_seconds, upload_final_mp4
+from app.services.talking_video_finish import finish_single_person_video, should_finish_single_person
 from app.services.premium_actual_seconds_pricing import (
     PREMIUM_ACTUAL_SECONDS_ACTION,
     PREMIUM_ACTUAL_SECONDS_SKU,
@@ -3258,6 +3259,24 @@ async def stitch_if_ready(
                 aspect_ratio=aspect_ratio,
                 overlay_meta=overlay_meta or {},
             )
+            if should_finish_single_person(tags, len(rows)):
+                source_audio_url = _safe_str(tags.get("voice_audio_url")) or _safe_str(
+                    _as_dict_loose(tags.get("selected_audio")).get("audio_url")
+                )
+                if not source_audio_url:
+                    raise RuntimeError("TALKING_FINISH_SOURCE_AUDIO_MISSING")
+                original_audio = os.path.join(td, "original_audio")
+                async with httpx.AsyncClient(timeout=300) as client:
+                    audio_response = await client.get(source_audio_url)
+                    audio_response.raise_for_status()
+                    with open(original_audio, "wb") as audio_file:
+                        audio_file.write(audio_response.content)
+                finished_local = os.path.join(td, "finished.mp4")
+                finish_receipt = finish_single_person_video(final_local, original_audio, finished_local)
+                final_local = finished_local
+                await jobs.merge_tags(conn, job_id, {"single_person_finish": finish_receipt})
+                # Keep provider-generation billing duration unchanged: the quiet
+                # closing hold is local post-processing, not a paid generation.
             storage_path, signed_url = upload_final_mp4(final_local)
             await jobs.set_final(conn, job_id, storage_path, signed_url)
             refreshed_job_row = await jobs.get_job(conn, job_id)
@@ -3321,3 +3340,4 @@ async def stitch_if_ready(
             context={"job_id": str(job_id), "user_id": str(_safe_str(job_row.get("user_id")) or ""), "event_type": "FUSION_FAILED", "reason": "finalization_failed"},
         )
         raise
+

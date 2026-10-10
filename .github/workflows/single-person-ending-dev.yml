@@ -1,0 +1,25 @@
+name: Single-person ending DEV certification
+
+on:
+  push:
+    branches: [codex/single-person-ending-dev-20261010]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install media tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Speech preservation, closing pause, billing and isolation tests
+        run: python services/svc-fusion-extension/tests/test_talking_video_finish.py
+      - name: Compile modified service modules
+        run: python -m py_compile services/svc-fusion-extension/app/app/services/talking_video_finish.py services/svc-fusion-extension/app/app/services/longform_orchestrator.py
