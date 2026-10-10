@@ -8,7 +8,7 @@ ROOT=/home/azureuser/workspace/desifaces-runtime
 STATE="$ROOT/.desifaces-deploy/single-person-ending-$SOURCE_SHA"
 mkdir -p "$STATE"
 EXPECTED_BASE=1d353d705863759ca821c9cde73c67daf0ad0a9b3766329f55f4faf2644475e6
-SERVICES=(svc-fusion-extension svc-fusion-extension-worker svc-fusion-extension-stitch-worker)
+SERVICES=()
 CONTAINERS=(df-svc-fusion-extension df-svc-fusion-extension-worker df-svc-fusion-extension-stitch-worker)
 
 for C in "${CONTAINERS[@]}"; do
@@ -22,6 +22,10 @@ print(hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest())
   [[ "$(cat "$STATE/$C.source-sha")" == "$EXPECTED_BASE" ]] || {
     echo "FAIL: unexpected live source in $C; nothing deployed"; exit 1;
   }
+  SERVICE="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$C")"
+  [[ "$SERVICE" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "FAIL: Compose service label missing: $C"; exit 1; }
+  SERVICES+=("$SERVICE")
+  echo "compose_service[$C]=$SERVICE"
 done
 
 PROJECT="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' df-svc-fusion-extension)"
@@ -33,7 +37,7 @@ ENV_FILE="$ROOT/infra/.env"
 # Preserve the existing model setting required when rendering the base compose.
 DF_OMNIHUMAN_MODEL_ID="$(docker exec df-svc-fusion printenv DF_OMNIHUMAN_MODEL_ID)"
 export DF_OMNIHUMAN_MODEL_ID
-COMPOSE=(docker compose --env-file "$ENV_FILE" -p "$PROJECT" --project-directory "$ROOT")
+COMPOSE=(docker compose --profile '*' --env-file "$ENV_FILE" -p "$PROJECT" --project-directory "$ROOT")
 for F in "${COMPOSE_FILES[@]}"; do
   [[ -f "$F" ]] || { echo "FAIL: active compose file missing: $F"; exit 1; }
   COMPOSE+=(-f "$F")
@@ -47,11 +51,13 @@ import json, shlex, sys
 from pathlib import Path
 state = Path(sys.argv[1])
 config = json.loads((state / 'compose-before.json').read_text())
-names = ['svc-fusion-extension', 'svc-fusion-extension-worker', 'svc-fusion-extension-stitch-worker']
+containers = ['df-svc-fusion-extension', 'df-svc-fusion-extension-worker', 'df-svc-fusion-extension-stitch-worker']
 def args(value):
     return shlex.split(value) if isinstance(value, str) else (value or [])
-for name in names:
-    live = json.loads((state / ('df-' + name + '.inspect.json')).read_text())[0]
+for container in containers:
+    live = json.loads((state / (container + '.inspect.json')).read_text())[0]
+    name = live['Config']['Labels']['com.docker.compose.service']
+    assert name in config['services'], 'active service missing from resolved Compose: ' + name
     wanted = config['services'][name]
     current_env = dict(item.split('=', 1) for item in live['Config']['Env'])
     assert all(str(value) == current_env.get(key) for key, value in wanted.get('environment', {}).items()), 'environment drift: ' + name
@@ -125,10 +131,11 @@ python3 - "$STATE" "$SOURCE_SHA" <<'PY'
 import json, sys
 from pathlib import Path
 p, sha = Path(sys.argv[1]), sys.argv[2]
-names = ['svc-fusion-extension', 'svc-fusion-extension-worker', 'svc-fusion-extension-stitch-worker']
+containers = ['df-svc-fusion-extension', 'df-svc-fusion-extension-worker', 'df-svc-fusion-extension-stitch-worker']
 candidate, rollback = {}, {}
-for name in names:
-    current = json.loads((p / ('df-' + name + '.inspect.json')).read_text())[0]
+for container in containers:
+    current = json.loads((p / (container + '.inspect.json')).read_text())[0]
+    name = current['Config']['Labels']['com.docker.compose.service']
     candidate[name] = {'image': f'desifaces-ending-{name}:{sha}'}
     rollback[name] = {'image': current['Image']}
 (p / 'candidate.json').write_text(json.dumps({'services': candidate}))
@@ -152,7 +159,7 @@ PY
 [[ "$(idle)" == 0 ]] || { echo 'FAIL: active longform work; candidates built, no runtime changed'; exit 1; }
 rollback(){
   if [[ "${CUTOVER_STARTED:-0}" == 0 ]]; then
-    "${COMPOSE[@]}" start svc-fusion-extension
+    "${COMPOSE[@]}" start "${SERVICES[0]}"
     return
   fi
   echo 'Rolling back Fusion Extension containers to their exact previous images'
@@ -161,7 +168,7 @@ rollback(){
 CUTOVER_STARTED=0
 trap 'CODE=$?; trap - ERR; rollback || true; exit "$CODE"' ERR
 # Pause creation first, then recheck the queue before stopping workers.
-"${COMPOSE[@]}" stop svc-fusion-extension
+"${COMPOSE[@]}" stop "${SERVICES[0]}"
 # The stopped API cannot run SQL: use the still-running stitch worker instead.
 ACTIVE="$(docker exec df-svc-fusion-extension-stitch-worker python -c '
 import asyncio, os, asyncpg
@@ -175,7 +182,7 @@ asyncio.run(main())
 ')"
 [[ "$ACTIVE" == 0 ]]
 CUTOVER_STARTED=1
-"${COMPOSE[@]}" stop svc-fusion-extension-worker svc-fusion-extension-stitch-worker
+"${COMPOSE[@]}" stop "${SERVICES[1]}" "${SERVICES[2]}"
 "${COMPOSE[@]}" -f "$STATE/candidate.json" up -d --no-deps --no-build --pull never --force-recreate "${SERVICES[@]}"
 for C in "${CONTAINERS[@]}"; do
   docker exec "$C" python -c '
