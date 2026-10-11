@@ -218,7 +218,20 @@ asyncio.run(main())
 CUTOVER_STARTED=1
 "${COMPOSE[@]}" stop "${SERVICES[1]}" "${SERVICES[2]}"
 "${COMPOSE[@]}" -f "$STATE/candidate.json" up -d --no-deps --no-build --pull never --force-recreate "${SERVICES[@]}"
-for C in "${CONTAINERS[@]}"; do
+ORCHESTRATOR_SHA="$(sha256sum "$STATE/longform_orchestrator.py" | cut -d ' ' -f1)"
+FINISH_SHA="$(sha256sum "$STATE/talking_video_finish.py" | cut -d ' ' -f1)"
+for I in "${!CONTAINERS[@]}"; do
+  C="${CONTAINERS[$I]}"
+  EXPECTED_IMAGE="$(docker image inspect -f '{{.Id}}' "desifaces-ending-${SERVICES[$I]}:$SOURCE_SHA")"
+  [[ "$(docker inspect -f '{{.Image}}' "$C")" == "$EXPECTED_IMAGE" ]]
+  docker exec "$C" python -c '
+import hashlib, sys
+from pathlib import Path
+from app.services import longform_orchestrator, talking_video_finish
+assert hashlib.sha256(Path(longform_orchestrator.__file__).read_bytes()).hexdigest() == sys.argv[1]
+assert hashlib.sha256(Path(talking_video_finish.__file__).read_bytes()).hexdigest() == sys.argv[2]
+print("RUNTIME_SOURCE_AND_IMAGE=PASS")
+' "$ORCHESTRATOR_SHA" "$FINISH_SHA"
   docker exec "$C" python -c '
 import inspect
 from app.services.longform_orchestrator import stitch_if_ready
@@ -239,5 +252,8 @@ done
 trap - ERR
 echo 'SINGLE_PERSON_ENDING_PROD_DEPLOY=PASS'
 echo 'PRODUCTION_RUNTIME_CERTIFICATION=PASS'
+echo "deployed_source_commit=$SOURCE_SHA"
+echo "orchestrator_sha256=$ORCHESTRATOR_SHA"
+echo "finish_sha256=$FINISH_SHA"
 echo 'GENERATED_VIDEO_COMPLETENESS=AWAITING_JOB_VERIFICATION'
 echo "rollback_overlay=$STATE/rollback.json"
