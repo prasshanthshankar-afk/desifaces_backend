@@ -34,7 +34,9 @@ jobs:
           '
       - name: Compile modified service modules
         run: python -m py_compile services/svc-fusion-extension/app/app/services/talking_video_finish.py services/svc-fusion-extension/app/app/services/longform_orchestrator.py
-      - name: DEV deployment script syntax
+      - name: DEV and PROD deployment contracts
         run: |
           bash -n scripts/ops/deploy-single-person-ending-dev.sh
+          bash -n scripts/ops/deploy-single-person-ending-prod.sh
+          python -m py_compile scripts/ops/verify-talking-video-completeness.py
           python services/svc-fusion-extension/tests/test_ending_deploy_contract.py

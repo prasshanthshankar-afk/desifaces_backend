@@ -11,6 +11,7 @@ SCRIPT = Path(__file__).parents[3] / "scripts/ops/deploy-single-person-ending-de
 
 
 class DeploymentContractTest(unittest.TestCase):
+    script = SCRIPT
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -34,7 +35,7 @@ class DeploymentContractTest(unittest.TestCase):
         (self.root / "compose-before.json").write_text(json.dumps(self.config))
 
     def run_block(self, marker):
-        blocks = re.findall(r"<<'PY'\n(.*?)\nPY", SCRIPT.read_text(), re.S)
+        blocks = re.findall(r"<<'PY'\n(.*?)\nPY", self.script.read_text(), re.S)
         block = next(b for b in blocks if marker in b)
         return subprocess.run([sys.executable, "-", str(self.root), "a" * 40],
                               input=block, text=True, capture_output=True)
@@ -55,10 +56,22 @@ class DeploymentContractTest(unittest.TestCase):
         self.assertIn("environment drift", result.stderr)
 
     def test_all_profiles_are_rendered_and_stop_uses_resolved_names(self):
-        source = SCRIPT.read_text()
+        source = self.script.read_text()
         self.assertIn("docker compose --profile '*'", source)
         self.assertIn('stop "${SERVICES[1]}" "${SERVICES[2]}"', source)
         self.assertNotIn("stop svc-fusion-extension-worker", source)
+
+
+class ProductionDeploymentContractTest(DeploymentContractTest):
+    script = SCRIPT.with_name("deploy-single-person-ending-prod.sh")
+
+    def test_production_guard_and_configuration_match_are_required(self):
+        source = self.script.read_text()
+        self.assertIn('"$(hostname -s)" == "desifaces-gpu"', source)
+        self.assertIn('com.docker.compose.project.working_dir', source)
+        self.assertIn('verify_configuration > "$STATE/config-check.log"', source)
+        self.assertLess(source.index('[[ -n "$ENV_FILE" ]]'), source.index('docker build'))
+        self.assertIn('GENERATED_VIDEO_COMPLETENESS=AWAITING_JOB_VERIFICATION', source)
 
 
 if __name__ == "__main__":
