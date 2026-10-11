@@ -2,7 +2,16 @@ name: Single-person ending DEV certification
 
 on:
   push:
-    branches: [codex/single-person-ending-dev-20261010]
+    branches: [codex/single-person-ending-dev-20261010, main]
+    paths:
+      - services/svc-fusion-extension/app/app/services/longform_orchestrator.py
+      - services/svc-fusion-extension/app/app/services/talking_video_finish.py
+      - services/svc-fusion-extension/tests/test_talking_video*.py
+      - services/svc-fusion-extension/tests/test_ending_deploy_contract.py
+      - scripts/ops/deploy-single-person-ending-*.sh
+      - scripts/ops/verify-talking-video-completeness.py
+      - scripts/ops/bundles/desifaces-ending-prod-offline.sh
+      - .github/workflows/single-person-ending-dev.yml
   workflow_dispatch:
 
 permissions:
@@ -38,5 +47,6 @@ jobs:
         run: |
           bash -n scripts/ops/deploy-single-person-ending-dev.sh
           bash -n scripts/ops/deploy-single-person-ending-prod.sh
+          bash scripts/ops/bundles/desifaces-ending-prod-offline.sh --verify
           python -m py_compile scripts/ops/verify-talking-video-completeness.py
           python services/svc-fusion-extension/tests/test_ending_deploy_contract.py
