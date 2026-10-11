@@ -71,6 +71,7 @@ from app.domain.models import (
 from app.repos.longform_jobs_repo import LongformJobsRepo
 from app.repos.longform_segments_repo import LongformSegmentsRepo
 from app.services.stitch_service import compose_timeline, download_to_local, probe_duration_seconds, upload_final_mp4
+from app.services.talking_video_finish import finish_single_person_video, should_finish_single_person
 from app.services.premium_actual_seconds_pricing import (
     PREMIUM_ACTUAL_SECONDS_ACTION,
     PREMIUM_ACTUAL_SECONDS_SKU,
@@ -590,6 +591,14 @@ def _economy_effective_duration_seconds(payload: Dict[str, Any], tags: Optional[
     return min(provider_limit, estimate_longform_duration_seconds(payload))
 
 
+def _talking_required_duration_seconds(payload: Dict[str, Any], tags: Optional[Dict[str, Any]] = None) -> int:
+    tags = tags or {}
+    requested = _requested_duration_hint_seconds(payload, tags)
+    audio = _safe_int(_effective_voice_audio_source(payload).get("duration_sec"), 0)
+    script = 0 if audio > 0 else _estimate_text_duration_seconds(_script_text_from_payload(payload))
+    return max(1, requested, audio, script)
+
+
 def _economy_segment_plan_seconds(total_duration_sec: Any, *, segment_limit_sec: int = 30) -> List[int]:
     total = max(1, _safe_int(total_duration_sec, 0))
     limit = max(10, _safe_int(segment_limit_sec, 30))
@@ -1093,6 +1102,7 @@ def build_longform_pricing_preview_spec(user_id: str, payload: Dict[str, Any]) -
             or requested_duration_sec
             or _economy_pricing_duration_seconds(payload, tags)
         )
+        requested_for_pricing = max(requested_for_pricing, _talking_required_duration_seconds(payload, tags))
 
         pricing_duration_sec = min(provider_limit_sec, max(1, requested_for_pricing))
         segmented = requested_for_pricing > provider_limit_sec
@@ -1360,6 +1370,7 @@ async def reserve_longform_pricing_for_job(conn, *, user_id: str, job_id: str, p
             or requested_duration_sec
             or _economy_pricing_duration_seconds(payload, tags)
         )
+        requested_for_pricing = max(requested_for_pricing, _talking_required_duration_seconds(payload, tags))
 
         pricing_duration_sec = min(provider_limit_sec, max(1, requested_for_pricing))
         segmented = requested_for_pricing > provider_limit_sec
@@ -2701,7 +2712,13 @@ def build_talking_video_segment_payloads(payload: Dict[str, Any]) -> Dict[str, A
             estimate_longform_duration_seconds(payload),
         )
     else:
-        total_duration_sec = _economy_effective_duration_seconds(payload, payload_tags)
+        # The provider cap limits each child, never the complete narration.
+        # Retain short-form buffer behavior, but plan every second of supplied
+        # audio or estimated script before creating provider-safe windows.
+        total_duration_sec = max(
+            _economy_effective_duration_seconds(payload, payload_tags),
+            _talking_required_duration_seconds(payload, payload_tags),
+        )
 
     provider_cap_sec = _single_segment_provider_cap_seconds(payload)
     segment_target_sec = min(provider_cap_sec, _safe_segment_seconds(payload))
@@ -3258,6 +3275,24 @@ async def stitch_if_ready(
                 aspect_ratio=aspect_ratio,
                 overlay_meta=overlay_meta or {},
             )
+            if should_finish_single_person(tags, len(rows)):
+                source_audio_url = _safe_str(tags.get("voice_audio_url")) or _safe_str(
+                    _as_dict_loose(tags.get("selected_audio")).get("audio_url")
+                )
+                if not source_audio_url:
+                    raise RuntimeError("TALKING_FINISH_SOURCE_AUDIO_MISSING")
+                original_audio = os.path.join(td, "original_audio")
+                async with httpx.AsyncClient(timeout=300) as client:
+                    audio_response = await client.get(source_audio_url)
+                    audio_response.raise_for_status()
+                    with open(original_audio, "wb") as audio_file:
+                        audio_file.write(audio_response.content)
+                finished_local = os.path.join(td, "finished.mp4")
+                finish_receipt = finish_single_person_video(final_local, original_audio, finished_local)
+                final_local = finished_local
+                await jobs.merge_tags(conn, job_id, {"single_person_finish": finish_receipt})
+                # Keep provider-generation billing duration unchanged: the quiet
+                # closing hold is local post-processing, not a paid generation.
             storage_path, signed_url = upload_final_mp4(final_local)
             await jobs.set_final(conn, job_id, storage_path, signed_url)
             refreshed_job_row = await jobs.get_job(conn, job_id)
@@ -3321,3 +3356,4 @@ async def stitch_if_ready(
             context={"job_id": str(job_id), "user_id": str(_safe_str(job_row.get("user_id")) or ""), "event_type": "FUSION_FAILED", "reason": "finalization_failed"},
         )
         raise
+
