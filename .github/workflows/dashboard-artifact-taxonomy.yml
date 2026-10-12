@@ -1,0 +1,28 @@
+name: dashboard-artifact-taxonomy
+on:
+  push:
+    branches: [codex/group-artifact-parity-20261012]
+  pull_request:
+    paths:
+      - services/svc-dashboard/**
+      - scripts/*dashboard*taxonomy*.py
+      - scripts/ops/build-dashboard-taxonomy-patch.py
+permissions:
+  contents: read
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Category, reuse identity, canonical final and patch preservation
+        run: |
+          set -Eeuo pipefail
+          python scripts/test-dashboard-artifact-taxonomy.py
+          python scripts/test-dashboard-canonical-final-taxonomy.py
+          python scripts/test-dashboard-taxonomy-patch.py
+          python -m py_compile services/svc-dashboard/app/app/services/dashboard_service.py services/svc-dashboard/app/app/services/final_video_visibility.py

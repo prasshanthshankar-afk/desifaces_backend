@@ -139,7 +139,7 @@ async def _fetch_canonical_v3_final_items(pool: Any, user_id: str) -> List[Dict[
     """
     from app.settings import settings
     from app.services.blob_sas_service import AzureBlobSasSigner
-    from app.services.dashboard_service import _normalize_library_item
+    from app.services.dashboard_service import _normalize_library_item, _attach_canonical_asset_lineage
 
     sql = r'''
     select
@@ -235,6 +235,13 @@ async def _fetch_canonical_v3_final_items(pool: Any, user_id: str) -> List[Dict[
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, user_id)
+            candidates = [dict(row) for row in rows]
+            try:
+                candidates = await _attach_canonical_asset_lineage(conn, candidates)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception('Canonical final classification unavailable')
+            rows = candidates
     except Exception:
         # Dashboard availability must not depend on V3 tables being present in an
         # older environment. Existing final-only behavior remains intact.
