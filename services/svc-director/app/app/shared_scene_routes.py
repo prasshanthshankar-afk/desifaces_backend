@@ -198,7 +198,6 @@ async def set_shared_scene_draft(
                 from public.media_assets
                 where id=$1 and user_id=$2
                   and (account_id is null or account_id=$3)
-                  and (project_id is null or project_id=$4)
                   and kind in ('image','source_image','face_image','face_source_image')
                   and lifecycle_state='active'
                 for update
@@ -206,7 +205,6 @@ async def set_shared_scene_draft(
                 body.shared_scene_media_id,
                 auth.user_id,
                 auth.account_id,
-                stage["project_id"],
             )
             if not media:
                 raise HTTPException(status_code=422, detail="shared_scene_media_not_owned_active_face_image")
@@ -335,7 +333,6 @@ async def set_shared_scene_conversation(
                 from public.media_assets
                 where id=$1 and user_id=$2
                   and (account_id is null or account_id=$3)
-                  and (project_id is null or project_id=$4)
                   and kind in ('image','source_image','face_image','face_source_image')
                   and lifecycle_state='active'
                 for update
@@ -343,7 +340,6 @@ async def set_shared_scene_conversation(
                 body.shared_scene_media_id,
                 auth.user_id,
                 auth.account_id,
-                stage["project_id"],
             )
             if not media:
                 raise HTTPException(
@@ -409,8 +405,9 @@ async def set_shared_scene_conversation(
             # propagation may be user-owned and fully validated while these two
             # columns are NULL. Adopt only missing lineage here, where the
             # authenticated account and workflow project are authoritative.
-            # Existing non-NULL lineage is never overwritten; mismatches are
-            # rejected by the SELECT predicate above.
+            # Existing non-NULL lineage is never overwritten. A saved photo
+            # may be reused by its owner in another project in the same account;
+            # project_id records its origin, not the current conversation.
             await conn.execute(
                 """
                 update public.media_assets
@@ -632,3 +629,4 @@ __all__ = [
     "SharedSceneSpeakerTarget",
     "router",
 ]
+

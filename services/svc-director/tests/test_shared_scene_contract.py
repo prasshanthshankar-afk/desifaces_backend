@@ -90,7 +90,7 @@ def test_shared_scene_adopts_only_missing_media_lineage():
     ).read_text(encoding="utf-8")
 
     assert "and (account_id is null or account_id=$3)" in source
-    assert "and (project_id is null or project_id=$4)" in source
+    assert "and (project_id is null or project_id=$4)" not in source
     assert "set account_id=coalesce(account_id,$2)" in source
     assert "project_id=coalesce(project_id,$3)" in source
     assert "for update" in source
@@ -263,3 +263,4 @@ def test_shared_scene_ambient_motion_respects_uploaded_source_fidelity():
     assert "This is a user-uploaded source photo" in compiler
     assert "animate only people and environmental elements already visible" in compiler
     assert "Do not invent new background people, objects, signage, architecture, or scenery." in compiler
+
