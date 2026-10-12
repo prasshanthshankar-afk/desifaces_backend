@@ -162,8 +162,8 @@ async def get_canonical_audio_output(
         if existing:
             if existing["account_id"] and UUID(str(existing["account_id"])) != account.account_id:
                 raise HTTPException(status_code=409, detail="audio_canonical_media_account_mismatch")
-            if existing["project_id"] and UUID(str(existing["project_id"])) != project_id:
-                raise HTTPException(status_code=409, detail="audio_canonical_media_project_mismatch")
+            # The original project is provenance. Owned audio may be reused in
+            # another project in the same account without recreating the audio.
             await conn.execute(
                 """
                 update public.media_assets
@@ -280,3 +280,4 @@ async def get_audio_media_read_url(
         raise HTTPException(status_code=503, detail="audio_read_url_unavailable") from exc
 
     return AudioReadUrlView(media_id=media_id, read_url=read_url)
+
