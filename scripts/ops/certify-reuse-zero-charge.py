@@ -8,6 +8,7 @@ from uuid import UUID
 import asyncpg
 import httpx
 from app.config import settings
+from app.db import open_business_pool
 from app.security import DirectorAuthContext
 from app.shared_scene_routes import SharedSceneDraftIn, SharedSceneConversationIn, set_shared_scene_draft, set_shared_scene_conversation
 from app.shared_scene_state_routes import load_shared_scene_state
@@ -49,7 +50,8 @@ async def financial_snapshot(conn,user_id):
 
 
 async def main():
-    c=await asyncpg.connect(settings.DATABASE_URL.replace('postgresql+asyncpg://','postgresql://'),timeout=10,server_settings={'statement_timeout':'15000'})
+    application_pool=await open_business_pool()
+    c=await application_pool.acquire()
     transaction=c.transaction(isolation='repeatable_read')
     await transaction.start()
     original_http=httpx.AsyncClient.request
@@ -103,7 +105,8 @@ async def main():
     finally:
         httpx.AsyncClient.request=original_http
         await transaction.rollback()
-        await c.close()
+        await application_pool.release(c)
+        await application_pool.close()
         print('DEVELOPMENT_PROOF_TRANSACTION=ROLLED_BACK')
 
 
