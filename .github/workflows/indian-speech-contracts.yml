@@ -1,13 +1,19 @@
 name: Indian speech candidate contracts
 on:
   push:
-    branches: [codex/indian-speech-dev-20261013]
+    branches: [codex/indian-speech-dev-20261013, main]
     paths:
       - services/svc-audio/**
       - services/shared/llm/gender_translation.py
       - services/svc-director/app/app/llm.py
       - migrations/2026_10_13_indian_speech_provider_preference.sql
       - .github/workflows/indian-speech-contracts.yml
+  pull_request:
+    paths:
+      - services/svc-audio/**
+      - services/shared/llm/gender_translation.py
+      - services/svc-director/app/app/llm.py
+      - migrations/2026_10_13_indian_speech_provider_preference.sql
 permissions:
   contents: read
 jobs:
@@ -25,5 +31,6 @@ jobs:
           PYTHONPATH: services/svc-audio/app:services/shared/llm
         run: |
           python services/svc-audio/tests/test_natural_speech_translation.py
+          python services/svc-audio/tests/test_sarvam_style_compatibility.py
           python -m pytest -q services/svc-audio/tests/test_global_audio_catalog.py services/svc-audio/tests/test_tts_model_resolver.py services/svc-audio/tests/test_tts_voice_resolver.py services/svc-audio/tests/test_tts_resolution_planner.py services/svc-audio/tests/test_tts_provider_registry.py services/svc-audio/tests/test_tts_provider_executor.py services/svc-audio/tests/test_sarvam_tts_adapter.py services/svc-audio/tests/test_elevenlabs_tts_adapter.py
           python -m compileall -q services/svc-audio/app/app services/shared/llm/gender_translation.py services/svc-director/app/app/llm.py

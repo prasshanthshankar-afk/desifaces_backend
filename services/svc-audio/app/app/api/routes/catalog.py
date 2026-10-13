@@ -342,7 +342,16 @@ async def list_voices(
               vl.locale AS locale,
               v.gender,
               v.voice_type,
-              v.is_default,
+              CASE WHEN {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")} = 0
+                THEN row_number() OVER (
+                  PARTITION BY v.gender
+                  ORDER BY {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")},
+                    CASE WHEN {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")} = 0
+                      THEN vl.selection_priority ELSE 0 END DESC,
+                    v.is_default DESC, vl.is_recommended DESC,
+                    COALESCE(vl.quality_score, 0) DESC, v.voice_name ASC
+                ) = 1
+                ELSE v.is_default END AS is_default,
               v.supports_styles,
               v.meta_json
             FROM public.tts_voices v
@@ -357,6 +366,8 @@ async def list_voices(
             WHERE {executable_model_for_voice}
             ORDER BY
               {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")},
+              CASE WHEN {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")} = 0
+                THEN vl.selection_priority ELSE 0 END DESC,
               v.is_default DESC,
               vl.is_recommended DESC,
               COALESCE(vl.quality_score, 0) DESC,
