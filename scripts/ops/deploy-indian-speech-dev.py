@@ -89,7 +89,7 @@ def main():
     bundle = json.loads((ROOT/'indian-speech-bundle.json').read_text())
     assert bundle['source_sha'] == sha
     stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
-    receipt_dir = Path('/home/azureuser/workspace/desifaces-runtime/.desifaces-deploy') / ('indian-speech-'+sha)
+    receipt_dir = Path('/home/azureuser/workspace/desifaces-runtime/.desifaces-deploy') / ('indian-speech-'+sha+'-'+stamp)
     receipt_dir.mkdir(parents=True, exist_ok=False)
     receipt_dir.chmod(0o700)
     original = {name: engine.inspect(name) for name in TARGETS}
