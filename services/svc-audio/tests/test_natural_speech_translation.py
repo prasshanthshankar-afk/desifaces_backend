@@ -2,6 +2,7 @@
 import asyncio
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -9,7 +10,13 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'shared' / 'llm'))
-import gender_translation as translation
+if os.getenv('DF_TRANSLATION_TEST_MODULE'):
+    spec = importlib.util.spec_from_file_location('gender_translation', os.environ['DF_TRANSLATION_TEST_MODULE'])
+    translation = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = translation
+    spec.loader.exec_module(translation)
+else:
+    import gender_translation as translation
 
 
 class Response:
