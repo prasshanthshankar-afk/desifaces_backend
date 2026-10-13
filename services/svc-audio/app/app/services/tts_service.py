@@ -430,7 +430,7 @@ class TTSService:
                     translated = await translate_with_gender(
                         text=text,
                         source_language=in_lang,
-                        target_language=target_lang,
+                        target_language=target_locale,
                         speaker_gender=resolved_speaker_gender,
                         tone=normalized_tone,
                     )
@@ -546,3 +546,4 @@ class TTSService:
             provider_result.extension,
             meta,
         )
+

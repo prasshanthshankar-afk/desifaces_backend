@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, List, Optional
 if TYPE_CHECKING:
     import asyncpg
 
+from app.services.tts_routing_preference import provider_preference_rank_sql
+
 
 @dataclass(frozen=True)
 class TTSRoutingPolicy:
@@ -134,8 +136,9 @@ class TTSCatalogRepository:
         require_approved_capability: bool,
         require_approved_quality: bool,
     ) -> List[TTSModelCandidate]:
+        preference = provider_preference_rank_sql(provider_expr="p.provider_code", language_expr="r.language_code")
         rows = await self.pool.fetch(
-            """
+            f"""
             WITH req AS (
                 SELECT
                     locale,
@@ -147,6 +150,7 @@ class TTSCatalogRepository:
             SELECT DISTINCT
                 p.provider_code,
                 p.adapter_key,
+                {preference} AS provider_preference_rank,
 
                 m.model_code,
                 m.provider_model_id,
@@ -282,6 +286,7 @@ class TTSCatalogRepository:
                   )
 
             ORDER BY
+                provider_preference_rank,
                 quality_score DESC NULLS LAST,
                 capability_rank,
                 p.provider_code,
@@ -491,3 +496,4 @@ class TTSCatalogRepository:
             )
 
         return result
+

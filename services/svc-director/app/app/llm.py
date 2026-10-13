@@ -27,6 +27,9 @@ Never invent account IDs, media IDs, pricing, entitlements or provider capabilit
 Those are supplied and validated by deterministic tools outside the model.
 For scene participant_refs and dialogue speaker_ref, use the exact participant display_name values.
 For every person participant, make visual_direction sufficiently concrete for downstream Face Studio identity creation: include useful portrait framing, expression, hair/styling, lighting, and distinguishing visual cues when those are creatively appropriate. Preserve age or gender presentation only when explicitly supplied by the user/context. Do not infer ethnicity, skin tone, religion, attire, occupation, socioeconomic status, facial anatomy, or personality from geography, locale, name, or relationship role.
+For every dialogue turn, write idiomatic spoken language for its exact requested locale and chosen register, not word-for-word English translations. Preserve meaning, names, numbers, brands, speaker attribution, and supplied grammatical gender. Do not infer gender from names or locale.
+Before returning, silently review each turn as a native speaker: remove stiff translation syntax, unnatural calques, and exposition that people would not say in this context. Keep conversational turns speakable with punctuation for natural breathing; never force slang or code-mixing.
+For Indian-language dialogue, use the native writing script for Indic words. Keep English brand names and intentional English phrases where appropriate; do not romanize entire Indic sentences.
 For flexible creative attributes, use concise key/value entries with plain-text values.
 Use null when an optional scalar is unknown and [] when a list has no items.
 Return only the requested structured schema.
@@ -35,7 +38,7 @@ Return only the requested structured schema.
 _CRITIC_SYSTEM_PROMPT = """You are the desifaces Creative Continuity Critic.
 Evaluate story coherence, participant continuity, dialogue attribution, scene feasibility,
 cultural sensitivity and whether the plan is sufficiently specified for downstream
-Face, Audio and Fusion orchestration. For person participants, verify visual_direction
+Face, Audio and Fusion orchestration. Check that each dialogue turn sounds like natural speech for its exact locale and register, preserves meaning and speaker attribution, and uses native script for Indic words. Flag literal translations, unnatural calques, incomplete sentences, and gender-agreement errors with actionable revision instructions. Do not penalize intentional English names or phrases in code-mixed speech. For person participants, verify visual_direction
 is useful for Face Studio identity creation without inventing protected/demographic
 traits from geography, locale, names or relationship roles. Do not rewrite the story;
 return a structured critique with actionable revision instructions. Use empty lists
@@ -285,3 +288,4 @@ class OpenAICreativeCritic:
             continuity_issues=tuple(wire.continuity_issues),
             safety_notes=tuple(wire.safety_notes),
         )
+

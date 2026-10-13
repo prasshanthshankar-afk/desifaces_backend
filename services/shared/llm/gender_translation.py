@@ -122,6 +122,12 @@ Requirements:
 - Do not introduce gender where the target language or sentence does not require it.
 - Preserve brand names, domain names, URLs, handles, numbers, product names,
   acronyms, and proper nouns exactly where appropriate.
+- Write idiomatic spoken language for the exact target locale and the requested tone,
+  rather than word-for-word translation. Do not force slang, code-mixing, or formality.
+- Silently check the draft as a native speaker before returning: fix unnatural calques,
+  stiff sentence order, and grammatical gender agreement without adding new claims.
+- Use native script for Indic words; preserve intentional English brands and phrases.
+- Use clear sentence punctuation for natural breathing. Preserve all dialogue.
 - Keep the result natural for speech synthesis.
 - Do not provide explanations, notes, labels, alternatives, transliterations,
   quotation marks, or markdown.
@@ -140,7 +146,7 @@ Requirements:
         "model": model,
         "instructions": instructions,
         "input": json.dumps(request_input, ensure_ascii=False),
-        "max_output_tokens": 500,
+        "max_output_tokens": min(16384, max(1000, len(str(text or "")) * 2)),
     }
 
     headers = {
@@ -232,6 +238,10 @@ Requirements:
                         break
 
                     if provider == "openai_responses":
+                        if payload.get("status") == "incomplete":
+                            raise GenderTranslationError(
+                                "translation_output_incomplete", retryable=False
+                            )
                         raw_text = _extract_output_text(payload)
                     else:
                         choices = payload.get("choices") or []
@@ -246,6 +256,12 @@ Requirements:
                             else ""
                         )
 
+                    if provider == "openai_chat_completions" and (
+                        choices and choices[0].get("finish_reason") == "length"
+                    ):
+                        raise GenderTranslationError(
+                            "translation_output_incomplete", retryable=False
+                        )
                     translated = _clean_translation(raw_text)
 
                     if translated:
@@ -312,3 +328,4 @@ Requirements:
         "gender translation failed without a provider response",
         retryable=True,
     )
+

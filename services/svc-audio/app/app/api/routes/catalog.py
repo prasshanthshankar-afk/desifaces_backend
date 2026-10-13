@@ -6,6 +6,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.db import get_pool
+from app.services.tts_routing_preference import provider_preference_rank_sql
 
 router = APIRouter(prefix="/api/audio/catalog", tags=["audio-catalog"])
 
@@ -186,6 +187,7 @@ async def list_locales(
                  AND vl.is_approved = TRUE
                 WHERE {executable_model_for_voice}
                 ORDER BY
+                  {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")},
                   v.is_default DESC,
                   vl.is_recommended DESC,
                   COALESCE(vl.quality_score, 0) DESC,
@@ -354,6 +356,7 @@ async def list_voices(
              AND l.is_enabled = TRUE
             WHERE {executable_model_for_voice}
             ORDER BY
+              {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")},
               v.is_default DESC,
               vl.is_recommended DESC,
               COALESCE(vl.quality_score, 0) DESC,
@@ -363,3 +366,4 @@ async def list_voices(
         )
 
     return {"items": [dict(r) for r in rows]}
+

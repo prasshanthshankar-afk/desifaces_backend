@@ -1,0 +1,29 @@
+name: Indian speech candidate contracts
+on:
+  push:
+    branches: [codex/indian-speech-dev-20261013]
+    paths:
+      - services/svc-audio/**
+      - services/shared/llm/gender_translation.py
+      - services/svc-director/app/app/llm.py
+      - migrations/2026_10_13_indian_speech_provider_preference.sql
+      - .github/workflows/indian-speech-contracts.yml
+permissions:
+  contents: read
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install httpx pytest asyncpg fastapi
+      - name: Natural speech, truncation, voice routing and adapter contracts
+        env:
+          PYTHONPATH: services/svc-audio/app:services/shared/llm
+        run: |
+          python services/svc-audio/tests/test_natural_speech_translation.py
+          python -m pytest -q services/svc-audio/tests/test_global_audio_catalog.py services/svc-audio/tests/test_tts_model_resolver.py services/svc-audio/tests/test_tts_voice_resolver.py services/svc-audio/tests/test_tts_resolution_planner.py services/svc-audio/tests/test_tts_provider_registry.py services/svc-audio/tests/test_tts_provider_executor.py services/svc-audio/tests/test_sarvam_tts_adapter.py services/svc-audio/tests/test_elevenlabs_tts_adapter.py
+          python -m compileall -q services/svc-audio/app/app services/shared/llm/gender_translation.py services/svc-director/app/app/llm.py
