@@ -24,7 +24,8 @@ from app.services.tts_resolution_planner import (
 )
 from app.services.tts_provider_executor import TTSProviderExecutor
 from app.services.tts_provider_adapter import TTSProviderAdapterError
-from gender_translation import (
+from app.services.tts_intent_policy import relax_native_style_only_for_eligible_sarvam_voice
+from app.services.gender_translation import (
     GenderTranslationError,
     normalize_gender,
     translate_with_gender,
@@ -170,6 +171,57 @@ class TTSService:
             "https://api.cognitive.microsofttranslator.com",
         ).strip()
 
+    async def _is_explicit_sarvam_voice_eligible(
+        self,
+        *,
+        voice: Optional[str],
+        target_locale: str,
+    ) -> bool:
+        requested_voice = str(voice or "").strip()
+        if not requested_voice:
+            return False
+
+        locale = _normalize_speech_locale(target_locale)
+
+        try:
+            value = await self.pool.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM public.tts_voices v
+                    JOIN public.tts_voice_model_capabilities vm
+                      ON vm.voice_id = v.id
+                     AND vm.provider_code = v.provider
+                     AND vm.is_enabled = true
+                     AND vm.is_approved = true
+                    JOIN public.tts_voice_locale_capabilities vl
+                      ON vl.voice_id = v.id
+                     AND vl.locale = $2
+                     AND vl.is_enabled = true
+                     AND vl.is_approved = true
+                    JOIN public.tts_provider_models m
+                      ON m.provider_code = vm.provider_code
+                     AND m.model_code = vm.model_code
+                     AND m.is_enabled = true
+                     AND m.routing_enabled = true
+                    JOIN public.tts_providers p
+                      ON p.provider_code = vm.provider_code
+                     AND p.is_enabled = true
+                     AND p.routing_enabled = true
+                    WHERE v.provider = 'sarvam'
+                      AND m.model_code = 'bulbul_v3'
+                      AND lower(v.voice_name) = lower($1)
+                )
+                """,
+                requested_voice,
+                locale,
+            )
+            return bool(value)
+        except Exception:
+            # Fail closed: if eligibility cannot be proven, preserve the
+            # pre-existing provider-native style requirement.
+            return False
+
     async def translate_text(self, *, text: str, to_lang: str) -> str:
         """
         Translator:
@@ -279,6 +331,7 @@ class TTSService:
         voice_gender: Optional[str] = None,
         voice_locale: Optional[str] = None,
         translation_tone: Optional[str] = "neutral",
+        context: Optional[str] = None,
     ) -> Tuple[bytes, str, str, str, str, Dict[str, Any]]:
         """Synthesize speech and return audio plus resolved translation metadata.
 
@@ -303,6 +356,22 @@ class TTSService:
         else:
             planner_gender = None
 
+        sarvam_voice_eligible = False
+        if style and voice:
+            sarvam_voice_eligible = (
+                await self._is_explicit_sarvam_voice_eligible(
+                    voice=voice,
+                    target_locale=target_locale,
+                )
+            )
+
+        requires_style = bool(style)
+        if relax_native_style_only_for_eligible_sarvam_voice(
+            style,
+            sarvam_voice_eligible=sarvam_voice_eligible,
+        ):
+            requires_style = False
+
         try:
             resolution_plan = (
                 await self.resolution_planner.resolve(
@@ -316,7 +385,7 @@ class TTSService:
                         ),
                         requested_voice=voice,
                         requested_gender=planner_gender,
-                        requires_style=bool(style),
+                        requires_style=requires_style,
                         requires_emotion=bool(emotion),
                     )
                 )
@@ -418,6 +487,7 @@ class TTSService:
 
         translation_provider: Optional[str] = None
         translation_model: Optional[str] = None
+        native_speech_reviewed = False
         in_lang = _base_lang(input_language)
 
         if _should_translate(
@@ -430,9 +500,11 @@ class TTSService:
                     translated = await translate_with_gender(
                         text=text,
                         source_language=in_lang,
-                        target_language=target_lang,
+                        target_language=target_locale,
                         speaker_gender=resolved_speaker_gender,
                         tone=normalized_tone,
+                        dialogue_context=context,
+                        native_review=resolution_plan.provider_code == "sarvam",
                     )
                 except GenderTranslationError as exc:
                     if getattr(exc, "retryable", False):
@@ -446,6 +518,7 @@ class TTSService:
                 final_text = translated.text
                 translation_provider = translated.provider
                 translation_model = translated.model
+                native_speech_reviewed = translated.native_reviewed
             else:
                 # Existing Azure Translator v3 path remains available for
                 # neutral/unspecified requests and backward-compatible clients.
@@ -467,6 +540,8 @@ class TTSService:
             base_meta["translation_provider"] = translation_provider
         if translation_model:
             base_meta["translation_model"] = translation_model
+            if native_speech_reviewed:
+                base_meta["native_speech_reviewed"] = True
 
         def result_meta(output_value: str, *, style_retried: bool = False) -> Dict[str, Any]:
             meta = dict(base_meta)
@@ -546,3 +621,4 @@ class TTSService:
             provider_result.extension,
             meta,
         )
+

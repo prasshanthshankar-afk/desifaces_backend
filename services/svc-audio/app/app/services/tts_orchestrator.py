@@ -1618,6 +1618,7 @@ class TTSOrchestrator:
                 voice_gender=payload.get("voice_gender"),
                 voice_locale=payload.get("voice_locale"),
                 translation_tone=payload.get("translation_tone") or "neutral",
+                context=payload.get("context"),
             )
 
             upload = await self.storage.upload_bytes(

@@ -6,6 +6,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.db import get_pool
+from app.services.tts_routing_preference import provider_preference_rank_sql
 
 router = APIRouter(prefix="/api/audio/catalog", tags=["audio-catalog"])
 
@@ -186,6 +187,7 @@ async def list_locales(
                  AND vl.is_approved = TRUE
                 WHERE {executable_model_for_voice}
                 ORDER BY
+                  {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")},
                   v.is_default DESC,
                   vl.is_recommended DESC,
                   COALESCE(vl.quality_score, 0) DESC,
@@ -340,7 +342,16 @@ async def list_voices(
               vl.locale AS locale,
               v.gender,
               v.voice_type,
-              v.is_default,
+              CASE WHEN {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")} = 0
+                THEN row_number() OVER (
+                  PARTITION BY v.gender
+                  ORDER BY {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")},
+                    CASE WHEN {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")} = 0
+                      THEN vl.selection_priority ELSE 0 END DESC,
+                    v.is_default DESC, vl.is_recommended DESC,
+                    COALESCE(vl.quality_score, 0) DESC, v.voice_name ASC
+                ) = 1
+                ELSE v.is_default END AS is_default,
               v.supports_styles,
               v.meta_json
             FROM public.tts_voices v
@@ -354,6 +365,9 @@ async def list_voices(
              AND l.is_enabled = TRUE
             WHERE {executable_model_for_voice}
             ORDER BY
+              {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")},
+              CASE WHEN {provider_preference_rank_sql(provider_expr="v.provider", language_expr="l.language_code")} = 0
+                THEN vl.selection_priority ELSE 0 END DESC,
               v.is_default DESC,
               vl.is_recommended DESC,
               COALESCE(vl.quality_score, 0) DESC,
@@ -363,3 +377,4 @@ async def list_voices(
         )
 
     return {"items": [dict(r) for r in rows]}
+
