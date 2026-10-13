@@ -20,6 +20,9 @@ COPY services/shared/python/desifaces_shared /app/desifaces_shared
 COPY services/shared/llm /app/desifaces_shared/llm
 COPY services/shared/df_contracts /app/df_contracts
 COPY services/svc-audio/app/app /app/app
+# Own the execution helper in the image; legacy shared-volume imports must not
+# silently override the certified translation implementation.
+COPY services/shared/llm/gender_translation.py /app/app/services/gender_translation.py
 
 EXPOSE 8004
 

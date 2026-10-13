@@ -25,7 +25,7 @@ from app.services.tts_resolution_planner import (
 from app.services.tts_provider_executor import TTSProviderExecutor
 from app.services.tts_provider_adapter import TTSProviderAdapterError
 from app.services.tts_intent_policy import relax_native_style_only_for_eligible_sarvam_voice
-from gender_translation import (
+from app.services.gender_translation import (
     GenderTranslationError,
     normalize_gender,
     translate_with_gender,
