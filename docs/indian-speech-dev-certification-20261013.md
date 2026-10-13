@@ -83,13 +83,35 @@ Final reviewed Tamil and Bengali speech transcribed verbatim; Hindi differences 
 QA samples were 3.840–7.765 seconds. Catalog access was read-only; no customer jobs, assets, reservations or billing writes were made by synthesis QA.
 Automated transcription and linguistic checks do not certify subjective pronunciation, accent or prosody across all ten languages.
 
-## Remaining quality gates
+## Quality conclusions and production boundary
 
 1. Broader native-speaker listening remains useful for pronunciation and prosody; automated real samples and linguistic review passed for the tested Hindi/Tamil/Bengali cases.
 2. Contextual translation is active and passed real-workflow, actual-model and regression checks.
-3. Compare mouth motion against the exact padded provider audio; waveform correlation compares audio with audio, not phonemes with mouth movement.
-4. Treat pause-aware shorter clips as an experiment if that measurement shows a benefit. No 5–8-second segmentation change is included here.
+3. The six-clip visual assessment completed against the exact prepared provider audio. Numerical results below show a small residual estimate; a perfect lip-sync pass is not claimed.
+4. These clips show no clear accumulating drift and do not justify blanket 5–8-second segmentation. A timing correction or shorter-clip comparison would require a separate validated experiment. No segmentation or global timing shift is included here.
 5. Promote validated source through main before any production deployment. Approved/reused audio must never be silently rewritten; revisions continue to require a new priced generation.
 
 Visual assessment run: https://github.com/prasshanthshankar-afk/desifaces_web/actions/runs/38445849863
-The isolated six-clip speaking-face evaluation remains in progress; no visual-sync pass is claimed yet.
+The isolated CPU assessment completed successfully using official SyncNet source pinned at `907c0b579c2e2d83f0eae1b2ac9e720cde4e5623`.
+Weights SHA-256: SyncNet `961e8696f888fce4f3f3a6c3d5b3267cf5b343100b238e79b2659bff2c605442`; S3FD `d54a87c2b7543b64729c9a25eafd188da15fd3f6e02f0ecec76ae1b30d86c491`.
+The reference offset changed by exactly five frames when audio was delayed 200 ms, confirming the measurement's relative response and sign.
+This validates the offset test, not an absolute zero-offset ground truth.
+
+## Exact prepared audio and visual measurements
+
+| Turn | Active speaker | Prepared audio → render audio lag | Speaking-face offset estimate | First/last estimate | SyncNet confidence |
+|---|---|---|---|---|---|
+| 1 | Speaker 1, left | 0 ms | −40 ms | −40 / −80 ms | 8.230 |
+| 2 | Speaker 2, right | 0 ms | −80 ms | −40 / −80 ms | 7.139 |
+| 3 | Speaker 1, left | 0 ms | −40 ms | 0 / −40 ms | 8.199 |
+| 4 | Speaker 2, right | 0 ms | −80 ms | −80 / −80 ms | 7.974 |
+| 5 | Speaker 1, left | 0 ms | −40 ms | 0 / −80 ms | 5.852 |
+| 6 | Speaker 2, right | 0 ms | −40 ms | −40 / −80 ms | 7.537 |
+
+Audio-envelope lag was measured at 10 ms resolution; correlations rounded to 1.0000 in every clip.
+Both faces were tracked separately: active faces gave strong matching scores, while listener scores were 0.168–0.721 for whole clips.
+Visual estimates use 25 fps / 40 ms steps. Negative values correspond to later audio under the synthetic-delay control; they are model estimates, not perceptual certification.
+The 300 ms source lead-in exists in the actual prepared Fal audio, and the rendered audio matches that prepared timeline. It is not an additional remux delay.
+First/last windows show no clear accumulating long-video drift. A small 40–80 ms residual estimate remains, so perfect synchronization is not claimed.
+Production services, media and approved audio were read only; all computation ran on the isolated CI runner.
+No production rollout, audio rewrite, segmentation change or global timing shift was performed.
