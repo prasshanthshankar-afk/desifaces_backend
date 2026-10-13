@@ -22,6 +22,8 @@ ORIGINAL = {
     '/app/app/services/tts_service.py': {'11398fe64ee167b49c2ff664af27bb5944ef462f5cef8bf11c92c4789ac68939', 'd9b678c902e9e67d82d153df4243e0c5f8604dc75697c78410d89c732ef2b41d'},
     '/app/app/llm.py': {'8bd0124450fa0f4336ade658af63e92265abda82cb065c91b454ef375e247d54'},
     '/app/services/shared/llm/gender_translation.py': {'a7260025abc17112117ad73a7fc8ea94e777412605aa9dd445e9c54fe7322b15'},
+    '/app/app/services/multi_person_pricing_policy.py': {'4ae8a3609f6bcdfbf84be49b2323ff1f67c3594288476a6d3973f0fbcfd5cc22'},
+    '/app/desifaces_shared/pricing/multi_person.py': {'ad2b7a333c4f371a2f44cd6dd6d95b9fb475b7589e22baf1bbf62f556bb910be'},
 }
 
 
@@ -105,6 +107,7 @@ def main():
         for name, obj in original.items():
             is_audio = name.startswith('df-svc-audio')
             files = bundle['audio'] if is_audio else bundle['director']
+            files = [item for item in files if not item.get('only_containers') or name in item['only_containers']]
             replacements = {item['destination'] for item in files}
             for change in subprocess.check_output(['docker','diff',name], text=True).splitlines():
                 if '.py' in change and not '.pyc' in change:

@@ -36,7 +36,7 @@ WITH eligible_languages AS (
   WHERE mlng.provider_code='sarvam' AND mlng.is_enabled AND mlng.is_approved
     AND m.is_enabled AND m.routing_enabled AND mlng.language_code <> 'en'
 ), preferences AS (
-  SELECT jsonb_object_agg(language_code,'sarvam') AS value FROM eligible_languages
+  SELECT jsonb_object_agg(language_code,'sarvam'::text) AS value FROM eligible_languages
 )
 UPDATE public.tts_routing_policies rp
 SET meta_json=coalesce(rp.meta_json,'{}'::jsonb) || jsonb_build_object(
