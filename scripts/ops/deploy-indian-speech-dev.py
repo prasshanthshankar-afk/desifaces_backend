@@ -21,6 +21,7 @@ ORIGINAL = {
     '/app/app/api/routes/catalog.py': {'437624ce13a87b1b5b6752c08b5dff7867d2e7c67e51cf53d558ef86a417aeca'},
     '/app/app/services/tts_service.py': {'11398fe64ee167b49c2ff664af27bb5944ef462f5cef8bf11c92c4789ac68939', 'd9b678c902e9e67d82d153df4243e0c5f8604dc75697c78410d89c732ef2b41d'},
     '/app/app/llm.py': {'8bd0124450fa0f4336ade658af63e92265abda82cb065c91b454ef375e247d54'},
+    '/app/services/shared/llm/gender_translation.py': {'a7260025abc17112117ad73a7fc8ea94e777412605aa9dd445e9c54fe7322b15'},
 }
 
 
@@ -104,6 +105,11 @@ def main():
         for name, obj in original.items():
             is_audio = name.startswith('df-svc-audio')
             files = bundle['audio'] if is_audio else bundle['director']
+            replacements = {item['destination'] for item in files}
+            for change in subprocess.check_output(['docker','diff',name], text=True).splitlines():
+                if '.py' in change and not '.pyc' in change:
+                    changed_path = change[2:]
+                    assert changed_path in replacements, name+' has an unpreserved runtime source overlay: '+changed_path
             root = work/name
             root.mkdir()
             baseline = 'desifaces-speech-baseline-'+name+':'+stamp
