@@ -487,6 +487,7 @@ class TTSService:
 
         translation_provider: Optional[str] = None
         translation_model: Optional[str] = None
+        native_speech_reviewed = False
         in_lang = _base_lang(input_language)
 
         if _should_translate(
@@ -503,6 +504,7 @@ class TTSService:
                         speaker_gender=resolved_speaker_gender,
                         tone=normalized_tone,
                         dialogue_context=context,
+                        native_review=resolution_plan.provider_code == "sarvam",
                     )
                 except GenderTranslationError as exc:
                     if getattr(exc, "retryable", False):
@@ -516,6 +518,7 @@ class TTSService:
                 final_text = translated.text
                 translation_provider = translated.provider
                 translation_model = translated.model
+                native_speech_reviewed = translated.native_reviewed
             else:
                 # Existing Azure Translator v3 path remains available for
                 # neutral/unspecified requests and backward-compatible clients.
@@ -537,6 +540,8 @@ class TTSService:
             base_meta["translation_provider"] = translation_provider
         if translation_model:
             base_meta["translation_model"] = translation_model
+            if native_speech_reviewed:
+                base_meta["native_speech_reviewed"] = True
 
         def result_meta(output_value: str, *, style_retried: bool = False) -> Dict[str, Any]:
             meta = dict(base_meta)

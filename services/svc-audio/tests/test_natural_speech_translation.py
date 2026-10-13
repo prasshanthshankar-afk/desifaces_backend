@@ -42,13 +42,13 @@ class Client:
 
 
 class TranslationTests(unittest.IsolatedAsyncioTestCase):
-    async def call(self, responses, text='Welcome to desifaces', tone='informal', dialogue_context=None):
+    async def call(self, responses, text='Welcome to desifaces', tone='informal', dialogue_context=None, native_review=False, target_language='hi-IN'):
         self.client = Client(responses)
         with patch.dict('os.environ', {'OPENAI_API_KEY': 'unit-test-not-a-key'}), \
              patch.object(translation.httpx, 'AsyncClient', return_value=self.client), \
              patch.object(translation.asyncio, 'sleep', return_value=None):
             return await translation.translate_with_gender(text=text, source_language='en',
-                target_language='hi-IN', speaker_gender='female', tone=tone, dialogue_context=dialogue_context)
+                target_language=target_language, speaker_gender='female', tone=tone, dialogue_context=dialogue_context, native_review=native_review)
 
     async def test_complete_native_script_preserves_text_and_locale(self):
         expected = 'desifaces में आपका स्वागत है।'
@@ -101,6 +101,33 @@ class TranslationTests(unittest.IsolatedAsyncioTestCase):
     async def test_context_is_bounded_before_model_request(self):
         await self.call([Response({'status':'completed','output_text':'हाँ।'})], dialogue_context='x'*5000)
         self.assertEqual(len(json.loads(self.client.calls[0][1]['input'])['dialogue_context']),1400)
+
+    async def test_native_review_corrects_malformed_word_before_returning_speech_text(self):
+        draft='ஆம், நான் அவைகளைப் பார்த்தேன்ம்.'
+        corrected='ஆம், நான் அவற்றைப் பார்த்தேன்.'
+        result=await self.call([Response({'status':'completed','output_text':draft}),Response({'status':'completed','output_text':corrected})],
+            text='Yes, I have seen them.',native_review=True,target_language='ta-IN')
+        self.assertEqual(result.text,corrected)
+        self.assertTrue(result.native_reviewed)
+        data=json.loads(self.client.calls[1][1]['input'])
+        self.assertEqual(data['draft_translation'],draft)
+        self.assertEqual(data['text'],'Yes, I have seen them.')
+        self.assertEqual(data['target_language'],'ta-IN')
+
+    async def test_incomplete_native_review_never_falls_back_to_unreviewed_draft(self):
+        with self.assertRaisesRegex(translation.GenderTranslationError,'translation_output_incomplete'):
+            await self.call([Response({'status':'completed','output_text':'पूर्ण मसौदा।'}),Response({'status':'incomplete','output_text':'अधूरी समीक्षा'})],native_review=True)
+        self.assertEqual(len(self.client.calls),2)
+
+    async def test_native_review_retains_context_gender_and_all_dialogue(self):
+        expected='हाँ, मैंने देखी हैं। मुझे संगीत का इंतज़ार है।'
+        result=await self.call([Response({'status':'completed','output_text':expected}),Response({'status':'completed','output_text':expected})],
+            text='I have! I am looking forward to the music.',native_review=True,
+            dialogue_context='Previous approved dialogue: Have you seen the announcements?')
+        data=json.loads(self.client.calls[1][1]['input'])
+        self.assertEqual(data['speaker_gender'],'female')
+        self.assertIn('Have you seen',data['dialogue_context'])
+        self.assertEqual(result.text,expected)
 
 
 if __name__ == '__main__':

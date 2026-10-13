@@ -15,6 +15,7 @@ class GenderTranslationResult:
     text: str
     provider: str
     model: str
+    native_reviewed: bool = False
 
 
 class GenderTranslationError(RuntimeError):
@@ -79,6 +80,8 @@ async def translate_with_gender(
     speaker_gender: str,
     tone: str = "neutral",
     dialogue_context: str | None = None,
+    native_review: bool = False,
+    _review_candidate: str | None = None,
 ) -> GenderTranslationResult:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -151,11 +154,24 @@ Requirements:
     if dialogue_context and str(dialogue_context).strip():
         request_input["dialogue_context"] = str(dialogue_context).strip()[:1400]
 
+    if _review_candidate is not None:
+        request_input["draft_translation"] = _review_candidate
+        instructions += """
+
+This request is a separate native speech review of draft_translation.
+Check the entire draft against the original text and dialogue_context. Correct
+spelling, malformed word endings, grammar, gender agreement and unnatural
+phrasing in the exact target locale. Preserve every original claim, name and
+number; do not add information or include neighboring speakers' dialogue.
+Return the complete corrected spoken text only. If the draft is already correct,
+return it unchanged. Do not explain corrections or return only the changed part.
+""".rstrip()
+
     body = {
         "model": model,
         "instructions": instructions,
         "input": json.dumps(request_input, ensure_ascii=False),
-        "max_output_tokens": min(16384, max(1000, len(str(text or "")) * 2)),
+        "max_output_tokens": min(16384, max(1000, len(str(text or "")) * 2, len(_review_candidate or "") * 2)),
     }
 
     headers = {
@@ -274,10 +290,18 @@ Requirements:
                     translated = _clean_translation(raw_text)
 
                     if translated:
+                        if native_review:
+                            return await translate_with_gender(
+                                text=text, source_language=source_language,
+                                target_language=target_language, speaker_gender=speaker_gender,
+                                tone=tone, dialogue_context=dialogue_context,
+                                native_review=False, _review_candidate=translated,
+                            )
                         return GenderTranslationResult(
                             text=translated,
                             provider=provider,
                             model=model,
+                            native_reviewed=_review_candidate is not None,
                         )
 
                     last_error = GenderTranslationError(
