@@ -1,0 +1,34 @@
+name: indian-speech-development-preflight
+on:
+  push:
+    branches: [codex/indian-speech-dev-20261013]
+    paths:
+      - scripts/ops/inspect-indian-speech-dev.py
+      - .github/workflows/indian-speech-dev-preflight.yml
+permissions:
+  contents: read
+jobs:
+  inspect-development:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Inspect development speech routing without generation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python - <<'PY'
+          import base64
+          from pathlib import Path
+          body = base64.b64encode(Path("scripts/ops/inspect-indian-speech-dev.py").read_bytes()).decode()
+          Path("/tmp/speech-readonly.sh").write_text(
+              "#!/usr/bin/env bash\nset -Eeuo pipefail\n"
+              "[[ \"$(hostname -s)\" == desifaces-dev ]]\n"
+              "base64 -d <<'SPEECH_READONLY' | docker exec -i df-svc-audio python -\n"
+              + body + "\nSPEECH_READONLY\n")
+          PY
+          timeout 300s az vm run-command invoke -g rg-desifaces-dev -n desifaces-dev --command-id RunShellScript --scripts @/tmp/speech-readonly.sh --query 'value[].message' -o tsv | tee /tmp/speech-result
+          grep -Fq 'READ_ONLY_SPEECH_PREFLIGHT=PASS' /tmp/speech-result
