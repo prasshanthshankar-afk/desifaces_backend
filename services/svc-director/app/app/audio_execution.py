@@ -79,6 +79,7 @@ class AudioStageContext:
     participant_metadata: dict[str, Any]
     voice_profile_ref: str | None
     voice_locale: str | None
+    translation_context: str = ""
 
 
 async def load_audio_stage_context(
@@ -94,7 +95,7 @@ async def load_audio_stage_context(
           s.stage_run_id,s.workflow_id,s.stage_type,s.scope_type,s.state,s.dialogue_turn_id,
           s.metadata_json as stage_metadata,
           w.account_id,w.owner_user_id,w.project_id,w.story_id,w.current_stage,
-          dt.scene_id,dt.speaker_participant_id,dt.text_value,dt.locale as turn_locale,
+          dt.scene_id,dt.sequence_no,dt.speaker_participant_id,dt.text_value,dt.locale as turn_locale,
           dt.emotion_code,dt.delivery_json,
           p.display_name,p.default_locale,p.voice_profile_ref,p.voice_locale,
           p.persona_json,p.metadata_json as participant_metadata,
@@ -139,6 +140,31 @@ async def load_audio_stage_context(
     if not target_locale:
         raise ParticipantAudioBridgeError("audio_target_locale_required")
 
+    # Context comes only from the validated workflow's own scene. It is not
+    # synthesized and is shared by pricing preview and generation compilation.
+    neighboring = await conn.fetch(
+        """
+        select dt.sequence_no,dt.text_value,p.display_name
+        from public.v3_dialogue_turns dt
+        join public.v3_participants p on p.participant_id=dt.speaker_participant_id
+        where dt.scene_id=$1 and dt.turn_id<>$2
+          and exists (
+            select 1 from public.v3_studio_stage_runs neighbor
+            where neighbor.workflow_id=$4 and neighbor.stage_type='audio'
+              and neighbor.dialogue_turn_id=dt.turn_id
+          )
+        order by abs(dt.sequence_no-$3),dt.sequence_no
+        limit 3
+        """,
+        row["scene_id"], row["dialogue_turn_id"], row["sequence_no"], workflow_id,
+    )
+    translation_context = "\n".join(
+        f"{'Previous' if item['sequence_no'] < row['sequence_no'] else 'Following'} "
+        f"approved dialogue — {_clean(item['display_name'])[:80]}: "
+        f"{_clean(item['text_value'])[:300]}"
+        for item in sorted(neighboring, key=lambda item: item["sequence_no"])
+    )[:1400]
+
     return AudioStageContext(
         workflow_id=UUID(str(row["workflow_id"])),
         stage_run_id=UUID(str(row["stage_run_id"])),
@@ -160,6 +186,7 @@ async def load_audio_stage_context(
         participant_metadata=_as_dict(row["participant_metadata"]),
         voice_profile_ref=_clean(row["voice_profile_ref"]) or None,
         voice_locale=_clean(row["voice_locale"]) or None,
+        translation_context=translation_context,
     )
 
 
@@ -188,6 +215,11 @@ def compile_context_audio_input(context: AudioStageContext) -> dict[str, Any]:
     }
     if translate:
         studio_input["source_language"] = source_language
+        if context.translation_context:
+            studio_input["context"] = (
+                studio_input["context"] + "\nDialogue context only (not spoken):\n"
+                + context.translation_context
+            )[:2000]
     if context.voice_profile_ref:
         studio_input["voice_id"] = context.voice_profile_ref
     if context.voice_locale:
@@ -662,3 +694,4 @@ __all__ = [
     "compile_context_audio_input",
     "load_audio_stage_context",
 ]
+

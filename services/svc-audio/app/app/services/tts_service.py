@@ -331,6 +331,7 @@ class TTSService:
         voice_gender: Optional[str] = None,
         voice_locale: Optional[str] = None,
         translation_tone: Optional[str] = "neutral",
+        context: Optional[str] = None,
     ) -> Tuple[bytes, str, str, str, str, Dict[str, Any]]:
         """Synthesize speech and return audio plus resolved translation metadata.
 
@@ -501,6 +502,7 @@ class TTSService:
                         target_language=target_locale,
                         speaker_gender=resolved_speaker_gender,
                         tone=normalized_tone,
+                        dialogue_context=context,
                     )
                 except GenderTranslationError as exc:
                     if getattr(exc, "retryable", False):
@@ -614,3 +616,4 @@ class TTSService:
             provider_result.extension,
             meta,
         )
+
