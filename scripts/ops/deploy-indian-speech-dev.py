@@ -15,16 +15,9 @@ spec = importlib.util.spec_from_file_location('engine', ROOT / 'deploy-audio-cro
 engine = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(engine)
 
-TARGETS = ('df-svc-audio', 'df-svc-audio-worker', 'df-svc-director', 'df-svc-director-worker')
-ORIGINAL = {
-    '/app/app/repos/tts_catalog_repo.py': {'8142c38b9b69c9b2eba854c03e0bc233ca7646b63392cf26202d2613cf848db8'},
-    '/app/app/api/routes/catalog.py': {'437624ce13a87b1b5b6752c08b5dff7867d2e7c67e51cf53d558ef86a417aeca'},
-    '/app/app/services/tts_service.py': {'11398fe64ee167b49c2ff664af27bb5944ef462f5cef8bf11c92c4789ac68939', 'd9b678c902e9e67d82d153df4243e0c5f8604dc75697c78410d89c732ef2b41d'},
-    '/app/app/llm.py': {'8bd0124450fa0f4336ade658af63e92265abda82cb065c91b454ef375e247d54'},
-    '/app/services/shared/llm/gender_translation.py': {'a7260025abc17112117ad73a7fc8ea94e777412605aa9dd445e9c54fe7322b15'},
-    '/app/app/services/multi_person_pricing_policy.py': {'4ae8a3609f6bcdfbf84be49b2323ff1f67c3594288476a6d3973f0fbcfd5cc22'},
-    '/app/desifaces_shared/pricing/multi_person.py': {'ad2b7a333c4f371a2f44cd6dd6d95b9fb475b7589e22baf1bbf62f556bb910be'},
-}
+TARGETS = ('df-svc-audio', 'df-svc-audio-worker')
+# Exact source hashes, allowing only pre-existing terminal-newline packaging variants.
+ORIGINAL = {"/app/app/services/tts_routing_preference.py": ["ef874fed5ad81c65ba6db92d83ed59d027b7c23bf288098cb60ec4fbd1329cc6"], "/app/app/repos/tts_catalog_repo.py": ["e80754dd63512ecb0d69a2810fa5c045c65f267b734d8235b5d0bbc9b31d9385"], "/app/app/api/routes/catalog.py": ["2a9f8dd8cbdedc5394d11401103e64ea8512f1b1461cab5c55ce9c0ba61fa644"], "/app/app/services/tts_service.py": ["e215ee010c3b8e95d5a52079b77041501b7b29cf1dee32972d494589e53cbb0c"], "/app/app/services/tts_intent_policy.py": ["e1eb0092e85f012952fdd03a669e899292efd568534fafbb5719ce85d3f43e50"], "/app/app/services/multi_person_pricing_policy.py": ["4ae8a3609f6bcdfbf84be49b2323ff1f67c3594288476a6d3973f0fbcfd5cc22"], "/app/desifaces_shared/pricing/multi_person.py": ["ad2b7a333c4f371a2f44cd6dd6d95b9fb475b7589e22baf1bbf62f556bb910be"], "/app/app/services/tts_orchestrator.py": ["8f13c526533c2f9abf0f1fd1058769fdc0d0d7988d963eeb4389886c14c4ecc5"], "/app/app/services/gender_translation.py": ["e76f48c98feebc79281383e0c935507cfe5212c7c51fb05e3c604186c8895368"], "/app/app/llm.py": ["279d790121162497713c1ddf907337de236c08649e3bf34f26e3b5048016dddb"], "/app/app/audio_execution.py": ["69b3f9f8a3449138992a9cfd5a34586479b30d23a8f6165b68b5139cf5041025"]}
 
 
 def call(*args, **kwargs):
@@ -140,14 +133,15 @@ def main():
         env_file.chmod(0o600)
         image = images['df-svc-audio']
         for test in ('test_sarvam_style_compatibility.py','test_natural_speech_translation.py','test-audio-cross-project-reuse.py'):
-            call('docker','run','--rm','--network','none','--env-file',str(env_file),'-e','AUDIO_REUSE_ROUTE=/app/app/api/routes/v3_audio_output.py','--entrypoint','python',image,'/opt/indian-speech/'+test)
+            call('docker','run','--rm','--network','none','--env-file',str(env_file),'-e','DF_TRANSLATION_TEST_MODULE=/app/app/services/gender_translation.py','-e','AUDIO_REUSE_ROUTE=/app/app/api/routes/v3_audio_output.py','--entrypoint','python',image,'/opt/indian-speech/'+test)
         network = next(iter(engine.endpoints(audio_obj)))
-        call('docker','run','--rm','--network',network,'--env-file',str(env_file),'--entrypoint','python',image,'/opt/indian-speech/certify-indian-speech-dev.py','counterfactual',timeout=90)
+        call('docker','run','--rm','--network',network,'--env-file',str(env_file),'--entrypoint','python',image,'/opt/indian-speech/certify-indian-speech-dev.py','active',timeout=90)
         assert database('snapshot') == snapshot, 'preflight changed stored policy'
         assert protected() == before, 'unrelated services changed'
+        assert database('snapshot') == snapshot, 'routing policy changed'
         try:
             # Stop workers first, preserving their exact runtime configuration.
-            for name in ('df-svc-audio-worker','df-svc-director-worker','df-svc-audio','df-svc-director'):
+            for name in ('df-svc-audio-worker','df-svc-audio'):
                 obj = original[name]
                 cfg = copy.deepcopy(obj['Config'])
                 cfg['Image'] = images[name]
@@ -169,14 +163,13 @@ def main():
                 engine.engine('POST','/containers/create?name='+name,body)
             database_before = json.loads(snapshot)
             # Start API so policy application uses the candidate's unchanged DB configuration.
-            for name in ('df-svc-audio','df-svc-director'):
+            for name in ('df-svc-audio',):
                 engine.engine('POST','/containers/'+name+'/start')
                 wait_ready(name)
-            database('apply', bundle['migration'])
-            applied = True
+            assert database('snapshot') == snapshot, 'context-only rollout must not change routing policy'
             call('docker','exec','df-svc-audio','python','/opt/indian-speech/certify-indian-speech-dev.py','active',timeout=90)
             call('docker','exec','df-svc-audio','python','/opt/indian-speech/certify-audio-cross-project-reuse.py',timeout=90)
-            for name in ('df-svc-audio-worker','df-svc-director-worker'):
+            for name in ('df-svc-audio-worker',):
                 engine.engine('POST','/containers/'+name+'/start')
                 wait_ready(name)
             for name,obj in original.items():
@@ -185,6 +178,9 @@ def main():
                 assert engine.endpoints(live) == engine.endpoints(obj), name+' network drift'
             assert protected() == before
             (receipt_dir/'receipt.json').write_text(json.dumps({'source_branch':'codex/indian-speech-dev-20261013','source_sha':sha,'images':images,'rollback_containers':dict(backups),'policy_backup_sha256':hashlib.sha256(snapshot.encode()).hexdigest()},indent=2))
+            for name in ('df-svc-audio','df-svc-audio-worker'):
+                call('docker','exec',name,'python','-c',"from app.services.tts_service import translate_with_gender; import inspect; assert inspect.getfile(translate_with_gender)=='/app/app/services/gender_translation.py'; print('IMAGE_OWNED_TRANSLATION_IMPORT=PASS')")
+            assert database('snapshot') == snapshot, 'context rollout changed routing policy'
             print('DEV_RUNTIME_CONFIG_AND_UNRELATED_SERVICES_PRESERVED=PASS')
             print('INDIAN_SPEECH_DEVELOPMENT_DEPLOYMENT=PASS')
         except BaseException:

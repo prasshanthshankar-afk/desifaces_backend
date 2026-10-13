@@ -1,6 +1,7 @@
 # Indian speech DEV certification — 2026-10-13
 
-DEV candidate: `55aeee7169efb676345b2c006215669ad9e31864`.
+Current DEV audio API/worker candidate: `84cddb707e68dc5c4514227b276809dae9b6b47a`.
+Director context rollout: `b518c19558a09436d9f7cb37854f06f0f3c7301b` (Director source is unchanged in the audio-review candidate).
 Production remains on its existing release.
 
 ## Implemented in DEV
@@ -10,6 +11,9 @@ Production remains on its existing release.
 - Browsing catalog and executable model/voice selection agree for male and female defaults.
 - Story planning and critique request idiomatic speech and native Indic script before story approval.
 - Translation requests preserve exact locale and grammatical gender and reject provider-reported incomplete output.
+- Up to three neighboring turns from the validated workflow and scene reach translation through the existing context field. The current spoken line, participant ID, voice selection and pricing units are preserved.
+- New translated Sarvam generations receive a separate native-language review before synthesis. An incomplete review fails rather than synthesizing the unreviewed draft. Already approved/reused audio is never rewritten.
+- Execution explicitly imports an image-owned translation helper. Read-only inspection found the older shared helper was still imported after the first candidate rollout; the packaging correction was verified in both live audio containers.
 - Existing DEV Sarvam Conversational/Narration compatibility was recovered by exact file hash and preserved.
 - Existing audio-worker pricing overlays were verified against main and copied unchanged into the candidate.
 
@@ -17,7 +21,13 @@ Production remains on its existing release.
 
 | Gate | Result | Actions run |
 |---|---|---|
-| Translation, style, voice, catalog, provider tests | 50 passed | 38433630816 / 38433642823 |
+| Translation, context, native review, style, voice, catalog and provider tests | 61 passed | 38447606535 |
+| Context and image-owned-helper DEV activation | Passed | 38445927775 |
+| Independent native-review DEV activation, audio services only | Passed, policy/config/unrelated services unchanged | 38447772380 |
+| Real workflow context and preview/generation payload parity | Passed on three existing stages | 38447932543 |
+| Reviewed Sarvam speech and transcription | Hindi male/female, Tamil female, Bengali male passed | 38447932543 |
+| Observed Tamil malformed ending repaired by actual reviewer | Passed | 38447932543 |
+| Post-review reuse billing and original lineage | Zero reservation/ledger/job/external-call deltas; transaction rolled back | 38447932543 |
 | DEV candidate build and rollback-only routing test | Passed | 38433638957 |
 | Active catalog and execution defaults | 10 languages × 2 genders passed | 38433638957 |
 | Explicit ElevenLabs Hindi voice and en-US routing | Preserved | 38433638957 |
@@ -63,10 +73,23 @@ Read-only production audits: 38432892644, 38433836346, 38434793478.
 - Original audio container durations total 63.480 seconds; rendered clip containers total 63.280 seconds; final audio duration is 63.230 seconds. Silence cleanup and codec/container durations must be distinguished from missing spoken content.
 - One concrete translation defect is confirmed: the answer “I have!” to a question asking whether announcements were seen became “मेरे पास है!” (“I possess it”). Group translation needs neighboring-dialogue context to resolve this ambiguity.
 
+## Actual native-language QA
+
+Contextual Hindi “I have!” became “हाँ, मैंने देखी हैं!”, rather than the possessive “मेरे पास है!”.
+Actual Sarvam outputs used priya (Hindi female), shubh (Hindi male), ishita (Tamil female) and rehan (Bengali male).
+The first Tamil QA draft contained the malformed ending “பார்த்தேன்ம்”, which STT normalized; intelligibility alone did not establish text quality.
+A separate reviewer was added and the actual model repaired that frozen negative sample to “பார்த்தேன்”.
+Final reviewed Tamil and Bengali speech transcribed verbatim; Hindi differences were punctuation and accepted spelling variants.
+QA samples were 3.840–7.765 seconds. Catalog access was read-only; no customer jobs, assets, reservations or billing writes were made by synthesis QA.
+Automated transcription and linguistic checks do not certify subjective pronunciation, accent or prosody across all ten languages.
+
 ## Remaining quality gates
 
-1. Validate native speech quality on actual new samples; prompt changes alone do not establish a native-speaker quality pass.
-2. Add and test neighboring-dialogue context for short ambiguous responses before treating the contextual translation defect as resolved.
+1. Broader native-speaker listening remains useful for pronunciation and prosody; automated real samples and linguistic review passed for the tested Hindi/Tamil/Bengali cases.
+2. Contextual translation is active and passed real-workflow, actual-model and regression checks.
 3. Compare mouth motion against the exact padded provider audio; waveform correlation compares audio with audio, not phonemes with mouth movement.
 4. Treat pause-aware shorter clips as an experiment if that measurement shows a benefit. No 5–8-second segmentation change is included here.
 5. Promote validated source through main before any production deployment. Approved/reused audio must never be silently rewritten; revisions continue to require a new priced generation.
+
+Visual assessment run: https://github.com/prasshanthshankar-afk/desifaces_web/actions/runs/38445849863
+The isolated six-clip speaking-face evaluation remains in progress; no visual-sync pass is claimed yet.
