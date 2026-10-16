@@ -31,9 +31,10 @@ FROM python:3.10-slim
 ENV PIP_NO_CACHE_DIR=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 CUDA_VISIBLE_DEVICES=""
 RUN apt-get update -qq && apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
-RUN pip install --disable-pip-version-check \
-    --index-url https://download.pytorch.org/whl/cpu \
-    torch==2.5.1
+RUN python -m pip install --disable-pip-version-check \
+    --index-url https://pypi.org/simple \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    'torch==2.5.1+cpu'
 RUN pip install --disable-pip-version-check \
     numpy==1.26.4 scipy==1.11.4 opencv-python-headless==4.10.0.84 \
     python_speech_features==0.6
