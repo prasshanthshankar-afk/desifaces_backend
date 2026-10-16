@@ -75,6 +75,7 @@ PY
   # Run in separate CPU-limited container. Expected exit 1 means REVIEW_REQUIRED.
   set +e
   docker run --rm --network none --cpus 1 --memory 1g --pids-limit 128 \
+    --user "$(id -u):$(id -g)" \
     --security-opt no-new-privileges --cap-drop ALL \
     -e DESIFACES_DEV_VERIFIED=1 \
     --mount "type=bind,src=$TMP,dst=/qc" \
