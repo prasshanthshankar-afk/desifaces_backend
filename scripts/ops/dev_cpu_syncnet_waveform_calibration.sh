@@ -23,13 +23,12 @@ docker run --rm --network none --cpus 1 --memory 512m \
 for ms in -240 -120 0 120 240; do
   if (( ms < 0 )); then label="m$((-ms))"; else label="p$ms"; fi
   if (( ms > 0 )); then
-    FILTER="adelay=${ms}S,atrim=start=0,apad"
     # adelay samples uses S suffix (samples), so 16 samples per ms at 16 kHz.
     SAMPLES="$((ms*16))"
     FILTER="adelay=${SAMPLES}S,apad"
   elif (( ms < 0 )); then
-    SECONDS="$(python3 -c "print($((-ms))/1000)")"
-    FILTER="atrim=start=${SECONDS},asetpts=PTS-STARTPTS,apad"
+    TRIM_SEC="$(python3 -c "print($((-ms))/1000)")"
+    FILTER="atrim=start=${TRIM_SEC},asetpts=PTS-STARTPTS,apad"
   else FILTER="anull"; fi
   docker run --rm --network none --cpus 1 --memory 512m \
     --user "$(id -u):$(id -g)" \
