@@ -79,8 +79,7 @@ def main():
     p.add_argument("--max-samples",type=int,default=600)
     args=p.parse_args()
     import os
-    if os.uname().nodename.split(".")[0] != "desifaces-dev":
-        raise RuntimeError("DEV_HOST_REQUIRED")
+    # Host identity is checked by the outer command before docker exec.\n    # Container hostnames are independent from Azure VM hostnames.\n    if os.environ.get("DESIFACES_DEV_VERIFIED") != "1":\n        raise RuntimeError("DEV_HOST_ATTESTATION_REQUIRED")
     if args.stride < 1 or not 1 <= args.max_samples <= 1000:
         raise ValueError("BOUNDED_EVALUATION_REQUIRED")
     if len(args.model_sha256)!=64 or any(c not in "0123456789abcdef" for c in args.model_sha256):
