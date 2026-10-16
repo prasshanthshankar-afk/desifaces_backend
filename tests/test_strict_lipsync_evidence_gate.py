@@ -1,7 +1,7 @@
 import importlib.util
 from pathlib import Path
 
-path = Path(__file__).resolve().parents[3] / "scripts" / "ops" / "strict_lipsync_evidence_gate.py"
+path = Path(__file__).resolve().parents[1] / "scripts" / "ops" / "strict_lipsync_evidence_gate.py"
 spec = importlib.util.spec_from_file_location("qc", path)
 qc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(qc)
