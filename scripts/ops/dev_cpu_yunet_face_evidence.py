@@ -32,6 +32,7 @@ def analyze(video, model, expected_sha, every=5, limit=600):
         raise ValueError("VIDEO_UNREADABLE")
     detector = cv2.FaceDetectorYN.create(str(model), "", (320, 320), 0.7, 0.3, 5000)
     rows, frames, sampled = [], 0, 0
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
     try:
         while sampled < limit:
             ok, frame = cap.read()
@@ -41,9 +42,11 @@ def analyze(video, model, expected_sha, every=5, limit=600):
             if (frames - 1) % every:
                 continue
             sampled += 1
-            height, width = frame.shape[:2]
-            detector.setInputSize((width, height))
-            _, faces = detector.detect(frame)
+            # The pinned 2023mar YuNet model has fixed 320x320 input.
+            # Scaling avoids OpenCV 5 ONNX backend dynamic-shape failures.
+            resized = cv2.resize(frame, (320, 320), interpolation=cv2.INTER_AREA)
+            _, faces = detector.detect(resized)
+            height = width = 320
             found = []
             if faces is not None:
                 for f in faces:
@@ -62,7 +65,7 @@ def analyze(video, model, expected_sha, every=5, limit=600):
                         "detection_score": round(float(f[14]),4),
                     })
             rows.append({"frame": frames-1,
-                         "time_s": round(float(cap.get(cv2.CAP_PROP_POS_MSEC))/1000,3),
+                         "time_s": round((frames-1)/fps,3) if fps > 0 else None,
                          "detected_faces": found})
     finally:
         cap.release()
