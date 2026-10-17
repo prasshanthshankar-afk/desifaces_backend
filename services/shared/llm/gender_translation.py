@@ -58,6 +58,52 @@ def _extract_output_text(payload: Dict[str, Any]) -> str:
     return "\n".join(parts).strip()
 
 
+def _quality_review_instructions() -> str:
+    return (
+        "You are an independent bilingual QA reviewer of SPOKEN dialogue. "
+        "Compare original English and proposed target-language speech. "
+        "Reject unnatural literal calques, incorrect conversational register, "
+        "unsupported added facts, omissions, and speaker/meaning changes. "
+        "Return JSON only with keys approved (boolean), reason (short string). "
+        "When uncertain, reject for human review. Do not rewrite the text."
+    )
+
+
+async def _quality_review(
+    *, client: httpx.AsyncClient, base_url: str, headers: dict,
+    model: str, request_input: dict, translated: str,
+) -> None:
+    """Optional strict DEV gate. Never silently approve if review is unavailable."""
+    payload = {
+        "model": os.getenv("DF_AUDIO_TRANSLATION_REVIEW_MODEL", "").strip() or model,
+        "instructions": _quality_review_instructions(),
+        "input": json.dumps(
+            {"source": request_input["text"], "translation": translated,
+             "source_language": request_input["source_language"],
+             "target_language": request_input["target_language"],
+             "previous_turn": request_input.get("previous_turn", ""),
+             "next_turn": request_input.get("next_turn", ""),
+             "tone": request_input.get("tone", "")},
+            ensure_ascii=False),
+        "max_output_tokens": 200,
+    }
+    try:
+        response = await client.post(f"{base_url}/responses", headers=headers, json=payload)
+        response.raise_for_status()
+        verdict = json.loads(_extract_output_text(response.json()))
+        approved = verdict.get("approved") is True if isinstance(verdict, dict) else False
+    except Exception as exc:
+        raise GenderTranslationError(
+            f"spoken_translation_quality_review_unavailable:{type(exc).__name__}",
+            retryable=False,
+        ) from exc
+    if not approved:
+        raise GenderTranslationError(
+            "spoken_translation_quality_review_rejected",
+            retryable=False,
+        )
+
+
 def _clean_translation(text: str) -> str:
     out = str(text or "").strip()
 
@@ -115,7 +161,10 @@ async def translate_with_gender(
     ).rstrip("/")
 
     instructions = """
-You are a production translation engine for spoken audio.
+You are an expert dialogue localizer for a contemporary spoken-language
+conversation, not a literal translation engine. Think like a native-language
+screenwriter rewriting the same utterance for a real person to speak.
+Produce idiomatic, everyday dialogue in the target locale.
 
 Translate the supplied text naturally into the requested target language.
 
@@ -129,6 +178,21 @@ Requirements:
 - Preserve brand names, domain names, URLs, handles, numbers, product names,
   acronyms, and proper nouns exactly where appropriate.
 - Adapt the dialogue as an authentic utterance, not a word-for-word translation.
+- Reject literal calques of English idioms and connective words: translate the
+  speaker's intention, not the surface grammar. Avoid stiff, textbook or
+  bureaucratic constructions when the relationship is informal.
+- Keep commonly spoken loanwords natural when local speakers normally use them;
+  do not substitute obscure dictionary equivalents for social media, content,
+  venture, or marketing terminology.
+- Before replying, silently back-translate your proposed line and check that
+  nothing was added, omitted, or inverted. In particular do not insert claims
+  about numbers of languages, platforms, audiences or product capabilities.
+- Silently test whether a native speaker would say the line aloud to this
+  conversation partner; rewrite awkward syntax before output.
+- Use the scene and adjacent turns to resolve pronouns and continuity only.
+  Never incorporate a fact appearing only in a neighboring turn.
+- Optimize for short, speakable clauses and the original emotional register,
+  without sacrificing essential meaning.
 - Prefer everyday target-language syntax and idioms appropriate to the locale,
   relationship, emotional delivery and scene context.
 - Use neighboring turns only as context; translate ONLY the current text.
@@ -269,6 +333,12 @@ Requirements:
                     translated = _clean_translation(raw_text)
 
                     if translated:
+                        if os.getenv("DF_AUDIO_NATURAL_SPEECH_QA_REQUIRED", "0").strip().lower() in {"1", "true", "yes"}:
+                            await _quality_review(
+                                client=client, base_url=base_url, headers=headers,
+                                model=model, request_input=request_input,
+                                translated=translated,
+                            )
                         return GenderTranslationResult(
                             text=translated,
                             provider=provider,
