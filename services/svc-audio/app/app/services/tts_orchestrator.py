@@ -1623,6 +1623,7 @@ class TTSOrchestrator:
                 speaker_relationship=payload.get("speaker_relationship") or "",
                 scene_context=payload.get("scene_context") or payload.get("context") or "",
                 locale_context=payload.get("locale_context") or normalized_target_locale,
+                authenticated_user_id=str(user_id),
             )
 
             upload = await self.storage.upload_bytes(
