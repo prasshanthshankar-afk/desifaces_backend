@@ -19,6 +19,7 @@ on:
       - 'services/svc-director/app/app/audio_execution.py'
       - 'services/svc-director/app/app/audio_execution_runtime.py'
       - 'services/svc-audio/app/app/api/routes/tts_jobs.py'
+      - 'services/svc-audio/app/Dockerfile'
       - '.github/workflows/dev-speech-translation-certification.yml'
 
 permissions:
@@ -99,6 +100,16 @@ jobs:
           assert "CREATE TABLE" not in s.upper()
           assert "DROP TABLE" not in s.upper()
           print("DEV_METADATA_SCOPE=PASS")
+          PY
+
+      - name: Verify Audio Docker module path
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          d=Path("services/svc-audio/app/Dockerfile").read_text()
+          assert "PYTHONPATH=/app:/app/desifaces_shared/llm" in d
+          assert "COPY services/shared/llm /app/desifaces_shared/llm" in d
+          print("AUDIO_SHARED_TRANSLATION_PACKAGING=PASS")
           PY
 
       - name: Verify no production deployment
