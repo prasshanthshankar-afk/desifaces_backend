@@ -149,6 +149,7 @@ def compile_context_audio_input(context: _audio_execution.AudioStageContext) -> 
     # Never invent neighboring turns from isolated stage metadata.
     metadata = _as_dict(context.stage_metadata)
     for key, limit in (
+        ("full_audio_script", 16000),
         ("previous_turn", 1000),
         ("next_turn", 1000),
         ("speaker_relationship", 160),
