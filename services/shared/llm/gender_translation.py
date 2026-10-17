@@ -78,6 +78,12 @@ async def translate_with_gender(
     target_language: str,
     speaker_gender: str,
     tone: str = "neutral",
+    previous_turn: str = "",
+    next_turn: str = "",
+    speaker_relationship: str = "",
+    scene_context: str = "",
+    locale: str = "",
+    emotion: str = "",
 ) -> GenderTranslationResult:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -122,6 +128,14 @@ Requirements:
 - Do not introduce gender where the target language or sentence does not require it.
 - Preserve brand names, domain names, URLs, handles, numbers, product names,
   acronyms, and proper nouns exactly where appropriate.
+- Adapt the dialogue as an authentic utterance, not a word-for-word translation.
+- Prefer everyday target-language syntax and idioms appropriate to the locale,
+  relationship, emotional delivery and scene context.
+- Use neighboring turns only as context; translate ONLY the current text.
+- Keep factual content, character intent and names intact; never invent claims,
+  drop key meaning, change who speaks, or add dialogue from other turns.
+- Keep the result speakable at a natural pace; no forced excessive compression.
+- Respect the tone and speaker relationship for politeness and pronoun choice.
 - Keep the result natural for speech synthesis.
 - Do not provide explanations, notes, labels, alternatives, transliterations,
   quotation marks, or markdown.
@@ -134,6 +148,12 @@ Requirements:
         "target_language": str(target_language or "").strip(),
         "speaker_gender": gender,
         "tone": normalized_tone,
+        "locale": str(locale or "").strip()[:80],
+        "previous_turn": str(previous_turn or "").strip()[:1000],
+        "next_turn": str(next_turn or "").strip()[:1000],
+        "speaker_relationship": str(speaker_relationship or "").strip()[:160],
+        "scene_context": str(scene_context or "").strip()[:1000],
+        "emotion": str(emotion or "").strip()[:120],
     }
 
     body = {
