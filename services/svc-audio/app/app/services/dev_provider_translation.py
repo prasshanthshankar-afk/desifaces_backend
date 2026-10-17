@@ -153,9 +153,16 @@ async def translate_approved(
 
         async def clarify(original, previous, next_turn):
             answer = await responses_json(
-                "Clarify ONLY the current English dialogue meaning using neighboring turns. "
-                "Return JSON with meaning as a speakable English sentence. Do not add facts, "
-                "change speaker, or translate into another language.",
+                "You are preparing ONE speaker's LINE OF DIRECT DIALOGUE for translation. "
+                "Use the full script ONLY to disambiguate meaning, relationship, emotion, "
+                "pronouns and register. Output a SPEAKABLE English rewrite of CURRENT TURN ONLY. "
+                "Preserve first/second person, speaker perspective, and all factual claims. "
+                "NEVER describe the speaker, summarize the plot, quote other turns, "
+                "add labels such as 'Speaker 1', or refer to the dialogue in third person. "
+                "For example, 'I'm excited about the venture' can be clarified as "
+                "'I'm excited about our new business venture', NEVER 'Speaker 1 is excited'. "
+                "Keep the length comparable to the current line. Maintain exact brand spelling "
+                "desifaces and do not add new claims. Return JSON ONLY with key meaning.",
                 {"current": original, "previous": previous, "next": next_turn,
                  "full_audio_script": full_script, "speaker_relationship": original_context.get("speaker_relationship", ""),
                  "emotion": original_context.get("emotion", ""), "target_locale": target_locale,
@@ -173,10 +180,20 @@ async def translate_approved(
 
         async def independently_review(original, candidate, previous, next_turn, meaning):
             answer = await responses_json(
-                "Independently assess natural SPOKEN translation against the ORIGINAL English "
-                "utterance and dialogue context; do not approve literal calques, missing or "
-                "invented claims, wrong gender or speaker. Return JSON with approved boolean "
-                "and reason string. If uncertain, reject.",
+                "You are a STRICT independent bilingual reviewer of ONE character's "
+                "SPEAKABLE dialogue. Compare the ORIGINAL English current utterance with "
+                "the translated candidate using full-script context ONLY to understand it. "
+                "REJECT if candidate narrates or summarizes what speakers said, refers to "
+                "'Speaker 1', 'Speaker 2', 'the speaker', or other characters rather than "
+                "speaking their current line in the original first/second-person perspective. "
+                "REJECT if candidate combines other dialogue turns, includes story exposition, "
+                "omits original details, invents new facts, changes desifaces brand spelling, "
+                "uses stiff literal calques, or is unnaturally verbose. "
+                "For ar-EG require natural Egyptian conversational register; for es-MX "
+                "require natural Mexican conversational register. For or-IN require natural "
+                "conversational Odia, not an English-heavy scripted summary. "
+                "If ambiguous or uncertain, reject. Return JSON ONLY with approved boolean "
+                "and concrete reason; do not silently repair or generate replacement text.",
                 {"original": original, "candidate": candidate, "meaning": meaning,
                  "full_audio_script": full_script, "speaker_relationship": original_context.get("speaker_relationship", ""),
                  "emotion": original_context.get("emotion", ""),
