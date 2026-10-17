@@ -284,6 +284,7 @@ class TTSService:
         next_turn: str = "",
         speaker_relationship: str = "",
         scene_context: str = "",
+        full_audio_script: str = "",
         locale_context: str = "",
         authenticated_user_id: Optional[str] = None,
     ) -> Tuple[bytes, str, str, str, str, Dict[str, Any]]:
@@ -451,6 +452,7 @@ class TTSService:
                             "next_turn": next_turn,
                             "speaker_relationship": speaker_relationship,
                             "scene_context": scene_context,
+                            "full_audio_script": full_audio_script,
                             "emotion": emotion,
                         },
                     )
