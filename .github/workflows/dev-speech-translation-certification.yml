@@ -9,6 +9,7 @@ on:
       - 'services/shared/llm/dev_*'
       - 'services/svc-audio/app/app/repos/translation_capability_repo.py'
       - 'tests/test_dev_*'
+      - 'migrations/2026_10_17_dev_audio_translation_capabilities.sql'
       - 'services/svc-audio/app/app/services/dev_provider_translation.py'
       - 'services/svc-audio/app/app/services/tts_service.py'
       - 'services/svc-audio/app/app/services/tts_orchestrator.py'
@@ -44,6 +45,18 @@ jobs:
             tests/test_dev_translation_capability_repo.py \
             tests/test_dev_provider_translation_integration.py \
             tests/test_dev_provider_translation_locale_resolution.py
+
+      - name: Assert retired migration cannot create tables
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          content = Path("migrations/2026_10_17_dev_audio_translation_capabilities.sql").read_text()
+          executable = "\\n".join(line for line in content.splitlines() if not line.lstrip().startswith("--"))
+          assert "CREATE TABLE" not in executable.upper()
+          assert "ALTER TABLE" not in executable.upper()
+          assert "INSERT INTO" not in executable.upper()
+          print("SCHEMA_MIGRATION=NO_OP")
+          PY
 
       - name: Verify no production deployment
         run: |
