@@ -48,7 +48,7 @@ def test_unattested_host_denied(monkeypatch):
 async def test_no_approved_route_fails_before_provider_call(monkeypatch):
     class Pool:
         async def fetch(self, query, *args):
-            assert "is_enabled AND is_approved" in query
+            assert "c.is_enabled AND c.is_approved" in query
             return []
     with pytest.raises(m.DevTranslationRejected, match="no_approved_translation_direction"):
         await m.translate_approved(
