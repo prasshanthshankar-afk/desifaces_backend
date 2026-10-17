@@ -24,6 +24,7 @@ from app.services.tts_resolution_planner import (
 )
 from app.services.tts_provider_executor import TTSProviderExecutor
 from app.services.tts_provider_adapter import TTSProviderAdapterError
+from app.services.dev_provider_translation import selected_for_dev, translate_approved, DevTranslationRejected
 from gender_translation import (
     GenderTranslationError,
     normalize_gender,
@@ -284,6 +285,7 @@ class TTSService:
         speaker_relationship: str = "",
         scene_context: str = "",
         locale_context: str = "",
+        authenticated_user_id: Optional[str] = None,
     ) -> Tuple[bytes, str, str, str, str, Dict[str, Any]]:
         """Synthesize speech and return audio plus resolved translation metadata.
 
@@ -430,7 +432,31 @@ class TTSService:
             input_language=input_language,
             target_lang=target_lang,
         ):
-            if resolved_speaker_gender in {"female", "male"}:
+            # Default-off DEV route. Non-cohort users retain the exact legacy path.
+            try:
+                provider_first = selected_for_dev(authenticated_user_id)
+            except DevTranslationRejected as exc:
+                raise TerminalTTSValidationError(str(exc)) from exc
+            if provider_first:
+                if resolved_speaker_gender not in {"female", "male"}:
+                    raise TerminalTTSValidationError("provider_first_gender_required")
+                try:
+                    final_text, translation_provider, translation_model = await translate_approved(
+                        self.pool, text=text,
+                        source_locale=str(input_language),
+                        target_locale=str(resolution_plan.canonical_locale),
+                        speaker_gender=resolved_speaker_gender,
+                        original_context={
+                            "previous_turn": previous_turn,
+                            "next_turn": next_turn,
+                            "speaker_relationship": speaker_relationship,
+                            "scene_context": scene_context,
+                            "emotion": emotion,
+                        },
+                    )
+                except DevTranslationRejected as exc:
+                    raise TerminalTTSValidationError(str(exc)) from exc
+            elif resolved_speaker_gender in {"female", "male"}:
                 try:
                     translated = await translate_with_gender(
                         text=text,
