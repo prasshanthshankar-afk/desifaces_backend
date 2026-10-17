@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json
 import os
-import socket
+import urllib.request
 import uuid
 import httpx
 
@@ -16,9 +16,25 @@ def selected_for_dev(user_id: str | None) -> bool:
         return False
     if os.getenv("DF_RUNTIME_ENV", "").lower() not in {"dev", "development"}:
         raise DevTranslationRejected("dev_environment_required")
-    if socket.gethostname().split(".")[0] != "desifaces-dev" and os.getenv(
-        "DF_DEV_TRANSLATION_HOST_ATTESTED", ""
-    ).lower() != "true":
+    # Environment flags and Docker hostnames are not trusted host identity.
+    # Azure Instance Metadata Service binds the decision to the actual VM.
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        request = urllib.request.Request(
+            "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01",
+            headers={"Metadata": "true"},
+        )
+        with opener.open(request, timeout=2) as response:
+            vm = json.load(response)
+        trusted = (
+            vm.get("name") == "desifaces-dev"
+            and str(vm.get("resourceGroupName", "")).lower() == "rg-desifaces-dev"
+            and str(vm.get("subscriptionId", "")).lower()
+            == "e70463a7-4016-4cf5-9291-b640b0f0f5cb"
+        )
+    except Exception as exc:
+        raise DevTranslationRejected("dev_host_attestation_required") from exc
+    if not trusted:
         raise DevTranslationRejected("dev_host_attestation_required")
     try:
         identity = str(uuid.UUID(str(user_id)))
