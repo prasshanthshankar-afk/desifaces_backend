@@ -186,6 +186,33 @@ async def translate_approved(
             )
 
         async def independently_review(original, candidate, previous, next_turn, meaning):
+            # Regional register is a separate veto: a generic bilingual PASS
+            # cannot certify Egyptian colloquial Arabic or idiomatic Odia.
+            regional_requirements = {
+                "or-IN": "Evaluate natural, current spoken Odia. Reject mechanical English "
+                         "calques and excessive untranslated English when natural Odia wording "
+                         "is available; allow familiar local loanwords.",
+                "ar-EG": "Evaluate Egyptian COLLOQUIAL Arabic as spoken in Egypt, not formal "
+                         "Modern Standard Arabic. Reject formal newsreader constructions.",
+                "es-MX": "Evaluate conversational Mexican Spanish (es-MX), not an unnatural "
+                         "literal translation or Spain-only regional vocabulary.",
+            }
+            requirement = regional_requirements.get(target_locale,
+                "Evaluate the locale's authentic conversational register.")
+            regional = await responses_json(
+                "Act as a strict independent regional DIALOGUE reviewer. "
+                "Do not rewrite, translate or summarize. The candidate must sound like "
+                "one person's real spoken line in the requested regional variety. "
+                "Return JSON ONLY with approved boolean and specific reason; if unsure reject. "
+                + requirement,
+                {"original": original, "candidate": candidate, "target_locale": target_locale,
+                 "context": full_script, "speaker_gender": speaker_gender},
+            )
+            if not isinstance(regional, dict) or regional.get("approved") is not True:
+                return Review(False, "regional_spoken_language_rejected: " +
+                              str(regional.get("reason", "invalid_region_review")
+                                  if isinstance(regional, dict) else "invalid_region_review")[:250])
+
             answer = await responses_json(
                 "You are a STRICT independent bilingual reviewer of ONE character's "
                 "SPEAKABLE dialogue. Compare the ORIGINAL English current utterance with "
