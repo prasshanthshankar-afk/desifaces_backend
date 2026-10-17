@@ -66,3 +66,30 @@ async def test_azure_credential_fail_closed(monkeypatch):
                 client, route={"provider_code":"azure_translator", "model_code":"text-translation-v3",
                 "provider_source_code":"en","provider_target_code":"es"},
                 text="Hi", speaker_gender="male")
+
+
+@pytest.mark.asyncio
+async def test_azure_wrong_target_rejected(monkeypatch):
+    monkeypatch.setenv("AZURE_TRANSLATOR_KEY", "mock")
+    monkeypatch.setenv("AZURE_TRANSLATOR_REGION", "eastus")
+    def handler(request):
+        return httpx.Response(200, json=[{"translations":[{"to":"es", "text":"Hola"}]}])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(m.ProviderTranslationError, match="empty_provider_translation"):
+            await m.translate_via_configured_provider(
+                client, route={"provider_code":"azure_translator",
+                "model_code":"text-translation-v3","provider_source_code":"en",
+                "provider_target_code":"ar"}, text="Hello", speaker_gender="female")
+
+
+@pytest.mark.asyncio
+async def test_unsupported_azure_model_rejected_before_network(monkeypatch):
+    monkeypatch.setenv("AZURE_TRANSLATOR_KEY", "mock")
+    monkeypatch.setenv("AZURE_TRANSLATOR_REGION", "eastus")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: pytest.fail("network must not be called"))) as client:
+        with pytest.raises(m.ProviderTranslationError, match="unsupported_azure_model"):
+            await m.translate_via_configured_provider(
+                client, route={"provider_code":"azure_translator",
+                "model_code":"unapproved","provider_source_code":"en",
+                "provider_target_code":"es"}, text="Hello", speaker_gender="male")
