@@ -135,10 +135,12 @@ async def translate_approved(
             )
             response.raise_for_status()
             body = response.json()
-            output = body.get("output_text") or "\\n".join(
+            output = body.get("output_text") or "\n".join(
                 c.get("text", "") for o in body.get("output", []) if isinstance(o, dict)
                 for c in o.get("content", []) if isinstance(c, dict)
             )
+            if not isinstance(output, str) or not output.strip():
+                raise DevTranslationRejected("empty_qa_response")
             return json.loads(output)
 
         async def clarify(original, previous, next_turn):
