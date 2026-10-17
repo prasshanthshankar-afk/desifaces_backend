@@ -65,3 +65,14 @@ def test_live_callers_pass_authenticated_user_identity():
     assert "authenticated_user_id=str(user_id)" in orch
     assert "provider_first = selected_for_dev(authenticated_user_id)" in svc
     assert "elif resolved_speaker_gender" in svc
+
+def test_provider_first_runtime_uses_bounded_review_gate():
+    root = Path(__file__).resolve().parents[1]
+    provider = (root / "services/svc-audio/app/app/services/dev_provider_translation.py").read_text()
+    assert "contextual_translation_with_review(" in provider
+    assert "max_repairs=2" in provider
+    assert "return approved.text, provider, model" in provider
+    assert "TRANSLATION_REVIEW_REQUIRED" in provider
+    # Synthesis is only called after translation finishes in the TTS service.
+    svc = (root / "services/svc-audio/app/app/services/tts_service.py").read_text()
+    assert svc.index("await translate_approved(") < svc.index("await self.provider_executor.synthesize(")
