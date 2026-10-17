@@ -111,6 +111,15 @@ async def translate_approved(
     provider, model = row["provider_code"], row["model_code"]
     if not text.strip() or len(text) > 1000:
         raise DevTranslationRejected("invalid_text_length")
+    # Preserve early fail-closed credential validation before attempting imports
+    # or external calls. Provider adapters also validate credentials.
+    if provider == "sarvam" and not os.getenv("SARVAM_API_KEY", "").strip():
+        raise DevTranslationRejected("sarvam_credential_missing")
+    if provider in {"azure", "azure_translator"} and not (
+        os.getenv("AZURE_TRANSLATOR_KEY", "").strip()
+        and os.getenv("AZURE_TRANSLATOR_REGION", "").strip()
+    ):
+        raise DevTranslationRejected("azure_translator_credential_missing")
     from app.services.dev_translation_provider_adapters import (
         translate_via_configured_provider,
     )
