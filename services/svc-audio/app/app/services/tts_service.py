@@ -279,6 +279,11 @@ class TTSService:
         voice_gender: Optional[str] = None,
         voice_locale: Optional[str] = None,
         translation_tone: Optional[str] = "neutral",
+        previous_turn: str = "",
+        next_turn: str = "",
+        speaker_relationship: str = "",
+        scene_context: str = "",
+        locale_context: str = "",
     ) -> Tuple[bytes, str, str, str, str, Dict[str, Any]]:
         """Synthesize speech and return audio plus resolved translation metadata.
 
@@ -433,6 +438,12 @@ class TTSService:
                         target_language=target_lang,
                         speaker_gender=resolved_speaker_gender,
                         tone=normalized_tone,
+                        previous_turn=previous_turn,
+                        next_turn=next_turn,
+                        speaker_relationship=speaker_relationship,
+                        scene_context=scene_context,
+                        locale=locale_context or target_locale,
+                        emotion=emotion or "",
                     )
                 except GenderTranslationError as exc:
                     if getattr(exc, "retryable", False):
