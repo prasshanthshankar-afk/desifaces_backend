@@ -139,6 +139,41 @@ async def load_audio_stage_context(
     if not target_locale:
         raise ParticipantAudioBridgeError("audio_target_locale_required")
 
+    # Same-scene neighbor context is drawn only from the canonical dialogue
+    # order; the current stage/workflow/account were verified above.
+    # Read-only: never mutate dialogue or approved stage metadata.
+    stage_metadata = _as_dict(row["stage_metadata"])
+    sequence_no = await conn.fetchval(
+        "SELECT sequence_no FROM public.v3_dialogue_turns WHERE turn_id=$1",
+        UUID(str(row["dialogue_turn_id"])),
+    )
+    if sequence_no is not None:
+        for key, comparator, direction in (
+            ("previous_turn", "<", "DESC"),
+            ("next_turn", ">", "ASC"),
+        ):
+            neighbor = await conn.fetchrow(
+                f"""
+                SELECT dt.text_value, p.display_name
+                FROM public.v3_dialogue_turns dt
+                LEFT JOIN public.v3_participants p
+                  ON p.participant_id=dt.speaker_participant_id
+                WHERE dt.scene_id=$1
+                  AND dt.sequence_no {comparator} $2
+                  AND NULLIF(btrim(dt.text_value),'') IS NOT NULL
+                ORDER BY dt.sequence_no {direction},dt.turn_id
+                LIMIT 1
+                """,
+                UUID(str(row["scene_id"])),
+                int(sequence_no),
+            )
+            if neighbor:
+                speaker = _clean(neighbor["display_name"]) or "Character"
+                value = f"{speaker}: {_clean(neighbor['text_value'])}"
+                stage_metadata[key] = value[:1000]
+            else:
+                stage_metadata.pop(key, None)
+
     return AudioStageContext(
         workflow_id=UUID(str(row["workflow_id"])),
         stage_run_id=UUID(str(row["stage_run_id"])),
@@ -147,7 +182,7 @@ async def load_audio_stage_context(
         project_id=UUID(str(row["project_id"])),
         story_id=UUID(str(row["story_id"])) if row["story_id"] else None,
         stage_state=_clean(row["state"]),
-        stage_metadata=_as_dict(row["stage_metadata"]),
+        stage_metadata=stage_metadata,
         dialogue_turn_id=UUID(str(row["dialogue_turn_id"])),
         scene_id=UUID(str(row["scene_id"])),
         participant_id=UUID(str(row["speaker_participant_id"])),
