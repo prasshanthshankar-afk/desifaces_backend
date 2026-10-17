@@ -123,6 +123,7 @@ async def translate_approved(
     from app.services.dev_translation_provider_adapters import (
         translate_via_configured_provider,
     )
+    full_script = str(original_context.get("full_audio_script") or "")[:16000]
     # The contextual pipeline is required; legacy direct translation must not
     # bypass its independent QA when provider-first is enabled.
     from app.services.dev_contextual_translation_gate import (
@@ -156,6 +157,8 @@ async def translate_approved(
                 "Return JSON with meaning as a speakable English sentence. Do not add facts, "
                 "change speaker, or translate into another language.",
                 {"current": original, "previous": previous, "next": next_turn,
+                 "full_audio_script": full_script, "speaker_relationship": original_context.get("speaker_relationship", ""),
+                 "emotion": original_context.get("emotion", ""), "target_locale": target_locale,
                  "speaker_gender": speaker_gender, "scene": original_context.get("scene_context", "")},
             )
             meaning = answer.get("meaning") if isinstance(answer, dict) else None
@@ -175,6 +178,8 @@ async def translate_approved(
                 "invented claims, wrong gender or speaker. Return JSON with approved boolean "
                 "and reason string. If uncertain, reject.",
                 {"original": original, "candidate": candidate, "meaning": meaning,
+                 "full_audio_script": full_script, "speaker_relationship": original_context.get("speaker_relationship", ""),
+                 "emotion": original_context.get("emotion", ""),
                  "previous": previous, "next": next_turn, "gender": speaker_gender,
                  "target_locale": target_locale},
             )
