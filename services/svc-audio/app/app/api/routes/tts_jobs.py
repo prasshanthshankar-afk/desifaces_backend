@@ -705,6 +705,7 @@ class TTSCreateRequest(BaseModel):
     volume: Optional[float] = None
     context: Optional[str] = None
     # Optional Director-authored spoken-dialogue context; never changes source text.
+    full_audio_script: Optional[str] = Field(default=None, max_length=16000)
     previous_turn: Optional[str] = Field(default=None, max_length=1000)
     next_turn: Optional[str] = Field(default=None, max_length=1000)
     speaker_relationship: Optional[str] = Field(default=None, max_length=160)
@@ -791,6 +792,7 @@ def _build_audio_payload(req: TTSCreateRequest) -> Dict[str, Any]:
         "pitch": req.pitch,
         "volume": req.volume,
         "context": req.context,
+        "full_audio_script": req.full_audio_script,
         "previous_turn": req.previous_turn,
         "next_turn": req.next_turn,
         "speaker_relationship": req.speaker_relationship,
