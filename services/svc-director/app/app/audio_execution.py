@@ -190,7 +190,7 @@ async def load_audio_stage_context(
     )
     if row["story_id"] and not scene_turns:
         raise ParticipantAudioBridgeError("audio_scene_script_unavailable")
-    transcript = "\\n".join(
+    transcript = "\n".join(
         f"{_clean(turn['display_name']) or 'Character'}: {_clean(turn['text_value'])}"
         for turn in scene_turns
     )
