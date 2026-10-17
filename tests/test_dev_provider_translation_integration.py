@@ -106,3 +106,15 @@ def test_provider_first_runtime_uses_bounded_review_gate():
     # Synthesis is only called after translation finishes in the TTS service.
     svc = (root / "services/svc-audio/app/app/services/tts_service.py").read_text()
     assert svc.index("await translate_approved(") < svc.index("await self.provider_executor.synthesize(")
+
+
+def test_full_audio_script_reaches_clarification_and_independent_review():
+    root = Path(__file__).resolve().parents[1]
+    orchestrator = (root / "services/svc-audio/app/app/services/tts_orchestrator.py").read_text()
+    service = (root / "services/svc-audio/app/app/services/tts_service.py").read_text()
+    translation = (root / "services/svc-audio/app/app/services/dev_provider_translation.py").read_text()
+    assert 'full_audio_script=payload.get("full_audio_script")' in orchestrator
+    assert '"full_audio_script": full_audio_script' in service
+    assert translation.count('"full_audio_script": full_script') == 2
+    assert '"speaker_relationship": original_context.get("speaker_relationship"' in translation
+    assert '"emotion": original_context.get("emotion"' in translation
