@@ -16,6 +16,9 @@ on:
       - 'services/svc-audio/app/app/services/dev_contextual_translation_gate.py'
       - 'services/svc-audio/app/app/services/tts_service.py'
       - 'services/svc-audio/app/app/services/tts_orchestrator.py'
+      - 'services/svc-director/app/app/audio_execution.py'
+      - 'services/svc-director/app/app/audio_execution_runtime.py'
+      - 'services/svc-audio/app/app/api/routes/tts_jobs.py'
       - '.github/workflows/dev-speech-translation-certification.yml'
 
 permissions:
@@ -50,6 +53,26 @@ jobs:
             tests/test_dev_provider_translation_locale_resolution.py \
             tests/test_dev_contextual_translation_gate.py \
             tests/test_dev_global_translation_adapters.py
+
+      - name: Verify executable source syntax across Director and Audio
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          files = [
+              "services/svc-director/app/app/audio_execution.py",
+              "services/svc-director/app/app/audio_execution_runtime.py",
+              "services/svc-audio/app/app/api/routes/tts_jobs.py",
+              "services/svc-audio/app/app/services/tts_orchestrator.py",
+              "services/svc-audio/app/app/services/tts_service.py",
+              "services/svc-audio/app/app/services/dev_provider_translation.py",
+              "services/svc-audio/app/app/services/dev_translation_provider_adapters.py",
+              "services/svc-audio/app/app/services/dev_contextual_translation_gate.py",
+          ]
+          for filename in files:
+              ast.parse(Path(filename).read_text(), filename=filename)
+          print(f"DIRECTOR_AUDIO_SYNTAX=PASS ({len(files)} files)")
+          PY
 
       - name: Assert retired migration cannot create tables
         run: |
