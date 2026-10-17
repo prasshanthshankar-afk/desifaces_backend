@@ -109,13 +109,11 @@ async def translate_approved(
                provider_source_code=c["provider_source_code"],
                provider_target_code=c["provider_target_code"])
     provider, model = row["provider_code"], row["model_code"]
-    if provider != "sarvam" or model != "mayura:v1":
-        raise DevTranslationRejected("translation_provider_not_implemented")
-    key = os.getenv("SARVAM_API_KEY", "").strip()
-    if not key:
-        raise DevTranslationRejected("sarvam_credential_missing")
     if not text.strip() or len(text) > 1000:
         raise DevTranslationRejected("invalid_text_length")
+    from app.services.dev_translation_provider_adapters import (
+        translate_via_configured_provider,
+    )
     # The contextual pipeline is required; legacy direct translation must not
     # bypass its independent QA when provider-first is enabled.
     from app.services.dev_contextual_translation_gate import (
@@ -157,20 +155,9 @@ async def translate_approved(
             return meaning
 
         async def provider_translate(meaning):
-            result = await client.post(
-                "https://api.sarvam.ai/translate",
-                headers={"api-subscription-key": key},
-                json={"input": meaning,
-                      "source_language_code": row["provider_source_code"],
-                      "target_language_code": row["provider_target_code"],
-                      "speaker_gender": speaker_gender.capitalize(),
-                      "mode": "modern-colloquial", "model": model,
-                      "output_script": "spoken-form-in-native",
-                      "numerals_format": "international"},
+            return await translate_via_configured_provider(
+                client, route=row, text=meaning, speaker_gender=speaker_gender,
             )
-            result.raise_for_status()
-            body = result.json()
-            return body.get("translated_text", "")
 
         async def independently_review(original, candidate, previous, next_turn, meaning):
             answer = await responses_json(
