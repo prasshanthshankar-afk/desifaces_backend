@@ -42,7 +42,8 @@ jobs:
             tests/test_dev_sarvam_mayura_translation.py \
             tests/test_dev_translation_selection.py \
             tests/test_dev_translation_capability_repo.py \
-            tests/test_dev_provider_translation_integration.py
+            tests/test_dev_provider_translation_integration.py \
+            tests/test_dev_provider_translation_locale_resolution.py
 
       - name: Verify no production deployment
         run: |
