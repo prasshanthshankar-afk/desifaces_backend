@@ -93,3 +93,53 @@ async def test_unsupported_azure_model_rejected_before_network(monkeypatch):
                 client, route={"provider_code":"azure_translator",
                 "model_code":"unapproved","provider_source_code":"en",
                 "provider_target_code":"es"}, text="Hello", speaker_gender="male")
+
+
+@pytest.mark.asyncio
+async def test_google_nmt_approved_route(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLOUD_TRANSLATION_API_KEY", "mock")
+    import json
+    def handler(request):
+        assert request.url.params["key"] == "mock"
+        body = json.loads(request.content)
+        assert body == {"q": "Hello", "source": "en", "target": "es",
+                        "format": "text", "model": "nmt"}
+        return httpx.Response(200, json={
+            "data": {"translations": [{"translatedText": "Hola"}]}})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await m.translate_via_configured_provider(
+            client, route={"provider_code": "google_cloud_translation",
+                           "model_code": "nmt",
+                           "provider_source_code": "en",
+                           "provider_target_code": "es"},
+            text="Hello", speaker_gender="female") == "Hola"
+
+
+@pytest.mark.asyncio
+async def test_google_missing_key_rejected_without_network(monkeypatch):
+    monkeypatch.delenv("GOOGLE_CLOUD_TRANSLATION_API_KEY", raising=False)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: pytest.fail("network must not be called"))) as client:
+        with pytest.raises(m.ProviderTranslationError,
+                           match="google_translation_credential_missing"):
+            await m.translate_via_configured_provider(
+                client, route={"provider_code": "google_cloud_translation",
+                               "model_code": "nmt",
+                               "provider_source_code": "en",
+                               "provider_target_code": "ar"},
+                text="Hello", speaker_gender="male")
+
+
+@pytest.mark.asyncio
+async def test_google_unapproved_model_rejected_without_network(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLOUD_TRANSLATION_API_KEY", "mock")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: pytest.fail("network must not be called"))) as client:
+        with pytest.raises(m.ProviderTranslationError,
+                           match="unsupported_google_model"):
+            await m.translate_via_configured_provider(
+                client, route={"provider_code": "google_cloud_translation",
+                               "model_code": "unapproved",
+                               "provider_source_code": "en",
+                               "provider_target_code": "es"},
+                text="Hello", speaker_gender="female")
