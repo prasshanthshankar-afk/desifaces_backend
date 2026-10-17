@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app \
+    PYTHONPATH=/app:/app/desifaces_shared/llm \
     HOST=0.0.0.0 \
     PORT=8004 \
     LOG_LEVEL=info
