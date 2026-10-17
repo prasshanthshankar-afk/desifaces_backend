@@ -36,17 +36,32 @@ async def translate_approved(
     speaker_gender: str, original_context: dict,
 ) -> tuple[str, str, str]:
     """Approved directional DB row required. No automatic provider fallback."""
+    # Exact approved locale direction first; base languages may resolve only when
+    # they identify ONE approved canonical route. Never arbitrarily map en to en-IN.
     rows = await pool.fetch(
-        """SELECT provider_code, model_code, provider_source_code, provider_target_code
-           FROM public.audio_translation_capabilities
-           WHERE source_locale=$1 AND target_locale=$2
-             AND is_enabled AND is_approved
-           ORDER BY priority,provider_code,model_code""",
+        """SELECT c.provider_code, c.model_code, c.provider_source_code,
+                  c.provider_target_code, c.source_locale, c.target_locale
+           FROM public.audio_translation_capabilities c
+           JOIN public.tts_locales src ON src.locale=c.source_locale
+           WHERE c.target_locale=$2
+             AND (c.source_locale=$1 OR (
+                strpos($1, '-')=0 AND lower(src.language_code)=lower($1)
+             ))
+             AND src.is_enabled AND c.is_enabled AND c.is_approved
+           ORDER BY CASE WHEN c.source_locale=$1 THEN 0 ELSE 1 END,
+                    c.priority,c.provider_code,c.model_code""",
         source_locale, target_locale,
     )
     if not rows:
         raise DevTranslationRejected("no_approved_translation_direction")
-    row = rows[0]
+    exact = [r for r in rows if r["source_locale"] == source_locale]
+    if exact:
+        row = exact[0]
+    else:
+        canonical = {r["source_locale"] for r in rows}
+        if len(canonical) != 1:
+            raise DevTranslationRejected("ambiguous_source_locale")
+        row = rows[0]
     provider, model = row["provider_code"], row["model_code"]
     if provider != "sarvam" or model != "mayura:v1":
         raise DevTranslationRejected("translation_provider_not_implemented")
