@@ -19,11 +19,30 @@ def test_flag_off_is_legacy(monkeypatch):
     assert m.selected_for_dev(UID) is False
 
 
+def _attest(monkeypatch, *, name="desifaces-dev"):
+    import io
+    import json
+    class MetadataResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.close()
+    class Opener:
+        def open(self, request, timeout=0):
+            assert request.get_header("Metadata") == "true"
+            return MetadataResponse(json.dumps({
+                "name": name,
+                "resourceGroupName": "rg-desifaces-dev",
+                "subscriptionId": "e70463a7-4016-4cf5-9291-b640b0f0f5cb",
+            }).encode())
+    monkeypatch.setattr(m.urllib.request, "build_opener", lambda *_: Opener())
+
+
 def test_allowlisted_dev_requires_attestation(monkeypatch):
     monkeypatch.setenv("DF_DEV_PROVIDER_TRANSLATION_ENABLED", "true")
     monkeypatch.setenv("DF_RUNTIME_ENV", "dev")
-    monkeypatch.setenv("DF_DEV_TRANSLATION_HOST_ATTESTED", "true")
     monkeypatch.setenv("DF_DEV_TRANSLATION_USER_IDS", UID)
+    _attest(monkeypatch)
     assert m.selected_for_dev(UID)
     assert m.selected_for_dev("00000000-0000-4000-8000-000000000002") is False
 
@@ -35,11 +54,22 @@ def test_production_denied(monkeypatch):
         m.selected_for_dev(UID)
 
 
-def test_unattested_host_denied(monkeypatch):
+def test_other_azure_host_denied_even_with_env_override(monkeypatch):
     monkeypatch.setenv("DF_DEV_PROVIDER_TRANSLATION_ENABLED", "true")
     monkeypatch.setenv("DF_RUNTIME_ENV", "dev")
-    monkeypatch.delenv("DF_DEV_TRANSLATION_HOST_ATTESTED", raising=False)
-    monkeypatch.setattr(m.socket, "gethostname", lambda: "other-host")
+    monkeypatch.setenv("DF_DEV_TRANSLATION_HOST_ATTESTED", "true")
+    _attest(monkeypatch, name="desifaces-gpu")
+    with pytest.raises(m.DevTranslationRejected, match="dev_host_attestation_required"):
+        m.selected_for_dev(UID)
+
+
+def test_unreachable_metadata_fails_closed(monkeypatch):
+    monkeypatch.setenv("DF_DEV_PROVIDER_TRANSLATION_ENABLED", "true")
+    monkeypatch.setenv("DF_RUNTIME_ENV", "dev")
+    monkeypatch.setenv("DF_DEV_TRANSLATION_USER_IDS", UID)
+    def unavailable(*args):
+        raise TimeoutError("unavailable")
+    monkeypatch.setattr(m.urllib.request, "build_opener", unavailable)
     with pytest.raises(m.DevTranslationRejected, match="dev_host_attestation_required"):
         m.selected_for_dev(UID)
 
