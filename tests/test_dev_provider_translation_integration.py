@@ -118,3 +118,15 @@ def test_full_audio_script_reaches_clarification_and_independent_review():
     assert translation.count('"full_audio_script": full_script') == 2
     assert '"speaker_relationship": original_context.get("speaker_relationship"' in translation
     assert '"emotion": original_context.get("emotion"' in translation
+
+
+def test_director_reconstructs_and_audio_api_accepts_canonical_script():
+    root = Path(__file__).resolve().parents[1]
+    director = (root / "services/svc-director/app/app/audio_execution.py").read_text()
+    runtime = (root / "services/svc-director/app/app/audio_execution_runtime.py").read_text()
+    api = (root / "services/svc-audio/app/app/api/routes/tts_jobs.py").read_text()
+    assert "ORDER BY dt.sequence_no, dt.turn_id" in director
+    assert 'stage_metadata["full_audio_script"] = transcript' in director
+    assert '("full_audio_script", 16000)' in runtime
+    assert 'full_audio_script: Optional[str] = Field(default=None, max_length=16000)' in api
+    assert '"full_audio_script": req.full_audio_script' in api
