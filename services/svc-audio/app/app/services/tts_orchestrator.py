@@ -1622,6 +1622,7 @@ class TTSOrchestrator:
                 next_turn=payload.get("next_turn") or "",
                 speaker_relationship=payload.get("speaker_relationship") or "",
                 scene_context=payload.get("scene_context") or payload.get("context") or "",
+                full_audio_script=payload.get("full_audio_script") or payload.get("conversation_script") or "",
                 locale_context=payload.get("locale_context") or normalized_target_locale,
                 authenticated_user_id=str(user_id),
             )
