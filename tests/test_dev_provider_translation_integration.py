@@ -147,3 +147,13 @@ def test_exact_lowercase_brand_required_before_tts():
     root = Path(__file__).resolve().parents[1]
     source = (root / 'services/svc-audio/app/app/services/dev_provider_translation.py').read_text()
     assert 'if "desifaces" in original and "desifaces" not in candidate:' in source
+
+
+def test_separate_regional_review_veto_covers_certification_locales():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "services/svc-audio/app/app/services/dev_provider_translation.py").read_text()
+    for locale in ("or-IN", "ar-EG", "es-MX"):
+        assert f'"{locale}":' in source
+    assert "regional_spoken_language_rejected:" in source
+    assert "regional.get(\"approved\") is not True" in source
+    assert "Modern Standard Arabic" in source
