@@ -141,3 +141,9 @@ def test_full_script_cannot_authorize_scene_summaries():
     assert "brand_name_not_preserved" in source
     assert "NEVER describe the speaker" in source
     assert "REJECT if candidate narrates or summarizes" in source
+
+
+def test_exact_lowercase_brand_required_before_tts():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / 'services/svc-audio/app/app/services/dev_provider_translation.py').read_text()
+    assert 'if "desifaces" in original and "desifaces" not in candidate:' in source
