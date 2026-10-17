@@ -42,7 +42,8 @@ DO $verify$
 BEGIN
  IF (SELECT COUNT(*) FROM public.tts_locales
      WHERE locale='hi-IN'
-       AND meta_json::jsonb #>> '{translation_routing_v1,capabilities,0,provider}') <> 1
+       AND (meta_json::jsonb #>> '{translation_routing_v1,capabilities,0,provider}') = 'sarvam'
+       AND (meta_json::jsonb #>> '{translation_routing_v1,capabilities,0,model}') = 'mayura:v1') <> 1
  THEN
    RAISE EXCEPTION 'Routing metadata postcondition failed';
  END IF;
