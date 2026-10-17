@@ -174,6 +174,31 @@ async def load_audio_stage_context(
             else:
                 stage_metadata.pop(key, None)
 
+    # Reconstruct the full canonical scene transcript, ordered and speaker-labelled.
+    # Do not synthesize invented context or trust client-supplied dialogue history.
+    scene_turns = await conn.fetch(
+        """
+        SELECT dt.text_value, p.display_name
+        FROM public.v3_dialogue_turns dt
+        LEFT JOIN public.v3_participants p
+          ON p.participant_id=dt.speaker_participant_id
+        WHERE dt.scene_id=$1
+          AND NULLIF(btrim(dt.text_value),'') IS NOT NULL
+        ORDER BY dt.sequence_no, dt.turn_id
+        """,
+        UUID(str(row["scene_id"])),
+    )
+    if row["story_id"] and not scene_turns:
+        raise ParticipantAudioBridgeError("audio_scene_script_unavailable")
+    transcript = "\\n".join(
+        f"{_clean(turn['display_name']) or 'Character'}: {_clean(turn['text_value'])}"
+        for turn in scene_turns
+    )
+    if row["story_id"] and (not transcript or len(transcript) > 16000):
+        raise ParticipantAudioBridgeError("audio_scene_script_exceeds_context_limit")
+    if transcript:
+        stage_metadata["full_audio_script"] = transcript
+
     return AudioStageContext(
         workflow_id=UUID(str(row["workflow_id"])),
         stage_run_id=UUID(str(row["stage_run_id"])),
