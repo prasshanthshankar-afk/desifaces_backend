@@ -130,3 +130,14 @@ def test_director_reconstructs_and_audio_api_accepts_canonical_script():
     assert '("full_audio_script", 16000)' in runtime
     assert 'full_audio_script: Optional[str] = Field(default=None, max_length=16000)' in api
     assert '"full_audio_script": req.full_audio_script' in api
+
+
+def test_full_script_cannot_authorize_scene_summaries():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "services/svc-audio/app/app/services/dev_provider_translation.py").read_text()
+    assert "narrative_instead_of_dialogue" in source
+    assert "meaning_expansion_not_dialogue" in source
+    assert "translation_expands_into_scene_summary" in source
+    assert "brand_name_not_preserved" in source
+    assert "NEVER describe the speaker" in source
+    assert "REJECT if candidate narrates or summarizes" in source
