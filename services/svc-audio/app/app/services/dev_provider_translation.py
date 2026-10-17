@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import os
+import re
 import urllib.request
 import uuid
 import httpx
@@ -171,6 +172,12 @@ async def translate_approved(
             meaning = answer.get("meaning") if isinstance(answer, dict) else None
             if not isinstance(meaning, str) or not meaning.strip():
                 raise DevTranslationRejected("invalid_meaning_clarification")
+            # Defense in depth: a line must not become an English plot synopsis.
+            summary_prefix = r"^\\s*(?:speaker\\s*\\d+|the speaker|speaker one|speaker two|character\\s*\\d+|the character)\\b"
+            if re.search(summary_prefix, meaning, flags=re.IGNORECASE):
+                raise DevTranslationRejected("narrative_instead_of_dialogue")
+            if len(meaning) > max(250, len(original) * 2):
+                raise DevTranslationRejected("meaning_expansion_not_dialogue")
             return meaning
 
         async def provider_translate(meaning):
@@ -200,6 +207,12 @@ async def translate_approved(
                  "previous": previous, "next": next_turn, "gender": speaker_gender,
                  "target_locale": target_locale},
             )
+            # Structural checks cannot replace linguistic review but must prevent
+            # obvious scene recaps and corruption even if reviewer approves them.
+            if len(candidate) > max(450, len(original) * 3):
+                return Review(False, "translation_expands_into_scene_summary")
+            if "desifaces" in original.lower() and "desifaces" not in candidate.lower():
+                return Review(False, "brand_name_not_preserved")
             if not isinstance(answer, dict) or answer.get("approved") is not True:
                 return Review(False, str(answer.get("reason", "rejected")) if isinstance(answer, dict) else "invalid_review")
             return Review(True, str(answer.get("reason", "approved")))
