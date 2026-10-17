@@ -34,6 +34,7 @@ async def contextual_translation_with_review(
     provider_translate: Callable[[str], Awaitable[str]],
     independent_review: Callable[[str, str, str, str, str], Awaitable[Review]],
     max_repairs: int = 2,
+    repair_target_speech: Callable[[str, str, str, str], Awaitable[str]] | None = None,
 ) -> ApprovedTranslation:
     if not original.strip() or max_repairs < 0 or max_repairs > 2:
         raise TranslationReviewRequired("invalid_translation_contract")
@@ -46,9 +47,12 @@ async def contextual_translation_with_review(
 
     # Always check candidate against original AND context; never certify against
     # clarified text alone. One initial attempt + at most two repairs.
+    repaired_candidate = None
     for attempt in range(max_repairs + 1):
         try:
-            candidate = (await provider_translate(meaning)).strip()
+            candidate = (repaired_candidate if repaired_candidate is not None
+                         else await provider_translate(meaning)).strip()
+            repaired_candidate = None
         except Exception as exc:
             raise TranslationReviewRequired("translation_provider_failed") from exc
         if not candidate:
@@ -64,12 +68,24 @@ async def contextual_translation_with_review(
         if review.approved is True:
             return ApprovedTranslation(candidate, attempt + 1, meaning)
         if attempt < max_repairs:
-            # Refresh source-language clarification using rejection reason,
-            # but do not use the reviewer to produce the final translation.
+            # Regional/register defects require target-language repair, not
+            # another attempt to explain the English dialogue.
+            if (repair_target_speech is not None and
+                    review.reason.startswith("regional_spoken_language_rejected:")):
+                try:
+                    revised = await repair_target_speech(
+                        original, candidate, meaning, review.reason[:350]
+                    )
+                    repaired_candidate = str(revised or "").strip()
+                except Exception as exc:
+                    raise TranslationReviewRequired("regional_speech_repair_failed") from exc
+                if not repaired_candidate:
+                    raise TranslationReviewRequired("empty_regional_speech_repair")
+                continue
             try:
                 revised = (await clarify_meaning(
                     original, previous_turn,
-                    next_turn + "\nReview feedback: " + review.reason[:350]
+                    next_turn + "\\nReview feedback: " + review.reason[:350]
                 )).strip()
             except Exception as exc:
                 raise TranslationReviewRequired("meaning_repair_failed") from exc
