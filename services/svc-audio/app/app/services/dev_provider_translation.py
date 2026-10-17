@@ -48,11 +48,56 @@ def selected_for_dev(user_id: str | None) -> bool:
     return identity.lower() in allowed
 
 
+async def _detect_auto_source_language(text: str) -> str:
+    """Resolve UI 'auto' to an ISO 639-1 language via independent detection.
+
+    Never infer geographic dialect, approve a provider, or default to English.
+    Routing still requires a unique enabled source locale and approved DB edge.
+    """
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise DevTranslationRejected("auto_source_detection_credential_missing")
+    if not text.strip() or len(text) > 1000:
+        raise DevTranslationRejected("invalid_text_length")
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            response = await client.post(
+                os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/responses",
+                headers={"Authorization": "Bearer " + key},
+                json={
+                    "model": os.getenv("DF_DEV_TRANSLATION_QA_MODEL", "gpt-4.1-mini"),
+                    "instructions": (
+                        "Identify the language of the CURRENT spoken utterance only, "
+                        "not the requested output language or surrounding dialogue. "
+                        "Return JSON ONLY with language_code, a lowercase ISO 639-1 "
+                        "two-letter code, or null if uncertain, mixed or ambiguous. "
+                        "Never assume English from context or invent a regional locale."
+                    ),
+                    "input": json.dumps({"utterance": text}, ensure_ascii=False),
+                    "max_output_tokens": 100,
+                },
+            )
+            response.raise_for_status()
+            body = response.json()
+            output = body.get("output_text") or "\\n".join(
+                c.get("text", "") for o in body.get("output", []) if isinstance(o, dict)
+                for c in o.get("content", []) if isinstance(c, dict)
+            )
+            detected = json.loads(output).get("language_code")
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
+            raise DevTranslationRejected("auto_source_detection_failed") from exc
+    if not isinstance(detected, str) or not re.fullmatch(r"[a-z]{2}", detected):
+        raise DevTranslationRejected("auto_source_language_ambiguous")
+    return detected
+
+
 async def translate_approved(
     pool, *, text: str, source_locale: str, target_locale: str,
     speaker_gender: str, original_context: dict,
 ) -> tuple[str, str, str]:
     """Approved directional DB row required. No automatic provider fallback."""
+    if str(source_locale or "").strip().lower() == "auto":
+        source_locale = await _detect_auto_source_language(text)
     # Existing-schema translation contract: stored only in target locale
     # meta_json.translation_routing_v1. No new table and no implicit fallback.
     records = await pool.fetch(
