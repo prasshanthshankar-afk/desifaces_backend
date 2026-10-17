@@ -196,7 +196,7 @@ async def translate_approved(
                 "REJECT if candidate combines other dialogue turns, includes story exposition, "
                 "omits original details, invents new facts, changes desifaces brand spelling, "
                 "uses stiff literal calques, or is unnaturally verbose. "
-                "For ar-EG require natural Egyptian conversational register; for es-MX "
+                 "For ar-EG require natural Egyptian conversational register; for es-MX "
                 "require natural Mexican conversational register. For or-IN require natural "
                 "conversational Odia, not an English-heavy scripted summary. "
                 "If ambiguous or uncertain, reject. Return JSON ONLY with approved boolean "
@@ -211,7 +211,7 @@ async def translate_approved(
             # obvious scene recaps and corruption even if reviewer approves them.
             if len(candidate) > max(450, len(original) * 3):
                 return Review(False, "translation_expands_into_scene_summary")
-            if "desifaces" in original.lower() and "desifaces" not in candidate.lower():
+            if "desifaces" in original and "desifaces" not in candidate:
                 return Review(False, "brand_name_not_preserved")
             if not isinstance(answer, dict) or answer.get("approved") is not True:
                 return Review(False, str(answer.get("reason", "rejected")) if isinstance(answer, dict) else "invalid_review")
