@@ -10,6 +10,7 @@ on:
       - 'services/svc-audio/app/app/repos/translation_capability_repo.py'
       - 'tests/test_dev_*'
       - 'migrations/2026_10_17_dev_audio_translation_capabilities.sql'
+      - 'migrations/2026_10_17_dev_enable_hindi_translation_routing.sql'
       - 'services/svc-audio/app/app/services/dev_provider_translation.py'
       - 'services/svc-audio/app/app/services/dev_contextual_translation_gate.py'
       - 'services/svc-audio/app/app/services/tts_service.py'
@@ -58,6 +59,21 @@ jobs:
           assert "ALTER TABLE" not in executable.upper()
           assert "INSERT INTO" not in executable.upper()
           print("SCHEMA_MIGRATION=NO_OP")
+          PY
+
+      - name: Verify DEV-only routing change scope
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path("migrations/2026_10_17_dev_enable_hindi_translation_routing.sql")
+          s=p.read_text()
+          assert "application_name" in s
+          assert "desifaces_dev_translation_certification" in s
+          assert "WHERE locale='hi-IN'" in s
+          assert "jsonb_set(" in s
+          assert "CREATE TABLE" not in s.upper()
+          assert "DROP TABLE" not in s.upper()
+          print("DEV_METADATA_SCOPE=PASS")
           PY
 
       - name: Verify no production deployment
