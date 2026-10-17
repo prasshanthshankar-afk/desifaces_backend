@@ -9,6 +9,9 @@ on:
       - 'services/shared/llm/dev_*'
       - 'services/svc-audio/app/app/repos/translation_capability_repo.py'
       - 'tests/test_dev_*'
+      - 'services/svc-audio/app/app/services/dev_provider_translation.py'
+      - 'services/svc-audio/app/app/services/tts_service.py'
+      - 'services/svc-audio/app/app/services/tts_orchestrator.py'
       - '.github/workflows/dev-speech-translation-certification.yml'
 
 permissions:
@@ -38,7 +41,8 @@ jobs:
           python -m pytest -q \
             tests/test_dev_sarvam_mayura_translation.py \
             tests/test_dev_translation_selection.py \
-            tests/test_dev_translation_capability_repo.py
+            tests/test_dev_translation_capability_repo.py \
+            tests/test_dev_provider_translation_integration.py
 
       - name: Verify no production deployment
         run: |
