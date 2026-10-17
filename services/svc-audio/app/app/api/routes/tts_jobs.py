@@ -704,6 +704,12 @@ class TTSCreateRequest(BaseModel):
     pitch: Optional[float] = None
     volume: Optional[float] = None
     context: Optional[str] = None
+    # Optional Director-authored spoken-dialogue context; never changes source text.
+    previous_turn: Optional[str] = Field(default=None, max_length=1000)
+    next_turn: Optional[str] = Field(default=None, max_length=1000)
+    speaker_relationship: Optional[str] = Field(default=None, max_length=160)
+    scene_context: Optional[str] = Field(default=None, max_length=1000)
+    locale_context: Optional[str] = Field(default=None, max_length=80)
 
     output_format: str = Field(default="mp3")  # mp3|wav
 
@@ -785,6 +791,11 @@ def _build_audio_payload(req: TTSCreateRequest) -> Dict[str, Any]:
         "pitch": req.pitch,
         "volume": req.volume,
         "context": req.context,
+        "previous_turn": req.previous_turn,
+        "next_turn": req.next_turn,
+        "speaker_relationship": req.speaker_relationship,
+        "scene_context": req.scene_context,
+        "locale_context": req.locale_context,
         "output_format": req.output_format,
     }
     if req.pricing_confirmation:
