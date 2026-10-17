@@ -115,7 +115,7 @@ def test_full_audio_script_reaches_clarification_and_independent_review():
     translation = (root / "services/svc-audio/app/app/services/dev_provider_translation.py").read_text()
     assert 'full_audio_script=payload.get("full_audio_script")' in orchestrator
     assert '"full_audio_script": full_audio_script' in service
-    assert translation.count('"full_audio_script": full_script') == 2
+    assert translation.count('"full_audio_script": full_script') == 3  # clarification, semantic QA, regional repair
     assert '"speaker_relationship": original_context.get("speaker_relationship"' in translation
     assert '"emotion": original_context.get("emotion"' in translation
 
