@@ -11,6 +11,7 @@ on:
       - 'tests/test_dev_*'
       - 'migrations/2026_10_17_dev_audio_translation_capabilities.sql'
       - 'services/svc-audio/app/app/services/dev_provider_translation.py'
+      - 'services/svc-audio/app/app/services/dev_contextual_translation_gate.py'
       - 'services/svc-audio/app/app/services/tts_service.py'
       - 'services/svc-audio/app/app/services/tts_orchestrator.py'
       - '.github/workflows/dev-speech-translation-certification.yml'
@@ -44,7 +45,8 @@ jobs:
             tests/test_dev_translation_selection.py \
             tests/test_dev_translation_capability_repo.py \
             tests/test_dev_provider_translation_integration.py \
-            tests/test_dev_provider_translation_locale_resolution.py
+            tests/test_dev_provider_translation_locale_resolution.py \
+            tests/test_dev_contextual_translation_gate.py
 
       - name: Assert retired migration cannot create tables
         run: |
