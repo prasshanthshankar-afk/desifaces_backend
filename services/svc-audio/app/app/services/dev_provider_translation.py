@@ -100,69 +100,84 @@ async def translate_approved(
         raise DevTranslationRejected("sarvam_credential_missing")
     if not text.strip() or len(text) > 1000:
         raise DevTranslationRejected("invalid_text_length")
+    # The contextual pipeline is required; legacy direct translation must not
+    # bypass its independent QA when provider-first is enabled.
+    from app.services.dev_contextual_translation_gate import (
+        contextual_translation_with_review, Review, TranslationReviewRequired,
+    )
     async with httpx.AsyncClient(timeout=30) as client:
-        try:
+        async def responses_json(instructions, value, tokens=250):
+            review_key = os.getenv("OPENAI_API_KEY", "").strip()
+            if not review_key:
+                raise DevTranslationRejected("independent_qa_credential_missing")
+            response = await client.post(
+                os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/responses",
+                headers={"Authorization": "Bearer " + review_key},
+                json={"model": os.getenv("DF_DEV_TRANSLATION_QA_MODEL", "gpt-4.1-mini"),
+                      "instructions": instructions, "input": json.dumps(value, ensure_ascii=False),
+                      "max_output_tokens": tokens},
+            )
+            response.raise_for_status()
+            body = response.json()
+            output = body.get("output_text") or "\\n".join(
+                c.get("text", "") for o in body.get("output", []) if isinstance(o, dict)
+                for c in o.get("content", []) if isinstance(c, dict)
+            )
+            return json.loads(output)
+
+        async def clarify(original, previous, next_turn):
+            answer = await responses_json(
+                "Clarify ONLY the current English dialogue meaning using neighboring turns. "
+                "Return JSON with meaning as a speakable English sentence. Do not add facts, "
+                "change speaker, or translate into another language.",
+                {"current": original, "previous": previous, "next": next_turn,
+                 "speaker_gender": speaker_gender, "scene": original_context.get("scene_context", "")},
+            )
+            meaning = answer.get("meaning") if isinstance(answer, dict) else None
+            if not isinstance(meaning, str) or not meaning.strip():
+                raise DevTranslationRejected("invalid_meaning_clarification")
+            return meaning
+
+        async def provider_translate(meaning):
             result = await client.post(
                 "https://api.sarvam.ai/translate",
                 headers={"api-subscription-key": key},
-                json={
-                    "input": text,
-                    "source_language_code": row["provider_source_code"],
-                    "target_language_code": row["provider_target_code"],
-                    "speaker_gender": speaker_gender.capitalize(),
-                    "mode": "modern-colloquial",
-                    "model": model,
-                    "output_script": "spoken-form-in-native",
-                    "numerals_format": "international",
-                },
+                json={"input": meaning,
+                      "source_language_code": row["provider_source_code"],
+                      "target_language_code": row["provider_target_code"],
+                      "speaker_gender": speaker_gender.capitalize(),
+                      "mode": "modern-colloquial", "model": model,
+                      "output_script": "spoken-form-in-native",
+                      "numerals_format": "international"},
             )
             result.raise_for_status()
-            candidate = result.json().get("translated_text", "")
-        except (httpx.HTTPError, ValueError, AttributeError) as exc:
-            raise DevTranslationRejected("sarvam_translation_failed") from exc
-        if not isinstance(candidate, str) or not candidate.strip():
-            raise DevTranslationRejected("empty_translation")
-        # Independent review is compulsory for DEV provider-first route.
-        review_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if not review_key:
-            raise DevTranslationRejected("independent_qa_credential_missing")
-        instructions = (
-            "Independently review the translated spoken line against the original. "
-            "Check conversational naturalness, correct contextual meaning, pronouns, "
-            "grammar, speaker identity, proper names, no extra or missing claims. "
-            "Do not add neighboring lines. Return JSON only: "
-            '{"approved":true/false,"reason":"brief reason"}. '
-            "If uncertain, reject."
-        )
-        try:
-            qa = await client.post(
-                (os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-                 + "/responses"),
-                headers={"Authorization": "Bearer " + review_key},
-                json={
-                    "model": os.getenv("DF_DEV_TRANSLATION_QA_MODEL", "gpt-4.1-mini"),
-                    "instructions": instructions,
-                    "input": json.dumps({
-                        "source": text, "candidate": candidate,
-                        "source_locale": source_locale, "target_locale": target_locale,
-                        "speaker_gender": speaker_gender,
-                        "context": original_context,
-                    }, ensure_ascii=False),
-                    "max_output_tokens": 200,
-                },
+            body = result.json()
+            return body.get("translated_text", "")
+
+        async def independently_review(original, candidate, previous, next_turn, meaning):
+            answer = await responses_json(
+                "Independently assess natural SPOKEN translation against the ORIGINAL English "
+                "utterance and dialogue context; do not approve literal calques, missing or "
+                "invented claims, wrong gender or speaker. Return JSON with approved boolean "
+                "and reason string. If uncertain, reject.",
+                {"original": original, "candidate": candidate, "meaning": meaning,
+                 "previous": previous, "next": next_turn, "gender": speaker_gender,
+                 "target_locale": target_locale},
             )
-            qa.raise_for_status()
-            body = qa.json()
-            verdict_text = body.get("output_text")
-            if not verdict_text:
-                verdict_text = "\n".join(
-                    c.get("text", "")
-                    for o in body.get("output", []) if isinstance(o, dict)
-                    for c in o.get("content", []) if isinstance(c, dict)
-                )
-            verdict = json.loads(verdict_text)
-        except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
-            raise DevTranslationRejected("translation_qa_unavailable") from exc
-        if not isinstance(verdict, dict) or verdict.get("approved") is not True:
-            raise DevTranslationRejected("translation_quality_rejected")
-    return candidate.strip(), provider, model
+            if not isinstance(answer, dict) or answer.get("approved") is not True:
+                return Review(False, str(answer.get("reason", "rejected")) if isinstance(answer, dict) else "invalid_review")
+            return Review(True, str(answer.get("reason", "approved")))
+
+        try:
+            approved = await contextual_translation_with_review(
+                original=text,
+                previous_turn=str(original_context.get("previous_turn") or ""),
+                next_turn=str(original_context.get("next_turn") or ""),
+                clarify_meaning=clarify,
+                provider_translate=provider_translate,
+                independent_review=independently_review,
+                max_repairs=2,
+            )
+        except (TranslationReviewRequired, httpx.HTTPError, ValueError, TypeError) as exc:
+            raise DevTranslationRejected("TRANSLATION_REVIEW_REQUIRED") from exc
+        return approved.text, provider, model
