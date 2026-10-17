@@ -145,6 +145,20 @@ def compile_context_audio_input(context: _audio_execution.AudioStageContext) -> 
         else:
             studio_input[key] = number
 
+    # Forward only explicitly supplied, story-approved conversational context.
+    # Never invent neighboring turns from isolated stage metadata.
+    metadata = _as_dict(context.stage_metadata)
+    for key, limit in (
+        ("previous_turn", 1000),
+        ("next_turn", 1000),
+        ("speaker_relationship", 160),
+        ("scene_context", 1000),
+        ("locale_context", 80),
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            studio_input[key] = value.strip()[:limit]
+
     _preserve_qualitative_direction(studio_input, qualitative_notes)
     return studio_input
 
