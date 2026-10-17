@@ -244,6 +244,27 @@ async def translate_approved(
                 return Review(False, str(answer.get("reason", "rejected")) if isinstance(answer, dict) else "invalid_review")
             return Review(True, str(answer.get("reason", "approved")))
 
+        async def repair_target_speech(original, candidate, meaning, reason):
+            answer = await responses_json(
+                "Rewrite ONLY the provided target-language candidate as one natural "
+                "spoken utterance in the specified locale. Fix regional register "
+                "without changing the speaker, original English meaning, facts, "
+                "brand spelling desifaces, or adding narration. Preserve first-person "
+                "voice and the approximate duration. This is a proposed correction, "
+                "NOT an approval: independent semantic and regional QA will rerun. "
+                "Return JSON only with key 'text'.",
+                {"original": original, "meaning": meaning, "candidate": candidate,
+                 "target_locale": target_locale, "regional_rejection": reason,
+                 "full_audio_script": full_script, "speaker_gender": speaker_gender},
+                tokens=500,
+            )
+            revised = answer.get("text") if isinstance(answer, dict) else None
+            if not isinstance(revised, str) or not revised.strip():
+                raise DevTranslationRejected("regional_repair_invalid_response")
+            if len(revised) > max(450, len(original) * 3):
+                raise DevTranslationRejected("regional_repair_expands_dialogue")
+            return revised
+
         try:
             approved = await contextual_translation_with_review(
                 original=text,
@@ -253,6 +274,7 @@ async def translate_approved(
                 provider_translate=provider_translate,
                 independent_review=independently_review,
                 max_repairs=2,
+                repair_target_speech=repair_target_speech,
             )
         except (TranslationReviewRequired, httpx.HTTPError, ValueError, TypeError) as exc:
             raise DevTranslationRejected("TRANSLATION_REVIEW_REQUIRED") from exc
