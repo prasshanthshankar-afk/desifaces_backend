@@ -234,6 +234,16 @@ async def translate_approved(
             # Regional register is a separate veto: a generic bilingual PASS
             # cannot certify Egyptian colloquial Arabic or idiomatic Odia.
             regional_requirements = {
+                "hi-IN": "Evaluate natural everyday SPOKEN Hindi for an Indian audience. "
+                         "Reject transliterated English sentences such as 'next Friday open', "
+                         "'that's exciting', 'good shape', 'first fifty customers', "
+                         "'neighborhood share', or 'absolutely' when clear idiomatic Hindi "
+                         "is available. Familiar established loanwords such as cafe, "
+                         "coffee, menu, and offer are acceptable where natural. Preserve "
+                         "who does what, all numbers, deadlines, offers, and chronology; "
+                         "in particular distinguish 'I will start telling people today' "
+                         "from 'I will start next Friday'. Reject even fluent Hindi "
+                         "if timing or speaker intent changes.",
                 "or-IN": "Evaluate natural, current spoken Odia. Reject mechanical English "
                          "calques and excessive untranslated English when natural Odia wording "
                          "is available; allow familiar local loanwords.",
