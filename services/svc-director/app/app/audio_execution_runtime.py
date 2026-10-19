@@ -145,6 +145,25 @@ def compile_context_audio_input(context: _audio_execution.AudioStageContext) -> 
         else:
             studio_input[key] = number
 
+    # DEV story-specific expressive prosody for the two certified Hindi voices.
+    # No unsupported Azure express-as style; Sarvam consumes rate as pace.
+    # Respect explicit participant or Director numeric controls.
+    if is_story_audio and target_locale.lower() == "hi-in":
+        mood = str(context.emotion_code or "").lower()
+        voice = str(context.voice_profile_ref or "").strip().lower()
+        if voice == "hi-in-aartineural":
+            if any(word in mood for word in ("excited", "enthusiastic", "cheerful", "proud")):
+                studio_input.setdefault("rate", 1.07)
+                studio_input.setdefault("pitch", 0.04)
+            elif "reassur" in mood or "confident" in mood:
+                studio_input.setdefault("rate", 0.97)
+                studio_input.setdefault("pitch", 0.01)
+        elif voice == "shubh":
+            if any(word in mood for word in ("surpris", "energiz", "encourag", "proactive")):
+                studio_input.setdefault("rate", 1.06)
+            else:
+                studio_input.setdefault("rate", 1.0)
+
     # Forward only explicitly supplied, story-approved conversational context.
     # Never invent neighboring turns from isolated stage metadata.
     metadata = _as_dict(context.stage_metadata)
