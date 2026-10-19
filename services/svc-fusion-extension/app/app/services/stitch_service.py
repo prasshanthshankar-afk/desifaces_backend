@@ -1085,6 +1085,34 @@ def stitch_videos(
 
         mode = effective_mode
         if mode == "shared_dialogue":
+            # Add a silent reaction hold *after* each complete provider clip,
+            # leaving its audio and lip-sync timeline untouched. This is an
+            # additive DEV candidate, limited to shared-scene speech.
+            pause = max(0.0, min(1.5, _env_float("DF_SHARED_DIALOGUE_PAUSE_SECONDS", 0.45)))
+            if pause > 0 and len(normalized_files) > 1:
+                for index, original_file in enumerate(normalized_files[:-1]):
+                    clip_duration = _probe_duration_seconds(original_file)
+                    if clip_duration is None or clip_duration <= 0:
+                        raise ValueError("shared_dialogue_duration_required")
+                    if not _probe_has_audio(original_file):
+                        raise ValueError("shared_dialogue_audio_required")
+                    padded = os.path.join(td, f"speech_safe_{index:04d}.mp4")
+                    _run([
+                        "ffmpeg", "-y", "-threads", _ffmpeg_threads(),
+                        "-i", original_file,
+                        "-vf", f"tpad=stop_mode=clone:stop_duration={pause:.3f}",
+                        "-af", f"apad=pad_dur={pause:.3f}",
+                        "-t", f"{clip_duration + pause:.3f}",
+                        "-c:v", "libx264", "-preset", _ffmpeg_preset(),
+                        "-crf", _ffmpeg_crf(), "-pix_fmt", "yuv420p", "-r", "30",
+                        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                        "-movflags", "+faststart", padded,
+                    ])
+                    _require_nonempty_file(padded)
+                    padded_duration = _probe_duration_seconds(padded) or 0.0
+                    if padded_duration + 0.08 < clip_duration + pause:
+                        raise ValueError("shared_dialogue_pause_truncated")
+                    normalized_files[index] = padded
             # Shared-scene provider clips already contain the authoritative
             # lip-synced dialogue timeline. Never overlap, trim, fade, or
             # otherwise rewrite that audio at a scene boundary. Each normalized
