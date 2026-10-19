@@ -1045,8 +1045,8 @@ def _shared_dialogue_silence_bounds(path: str, duration: float) -> tuple[float, 
     )
     if result.returncode:
         return (0.0, 0.0)
-    starts = [float(x) for x in re.findall(r"silence_start:\\s*([0-9.]+)", result.stderr)]
-    ends = [float(x) for x in re.findall(r"silence_end:\\s*([0-9.]+)", result.stderr)]
+    starts = [float(x) for x in re.findall(r"silence_start:\s*([0-9.]+)", result.stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end:\s*([0-9.]+)", result.stderr)]
     if not starts:
         return (0.0, 0.0)
     leading = ends[0] if starts[0] <= 0.035 and ends else 0.0
