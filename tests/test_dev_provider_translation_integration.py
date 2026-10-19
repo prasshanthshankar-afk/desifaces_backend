@@ -96,28 +96,15 @@ def test_live_callers_pass_authenticated_user_identity():
     assert "provider_first = selected_for_dev(authenticated_user_id)" in svc
     assert "elif resolved_speaker_gender" in svc
 
-def test_provider_first_runtime_uses_bounded_review_gate():
+def test_provider_first_approved_provider_no_language_veto():
     root = Path(__file__).resolve().parents[1]
-    provider = (root / "services/svc-audio/app/app/services/dev_provider_translation.py").read_text()
-    assert "contextual_translation_with_review(" in provider
-    assert "max_repairs=2" in provider
-    assert "return approved.text, provider, model" in provider
-    assert "TRANSLATION_REVIEW_REQUIRED" in provider
-    # Synthesis is only called after translation finishes in the TTS service.
+    source = (root / "services/svc-audio/app/app/services/dev_provider_translation.py").read_text()
+    assert "translate_via_configured_provider(" in source
+    assert "no_approved_translation_direction" in source
+    assert "return translated.strip(), provider, model" in source
+    assert "contextual_translation_with_review(" not in source
     svc = (root / "services/svc-audio/app/app/services/tts_service.py").read_text()
     assert svc.index("await translate_approved(") < svc.index("await self.provider_executor.synthesize(")
-
-
-def test_full_audio_script_reaches_clarification_and_independent_review():
-    root = Path(__file__).resolve().parents[1]
-    orchestrator = (root / "services/svc-audio/app/app/services/tts_orchestrator.py").read_text()
-    service = (root / "services/svc-audio/app/app/services/tts_service.py").read_text()
-    translation = (root / "services/svc-audio/app/app/services/dev_provider_translation.py").read_text()
-    assert 'full_audio_script=payload.get("full_audio_script")' in orchestrator
-    assert '"full_audio_script": full_audio_script' in service
-    assert translation.count('"full_audio_script": full_script') == 3  # clarification, semantic QA, regional repair
-    assert '"speaker_relationship": original_context.get("speaker_relationship"' in translation
-    assert '"emotion": original_context.get("emotion"' in translation
 
 
 def test_director_reconstructs_and_audio_api_accepts_canonical_script():
@@ -132,28 +119,3 @@ def test_director_reconstructs_and_audio_api_accepts_canonical_script():
     assert '"full_audio_script": req.full_audio_script' in api
 
 
-def test_full_script_cannot_authorize_scene_summaries():
-    root = Path(__file__).resolve().parents[1]
-    source = (root / "services/svc-audio/app/app/services/dev_provider_translation.py").read_text()
-    assert "narrative_instead_of_dialogue" in source
-    assert "meaning_expansion_not_dialogue" in source
-    assert "translation_expands_into_scene_summary" in source
-    assert "brand_name_not_preserved" in source
-    assert "NEVER describe the speaker" in source
-    assert "REJECT if candidate narrates or summarizes" in source
-
-
-def test_exact_lowercase_brand_required_before_tts():
-    root = Path(__file__).resolve().parents[1]
-    source = (root / 'services/svc-audio/app/app/services/dev_provider_translation.py').read_text()
-    assert 'if "desifaces" in original and "desifaces" not in candidate:' in source
-
-
-def test_separate_regional_review_veto_covers_certification_locales():
-    root = Path(__file__).resolve().parents[1]
-    source = (root / "services/svc-audio/app/app/services/dev_provider_translation.py").read_text()
-    for locale in ("or-IN", "ar-EG", "es-MX"):
-        assert f'"{locale}":' in source
-    assert "regional_spoken_language_rejected:" in source
-    assert "regional.get(\"approved\") is not True" in source
-    assert "Modern Standard Arabic" in source
