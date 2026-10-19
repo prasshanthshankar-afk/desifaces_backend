@@ -176,26 +176,50 @@ async def translate_approved(
         contextual_translation_with_review, Review, TranslationReviewRequired,
     )
     async with httpx.AsyncClient(timeout=30) as client:
-        async def responses_json(instructions, value, tokens=250):
+        async def responses_json(instructions, value, tokens=600):
             review_key = os.getenv("OPENAI_API_KEY", "").strip()
             if not review_key:
                 raise DevTranslationRejected("independent_qa_credential_missing")
-            response = await client.post(
-                os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/responses",
-                headers={"Authorization": "Bearer " + review_key},
-                json={"model": os.getenv("DF_DEV_TRANSLATION_QA_MODEL", "gpt-4.1-mini"),
-                      "instructions": instructions, "input": json.dumps(value, ensure_ascii=False),
-                      "max_output_tokens": tokens},
-            )
-            response.raise_for_status()
-            body = response.json()
-            output = body.get("output_text") or "\n".join(
-                c.get("text", "") for o in body.get("output", []) if isinstance(o, dict)
-                for c in o.get("content", []) if isinstance(c, dict)
-            )
-            if not isinstance(output, str) or not output.strip():
-                raise DevTranslationRejected("empty_qa_response")
-            return json.loads(output)
+            request = {
+                "model": os.getenv("DF_DEV_TRANSLATION_QA_MODEL", "gpt-4.1-mini"),
+                "instructions": instructions,
+                "input": json.dumps(value, ensure_ascii=False),
+                "max_output_tokens": max(600, tokens),
+                "text": {"format": {"type": "json_object"}},
+            }
+            # One bounded retry for malformed/incomplete JSON or transient
+            # upstream failures. Never synthesize approval or skip review.
+            for attempt in range(2):
+                try:
+                    response = await client.post(
+                        os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/responses",
+                        headers={"Authorization": "Bearer " + review_key},
+                        json=request,
+                    )
+                    response.raise_for_status()
+                    body = response.json()
+                    if body.get("status") == "incomplete":
+                        raise DevTranslationRejected("incomplete_qa_response")
+                    output = body.get("output_text") or "\n".join(
+                        item.get("text", "")
+                        for entry in body.get("output", []) if isinstance(entry, dict)
+                        for item in entry.get("content", []) if isinstance(item, dict)
+                        and item.get("type") == "output_text"
+                    )
+                    if not isinstance(output, str) or not output.strip():
+                        raise DevTranslationRejected("empty_qa_response")
+                    parsed = json.loads(output)
+                    if not isinstance(parsed, dict):
+                        raise DevTranslationRejected("invalid_qa_response_shape")
+                    return parsed
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code not in {408, 429, 500, 502, 503, 504} or attempt:
+                        raise
+                except (httpx.TimeoutException, httpx.TransportError,
+                        json.JSONDecodeError, DevTranslationRejected):
+                    if attempt:
+                        raise
+            raise DevTranslationRejected("independent_qa_unavailable")
 
         async def clarify(original, previous, next_turn):
             answer = await responses_json(
