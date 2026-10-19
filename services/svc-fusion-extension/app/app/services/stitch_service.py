@@ -1028,6 +1028,57 @@ def compose_presenter_with_motion_background(
 # Stitching / composition
 # ---------------------------------------------------------------------------
 
+def _shared_dialogue_silence_bounds(path: str, duration: float) -> tuple[float, float]:
+    """Conservative edge silence scan; return (leading, trailing) seconds.
+
+    The last/first audible sample and its associated video frames are never
+    eligible for trimming. On any uncertainty, leave the clip unchanged.
+    """
+    import re
+    if duration < 0.8:
+        return (0.0, 0.0)
+    result = subprocess.run(
+        ["ffmpeg", "-nostdin", "-hide_banner", "-i", path,
+         "-map", "0:a:0", "-af",
+         "silencedetect=noise=-38dB:d=0.08", "-f", "null", "-"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    if result.returncode:
+        return (0.0, 0.0)
+    starts = [float(x) for x in re.findall(r"silence_start:\\s*([0-9.]+)", result.stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end:\\s*([0-9.]+)", result.stderr)]
+    if not starts:
+        return (0.0, 0.0)
+    leading = ends[0] if starts[0] <= 0.035 and ends else 0.0
+    trailing = duration - starts[-1] if starts[-1] > 0 and (
+        len(ends) < len(starts) or ends[-1] >= duration - 0.035
+    ) else 0.0
+    return max(0.0, leading), max(0.0, trailing)
+
+
+def _shared_dialogue_trim_unit(source: str, destination: str,
+                                trim_start: float, trim_end: float,
+                                duration: float) -> None:
+    """Remove only verified outer silence, trimming audio and video together."""
+    keep = duration - trim_start - trim_end
+    if keep <= 0.5:
+        raise ValueError("shared_dialogue_invalid_trim_window")
+    _run([
+        "ffmpeg", "-y", "-threads", _ffmpeg_threads(),
+        "-ss", f"{trim_start:.3f}", "-i", source,
+        "-t", f"{keep:.3f}",
+        "-map", "0:v:0", "-map", "0:a:0",
+        "-c:v", "libx264", "-preset", _ffmpeg_preset(),
+        "-crf", _ffmpeg_crf(), "-pix_fmt", "yuv420p", "-r", "30",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart", destination,
+    ])
+    _require_nonempty_file(destination)
+    actual = _probe_duration_seconds(destination) or 0
+    if actual < keep - 0.08:
+        raise ValueError("shared_dialogue_trim_duration_loss")
+
+
 def stitch_videos(
     segment_files: List[str],
     out_mp4: str,
@@ -1094,7 +1145,22 @@ def stitch_videos(
                     raise ValueError("shared_dialogue_audio_required")
                 if (_probe_duration_seconds(normalized) or 0.0) <= 0:
                     raise ValueError("shared_dialogue_duration_required")
-            # Concatenate complete normalized segments with no overlap.
+            # Remove only measured silence at a handoff. Keep a 160 ms
+            # safety margin at each edge, cap adjustment at 250 ms, and
+            # always trim both tracks as one synchronized unit.
+            max_trim = max(0.0, min(0.25, _env_float("DF_SHARED_DIALOGUE_MAX_SILENCE_TRIM", 0.25)))
+            safety = 0.16
+            for index, current in enumerate(list(normalized_files)):
+                duration = _probe_duration_seconds(current) or 0.0
+                leading, trailing = _shared_dialogue_silence_bounds(current, duration)
+                begin = min(max_trim, max(0.0, leading - safety)) if index > 0 else 0.0
+                ending = min(max_trim, max(0.0, trailing - safety)) if index < len(normalized_files) - 1 else 0.0
+                if begin > 0.01 or ending > 0.01:
+                    trimmed = os.path.join(td, f"speech_bound_{index:04d}.mp4")
+                    _shared_dialogue_trim_unit(current, trimmed, begin, ending, duration)
+                    normalized_files[index] = trimmed
+                    logger.info("shared_dialogue silent edge trim index=%s leading=%.3f trailing=%.3f", index, begin, ending)
+            # Concatenate complete synchronized speech with no overlap.
             shared_concat_list = os.path.join(td, "shared_dialogue_concat.txt")
             _write_concat_list(normalized_files, shared_concat_list)
             transition = 0.0
