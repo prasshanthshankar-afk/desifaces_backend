@@ -48,6 +48,7 @@ async def contextual_translation_with_review(
     # Always check candidate against original AND context; never certify against
     # clarified text alone. One initial attempt + at most two repairs.
     repaired_candidate = None
+    last_rejection_category = "unknown"
     for attempt in range(max_repairs + 1):
         try:
             candidate = (repaired_candidate if repaired_candidate is not None
@@ -67,6 +68,10 @@ async def contextual_translation_with_review(
             raise TranslationReviewRequired("invalid_review_response")
         if review.approved is True:
             return ApprovedTranslation(candidate, attempt + 1, meaning)
+        last_rejection_category = (
+            "regional_spoken_language" if review.reason.startswith("regional_spoken_language_rejected:")
+            else "semantic_or_fidelity"
+        )
         if attempt < max_repairs:
             # Regional/register defects require target-language repair, not
             # another attempt to explain the English dialogue.
@@ -92,4 +97,4 @@ async def contextual_translation_with_review(
             if not revised:
                 raise TranslationReviewRequired("empty_meaning_repair")
             meaning = revised
-    raise TranslationReviewRequired("TRANSLATION_REVIEW_REQUIRED")
+    raise TranslationReviewRequired("TRANSLATION_REVIEW_REQUIRED:" + last_rejection_category)
