@@ -1,94 +1,59 @@
-"""Isolated DEV reviewer JSON/retry contracts. No real API, DB, TTS, or credits."""
-import json
+"""Provider-first DEV translation: approved direction, fail-closed provider errors."""
 import pytest
-import httpx
-from app.services.dev_provider_translation import translate_approved, DevTranslationRejected
+from app.services import dev_provider_translation as module
+from app.services import dev_translation_provider_adapters as adapters
 
 
 class Pool:
-    async def fetch(self, query, *args):
-        assert "public.tts_locales" in query
-        route = {"source_locale": "en-US", "target_locale": "hi-IN",
-                 "provider": "sarvam", "model": "mayura:v1",
-                 "provider_source_code": "en-IN", "provider_target_code": "hi-IN",
-                 "approved": True, "enabled": True}
-        return [
-            {"locale": "en-US", "language_code": "en", "meta_json": {}},
-            {"locale": "hi-IN", "language_code": "hi",
-             "meta_json": {"translation_routing_v1":
-                           {"enabled": True, "capabilities": [route]}}},
-        ]
-
-
-class FakeResponse:
-    def __init__(self, body, status_code=200):
-        self.body = body
-        self.status_code = status_code
-        self.request = httpx.Request("POST", "https://api.openai.com/v1/responses")
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError("upstream failure", request=self.request,
-                                         response=httpx.Response(self.status_code,
-                                                                  request=self.request))
-    def json(self):
-        return self.body
+    async def fetch(self, sql, *args):
+        assert "public.tts_locales" in sql
+        capability = dict(source_locale="en-US", target_locale="hi-IN",
+                          provider="sarvam", model="mayura:v1",
+                          provider_source_code="en-IN", provider_target_code="hi-IN",
+                          approved=True, enabled=True)
+        return [dict(locale="en-US", language_code="en", meta_json={}),
+                dict(locale="hi-IN", language_code="hi",
+                     meta_json={"translation_routing_v1":
+                                {"enabled":True,"capabilities":[capability]}})]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["malformed", "incomplete", "http503"])
-async def test_reviewer_transient_failure_retried_then_accepts(monkeypatch, failure):
-    from app.services import dev_provider_translation as module
-    from app.services import dev_translation_provider_adapters as adapter
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-test-only")
-    monkeypatch.setenv("SARVAM_API_KEY", "fake-test-only")
-    calls = []
-    async def provider(*args, **kwargs):
-        return "हमारा कैफ़े अगले शुक्रवार खुलेगा।"
-    monkeypatch.setattr(adapter, "translate_via_configured_provider", provider)
-    class Client:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *args): return False
-        async def post(self, url, **kwargs):
-            assert url.endswith("/responses")
-            assert kwargs["json"]["text"]["format"]["type"] == "json_object"
-            assert kwargs["json"]["max_output_tokens"] >= 600
-            calls.append(kwargs["json"])
-            if len(calls) == 1:
-                if failure == "malformed":
-                    return FakeResponse({"output_text": "{broken"})
-                if failure == "incomplete":
-                    return FakeResponse({"status": "incomplete", "output_text": ""})
-                return FakeResponse({}, 503)
-            if len(calls) == 2:
-                return FakeResponse({"output_text": json.dumps({"meaning": "The cafe opens next Friday."})})
-            if len(calls) == 3:
-                return FakeResponse({"output_text": json.dumps({"approved": True, "reason": "natural Hindi"})})
-            return FakeResponse({"output_text": json.dumps({"approved": True, "reason": "meaning preserved"})})
-    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **kwargs: Client())
-    translated, provider, model = await translate_approved(
-        Pool(), text="Our cafe opens next Friday.", source_locale="en-US",
+async def test_approved_route_calls_provider_once_without_ai_review(monkeypatch):
+    monkeypatch.setenv("SARVAM_API_KEY","fake")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    calls=[]
+    async def fake_provider(client, *, route, text, speaker_gender):
+        calls.append((route["provider_code"], text, speaker_gender))
+        return "हमारा कैफ़े अगले शुक्रवार खुल रहा है!"
+    monkeypatch.setattr(adapters,"translate_via_configured_provider",fake_provider)
+    result = await module.translate_approved(
+        Pool(), text="Our café opens next Friday.", source_locale="en-US",
         target_locale="hi-IN", speaker_gender="female",
-        original_context={"full_audio_script": "Maya: Our cafe opens next Friday."})
-    assert translated == "हमारा कैफ़े अगले शुक्रवार खुलेगा।"
-    assert (provider, model) == ("sarvam", "mayura:v1")
-    assert len(calls) == 4
+        original_context={"full_audio_script":"Maya: Our café opens next Friday."})
+    assert result == ("हमारा कैफ़े अगले शुक्रवार खुल रहा है!","sarvam","mayura:v1")
+    assert calls == [("sarvam","Our café opens next Friday.","female")]
 
 
 @pytest.mark.asyncio
-async def test_reviewer_twice_invalid_never_approves(monkeypatch):
-    from app.services import dev_provider_translation as module
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-test-only")
-    monkeypatch.setenv("SARVAM_API_KEY", "fake-test-only")
-    calls = []
-    class Client:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *args): return False
-        async def post(self, url, **kwargs):
-            calls.append(1)
-            return FakeResponse({"output_text": "{invalid"})
-    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **kwargs: Client())
-    with pytest.raises(DevTranslationRejected, match="TRANSLATION_REVIEW_REQUIRED"):
-        await translate_approved(
-            Pool(), text="Our cafe opens next Friday.", source_locale="en-US",
-            target_locale="hi-IN", speaker_gender="female", original_context={})
-    assert len(calls) == 2
+@pytest.mark.parametrize("output",["", "   ", None])
+async def test_empty_provider_result_rejected(monkeypatch, output):
+    monkeypatch.setenv("SARVAM_API_KEY","fake")
+    async def fake_provider(*args, **kwargs):
+        return output
+    monkeypatch.setattr(adapters,"translate_via_configured_provider",fake_provider)
+    with pytest.raises(module.DevTranslationRejected,match="empty_provider_translation"):
+        await module.translate_approved(Pool(),text="Hello",source_locale="en-US",
+                                        target_locale="hi-IN",speaker_gender="male",
+                                        original_context={})
+
+
+@pytest.mark.asyncio
+async def test_provider_exception_never_silently_synthesizes(monkeypatch):
+    monkeypatch.setenv("SARVAM_API_KEY","fake")
+    async def fake_provider(*args, **kwargs):
+        raise adapters.ProviderTranslationError("provider_unavailable")
+    monkeypatch.setattr(adapters,"translate_via_configured_provider",fake_provider)
+    with pytest.raises(adapters.ProviderTranslationError,match="provider_unavailable"):
+        await module.translate_approved(Pool(),text="Hello",source_locale="en-US",
+                                        target_locale="hi-IN",speaker_gender="male",
+                                        original_context={})
