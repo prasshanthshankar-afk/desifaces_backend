@@ -9,8 +9,7 @@ import json
 import os
 from typing import Any
 
-import httpx
-
+ 
 
 class SceneLocalizationError(ValueError):
     pass
@@ -102,6 +101,7 @@ async def localize_scene_for_hitl(
         "input": json.dumps(request_data, ensure_ascii=False),
         "max_output_tokens": 5000,
     }
+    import httpx  # Live API dependency; offline HITL contract tests need no SDK.
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=60)
     try:
