@@ -232,8 +232,23 @@ def compile_context_audio_input(context: AudioStageContext) -> dict[str, Any]:
     resolved_target_locale = _clean(conversation_settings.get("target_locale")) or context.target_locale
     translate = bool(conversation_settings.get("translate"))
     source_language = _clean(conversation_settings.get("source_language")) or "auto"
+    # An existing dialogue HITL may persist its accepted localized line in
+    # stage metadata. Never send accepted text through translation a second time.
+    # This is not a new approval gate: without a valid approval snapshot,
+    # legacy audio translation remains unchanged.
+    approved_localization = _as_dict(context.stage_metadata.get("approved_localization"))
+    approved_text = approved_localization.get("text")
+    use_approved_localization = (
+        approved_localization.get("approved_by_user") is True
+        and _clean(approved_localization.get("dialogue_turn_id")) == str(context.dialogue_turn_id)
+        and _clean(approved_localization.get("target_locale")).lower() == resolved_target_locale.lower()
+        and isinstance(approved_text, str) and bool(approved_text.strip())
+        and _clean(approved_localization.get("source_text")) == context.text
+    )
+    if use_approved_localization:
+        translate = False
     studio_input: dict[str, Any] = {
-        "text": context.text,
+        "text": approved_text if use_approved_localization else context.text,
         "target_locale": resolved_target_locale,
         "translate": translate,
         "speaker_gender": gender,
