@@ -245,6 +245,8 @@ def compile_context_audio_input(context: AudioStageContext) -> dict[str, Any]:
         and isinstance(approved_text, str) and bool(approved_text.strip())
         and _clean(approved_localization.get("source_text")) == context.text
     )
+    if approved_localization and not use_approved_localization:
+        raise ParticipantAudioBridgeError("approved_localization_snapshot_mismatch")
     if use_approved_localization:
         translate = False
     studio_input: dict[str, Any] = {
