@@ -38,16 +38,16 @@ async def prepare_hindi_language_version(
             """select dt.turn_id,dt.sequence_no,dt.text_value,dt.speaker_participant_id,
                       p.display_name,dt.scene_id
                from public.v3_dialogue_turns dt
+               join public.v3_scenes sc on sc.scene_id=dt.scene_id
                join public.v3_participants p on p.participant_id=dt.speaker_participant_id
-               where dt.story_id=$1
+               where sc.story_id=$1
                order by dt.scene_id,dt.sequence_no,dt.turn_id""",
             workflow["story_id"],
         )
         if not turns:
             raise HTTPException(status_code=409, detail="source_dialogue_missing")
         preserved = await conn.fetch(
-            """select stage_run_id,stage_type,state,primary_face_media_id,
-                      primary_audio_media_id,primary_video_media_id
+            """select stage_run_id,stage_type,state
                from public.v3_studio_stage_runs where workflow_id=$1""",
             workflow_id,
         )
