@@ -30,6 +30,7 @@ from .shared_scene_routes import router as _shared_scene_router  # noqa: E402
 from .shared_scene_state_routes import router as _shared_scene_state_router  # noqa: E402
 from .dialogue_localization_routes import router as _dialogue_localization_router  # noqa: E402
 from .language_version_prepare_routes import router as _language_version_prepare_router  # noqa: E402
+from .language_version_routes import router as _language_version_router  # noqa: E402
 
 router.include_router(_e2e_router)
 router.include_router(_audio_voice_router)
@@ -42,3 +43,4 @@ router.include_router(_shared_scene_router)
 router.include_router(_shared_scene_state_router)
 router.include_router(_dialogue_localization_router)
 router.include_router(_language_version_prepare_router)
+router.include_router(_language_version_router)
