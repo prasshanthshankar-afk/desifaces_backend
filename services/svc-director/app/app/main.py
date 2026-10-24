@@ -42,6 +42,8 @@ _TRANSIENT_CHECKPOINT_SQLSTATES = frozenset({"57P01", "57P02", "57P03"})
 class ResumeIn(BaseModel):
     approved: bool
     feedback: str | None = Field(default=None, max_length=12000)
+    localized_turns: list[dict[str, str]] | None = Field(default=None, max_length=50)
+    target_locale: str | None = Field(default=None, max_length=40)
 
 
 class RecentStoryOut(BaseModel):
@@ -245,7 +247,7 @@ async def resume_run(thread_id: str, body: ResumeIn, auth: DirectorAuthContext =
         async with app.state.business_pool.acquire() as conn:
             row = await app.state.run_store.queue_resume(
                 conn, thread_id=thread_id, account_id=auth.account_id, owner_user_id=auth.user_id,
-                resume_payload={"approved": body.approved, "feedback": body.feedback or ""},
+                resume_payload={"approved": body.approved, "feedback": body.feedback or "", "localized_turns": body.localized_turns, "target_locale": body.target_locale},
             )
     except DirectorRunNotFound as exc:
         raise HTTPException(status_code=409, detail="director_run_not_awaiting_review") from exc
