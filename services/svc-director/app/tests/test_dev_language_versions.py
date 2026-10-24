@@ -5,7 +5,7 @@ import unittest
 ROOT=Path(__file__).resolve().parents[1]
 class VersioningContract(unittest.TestCase):
     def test_isolated_tables(self):
-        sql=(ROOT.parents[3]/"migrations/2026_10_24_dev_story_language_versions.sql").read_text()
+        sql=(ROOT.parents[2]/"migrations/2026_10_24_dev_story_language_versions.sql").read_text()
         self.assertIn("UNIQUE (source_workflow_id,target_locale,version_no)",sql)
         self.assertIn("PRIMARY KEY(language_version_id,source_turn_id)",sql)
         self.assertIn("ON DELETE RESTRICT",sql)
