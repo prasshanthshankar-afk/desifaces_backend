@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class HindiApprovedTextContract(unittest.TestCase):
     def test_same_hitl_accepts_localized_turns(self):
         main = (ROOT / "app/main.py").read_text()
-        graph = (ROOT.parents[2] / "shared/python/desifaces_shared/v3/director_graph.py").read_text()
+        graph = (ROOT.parents[1] / "shared/python/desifaces_shared/v3/director_graph.py").read_text()
         self.assertIn("localized_turns: list[dict[str, str]]", main)
         self.assertIn('"localized_turns": body.localized_turns', main)
         self.assertIn("hindi_hitl_dialogue_required", graph)
