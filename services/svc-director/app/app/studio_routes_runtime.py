@@ -44,3 +44,6 @@ router.include_router(_shared_scene_state_router)
 router.include_router(_dialogue_localization_router)
 router.include_router(_language_version_prepare_router)
 router.include_router(_language_version_router)
+
+from .scene_localization_preview_routes import router as _scene_localization_preview_router  # noqa: E402
+router.include_router(_scene_localization_preview_router)
