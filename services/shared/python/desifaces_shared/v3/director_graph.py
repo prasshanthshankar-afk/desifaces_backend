@@ -60,6 +60,8 @@ class DirectorState(TypedDict, total=False):
     revision_count: int
     review_approved: bool
     review_feedback: str
+    approved_localized_turns: list[dict[str, str]]
+    approved_target_locale: str
     story_graph: dict[str, Any]
     workspace: dict[str, Any]
     assistant_context: dict[str, Any]
@@ -166,10 +168,29 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
         response = interrupt(payload)
         approved = bool((response or {}).get("approved")) if isinstance(response, dict) else bool(response)
         feedback = str((response or {}).get("feedback") or "") if isinstance(response, dict) else ""
+        brief = CreativeBrief.model_validate(state["brief"])
+        requested_locale = str(brief.constraints.get("requested_output_locale") or "")
+        localized = (response or {}).get("localized_turns") if isinstance(response, dict) else None
+        target_locale = str((response or {}).get("target_locale") or "") if isinstance(response, dict) else ""
+        if approved and requested_locale == "hi-IN":
+            plan = CreativeStoryPlan.model_validate(state["plan"])
+            expected = [
+                (str(scene.sequence) + ":" + str(turn.sequence), str(turn.speaker_ref), turn.text)
+                for scene in plan.scenes for turn in scene.dialogue
+                if str(turn.kind.value if hasattr(turn.kind, "value") else turn.kind) == "speech"
+            ]
+            if (target_locale != "hi-IN" or not isinstance(localized, list)
+                or len(localized) != len(expected)):
+                raise ValueError("hindi_hitl_dialogue_required")
+            for item, (turn_key, speaker, original) in zip(localized, expected):
+                if not isinstance(item, dict) or item.get("turn_id") != turn_key or item.get("speaker") != speaker or item.get("source_text") != original or not isinstance(item.get("text"), str) or not item["text"].strip():
+                    raise ValueError("hindi_hitl_dialogue_mismatch")
         return {
             "phase": DirectorRunState.AWAITING_REVIEW.value,
             "review_approved": approved,
             "review_feedback": feedback,
+            "approved_localized_turns": localized if approved and requested_locale == "hi-IN" else [],
+            "approved_target_locale": target_locale if approved and requested_locale == "hi-IN" else "",
         }
 
     async def compile_story(state: DirectorState) -> DirectorState:
