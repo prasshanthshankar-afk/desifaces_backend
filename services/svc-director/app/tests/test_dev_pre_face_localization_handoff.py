@@ -16,8 +16,12 @@ class HindiApprovedTextContract(unittest.TestCase):
 
     def test_canonical_english_stays_intact(self):
         compiler = (ROOT / "app/experience_compiler.py").read_text()
-        self.assertIn("UPDATE public.v3_dialogue_turns", compiler)
-        self.assertIn("jsonb_build_object('approved_localization'", compiler)
+        canonical = (ROOT / "app/compiler.py").read_text()
+        self.assertIn('approved_hitl_compilation_mismatch', canonical)
+        self.assertIn('"approved_localization": {', canonical)
+        self.assertIn('await self._store.add_dialogue_turn(conn, turn=turn)', canonical)
+        self.assertLess(canonical.index('await self._store.add_dialogue_turn(conn, turn=turn)'), canonical.index('await tx.commit()'))
+        self.assertNotIn("UPDATE public.v3_dialogue_turns", compiler)
         self.assertNotIn("SET text_value=", compiler)
         self.assertIn("approved_hitl_canonical_turn_mismatch", compiler)
 
