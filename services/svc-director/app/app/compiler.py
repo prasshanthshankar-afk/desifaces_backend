@@ -287,6 +287,11 @@ class CanonicalStoryCompiler:
                         await self._store.add_scene_participant(conn, membership=membership)
                         scene_memberships.append(membership)
 
+                    approved_hitl = retrieved_context.get("_approved_hitl_localization") or {}
+                    approved_lookup = {
+                        entry["turn_id"]: entry
+                        for entry in (approved_hitl.get("turns") or [])
+                    } if approved_hitl else {}
                     for item in sorted(planned_scene.dialogue, key=lambda x: x.sequence):
                         speaker_id = participant_ids.get(item.speaker_ref) if item.speaker_ref else None
                         turn = DialogueTurn(
@@ -301,6 +306,23 @@ class CanonicalStoryCompiler:
                             delivery=item.delivery,
                             created_at=now,
                         )
+                        if approved_hitl and str(getattr(item.kind, "value", item.kind)) == "speech":
+                            key = f"{planned_scene.sequence}:{item.sequence}"
+                            approved_item = approved_lookup.get(key)
+                            if not approved_item or approved_item.get("source_text") != item.text or approved_item.get("speaker") != item.speaker_ref:
+                                raise ValueError("approved_hitl_compilation_mismatch")
+                            turn = turn.model_copy(update={
+                                "metadata": {
+                                    **turn.metadata,
+                                    "approved_localization": {
+                                        "approved_by_user": True,
+                                        "dialogue_turn_id": str(turn.turn_id),
+                                        "source_text": turn.text,
+                                        "target_locale": approved_hitl["target_locale"],
+                                        "text": approved_item["text"],
+                                    },
+                                },
+                            })
                         await self._store.add_dialogue_turn(conn, turn=turn)
                         turns.append(turn)
 
