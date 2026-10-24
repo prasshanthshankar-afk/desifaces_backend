@@ -75,6 +75,28 @@ class UserOwnedStoryCompiler(CanonicalStoryCompiler):
         plan: CreativeStoryPlan,
         retrieved_context: dict[str, Any],
     ) -> StoryGraph:
+        # Validate the COMPLETE HITL snapshot before any canonical story writes.
+        localization = retrieved_context.get("_approved_hitl_localization")
+        if localization:
+            if localization.get("target_locale") != "hi-IN":
+                raise ValueError("unsupported_hitl_localization_locale")
+            approved = localization.get("turns")
+            expected = [
+                (f"{scene.sequence}:{turn.sequence}", str(turn.speaker_ref), turn.text)
+                for scene in plan.scenes for turn in scene.dialogue
+                if str(getattr(turn.kind, "value", turn.kind)) == "speech"
+            ]
+            expected.sort(key=lambda entry: tuple(map(int, entry[0].split(":"))))
+            if not isinstance(approved, list) or len(approved) != len(expected):
+                raise ValueError("approved_hitl_turn_count_mismatch")
+            for item, (key, speaker, source_text) in zip(approved, expected):
+                if (not isinstance(item, dict)
+                    or item.get("turn_id") != key
+                    or item.get("speaker") != speaker
+                    or item.get("source_text") != source_text
+                    or not isinstance(item.get("text"), str)
+                    or not item["text"].strip()):
+                    raise ValueError("approved_hitl_precompile_mismatch")
         graph = await super().compile(
             brief=brief,
             plan=plan,
