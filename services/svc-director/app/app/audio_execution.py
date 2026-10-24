@@ -95,7 +95,7 @@ async def load_audio_stage_context(
           s.metadata_json as stage_metadata,
           w.account_id,w.owner_user_id,w.project_id,w.story_id,w.current_stage,
           dt.scene_id,dt.speaker_participant_id,dt.text_value,dt.locale as turn_locale,
-          dt.emotion_code,dt.delivery_json,
+          dt.emotion_code,dt.delivery_json,dt.metadata_json AS dialogue_metadata,
           p.display_name,p.default_locale,p.voice_profile_ref,p.voice_locale,
           p.persona_json,p.metadata_json as participant_metadata,
           st.default_locale as story_locale
@@ -143,6 +143,18 @@ async def load_audio_stage_context(
     # order; the current stage/workflow/account were verified above.
     # Read-only: never mutate dialogue or approved stage metadata.
     stage_metadata = _as_dict(row["stage_metadata"])
+    canonical_approved = _as_dict(_as_dict(row["dialogue_metadata"]).get("approved_localization"))
+    if canonical_approved:
+        stage_metadata["approved_localization"] = canonical_approved
+        # The creator's selected locale is inherited from the approved
+        # dialogue if explicit conversation language settings have not yet
+        # been stored; later settings must match or Audio fails closed.
+        if not _as_dict(stage_metadata.get("conversation_settings")).get("target_locale"):
+            stage_metadata["conversation_settings"] = {
+                "target_locale": canonical_approved.get("target_locale"),
+                "translate": False,
+                "source_language": "en-US",
+            }
     sequence_no = await conn.fetchval(
         "SELECT sequence_no FROM public.v3_dialogue_turns WHERE turn_id=$1",
         UUID(str(row["dialogue_turn_id"])),
