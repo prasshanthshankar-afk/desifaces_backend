@@ -81,6 +81,59 @@ class UserOwnedStoryCompiler(CanonicalStoryCompiler):
             retrieved_context=retrieved_context,
         )
 
+        localization = retrieved_context.get("_approved_hitl_localization")
+        if localization:
+            if localization.get("target_locale") != "hi-IN":
+                raise ValueError("unsupported_hitl_localization_locale")
+            approved = localization.get("turns")
+            if not isinstance(approved, list):
+                raise ValueError("missing_approved_hitl_turns")
+            canonical_scenes = {scene.scene_id: scene.sequence for scene in graph.scenes}
+            canonical_speakers = {
+                participant.participant_id: participant.display_name
+                for participant in graph.participants
+            }
+            speech = [
+                turn for turn in graph.dialogue_turns
+                if str(getattr(turn.kind, "value", turn.kind)) == "speech"
+            ]
+            expected = sorted(
+                speech,
+                key=lambda turn: (canonical_scenes[turn.scene_id], turn.sequence),
+            )
+            if len(approved) != len(expected):
+                raise ValueError("approved_hitl_turn_count_mismatch")
+            # The user-approved text is the authority. Store its exact value
+            # against canonical UUID turn identity, without rewriting English.
+            async with self._pool.acquire() as conn:
+                async with conn.transaction():
+                    for turn, item in zip(expected, approved):
+                        key = f"{canonical_scenes[turn.scene_id]}:{turn.sequence}"
+                        expected_speaker = canonical_speakers[turn.speaker_participant_id]
+                        if (
+                            item.get("turn_id") != key
+                            or item.get("speaker") != expected_speaker
+                            or item.get("source_text") != turn.text
+                            or not isinstance(item.get("text"), str)
+                            or not item["text"].strip()
+                        ):
+                            raise ValueError("approved_hitl_canonical_turn_mismatch")
+                        snapshot = {
+                            "approved_by_user": True,
+                            "dialogue_turn_id": str(turn.turn_id),
+                            "source_text": turn.text,
+                            "target_locale": "hi-IN",
+                            "text": item["text"],
+                        }
+                        await conn.execute(
+                            """UPDATE public.v3_dialogue_turns
+                               SET metadata_json=coalesce(metadata_json,'{}'::jsonb)
+                                   || jsonb_build_object('approved_localization',$2::jsonb)
+                               WHERE turn_id=$1""",
+                            turn.turn_id,
+                            json.dumps(snapshot, ensure_ascii=False),
+                        )
+
         planned_by_name = {item.display_name: item for item in plan.participants}
         changed = False
 
