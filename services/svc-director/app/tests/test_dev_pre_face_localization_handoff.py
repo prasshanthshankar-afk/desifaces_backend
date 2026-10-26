@@ -23,7 +23,8 @@ class HindiApprovedTextContract(unittest.TestCase):
         self.assertLess(canonical.index('await self._store.add_dialogue_turn(conn, turn=turn)'), canonical.index('await tx.commit()'))
         self.assertNotIn("UPDATE public.v3_dialogue_turns", compiler)
         self.assertNotIn("SET text_value=", compiler)
-        self.assertIn("approved_hitl_canonical_turn_mismatch", compiler)
+        self.assertIn("approved_hitl_precompile_mismatch", compiler)
+        self.assertIn("approved_hitl_compilation_mismatch", canonical)
 
     def test_audio_uses_exact_approved_text(self):
         audio = (ROOT / "app/audio_execution.py").read_text()
