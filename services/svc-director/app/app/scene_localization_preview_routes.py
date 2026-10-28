@@ -9,6 +9,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from .security import DirectorAuthContext, get_director_auth
+from .localization_source_contract import validate_english_source
 
 router = APIRouter()
 
@@ -33,6 +34,11 @@ async def localize_preview(body: LocalizeSceneIn,
         raise HTTPException(422,detail="unsupported_preview_language_pair")
     if len({t.turn_id for t in body.turns}) != len(body.turns):
         raise HTTPException(422,detail="duplicate_turn_ids")
+    try:
+        for turn in body.turns:
+            validate_english_source(turn.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     key=os.getenv("OPENAI_API_KEY","").strip()
     if not key:
         raise HTTPException(503,detail="localization_provider_not_configured")
