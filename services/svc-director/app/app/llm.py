@@ -240,14 +240,35 @@ class OpenAICreativePlanner:
             "current_plan": current_plan.model_dump(mode="json") if current_plan else None,
             "revision_feedback": revision_feedback,
         }
+        # Canonical source remains English even when final spoken output is Hindi.
+        # Requested output locale selects downstream localization, NOT planner language.
+        requested_output = str(brief.constraints.get("requested_output_locale") or "")
+        source_locale = str(brief.constraints.get("source_dialogue_locale") or brief.locale or "")
+        if requested_output == "hi-IN" and source_locale.lower() not in {"en", "en-us"}:
+            raise ValueError("canonical_source_must_be_english")
+        source_instruction = (
+            "\nMANDATORY LANGUAGE SEPARATION: Plan every spoken dialogue line in "
+            "natural ENGLISH (en-US). Never write, translate, or transliterate "
+            "dialogue into Hindi here, regardless of requested_output_locale=hi-IN. "
+            "The separate downstream whole-scene localization pass produces Hindi "
+            "for user review. Preserve turn sequence and speaker_ref exactly.\n"
+            if requested_output == "hi-IN" else ""
+        )
         result = await self._structured.ainvoke(
             [
-                ("system", _DIRECTOR_SYSTEM_PROMPT),
+                ("system", _DIRECTOR_SYSTEM_PROMPT + source_instruction),
                 ("human", json.dumps(payload, ensure_ascii=False, default=str)),
             ]
         )
         wire = result if isinstance(result, _WireCreativeStoryPlan) else _WireCreativeStoryPlan.model_validate(result)
-        return _validate_plan_content_safety(_to_canonical_plan(wire))
+        plan = _validate_plan_content_safety(_to_canonical_plan(wire))
+        if requested_output == "hi-IN":
+            from .localization_source_contract import validate_english_source
+            for scene in plan.scenes:
+                for turn in scene.dialogue:
+                    if str(getattr(turn.kind, "value", turn.kind)) == "speech":
+                        validate_english_source(turn.text)
+        return plan
 
 
 class OpenAICreativeCritic:
