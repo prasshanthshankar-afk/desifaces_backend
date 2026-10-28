@@ -7,6 +7,7 @@ from df_contracts.v3.director import CreativeBrief, CreativeStoryPlan, PlannedPa
 from df_contracts.v3.story import StoryGraph
 
 from .compiler import CanonicalStoryCompiler
+from .localization_source_contract import validate_english_source
 
 
 def _clean(value: Any) -> str:
@@ -106,6 +107,7 @@ class UserOwnedStoryCompiler(CanonicalStoryCompiler):
             if not isinstance(approved, list) or len(approved) != len(expected):
                 raise ValueError("approved_hitl_turn_count_mismatch")
             for item, (key, speaker, source_text) in zip(approved, expected):
+                validate_english_source(source_text)
                 if (not isinstance(item, dict)
                     or item.get("turn_id") != key
                     or item.get("speaker") != speaker
