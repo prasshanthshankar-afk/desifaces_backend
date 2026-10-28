@@ -75,6 +75,22 @@ class UserOwnedStoryCompiler(CanonicalStoryCompiler):
         plan: CreativeStoryPlan,
         retrieved_context: dict[str, Any],
     ) -> StoryGraph:
+        # Canonical source language is English for this DEV en-US -> hi-IN path.
+        # Never treat a Hindi Director draft as the English original.
+        requested_locale = str(brief.constraints.get("requested_output_locale") or "")
+        if requested_locale == "hi-IN":
+            if str(brief.locale or "").lower() not in {"en-us", "en"}:
+                raise ValueError("canonical_source_must_be_english")
+            for scene in plan.scenes:
+                for turn in scene.dialogue:
+                    if str(getattr(turn.kind, "value", turn.kind)) != "speech":
+                        continue
+                    devanagari = sum("\\u0900" <= ch <= "\\u097f" for ch in turn.text)
+                    if devanagari >= 3:
+                        raise ValueError("director_source_contains_hindi_not_english")
+            approved_snapshot = retrieved_context.get("_approved_hitl_localization")
+            if not isinstance(approved_snapshot, dict) or approved_snapshot.get("target_locale") != "hi-IN":
+                raise ValueError("hindi_hitl_approval_required_before_story_creation")
         # Validate the COMPLETE HITL snapshot before any canonical story writes.
         localization = retrieved_context.get("_approved_hitl_localization")
         if localization:
