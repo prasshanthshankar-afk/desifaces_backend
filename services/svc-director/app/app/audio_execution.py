@@ -146,15 +146,14 @@ async def load_audio_stage_context(
     canonical_approved = _as_dict(_as_dict(row["dialogue_metadata"]).get("approved_localization"))
     if canonical_approved:
         stage_metadata["approved_localization"] = canonical_approved
-        # The creator's selected locale is inherited from the approved
-        # dialogue if explicit conversation language settings have not yet
-        # been stored; later settings must match or Audio fails closed.
-        if not _as_dict(stage_metadata.get("conversation_settings")).get("target_locale"):
-            stage_metadata["conversation_settings"] = {
-                "target_locale": canonical_approved.get("target_locale"),
-                "translate": False,
-                "source_language": "en-US",
-            }
+        # Canonical human approval is authoritative. The later voice-setup UI
+        # may still carry a stale en-US default; never retranslate or silently
+        # override the user's hi-IN choice.
+        settings = _as_dict(stage_metadata.get("conversation_settings"))
+        settings["target_locale"] = canonical_approved.get("target_locale")
+        settings["translate"] = False
+        settings["source_language"] = "en-US"
+        stage_metadata["conversation_settings"] = settings
     sequence_no = await conn.fetchval(
         "SELECT sequence_no FROM public.v3_dialogue_turns WHERE turn_id=$1",
         UUID(str(row["dialogue_turn_id"])),
