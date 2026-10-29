@@ -234,12 +234,21 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
             "assistant_context": assistant_context.model_dump(mode="json"),
         }
 
+    def _requires_hindi_hitl(state: DirectorState) -> bool:
+        brief = state.get("brief") or {}
+        constraints = brief.get("constraints") or {}
+        return constraints.get("requested_output_locale") == "hi-IN"
+
     def after_plan(state: DirectorState) -> str:
+        if _requires_hindi_hitl(state):
+            return "review"
         if runtime.blocking_critic:
             return "critique"
         return "review" if runtime.require_human_review else "compile"
 
     def after_critique(state: DirectorState) -> str:
+        if _requires_hindi_hitl(state):
+            return "review"
         critique = CreativeCritique.model_validate(state["critique"])
         revisions = int(state.get("revision_count") or 0)
         if not critique.ready and revisions < runtime.max_revisions:
