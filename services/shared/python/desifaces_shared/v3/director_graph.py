@@ -105,13 +105,7 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
         brief = CreativeBrief.model_validate(state["brief"])
         plan = await runtime.planner.plan(
             brief=brief,
-            retrieved_context={
-                **dict(state.get("retrieved_context") or {}),
-                "_approved_hitl_localization": {
-                    "target_locale": state.get("approved_target_locale"),
-                    "turns": list(state.get("approved_localized_turns") or []),
-                } if state.get("approved_target_locale") else None,
-            },
+            retrieved_context=dict(state.get("retrieved_context") or {}),
         )
         return {
             "phase": DirectorRunState.PLANNING.value,
@@ -205,7 +199,13 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
         graph = await runtime.compiler.compile(
             brief=brief,
             plan=plan,
-            retrieved_context=dict(state.get("retrieved_context") or {}),
+            retrieved_context={
+                **dict(state.get("retrieved_context") or {}),
+                "_approved_hitl_localization": {
+                    "target_locale": state.get("approved_target_locale"),
+                    "turns": list(state.get("approved_localized_turns") or []),
+                } if state.get("approved_target_locale") else None,
+            },
         )
         workspace = build_story_workspace(
             graph,
