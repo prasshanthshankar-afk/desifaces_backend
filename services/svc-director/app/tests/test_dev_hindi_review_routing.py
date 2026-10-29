@@ -2,7 +2,7 @@
 from pathlib import Path
 import unittest
 
-ROOT = Path(__file__).resolve().parents[2] / "shared/python/desifaces_shared/v3/director_graph.py"
+ROOT = Path(__file__).resolve().parents[3] / "shared/python/desifaces_shared/v3/director_graph.py"
 
 class HindiReviewRoutingTests(unittest.TestCase):
     def test_review_required_independent_of_default_runtime_flag(self):
