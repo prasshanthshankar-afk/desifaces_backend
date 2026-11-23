@@ -141,6 +141,7 @@ async def preview_director_translation(
 
     drafts = []
     previous_provider = None
+    experimental_used = False
 
     for index, turn in enumerate(body.turns):
         context = {
@@ -166,7 +167,42 @@ async def preview_director_translation(
                 require_natural_speech_check=True,
             )
         except DevTranslationRejected as exc:
-            raise HTTPException(422, str(exc)) from exc
+            # Explicit DEV-only experimental route discovery for languages
+            # without a certified DB direction. Never fall back from a
+            # configured provider error or an explicitly rejected route.
+            if (
+                runtime in {"dev", "development"}
+                and os.getenv(
+                    "DF_DEV_GLOBAL_TRANSLATION_ENABLED", ""
+                ).strip().lower() == "true"
+                and str(exc) == "no_approved_translation_direction"
+            ):
+                from app.services.dev_global_translation import (
+                    DevGlobalRouteUnavailable,
+                    translate_global_dev_draft,
+                )
+                try:
+                    translated, provider, model = (
+                        await translate_global_dev_draft(
+                            pool,
+                            text=turn.text,
+                            source_locale=body.source_locale.strip(),
+                            target_locale=body.target_locale.strip(),
+                            speaker_gender=turn.speaker_gender,
+                            original_context=context,
+                        )
+                    )
+                    experimental_used = True
+                except DevGlobalRouteUnavailable as candidate_exc:
+                    raise HTTPException(
+                        422, str(candidate_exc)
+                    ) from candidate_exc
+                except (httpx.HTTPError, ProviderTranslationError) as provider_exc:
+                    raise HTTPException(
+                        502, "translation_provider_unavailable"
+                    ) from provider_exc
+            else:
+                raise HTTPException(422, str(exc)) from exc
         except (httpx.HTTPError, ProviderTranslationError) as exc:
             raise HTTPException(
                 502, "translation_provider_unavailable"
@@ -195,4 +231,5 @@ async def preview_director_translation(
         "model": previous_provider[1],
         "turns": drafts,
         "contextual_quality_certified": False,
+        "experimental_translation_route": experimental_used,
     }
