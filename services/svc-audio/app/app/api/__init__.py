@@ -18,4 +18,16 @@ def build_router() -> APIRouter:
     router.include_router(catalog_admin_router)
     router.include_router(v3_audio_output_router)
 
+    # DEV-only: provider-authenticated localization draft preview.
+    # The endpoint has no canonical approval authority.
+    import os
+    if (
+        os.getenv("DF_RUNTIME_ENV", "").strip().lower()
+        in {"dev", "development"}
+    ):
+        from app.api.routes.dev101_translation_preview import (
+            router as dev101_preview_router,
+        )
+        router.include_router(dev101_preview_router)
+
     return router

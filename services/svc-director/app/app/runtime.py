@@ -12,6 +12,7 @@ def create_director_graph(business_pool, checkpointer):
     if not settings.DF_DIRECTOR_LLM_MODEL:
         return None
     runtime = CreativeDirectorRuntime(
+        localization_pool=business_pool,
         retriever=HybridCreativeRetriever(business_pool),
         planner=OpenAICreativePlanner(),
         critic=OpenAICreativeCritic(),

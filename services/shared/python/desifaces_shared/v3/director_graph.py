@@ -9,6 +9,10 @@ from langgraph.types import interrupt
 from df_contracts.v3.director import CreativeBrief, CreativeCritique, CreativeStoryPlan, DirectorRunState
 from df_contracts.v3.story import StoryGraph
 from desifaces_shared.v3.creation_context import build_creation_context, build_story_workspace
+from desifaces_shared.v3.translation_route_contract import (
+    TranslationRouteRejected,
+    resolve_approved_translation_route,
+)
 
 
 class CreativeRetriever(Protocol):
@@ -80,6 +84,7 @@ class CreativeDirectorRuntime:
     # human-review gate. This keeps interactive Studio creation to one LLM call
     # per user action while preserving the optional critic path for deeper review.
     blocking_critic: bool = True
+    localization_pool: Any | None = None
 
 
 def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpointer=None):
@@ -157,6 +162,38 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
         }
 
     async def human_review(state: DirectorState) -> DirectorState:
+        route_brief = CreativeBrief.model_validate(state["brief"])
+        constraints = route_brief.constraints or {}
+
+        source = str(
+            constraints.get("source_dialogue_locale")
+            or route_brief.locale or ""
+        ).strip()
+        target = str(
+            constraints.get("requested_output_locale") or ""
+        ).strip()
+
+        if target and not source:
+            raise ValueError(
+                "localization_source_locale_required"
+            )
+
+        if target and target.casefold() != source.casefold():
+            if runtime.localization_pool is None:
+                raise ValueError(
+                    "translation_capability_resolver_unavailable"
+                )
+
+            try:
+                await resolve_approved_translation_route(
+                    runtime.localization_pool,
+                    source_locale=source,
+                    target_locale=target,
+                )
+            except TranslationRouteRejected as exc:
+                raise ValueError(
+                    "translation_direction_not_approved"
+                ) from exc
         payload = {
             "type": "creative_plan_review",
             "run_id": state.get("run_id"),
@@ -165,21 +202,95 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
             "critique": state.get("critique") or None,
             "revision_count": int(state.get("revision_count") or 0),
         }
+        # Additive source-version metadata for localization review.
+        # The fingerprint is generated server-side from the saved plan.
+        # This does not authorize a locale/provider or alter the
+        # existing Hindi review/approval decision.
+        review_brief = CreativeBrief.model_validate(state["brief"])
+        review_constraints = review_brief.constraints or {}
+        review_target = str(
+            review_constraints.get("requested_output_locale") or ""
+        ).strip()
+        review_source = str(
+            review_constraints.get("source_dialogue_locale")
+            or review_brief.locale
+            or ""
+        ).strip()
+
+        if (review_source and review_target
+                and review_source.casefold() != review_target.casefold()):
+            from .localization_contract import (
+                canonical_turns_from_plan,
+                source_fingerprint,
+            )
+
+            review_plan = CreativeStoryPlan.model_validate(
+                state["plan"]
+            )
+            review_turns = canonical_turns_from_plan(review_plan)
+
+            payload["source_locale"] = review_source
+            payload["target_locale"] = review_target
+            payload["source_fingerprint"] = source_fingerprint(
+                review_source, review_turns
+            )
+
         response = interrupt(payload)
+
+        # Verify approval against the checkpointed source plan.
+        # Legacy Hindi approvals may omit the fingerprint.
+        # Any supplied fingerprint must match exactly.
+        expected_fingerprint = payload.get("source_fingerprint")
+
+        if expected_fingerprint is not None:
+            approval_requested = (
+                bool(response.get("approved"))
+                if isinstance(response, dict)
+                else bool(response)
+            )
+
+            if approval_requested:
+                supplied_fingerprint = (
+                    response.get("source_fingerprint")
+                    if isinstance(response, dict)
+                    else None
+                )
+
+                if supplied_fingerprint is None:
+                    if payload.get("target_locale") != "hi-IN":
+                        raise ValueError(
+                            "localization_source_fingerprint_required"
+                        )
+                elif (
+                    not isinstance(supplied_fingerprint, str)
+                    or supplied_fingerprint != expected_fingerprint
+                ):
+                    raise ValueError(
+                        "localization_source_fingerprint_mismatch"
+                    )
         approved = bool((response or {}).get("approved")) if isinstance(response, dict) else bool(response)
         feedback = str((response or {}).get("feedback") or "") if isinstance(response, dict) else ""
         brief = CreativeBrief.model_validate(state["brief"])
         requested_locale = str(brief.constraints.get("requested_output_locale") or "")
+        source_locale = str(
+            brief.constraints.get("source_dialogue_locale")
+            or brief.locale or ""
+        ).strip()
+        requires_localization = bool(
+            requested_locale
+            and requested_locale.casefold()
+            != source_locale.casefold()
+        )
         localized = (response or {}).get("localized_turns") if isinstance(response, dict) else None
         target_locale = str((response or {}).get("target_locale") or "") if isinstance(response, dict) else ""
-        if approved and requested_locale == "hi-IN":
+        if approved and requires_localization:
             plan = CreativeStoryPlan.model_validate(state["plan"])
             expected = [
                 (str(scene.sequence) + ":" + str(turn.sequence), str(turn.speaker_ref), turn.text)
                 for scene in plan.scenes for turn in scene.dialogue
                 if str(turn.kind.value if hasattr(turn.kind, "value") else turn.kind) == "speech"
             ]
-            if (target_locale != "hi-IN" or not isinstance(localized, list)
+            if (target_locale != requested_locale or not isinstance(localized, list)
                 or len(localized) != len(expected)):
                 raise ValueError("hindi_hitl_dialogue_required")
             for item, (turn_key, speaker, original) in zip(localized, expected):
@@ -189,13 +300,39 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
             "phase": DirectorRunState.AWAITING_REVIEW.value,
             "review_approved": approved,
             "review_feedback": feedback,
-            "approved_localized_turns": localized if approved and requested_locale == "hi-IN" else [],
-            "approved_target_locale": target_locale if approved and requested_locale == "hi-IN" else "",
+            "approved_localized_turns": localized if approved and requires_localization else [],
+            "approved_target_locale": target_locale if approved and requires_localization else "",
         }
 
     async def compile_story(state: DirectorState) -> DirectorState:
         brief = CreativeBrief.model_validate(state["brief"])
         plan = CreativeStoryPlan.model_validate(state["plan"])
+
+        # Fail closed for every source/target language pair.
+        # Locale eligibility is resolved separately from DB masterdata.
+        constraints = brief.constraints or {}
+        source_locale = str(
+            constraints.get("source_dialogue_locale")
+            or brief.locale or ""
+        ).strip()
+        target_locale = str(
+            constraints.get("requested_output_locale") or ""
+        ).strip()
+
+        if target_locale:
+            if not source_locale:
+                raise ValueError("localization_source_locale_required")
+
+            if source_locale.casefold() != target_locale.casefold():
+                if (
+                    state.get("review_approved") is not True
+                    or state.get("approved_target_locale") != target_locale
+                    or not state.get("approved_localized_turns")
+                ):
+                    raise ValueError(
+                        "localization_approval_required_before_compile"
+                    )
+
         graph = await runtime.compiler.compile(
             brief=brief,
             plan=plan,
@@ -234,20 +371,34 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
             "assistant_context": assistant_context.model_dump(mode="json"),
         }
 
-    def _requires_hindi_hitl(state: DirectorState) -> bool:
+    def _requires_localization_hitl(
+        state: DirectorState
+    ) -> bool:
         brief = state.get("brief") or {}
         constraints = brief.get("constraints") or {}
-        return constraints.get("requested_output_locale") == "hi-IN"
+
+        source = str(
+            constraints.get("source_dialogue_locale")
+            or brief.get("locale") or ""
+        ).strip()
+        target = str(
+            constraints.get("requested_output_locale") or ""
+        ).strip()
+
+        return bool(
+            target
+            and target.casefold() != source.casefold()
+        )
 
     def after_plan(state: DirectorState) -> str:
-        if _requires_hindi_hitl(state):
+        if _requires_localization_hitl(state):
             return "review"
         if runtime.blocking_critic:
             return "critique"
         return "review" if runtime.require_human_review else "compile"
 
     def after_critique(state: DirectorState) -> str:
-        if _requires_hindi_hitl(state):
+        if _requires_localization_hitl(state):
             return "review"
         critique = CreativeCritique.model_validate(state["critique"])
         revisions = int(state.get("revision_count") or 0)

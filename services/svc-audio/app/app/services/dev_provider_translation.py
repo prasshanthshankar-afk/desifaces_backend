@@ -91,69 +91,37 @@ async def _detect_auto_source_language(text: str) -> str:
     return detected
 
 
+async def resolve_approved_translation_route(
+    pool, *, source_locale: str, target_locale: str
+) -> dict[str, str]:
+    """Audio compatibility wrapper for shared DB routing."""
+    from desifaces_shared.v3.translation_route_contract import (
+        TranslationRouteRejected,
+        resolve_approved_translation_route as shared_resolve,
+    )
+    try:
+        return await shared_resolve(
+            pool,
+            source_locale=source_locale,
+            target_locale=target_locale,
+        )
+    except TranslationRouteRejected as exc:
+        raise DevTranslationRejected(str(exc)) from exc
+
+
 async def translate_approved(
     pool, *, text: str, source_locale: str, target_locale: str,
     speaker_gender: str, original_context: dict,
+    require_natural_speech_check: bool = False,
 ) -> tuple[str, str, str]:
     """Approved directional DB row required. No automatic provider fallback."""
     if str(source_locale or "").strip().lower() == "auto":
         source_locale = await _detect_auto_source_language(text)
-    # Existing-schema translation contract: stored only in target locale
-    # meta_json.translation_routing_v1. No new table and no implicit fallback.
-    records = await pool.fetch(
-        """SELECT locale, language_code, meta_json
-           FROM public.tts_locales
-           WHERE is_enabled AND (
-             locale=$2 OR locale=$1 OR
-             (strpos($1,'-')=0 AND lower(language_code)=lower($1))
-           )""",
-        source_locale, target_locale,
+    row = await resolve_approved_translation_route(
+        pool,
+        source_locale=source_locale,
+        target_locale=target_locale,
     )
-    source_locales = {
-        r["locale"] for r in records
-        if r["locale"] == source_locale or (
-            "-" not in source_locale and
-            str(r["language_code"] or "").lower() == source_locale.lower()
-        )
-    }
-    targets = [r for r in records if r["locale"] == target_locale]
-    if len(targets) != 1 or not source_locales:
-        raise DevTranslationRejected("no_approved_translation_direction")
-    metadata = targets[0]["meta_json"] or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except ValueError as exc:
-            raise DevTranslationRejected("invalid_translation_metadata") from exc
-    routing = metadata.get("translation_routing_v1") if isinstance(metadata, dict) else None
-    if not isinstance(routing, dict) or routing.get("enabled") is not True:
-        raise DevTranslationRejected("no_approved_translation_direction")
-    entries = routing.get("capabilities")
-    if not isinstance(entries, list):
-        raise DevTranslationRejected("invalid_translation_metadata")
-    candidates = []
-    for c in entries:
-        if not isinstance(c, dict) or c.get("approved") is not True or c.get("enabled") is not True:
-            continue
-        if c.get("source_locale") not in source_locales or c.get("target_locale") != target_locale:
-            continue
-        if not all(isinstance(c.get(k), str) and c[k].strip() for k in (
-            "provider", "model", "provider_source_code", "provider_target_code"
-        )):
-            continue
-        candidates.append(c)
-    if not candidates:
-        raise DevTranslationRejected("no_approved_translation_direction")
-    exact = [c for c in candidates if c["source_locale"] == source_locale]
-    pool_candidates = exact or candidates
-    if len({c["source_locale"] for c in pool_candidates}) != 1:
-        raise DevTranslationRejected("ambiguous_source_locale")
-    if len(pool_candidates) != 1:
-        raise DevTranslationRejected("ambiguous_translation_route")
-    c = pool_candidates[0]
-    row = dict(provider_code=c["provider"], model_code=c["model"],
-               provider_source_code=c["provider_source_code"],
-               provider_target_code=c["provider_target_code"])
     provider, model = row["provider_code"], row["model_code"]
     if not text.strip() or len(text) > 1000:
         raise DevTranslationRejected("invalid_text_length")
@@ -179,4 +147,24 @@ async def translate_approved(
         )
     if not isinstance(translated, str) or not translated.strip():
         raise DevTranslationRejected("empty_provider_translation")
+
+    if require_natural_speech_check:
+        from app.services.dev101_natural_speech import (
+            NaturalSpeechRejected,
+            naturalize_provider_translation,
+        )
+        try:
+            translated = await naturalize_provider_translation(
+                original_text=text,
+                provider_draft=translated,
+                source_locale=source_locale,
+                target_locale=target_locale,
+                speaker_gender=speaker_gender,
+                original_context=original_context,
+            )
+        except NaturalSpeechRejected as exc:
+            raise DevTranslationRejected(
+                "natural_speech_check_failed"
+            ) from exc
+
     return translated.strip(), provider, model

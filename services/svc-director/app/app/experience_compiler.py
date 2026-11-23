@@ -8,6 +8,10 @@ from df_contracts.v3.story import StoryGraph
 
 from .compiler import CanonicalStoryCompiler
 from .localization_source_contract import validate_english_source
+from desifaces_shared.v3.translation_route_contract import (
+    TranslationRouteRejected,
+    resolve_approved_translation_route,
+)
 
 
 def _clean(value: Any) -> str:
@@ -76,45 +80,102 @@ class UserOwnedStoryCompiler(CanonicalStoryCompiler):
         plan: CreativeStoryPlan,
         retrieved_context: dict[str, Any],
     ) -> StoryGraph:
-        # Canonical source language is English for this DEV en-US -> hi-IN path.
-        # Never treat a Hindi Director draft as the English original.
-        requested_locale = str(brief.constraints.get("requested_output_locale") or "")
-        if requested_locale == "hi-IN":
-            if str(brief.locale or "").lower() not in {"en-us", "en"}:
-                raise ValueError("canonical_source_must_be_english")
-            for scene in plan.scenes:
-                for turn in scene.dialogue:
-                    if str(getattr(turn.kind, "value", turn.kind)) != "speech":
-                        continue
-                    devanagari = sum("\\u0900" <= ch <= "\\u097f" for ch in turn.text)
-                    if devanagari >= 3:
-                        raise ValueError("director_source_contains_hindi_not_english")
-            approved_snapshot = retrieved_context.get("_approved_hitl_localization")
-            if not isinstance(approved_snapshot, dict) or approved_snapshot.get("target_locale") != "hi-IN":
-                raise ValueError("hindi_hitl_approval_required_before_story_creation")
-        # Validate the COMPLETE HITL snapshot before any canonical story writes.
-        localization = retrieved_context.get("_approved_hitl_localization")
-        if localization:
-            if localization.get("target_locale") != "hi-IN":
-                raise ValueError("unsupported_hitl_localization_locale")
+        # A localization must match the requested source, target and
+        # complete canonical dialogue before any Story writes occur.
+        constraints = brief.constraints or {}
+        source_locale = str(
+            constraints.get("source_dialogue_locale")
+            or brief.locale or ""
+        ).strip()
+        target_locale = str(
+            constraints.get("requested_output_locale") or ""
+        ).strip()
+        if target_locale and (
+            not source_locale or source_locale.casefold() == "auto"
+        ):
+            raise ValueError("localization_source_locale_required")
+
+        needs_localization = bool(
+            target_locale
+            and target_locale.casefold() != source_locale.casefold()
+        )
+        localization = retrieved_context.get(
+            "_approved_hitl_localization"
+        )
+
+        if needs_localization:
+            if (
+                not isinstance(localization, dict)
+                or localization.get("target_locale") != target_locale
+            ):
+                raise ValueError(
+                    "localization_approval_required_before_story_creation"
+                )
+            if (
+                localization.get("source_locale")
+                and localization["source_locale"] != source_locale
+            ):
+                raise ValueError("approved_hitl_source_locale_mismatch")
+
             approved = localization.get("turns")
             expected = [
-                (f"{scene.sequence}:{turn.sequence}", str(turn.speaker_ref), turn.text)
-                for scene in plan.scenes for turn in scene.dialogue
-                if str(getattr(turn.kind, "value", turn.kind)) == "speech"
+                (
+                    f"{scene.sequence}:{turn.sequence}",
+                    str(turn.speaker_ref),
+                    turn.text,
+                )
+                for scene in plan.scenes
+                for turn in scene.dialogue
+                if str(getattr(turn.kind, "value", turn.kind))
+                == "speech"
             ]
-            expected.sort(key=lambda entry: tuple(map(int, entry[0].split(":"))))
-            if not isinstance(approved, list) or len(approved) != len(expected):
+            expected.sort(
+                key=lambda row: tuple(
+                    map(int, row[0].split(":"))
+                )
+            )
+            if (
+                not expected
+                or not isinstance(approved, list)
+                or len(approved) != len(expected)
+            ):
                 raise ValueError("approved_hitl_turn_count_mismatch")
-            for item, (key, speaker, source_text) in zip(approved, expected):
-                validate_english_source(source_text)
-                if (not isinstance(item, dict)
+
+            for item, (key, speaker, source_text) in zip(
+                approved, expected
+            ):
+                if (
+                    not isinstance(item, dict)
                     or item.get("turn_id") != key
                     or item.get("speaker") != speaker
                     or item.get("source_text") != source_text
                     or not isinstance(item.get("text"), str)
-                    or not item["text"].strip()):
+                    or not item["text"].strip()
+                ):
                     raise ValueError("approved_hitl_precompile_mismatch")
+
+                # Preserve the existing English-source safety check.
+                # Additional source-language quality certification is
+                # a separate provider/policy responsibility.
+                if source_locale.split("-", 1)[0].casefold() == "en":
+                    validate_english_source(source_text)
+
+            # Defense in depth: recheck the DB direction immediately
+            # before entering canonical persistence.
+            async with self._pool.acquire() as conn:
+                try:
+                    await resolve_approved_translation_route(
+                        conn,
+                        source_locale=source_locale,
+                        target_locale=target_locale,
+                    )
+                except TranslationRouteRejected as exc:
+                    raise ValueError(
+                        "translation_direction_not_approved_before_story_creation"
+                    ) from exc
+        elif localization:
+            raise ValueError("unrequested_hitl_localization")
+
         graph = await super().compile(
             brief=brief,
             plan=plan,

@@ -44,6 +44,7 @@ class ResumeIn(BaseModel):
     feedback: str | None = Field(default=None, max_length=12000)
     localized_turns: list[dict[str, str]] | None = Field(default=None, max_length=50)
     target_locale: str | None = Field(default=None, max_length=40)
+    source_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class RecentStoryOut(BaseModel):
@@ -247,7 +248,7 @@ async def resume_run(thread_id: str, body: ResumeIn, auth: DirectorAuthContext =
         async with app.state.business_pool.acquire() as conn:
             row = await app.state.run_store.queue_resume(
                 conn, thread_id=thread_id, account_id=auth.account_id, owner_user_id=auth.user_id,
-                resume_payload={"approved": body.approved, "feedback": body.feedback or "", "localized_turns": body.localized_turns, "target_locale": body.target_locale},
+                resume_payload={"approved": body.approved, "feedback": body.feedback or "", "localized_turns": body.localized_turns, "target_locale": body.target_locale, "source_fingerprint": body.source_fingerprint},
             )
     except DirectorRunNotFound as exc:
         raise HTTPException(status_code=409, detail="director_run_not_awaiting_review") from exc

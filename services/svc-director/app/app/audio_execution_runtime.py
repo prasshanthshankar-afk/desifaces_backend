@@ -115,10 +115,43 @@ def compile_context_audio_input(context: _audio_execution.AudioStageContext) -> 
 
     if context.voice_profile_ref:
         studio_input["voice_id"] = str(context.voice_profile_ref).strip()
-    studio_input["source_language"] = source_locale
-    studio_input["target_locale"] = target_locale
-    studio_input["voice_locale"] = target_locale
-    studio_input["translate"] = _base_language(source_locale) != _base_language(target_locale)
+    # The base bridge already verifies canonical approved localization
+    # against the dialogue turn, source text and target locale.
+    # Never translate that exact user-approved text a second time.
+    approved = _as_dict(
+        context.stage_metadata.get("approved_localization")
+    )
+    if approved:
+        approved_target = str(
+            approved.get("target_locale") or ""
+        ).strip()
+        if (
+            not approved_target
+            or approved_target.casefold() != target_locale.casefold()
+        ):
+            raise _audio_execution.ParticipantAudioBridgeError(
+                "approved_localization_voice_locale_mismatch"
+            )
+        if (
+            studio_input.get("text") != approved.get("text")
+            or studio_input.get("translate") is not False
+        ):
+            raise _audio_execution.ParticipantAudioBridgeError(
+                "approved_localization_integrity_mismatch"
+            )
+
+        studio_input["source_language"] = target_locale
+        studio_input["target_locale"] = target_locale
+        studio_input["voice_locale"] = target_locale
+        studio_input["translate"] = False
+    else:
+        studio_input["source_language"] = source_locale
+        studio_input["target_locale"] = target_locale
+        studio_input["voice_locale"] = target_locale
+        studio_input["translate"] = (
+            _base_language(source_locale)
+            != _base_language(target_locale)
+        )
 
     # Explicit participant-level delivery choices override Director-authored
     # defaults. String controls remain strings; numeric controls are forwarded
