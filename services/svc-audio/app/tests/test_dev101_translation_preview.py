@@ -244,6 +244,71 @@ class TranslationPreviewTests(
 
         self.assertEqual(result.status_code, 422)
 
+    async def test_global_dev_preview_is_always_pending_human_review(self):
+        # No global DB route is approved here; a DEV candidate can draft only.
+        with patch.dict(os.environ, {
+            "DF_RUNTIME_ENV": "dev",
+            "DF_DEV_GLOBAL_TRANSLATION_ENABLED": "true",
+        }), patch.object(
+            preview, "selected_for_dev", return_value=True
+        ), patch.object(
+            preview, "translate_approved",
+            AsyncMock(side_effect=preview.DevTranslationRejected(
+                "no_approved_translation_direction"
+            )),
+        ), patch(
+            "app.services.dev_global_translation.translate_global_dev_draft",
+            new_callable=AsyncMock,
+            return_value=("नमस्ते", "azure_translator", "text-translation-v3"),
+        ) as draft:
+            result = await self.post(headers=authorization())
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(draft.await_count, 2)
+        self.assertTrue(result.json()["experimental_translation_route"])
+        self.assertEqual(result.json()["status"], "pending_hitl")
+        self.assertFalse(result.json()["approved"])
+
+    async def test_global_dev_preview_requires_explicit_feature_flag(self):
+        with patch.dict(os.environ, {
+            "DF_RUNTIME_ENV": "dev",
+            "DF_DEV_GLOBAL_TRANSLATION_ENABLED": "false",
+        }), patch.object(
+            preview, "selected_for_dev", return_value=True
+        ), patch.object(
+            preview, "translate_approved",
+            AsyncMock(side_effect=preview.DevTranslationRejected(
+                "no_approved_translation_direction"
+            )),
+        ), patch(
+            "app.services.dev_global_translation.translate_global_dev_draft",
+            new_callable=AsyncMock,
+        ) as draft:
+            result = await self.post(headers=authorization())
+
+        self.assertEqual(result.status_code, 422)
+        draft.assert_not_awaited()
+
+    async def test_production_cannot_use_dev_candidate_even_if_flag_set(self):
+        with patch.dict(os.environ, {
+            "DF_RUNTIME_ENV": "production",
+            "DF_PROD_TRANSLATION_PREVIEW_ENABLED": "true",
+            "DF_PROD_TRANSLATION_PREVIEW_USER_IDS": USER_ID,
+            "DF_DEV_GLOBAL_TRANSLATION_ENABLED": "true",
+        }), patch.object(
+            preview, "translate_approved",
+            AsyncMock(side_effect=preview.DevTranslationRejected(
+                "no_approved_translation_direction"
+            )),
+        ), patch(
+            "app.services.dev_global_translation.translate_global_dev_draft",
+            new_callable=AsyncMock,
+        ) as draft:
+            result = await self.post(headers=authorization())
+
+        self.assertEqual(result.status_code, 422)
+        draft.assert_not_awaited()
+
     async def test_provider_failure_is_not_fallback(self):
         translator = AsyncMock(
             side_effect=httpx.RequestError(
