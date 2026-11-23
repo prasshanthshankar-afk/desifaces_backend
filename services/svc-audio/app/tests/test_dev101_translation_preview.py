@@ -179,6 +179,51 @@ class TranslationPreviewTests(
 
         self.assertEqual(result.status_code, 404)
 
+    async def test_prod_enabled_without_allowlist_denied(self):
+        with patch.dict(os.environ, {
+            "DF_RUNTIME_ENV": "production",
+            "DF_PROD_TRANSLATION_PREVIEW_ENABLED": "true",
+            "DF_PROD_TRANSLATION_PREVIEW_USER_IDS": "",
+        }), patch.object(
+            preview, "translate_approved", new_callable=AsyncMock
+        ) as translator:
+            result = await self.post(headers=authorization())
+
+        self.assertEqual(result.status_code, 403)
+        translator.assert_not_awaited()
+
+    async def test_prod_enabled_with_allowlist_returns_draft(self):
+        with patch.dict(os.environ, {
+            "DF_RUNTIME_ENV": "production",
+            "DF_PROD_TRANSLATION_PREVIEW_ENABLED": "true",
+            "DF_PROD_TRANSLATION_PREVIEW_USER_IDS": USER_ID,
+        }), patch.object(
+            preview, "translate_approved",
+            AsyncMock(return_value=(
+                "हमारे ग्राहक इसे पसंद करेंगे।",
+                "sarvam",
+                "mayura:v1",
+            ))
+        ):
+            result = await self.post(headers=authorization())
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json()["status"], "pending_hitl")
+        self.assertFalse(result.json()["approved"])
+
+    async def test_prod_flag_disabled_rejected(self):
+        with patch.dict(os.environ, {
+            "DF_RUNTIME_ENV": "production",
+            "DF_PROD_TRANSLATION_PREVIEW_ENABLED": "false",
+            "DF_PROD_TRANSLATION_PREVIEW_USER_IDS": USER_ID,
+        }), patch.object(
+            preview, "translate_approved", new_callable=AsyncMock
+        ) as translator:
+            result = await self.post(headers=authorization())
+
+        self.assertEqual(result.status_code, 404)
+        translator.assert_not_awaited()
+
     async def test_unapproved_direction_rejected(self):
         translator = AsyncMock(
             side_effect=preview.DevTranslationRejected(

@@ -75,10 +75,17 @@ async def preview_director_translation(
     claims: dict = Depends(get_current_claims),
     pool: asyncpg.Pool = Depends(get_pool),
 ):
-    if os.getenv("DF_RUNTIME_ENV", "").lower() not in {
-        "dev", "development"
-    }:
-        raise HTTPException(404, "dev_only")
+    runtime = os.getenv("DF_RUNTIME_ENV", "").strip().lower()
+    if runtime not in {"dev", "development", "prod", "production"}:
+        raise HTTPException(404, "translation_preview_unavailable")
+
+    if runtime in {"prod", "production"}:
+        if (
+            os.getenv(
+                "DF_PROD_TRANSLATION_PREVIEW_ENABLED", ""
+            ).strip().lower() != "true"
+        ):
+            raise HTTPException(404, "translation_preview_unavailable")
 
     # Never interpret an internal service bearer as a user approval.
     if claims.get("is_service") or claims.get("token_type") == "service":
@@ -89,11 +96,29 @@ async def preview_director_translation(
     except (ValueError, TypeError, AttributeError) as exc:
         raise HTTPException(401, "invalid_user_identity") from exc
 
-    try:
-        if not selected_for_dev(str(user_id)):
-            raise HTTPException(403, "dev_translation_cohort_required")
-    except DevTranslationRejected as exc:
-        raise HTTPException(403, str(exc)) from exc
+    if runtime in {"dev", "development"}:
+        try:
+            if not selected_for_dev(str(user_id)):
+                raise HTTPException(403, "dev_translation_cohort_required")
+        except DevTranslationRejected as exc:
+            raise HTTPException(403, str(exc)) from exc
+    else:
+        # Production authorization does not rely on DEV host identity.
+        # Invalid/empty allowlist entries grant no access.
+        allowed_ids = set()
+        configured = os.getenv(
+            "DF_PROD_TRANSLATION_PREVIEW_USER_IDS", ""
+        )
+        for value in configured.split(","):
+            try:
+                allowed_ids.add(UUID(value.strip()))
+            except (ValueError, TypeError, AttributeError):
+                continue
+
+        if user_id not in allowed_ids:
+            raise HTTPException(
+                403, "production_translation_preview_cohort_required"
+            )
 
     try:
         validate_preview_request(body)
