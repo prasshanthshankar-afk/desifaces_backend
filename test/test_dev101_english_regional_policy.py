@@ -4,10 +4,14 @@ Run with the existing backend test environment/PYTHONPATH; no external provider,
 database, wallet, or story creation is involved.
 """
 from pathlib import Path
+from runpy import run_path
 
 import pytest
 
-from desifaces_shared.v3.english_source_policy import requires_translation
+# Isolate the pure policy module from the legacy v3 package initializer,
+# which imports full database/persistence dependencies unrelated to this gate.
+_ROOT = Path(__file__).resolve().parents[1]
+requires_translation = run_path(str(_ROOT / 'services/shared/python/desifaces_shared/v3/english_source_policy.py'))['requires_translation']
 
 @pytest.mark.parametrize("source,target,expected", [
     ("en-GB", "en-US", False),
