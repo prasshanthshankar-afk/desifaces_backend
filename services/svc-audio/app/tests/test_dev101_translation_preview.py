@@ -199,6 +199,50 @@ class TranslationPreviewTests(
 
         self.assertEqual(result.status_code, 422)
 
+    async def test_rejected_second_turn_has_actionable_feedback(self):
+        from app.services.dev101_natural_speech import NaturalSpeechRejected
+        from app.services.dev101_translation_quality_gate import (
+            TranslationQualityRejected,
+        )
+
+        audit = TranslationQualityRejected(
+            "translation_quality_rejected",
+            failed_checks=("speaker_actions_preserved",),
+            issue="The wrong person promised to return.",
+        )
+        speech = NaturalSpeechRejected(
+            "natural_speech_quality_gate_rejected"
+        )
+        speech.__cause__ = audit
+        failure = preview.DevTranslationRejected(
+            "natural_speech_check_failed"
+        )
+        failure.__cause__ = speech
+        translator = AsyncMock(side_effect=[
+            ("नमस्ते", "sarvam", "mayura:v1"),
+            failure,
+        ])
+
+        with patch.object(
+            preview, "selected_for_dev", return_value=True,
+        ), patch.object(
+            preview, "translate_approved", translator,
+        ):
+            response = await self.post(headers=authorization())
+
+        self.assertEqual(response.status_code, 422, response.text)
+        detail = response.json()["detail"]
+        self.assertEqual(detail["turn_id"], "1:2")
+        self.assertEqual(detail["speaker"], "Arjun")
+        self.assertEqual(
+            detail["failed_checks"], ["speaker_actions_preserved"]
+        )
+        self.assertIn(
+            "The wrong person promised to return.",
+            detail["message"],
+        )
+        self.assertEqual(translator.await_count, 2)
+
     async def test_provider_failure_is_not_fallback(self):
         translator = AsyncMock(
             side_effect=httpx.RequestError(
