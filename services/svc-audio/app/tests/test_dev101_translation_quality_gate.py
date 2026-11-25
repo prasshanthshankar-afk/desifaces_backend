@@ -84,6 +84,24 @@ class QualityGateTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.audit(client)
 
+    async def test_rejection_exposes_bounded_audit_reason(self):
+        long_issue = "Incorrect speaker action. " * 30
+        client = FakeClient(self.flags(
+            meaning_preserved=False,
+            speaker_actions_preserved=False,
+            issue=long_issue,
+        ))
+        with self.assertRaises(TranslationQualityRejected) as captured:
+            await self.audit(client)
+        exc = captured.exception
+        self.assertEqual(str(exc), "translation_quality_rejected")
+        self.assertEqual(
+            exc.failed_checks,
+            ("meaning_preserved", "speaker_actions_preserved"),
+        )
+        self.assertLessEqual(len(exc.issue), 240)
+        self.assertIn("Incorrect speaker action.", exc.issue)
+
     async def test_bad_grammar_is_rejected(self):
         client = FakeClient(self.flags(
             grammar_correct=False,
