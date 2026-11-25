@@ -9,6 +9,7 @@ from langgraph.types import interrupt
 from df_contracts.v3.director import CreativeBrief, CreativeCritique, CreativeStoryPlan, DirectorRunState
 from df_contracts.v3.story import StoryGraph
 from desifaces_shared.v3.creation_context import build_creation_context, build_story_workspace
+from desifaces_shared.v3.english_source_policy import requires_translation
 from desifaces_shared.v3.translation_route_contract import (
     TranslationRouteRejected,
     resolve_approved_translation_route,
@@ -178,7 +179,7 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
                 "localization_source_locale_required"
             )
 
-        if target and target.casefold() != source.casefold():
+        if requires_translation(source, target):
             if runtime.localization_pool is None:
                 raise ValueError(
                     "translation_capability_resolver_unavailable"
@@ -217,8 +218,7 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
             or ""
         ).strip()
 
-        if (review_source and review_target
-                and review_source.casefold() != review_target.casefold()):
+        if requires_translation(review_source, review_target):
             from .localization_contract import (
                 canonical_turns_from_plan,
                 source_fingerprint,
@@ -276,11 +276,7 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
             brief.constraints.get("source_dialogue_locale")
             or brief.locale or ""
         ).strip()
-        requires_localization = bool(
-            requested_locale
-            and requested_locale.casefold()
-            != source_locale.casefold()
-        )
+        requires_localization = requires_translation(source_locale, requested_locale)
         localized = (response or {}).get("localized_turns") if isinstance(response, dict) else None
         target_locale = str((response or {}).get("target_locale") or "") if isinstance(response, dict) else ""
         if approved and requires_localization:
@@ -323,7 +319,7 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
             if not source_locale:
                 raise ValueError("localization_source_locale_required")
 
-            if source_locale.casefold() != target_locale.casefold():
+            if requires_translation(source_locale, target_locale):
                 if (
                     state.get("review_approved") is not True
                     or state.get("approved_target_locale") != target_locale
@@ -385,10 +381,7 @@ def build_creative_director_graph(runtime: CreativeDirectorRuntime, *, checkpoin
             constraints.get("requested_output_locale") or ""
         ).strip()
 
-        return bool(
-            target
-            and target.casefold() != source.casefold()
-        )
+        return requires_translation(source, target)
 
     def after_plan(state: DirectorState) -> str:
         if _requires_localization_hitl(state):
