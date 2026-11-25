@@ -8,6 +8,7 @@ from df_contracts.v3.story import StoryGraph
 
 from .compiler import CanonicalStoryCompiler
 from .localization_source_contract import validate_english_source
+from desifaces_shared.v3.english_source_policy import requires_translation
 from desifaces_shared.v3.translation_route_contract import (
     TranslationRouteRejected,
     resolve_approved_translation_route,
@@ -95,10 +96,7 @@ class UserOwnedStoryCompiler(CanonicalStoryCompiler):
         ):
             raise ValueError("localization_source_locale_required")
 
-        needs_localization = bool(
-            target_locale
-            and target_locale.casefold() != source_locale.casefold()
-        )
+        needs_localization = requires_translation(source_locale, target_locale)
         localization = retrieved_context.get(
             "_approved_hitl_localization"
         )
