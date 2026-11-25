@@ -25,6 +25,9 @@ from app.services.dev_provider_translation import (
 from app.services.dev_translation_provider_adapters import (
     ProviderTranslationError,
 )
+from app.services.dev101_translation_quality_gate import (
+    TranslationQualityRejected,
+)
 
 router = APIRouter(
     prefix="/api/audio/dev101",
@@ -64,6 +67,48 @@ def validate_preview_request(body: TranslationPreviewIn) -> None:
 
     if sum(len(turn.text) for turn in body.turns) > 6000:
         raise ValueError("translation_preview_batch_too_large")
+
+
+def translation_review_error(exc: DevTranslationRejected, turn: PreviewTurn):
+    """Expose one rejected dialogue turn, not its private provider payload."""
+    cause = exc.__cause__
+    while cause is not None:
+        if isinstance(cause, TranslationQualityRejected):
+            if str(cause) != "translation_quality_rejected":
+                break
+            failed = list(cause.failed_checks)
+            labels = {
+                "meaning_preserved": "meaning",
+                "grammar_correct": "grammar",
+                "speaker_actions_preserved": "speaker actions",
+                "register_appropriate": "conversational register",
+            }
+            areas = ", ".join(labels[c] for c in failed if c in labels)
+            explanation = cause.issue
+            message = (
+                f"Translation review rejected dialogue {turn.turn_id} "
+                f"({turn.speaker})"
+                + (f": {areas}" if areas else "")
+                + (f". {explanation}" if explanation else ".")
+                + " Please revise this dialogue or regenerate its draft."
+            )
+            return {
+                "code": "translation_quality_rejected",
+                "turn_id": turn.turn_id,
+                "speaker": turn.speaker,
+                "failed_checks": failed,
+                "review_issue": explanation,
+                "message": message,
+            }
+        cause = cause.__cause__
+    return {
+        "code": str(exc),
+        "turn_id": turn.turn_id,
+        "message": (
+            f"Translation preview failed for dialogue {turn.turn_id} "
+            f"({turn.speaker}): {str(exc)}"
+        ),
+    }
 
 
 @router.post(
@@ -141,7 +186,9 @@ async def preview_director_translation(
                 require_natural_speech_check=True,
             )
         except DevTranslationRejected as exc:
-            raise HTTPException(422, str(exc)) from exc
+            raise HTTPException(
+                422, detail=translation_review_error(exc, turn)
+            ) from exc
         except (httpx.HTTPError, ProviderTranslationError) as exc:
             raise HTTPException(
                 502, "translation_provider_unavailable"
