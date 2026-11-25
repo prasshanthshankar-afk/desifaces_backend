@@ -51,6 +51,75 @@ class NaturalSpeechTests(unittest.IsolatedAsyncioTestCase):
         self.audit_mock = self._audit_patch.start()
         self.addCleanup(self._audit_patch.stop)
 
+    async def test_auditor_feedback_repairs_only_once_and_reaudits(self):
+        from app.services.dev101_translation_quality_gate import (
+            TranslationQualityRejected,
+        )
+
+        class RecordingClient(FakeClient):
+            def __init__(self):
+                super().__init__("मैं कॉफ़ी बनाऊँगा।")
+                self.requests = []
+
+            async def post(self, url, headers, json):
+                self.requests.append(json)
+                return await super().post(url, headers, json)
+
+        client = RecordingClient()
+        self.audit_mock.side_effect = [
+            TranslationQualityRejected(
+                "translation_quality_rejected",
+                failed_checks=("grammar_correct",),
+                issue="Correct the verb construction.",
+            ),
+            None,
+        ]
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "offline-test"}):
+            answer = await naturalize_provider_translation(
+                **self.arguments(), client=client
+            )
+
+        self.assertEqual(answer, "मैं कॉफ़ी बनाऊँगा।")
+        self.assertEqual(len(client.requests), 2)
+        self.assertEqual(self.audit_mock.await_count, 2)
+        feedback = json.loads(client.requests[1]["input"])
+        self.assertEqual(
+            feedback["failed_quality_checks"], ["grammar_correct"]
+        )
+        self.assertEqual(
+            feedback["quality_audit_issue"],
+            "Correct the verb construction.",
+        )
+
+    async def test_second_audit_rejection_remains_blocking(self):
+        from app.services.dev101_translation_quality_gate import (
+            TranslationQualityRejected,
+        )
+
+        first = TranslationQualityRejected(
+            "translation_quality_rejected",
+            failed_checks=("grammar_correct",),
+            issue="Fix incorrect phrasing",
+        )
+        second = TranslationQualityRejected(
+            "translation_quality_rejected",
+            failed_checks=("speaker_actions_preserved",),
+            issue="Wrong speaker promised to call",
+        )
+        self.audit_mock.side_effect = [first, second]
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "offline-test"}):
+            with self.assertRaisesRegex(
+                NaturalSpeechRejected, "quality_gate_rejected"
+            ) as capture:
+                await naturalize_provider_translation(
+                    **self.arguments(),
+                    client=FakeClient("अनुवाद अस्वीकार किया गया"),
+                )
+
+        self.assertEqual(self.audit_mock.await_count, 2)
+        self.assertIs(capture.exception.__cause__, second)
+
     async def test_quality_rejection_blocks_approval(self):
         from app.services.dev101_translation_quality_gate import (
             TranslationQualityRejected,
