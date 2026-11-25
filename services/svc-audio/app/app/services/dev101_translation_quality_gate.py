@@ -8,7 +8,16 @@ import httpx
 
 
 class TranslationQualityRejected(RuntimeError):
-    pass
+    """Fail-closed audit rejection with bounded, structured reviewer feedback."""
+
+    def __init__(
+        self, code: str, *,
+        failed_checks: tuple[str, ...] = (),
+        issue: str = "",
+    ) -> None:
+        super().__init__(code)
+        self.failed_checks = tuple(failed_checks)
+        self.issue = " ".join(str(issue).split())[:240]
 
 
 async def audit_translation(
@@ -166,8 +175,13 @@ async def audit_translation(
         ):
             raise TranslationQualityRejected("quality_audit_invalid_schema")
 
-        if not all(result[flag] for flag in flags):
-            raise TranslationQualityRejected("translation_quality_rejected")
+        failed = tuple(flag for flag in flags if not result[flag])
+        if failed:
+            raise TranslationQualityRejected(
+                "translation_quality_rejected",
+                failed_checks=failed,
+                issue=result["issue"],
+            )
 
     except TranslationQualityRejected:
         raise
