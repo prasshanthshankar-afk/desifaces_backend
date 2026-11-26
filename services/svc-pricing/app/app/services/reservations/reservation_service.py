@@ -1616,6 +1616,12 @@ async def release(
         if st == "committed":
             raise ValueError("PRICING_RESERVATION_ALREADY_COMMITTED")
 
+        # A stale expiration caller must never undo a lease renewed concurrently.
+        # The reservation row is locked above, so this check and the release
+        # participate in the same serialization order as renew_reservation().
+        if _clean_text(reason).lower() == "expired" and r["expires_at"] > _now():
+            raise ValueError("PRICING_RESERVATION_RENEWED_NOT_EXPIRED")
+
         balance_before = await get_balance(conn, user_id)
 
         if allocations:
@@ -1828,6 +1834,31 @@ async def finalize(
 
         if st != "reserved":
             raise ValueError(f"PRICING_INVALID_RESERVATION_STATUS:{st}")
+
+        # All V3 scene charges, including replacement reservations, serialize
+        # against one durable scene identity. A caller cannot double-consume
+        # by changing the reservation ID or its commit idempotency key.
+        if str(actuals.get("external_ref_type") or "") == "v3_scene_stage":
+            scene_ref = _clean_text(actuals.get("external_ref_id"))
+            if not scene_ref:
+                raise ValueError("PRICING_SCENE_IDENTITY_REQUIRED")
+            await conn.execute(
+                "select pg_advisory_xact_lock(hashtextextended($1,0))",
+                "pricing_scene_settlement:" + scene_ref,
+            )
+            consumed = await conn.fetchval(
+                """
+                select exists (
+                    select 1 from public.pricing_credit_ledger_events
+                    where user_id=$1 and credits_delta<0
+                      and idempotency_key like $2
+                )
+                """,
+                user_id,
+                "consume:svc-fusion-extension:v3-scene:" + scene_ref + ":commit:%",
+            )
+            if consumed:
+                raise ValueError("PRICING_SCENE_ALREADY_SETTLED")
 
         snapshot_mode = str(quote.get("billing_mode_snapshot") or quote.get("billing_mode") or "").strip()
         effective_billing_mode = snapshot_mode if snapshot_mode else str(billing_mode or "bill")
@@ -2111,3 +2142,56 @@ async def finalize(
             available_after=avail_after,
         )
 
+
+
+async def renew_reservation(
+    conn: asyncpg.Connection,
+    *,
+    user_id: UUID,
+    reservation_id: UUID,
+    job_ref: str,
+    extend_seconds: int = 900,
+    renew_if_remaining_seconds: int = 300,
+) -> datetime:
+    """Extend an existing held reservation without creating a second hold.
+
+    A renewal is deliberately forbidden after expiry: released funds may already
+    have been reused by another job. The caller must recover separately instead
+    of resurrecting the reservation.
+    """
+    duration = max(60, min(int(extend_seconds), settings.MAX_RESERVATION_TTL_S))
+    window = max(30, min(int(renew_if_remaining_seconds), duration))
+    async with conn.transaction():
+        row = await conn.fetchrow(
+            """
+            select status, expires_at, job_ref
+            from public.pricing_credit_reservations
+            where id=$1 and user_id=$2
+            for update
+            """,
+            reservation_id, user_id,
+        )
+        if not row:
+            raise ValueError("PRICING_RESERVATION_NOT_FOUND")
+        if str(row["job_ref"] or "") != str(job_ref):
+            raise ValueError("PRICING_RESERVATION_JOB_MISMATCH")
+        if str(row["status"]) != "reserved":
+            raise ValueError(f"PRICING_INVALID_RESERVATION_STATUS:{row['status']}")
+        now = _now()
+        if row["expires_at"] <= now:
+            raise ValueError("PRICING_RESERVATION_ALREADY_EXPIRED")
+        if (row["expires_at"] - now).total_seconds() > window:
+            return row["expires_at"]
+        updated = await conn.fetchval(
+            """
+            update public.pricing_credit_reservations
+            set expires_at = greatest(expires_at, now() + ($3::int * interval '1 second')),
+                updated_at = now()
+            where id=$1 and user_id=$2 and status='reserved'
+            returning expires_at
+            """,
+            reservation_id, user_id, duration,
+        )
+        if updated is None:
+            raise ValueError("PRICING_RESERVATION_RENEWAL_RACE")
+        return updated
