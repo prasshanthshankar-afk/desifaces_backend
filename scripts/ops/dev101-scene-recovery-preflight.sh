@@ -14,8 +14,9 @@ done
 command -v docker >/dev/null || { echo 'BLOCK: docker missing' >&2; exit 2; }
 query() {
   docker exec -i "$DB_CONTAINER" sh -c \
-    'psql -X -v ON_ERROR_STOP=1 -qAt -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
-    -v stage_id="$STAGE_ID" -v reservation_id="$ORIGINAL_RESERVATION_ID" -v media_id="$MEDIA_ID" <<'SQL'
+    'exec psql -X -v ON_ERROR_STOP=1 -qAt -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+       -v stage_id="$1" -v reservation_id="$2" -v media_id="$3"' \
+    sh "$STAGE_ID" "$ORIGINAL_RESERVATION_ID" "$MEDIA_ID" <<'SQL'
 BEGIN READ ONLY;
 WITH incident AS (
   SELECT s.stage_run_id,s.workflow_id,s.state AS stage_state,
