@@ -68,6 +68,20 @@ class PricingClientError(RuntimeError):
     pass
 
 
+class PricingRenewRequest(BaseModel):
+    user_id: str
+    reservation_id: str
+    external_ref_type: str = "v3_scene_stage"
+    external_ref_id: str
+    extend_seconds: int = 900
+
+
+class PricingRenewResponse(BaseModel):
+    status: str
+    reservation_id: str
+    expires_at: str
+
+
 class SvcPricingClient:
     def __init__(self, config: PricingClientConfig) -> None:
         self.config = config
@@ -164,6 +178,14 @@ class SvcPricingClient:
             "/api/pricing/reservations/commit",
             req,
             PricingCommitResponse,
+            user_id=req.user_id,
+        )
+
+    async def renew(self, req: PricingRenewRequest) -> PricingRenewResponse:
+        return await self._post(
+            "/api/pricing/reservations/renew",
+            req,
+            PricingRenewResponse,
             user_id=req.user_id,
         )
 
