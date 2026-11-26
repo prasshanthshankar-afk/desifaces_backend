@@ -589,6 +589,12 @@ async def preview_scene_pricing(
         )
         if _clean(scene["current_stage"]) != "fusion":
             raise HTTPException(status_code=409, detail="scene_pricing_workflow_not_at_fusion")
+        # A fresh preview must not replace an active parent's canonical hold
+        # or a pending commit. Expired-hold recovery requires its own audited
+        # workflow, never the ordinary user-preview endpoint.
+        stage_state = _clean(scene["stage_state"]).lower() if "stage_state" in scene else ""
+        if stage_state in {"generating", "awaiting_review", "approved"}:
+            raise HTTPException(status_code=409, detail="scene_pricing_active_stage_cannot_repreview")
         meta = _pricing_meta(
             body=body,
             scene_id=UUID(str(scene["scene_id"])),
