@@ -213,7 +213,6 @@ for marker in (
     'DF_SHARED_SCENE_TRANSITION_SECONDS',
     'mode == "shared_dialogue"',
     'audio_edge_fade=not shared_dialogue',
-    'VIDEO-ONLY fade-out/fade-in',
     '"shared_dialogue_concat.txt"',
     '"-c", "copy"',
     'audio_transition=none',
@@ -229,6 +228,10 @@ shared_dialogue_block = stitch_service.split('if mode == "shared_dialogue":', 1)
 )[0]
 assert "_xfade_pair(" not in shared_dialogue_block
 assert "acrossfade" not in shared_dialogue_block
+# Certified shared-dialogue mode concatenates synchronized A/V units directly;
+# neither video nor audio fade filters may be introduced in this mode.
+assert "fade=t=" not in shared_dialogue_block
+assert "afade=t=" not in shared_dialogue_block
 
 customer_migration = (
     root / "migrations/2026_10_03_group_conversation_premium_actual_seconds.sql"
