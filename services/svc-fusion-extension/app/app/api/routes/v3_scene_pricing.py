@@ -23,6 +23,11 @@ from app.services.premium_actual_seconds_pricing import (
     premium_actual_seconds_meta,
     premium_billable_seconds,
 )
+from desifaces_shared.pricing.scene_recovery_guards import (
+    finished_children_match,
+    scene_debit_replay_allowed,
+    confirmed_review_checkpoint,
+)
 from desifaces_shared.identity import AccountContextNotFound, resolve_account_context
 from desifaces_shared.pricing.client import PricingClientError, SvcPricingClient
 from desifaces_shared.pricing.orchestration import (
@@ -1142,12 +1147,9 @@ async def recover_expired_stitched_scene(
             children = list(attempt_metadata.get("children") or [])
             if (
                 not attempt or _clean(attempt["state"]) not in {"running", "succeeded"}
-                or not children or len(children) != int(stored.get("turn_count") or 0)
-                or any(
-                    _clean(_as_dict(child).get("status")).lower()
-                    not in {"succeeded", "completed", "complete", "ready"}
-                    or not _clean(_as_dict(child).get("video_url"))
-                    for child in children
+                or not finished_children_match(
+                    [_as_dict(child) for child in children],
+                    int(stored.get("turn_count") or 0),
                 )
                 or _clean(attempt_metadata.get("stitched_media_id")) != str(body.stitched_media_id)
             ):
@@ -1200,9 +1202,10 @@ async def recover_expired_stitched_scene(
                 f"consume:svc-fusion-extension:v3-scene:{body.stage_run_id}:"
                 f"commit:{current_id}"
             )
-            if existing_debits and not (
-                is_recovery and len(existing_debits) == 1
-                and _clean(existing_debits[0]["idempotency_key"]) == expected_recovery_key
+            if not scene_debit_replay_allowed(
+                [_clean(row["idempotency_key"]) for row in existing_debits],
+                recovery_started=is_recovery,
+                expected_key=expected_recovery_key,
             ):
                 raise HTTPException(409, "scene_recovery_existing_scene_debit")
 
@@ -1318,12 +1321,9 @@ async def recover_expired_stitched_scene(
                 """,
                 body.stage_run_id, attempt["attempt_id"],
             )
-            if not completed or not (
-                _clean(completed["stage_state"]) in {"awaiting_review", "approved"}
-                and _clean(completed["pricing_state"]) == "committed"
-                and _clean(completed["attempt_state"]) == "succeeded"
-                and _clean(completed["output_media_id"]) == str(body.stitched_media_id)
-                and _clean(completed["attempt_media_id"]) == str(body.stitched_media_id)
+            if not confirmed_review_checkpoint(
+                dict(completed) if completed else None,
+                media_id=str(body.stitched_media_id),
             ):
                 raise HTTPException(
                     status_code=409,
