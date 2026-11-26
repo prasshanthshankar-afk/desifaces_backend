@@ -11,6 +11,9 @@ from uuid import UUID
 
 import httpx
 
+from desifaces_shared.pricing.client import PricingRenewRequest
+from app.api.routes.v3_scene_pricing import _pricing_client
+
 from app.api.routes.v3_scene_pricing import (
     ScenePricingKey,
     ScenePricingReleaseIn,
@@ -601,6 +604,26 @@ async def _finalize_scene(pool, row: dict[str, Any], children: list[dict[str, An
     )
 
 
+async def _renew_scene_lease(row: dict[str, Any]) -> None:
+    """Renew while the coordinator owns an active scene, before provider polling."""
+    stage = _as_dict(row.get("stage_metadata"))
+    parent = _as_dict(stage.get("fusion_parent_pricing"))
+    if _clean(parent.get("state")).lower() not in {"reserved", "commit_pending"}:
+        return
+    reservation_id = _clean(parent.get("reservation_id") or _as_dict(parent.get("pricing")).get("reservation_id"))
+    if not reservation_id:
+        raise RuntimeError("fusion_scene_active_reservation_missing")
+    await _pricing_client().renew(
+        PricingRenewRequest(
+            user_id=str(row["owner_user_id"]),
+            reservation_id=reservation_id,
+            external_ref_type="v3_scene_stage",
+            external_ref_id=str(row["stage_run_id"]),
+            extend_seconds=900,
+        )
+    )
+
+
 async def reconcile_one(pool, row: dict[str, Any]) -> None:
     stage_run_id = UUID(str(row["stage_run_id"]))
     async with pool.acquire() as lock_conn:
@@ -611,6 +634,12 @@ async def reconcile_one(pool, row: dict[str, Any]) -> None:
             children = [dict(item or {}) for item in list(metadata.get("children") or [])]
             if not children:
                 return
+            # A lease failure is logged and retried, never silently ignored.
+            # The stitched checkpoint is preserved independently of pricing.
+            try:
+                await _renew_scene_lease(row)
+            except Exception:
+                logger.exception("v3_scene_reservation_renew_failed stage_run_id=%s", stage_run_id)
             refreshed = await _refresh_children(children)
             await _persist_children(
                 pool,
