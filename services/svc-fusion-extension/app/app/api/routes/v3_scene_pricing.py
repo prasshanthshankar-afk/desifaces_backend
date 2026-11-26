@@ -592,8 +592,9 @@ async def preview_scene_pricing(
         # A fresh preview must not replace an active parent's canonical hold
         # or a pending commit. Expired-hold recovery requires its own audited
         # workflow, never the ordinary user-preview endpoint.
-        stage_state = _clean(scene["stage_state"]).lower() if "stage_state" in scene else ""
-        if stage_state in {"generating", "awaiting_review", "approved"}:
+        stage_state = _clean(scene["state"]).lower()
+        current_pricing_state = _clean(_stored_parent_pricing(scene).get("state")).lower()
+        if stage_state in {"generating", "awaiting_review", "approved"} or current_pricing_state in {"reserved", "commit_pending", "committed"}:
             raise HTTPException(status_code=409, detail="scene_pricing_active_stage_cannot_repreview")
         meta = _pricing_meta(
             body=body,
