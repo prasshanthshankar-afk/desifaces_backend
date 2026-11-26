@@ -24,6 +24,7 @@ from app.services.reservations.reservation_service import (
     finalize as finalize_impl,
     get_balance,
     release as release_impl,
+    renew_reservation as renew_impl,
     reserve as reserve_impl,
 )
 
@@ -1577,6 +1578,52 @@ async def release_reservation(
         )
         or None,
         message=f"Reservation released: {req.reason}",
+    )
+
+
+
+class PricingRenewRequest(BaseModel):
+    user_id: str
+    reservation_id: str
+    external_ref_type: str
+    external_ref_id: str
+    extend_seconds: int = Field(default=900, ge=60, le=3600)
+
+
+class PricingRenewResponse(BaseModel):
+    status: str = "reserved"
+    reservation_id: str
+    expires_at: str
+
+
+@router.post("/api/pricing/reservations/renew", response_model=PricingRenewResponse)
+async def renew_active_reservation(
+    req: PricingRenewRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    x_service_name: Optional[str] = Header(default=None, alias="X-Service-Name"),
+    pool=PoolDep,
+) -> PricingRenewResponse:
+    caller = _require_internal_pricing_caller(authorization, x_user_id, x_service_name)
+    if str(caller.user_id) != req.user_id:
+        raise HTTPException(status_code=403, detail="user_mismatch")
+    # Only the V3 scene owner may renew its own held scene reservation.
+    if caller.service_name != "svc-fusion-extension" or req.external_ref_type != "v3_scene_stage":
+        raise HTTPException(status_code=403, detail="scene_reservation_renewal_not_authorized")
+    try:
+        async with pool.acquire() as conn:
+            expires_at = await renew_impl(
+                conn,
+                user_id=UUID(req.user_id),
+                reservation_id=UUID(req.reservation_id),
+                job_ref=req.external_ref_id,
+                extend_seconds=req.extend_seconds,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return PricingRenewResponse(
+        reservation_id=req.reservation_id,
+        expires_at=expires_at.isoformat(),
     )
 
 
