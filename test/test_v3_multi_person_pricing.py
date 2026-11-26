@@ -197,3 +197,13 @@ def test_runtime_policy_sources_preserve_single_person_fallback() -> None:
     ).read_text(encoding="utf-8")
     assert "if _participant_count_ctx.get() >= 2:" in audio_source
     assert "self.VARIANT_CODE = AUDIO_MULTI_PERSON" in audio_source
+
+
+def test_scene_reservations_request_supported_longform_ttl() -> None:
+    """Asynchronous parent scene work must not inherit the 15-minute default."""
+    scene_pricing = (ROOT / "services/svc-fusion-extension/app/app/api/routes/v3_scene_pricing.py").read_text()
+    assert '"reservation_owner": "v3_scene_parent"' in scene_pricing
+    assert '"ttl_seconds": 3600' in scene_pricing
+    assert 'f"reserve:{cycle_token}"' in scene_pricing
+    pricing_reservations = (ROOT / "services/svc-pricing/app/app/api/routes/reservations.py").read_text()
+    assert '_to_int(meta.get("ttl_seconds"), 0) or None' in pricing_reservations
