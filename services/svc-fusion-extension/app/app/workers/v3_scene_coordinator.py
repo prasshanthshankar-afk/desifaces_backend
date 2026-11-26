@@ -646,8 +646,17 @@ async def reconcile_one(pool, row: dict[str, Any]) -> None:
             # The stitched checkpoint is preserved independently of pricing.
             try:
                 await _renew_scene_lease(row)
-            except Exception:
-                logger.exception("v3_scene_reservation_renew_failed stage_run_id=%s", stage_run_id)
+            except Exception as exc:
+                # Do not keep dispatching/polling with a known-invalid hold:
+                # preserve completed children and the stitched checkpoint.
+                # The next pass may retry a transient error, while terminal
+                # failures are quarantined by the persisted commit error.
+                logger.error(
+                    "v3_scene_reservation_renew_failed stage_run_id=%s error_type=%s",
+                    stage_run_id, type(exc).__name__,
+                    exc_info=True,
+                )
+                return
             refreshed = await _refresh_children(children)
             await _persist_children(
                 pool,
