@@ -1835,6 +1835,31 @@ async def finalize(
         if st != "reserved":
             raise ValueError(f"PRICING_INVALID_RESERVATION_STATUS:{st}")
 
+        # All V3 scene charges, including replacement reservations, serialize
+        # against one durable scene identity. A caller cannot double-consume
+        # by changing the reservation ID or its commit idempotency key.
+        if str(actuals.get("external_ref_type") or "") == "v3_scene_stage":
+            scene_ref = _clean_text(actuals.get("external_ref_id"))
+            if not scene_ref:
+                raise ValueError("PRICING_SCENE_IDENTITY_REQUIRED")
+            await conn.execute(
+                "select pg_advisory_xact_lock(hashtextextended($1,0))",
+                "pricing_scene_settlement:" + scene_ref,
+            )
+            consumed = await conn.fetchval(
+                """
+                select exists (
+                    select 1 from public.pricing_credit_ledger_events
+                    where user_id=$1 and credits_delta<0
+                      and idempotency_key like $2
+                )
+                """,
+                user_id,
+                "consume:svc-fusion-extension:v3-scene:" + scene_ref + ":commit:%",
+            )
+            if consumed:
+                raise ValueError("PRICING_SCENE_ALREADY_SETTLED")
+
         snapshot_mode = str(quote.get("billing_mode_snapshot") or quote.get("billing_mode") or "").strip()
         effective_billing_mode = snapshot_mode if snapshot_mode else str(billing_mode or "bill")
 
