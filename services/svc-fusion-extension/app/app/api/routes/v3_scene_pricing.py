@@ -1097,6 +1097,21 @@ async def recover_expired_stitched_scene(
             recovery = _as_dict(stored.get("recovery"))
             current_id = _clean(stored.get("reservation_id"))
             is_recovery = _clean(recovery.get("original_reservation_id")) == original_id
+            if _clean(scene["state"]) in {"awaiting_review", "approved"}:
+                # Repeated recovery after successful delivery is a no-op.
+                stage_metadata = _as_dict(scene["metadata_json"])
+                if (
+                    is_recovery and _clean(stored.get("state")) == "committed"
+                    and _clean(stage_metadata.get("canonical_scene_video_media_id"))
+                        == str(body.stitched_media_id)
+                ):
+                    return _out(
+                        scene_id=UUID(str(scene["scene_id"])),
+                        body=body, measured=measured, total=total, minutes=minutes,
+                        lineage_hash=lineage_hash, pricing=_as_dict(stored.get("pricing")),
+                        pricing_summary=_as_dict(stored.get("pricing_summary")),
+                        contract=contract,
+                    )
             if _clean(scene["state"]) != "generating":
                 raise HTTPException(409, "scene_recovery_requires_generating_stage")
             if not is_recovery and (
