@@ -1071,6 +1071,12 @@ async def recover_expired_stitched_scene(
     Fail closed if pricing drifted, the original debit exists, or any lineage
     check fails. The existing background finalizer attaches the original media.
     """
+    # Off by default in every environment, including production.
+    import os
+    if os.getenv("DF_V3_EXPIRED_SCENE_RECOVERY_ENABLED", "0").lower() not in {
+        "1", "true", "yes", "on"
+    }:
+        raise HTTPException(status_code=503, detail="scene_recovery_disabled")
     canonical_user_id = UUID(str(user_id))
     lock_key = str(body.stage_run_id)
     async with pool.acquire() as lock_conn:
