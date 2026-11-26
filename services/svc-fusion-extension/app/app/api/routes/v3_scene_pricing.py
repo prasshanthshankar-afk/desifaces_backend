@@ -1301,6 +1301,34 @@ async def recover_expired_stitched_scene(
                 "stage_metadata": _as_dict(scene["metadata_json"]),
                 "attempt_metadata": attempt_metadata,
             }, [_as_dict(child) for child in children])
+            # A successful credit commit is not proof that the scene was
+            # attached for human review. Re-read the durable checkpoint.
+            # If attachment failed after the debit, a subsequent request
+            # must resume finalization without reserving or charging again.
+            completed = await lock_conn.fetchrow(
+                """
+                select s.state as stage_state,
+                       s.metadata_json #>> '{fusion_parent_pricing,state}' as pricing_state,
+                       s.metadata_json ->> 'canonical_scene_video_media_id' as output_media_id,
+                       a.state as attempt_state,
+                       a.media_id as attempt_media_id
+                from public.v3_studio_stage_runs s
+                join public.v3_studio_stage_attempts a on a.attempt_id=$2
+                where s.stage_run_id=$1
+                """,
+                body.stage_run_id, attempt["attempt_id"],
+            )
+            if not completed or not (
+                _clean(completed["stage_state"]) in {"awaiting_review", "approved"}
+                and _clean(completed["pricing_state"]) == "committed"
+                and _clean(completed["attempt_state"]) == "succeeded"
+                and _clean(completed["output_media_id"]) == str(body.stitched_media_id)
+                and _clean(completed["attempt_media_id"]) == str(body.stitched_media_id)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="scene_recovery_settled_but_review_not_ready",
+                )
             return settled
         finally:
             await lock_conn.execute(
