@@ -130,6 +130,14 @@ async def _candidate_rows(pool) -> list[dict[str, Any]]:
               and a.state in ('running','succeeded')
               and coalesce(s.metadata_json #>> '{fusion_parent_pricing,state}','')
                     in ('reserved','commit_pending')
+              -- A released/expired reservation cannot be committed again.
+              -- Quarantine this existing attempt instead of hammering Pricing.
+              -- An authorized settlement recovery must update the durable
+              -- attempt checkpoint before coordinator processing resumes.
+              and coalesce(a.metadata_json ->> 'parent_pricing_commit_error','')
+                    not like '%PRICING_INVALID_RESERVATION_STATUS:released%'
+              and coalesce(a.metadata_json ->> 'parent_pricing_commit_error','')
+                    not like '%PRICING_INVALID_RESERVATION_STATUS:expired%'
             order by s.updated_at,s.stage_run_id
             limit $1
             """,
