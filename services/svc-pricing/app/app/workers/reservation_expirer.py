@@ -50,13 +50,17 @@ async def _expire_batch(conn: asyncpg.Connection) -> int:
             # re-lock the reservation row
             rr = await conn.fetchrow(
                 """
-                select status, reserved_credits
+                select status, reserved_credits, expires_at
                 from pricing_credit_reservations
                 where id=$1
                 for update
                 """,
                 rid,
             )
+            # The candidate was selected before this transaction. Renewal
+            # may have extended it in between: check again under the lock.
+            if rr and rr["expires_at"] >= _now():
+                continue
             if not rr or str(rr["status"]) != "reserved":
                 continue
 
