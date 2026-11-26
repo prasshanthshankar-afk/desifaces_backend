@@ -78,3 +78,33 @@ async def test_renewal_fails_closed(row, error):
                                     reservation_id=__import__("uuid").uuid4(),
                                     job_ref="stage-a")
     conn.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_expiry_release_cannot_spend_renewed_credits():
+    """The canonical release rechecks expiration under row lock, not on selection."""
+    from app.services.reservations.reservation_service import release
+
+    row = {
+        "id": __import__("uuid").uuid4(),
+        "status": "reserved",
+        "reserved_credits": 918,
+        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10),
+        "currency": "USD",
+        "estimated_money": "9.18",
+        "quote_json": {},
+        "allocations_json": {"allocations": [
+            {"lot_id": "test-lot", "amount": 918, "bucket_type": "purchased"}
+        ]},
+    }
+    conn = _Conn(row)
+    conn.execute = AsyncMock()
+    with patch("app.services.reservations.reservation_service._ensure_account_row", new_callable=AsyncMock), \
+         patch("app.services.reservations.reservation_service._backfill_legacy_lots_if_needed", new_callable=AsyncMock):
+        with pytest.raises(ValueError, match="PRICING_RESERVATION_RENEWED_NOT_EXPIRED"):
+            await release(
+                conn, user_id=__import__("uuid").uuid4(),
+                reservation_id=row["id"], idempotency_key=None,
+                channel="worker", country_code="", reason="expired",
+            )
+    conn.execute.assert_not_awaited()
