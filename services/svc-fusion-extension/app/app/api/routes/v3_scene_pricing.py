@@ -715,6 +715,11 @@ async def reserve_scene_pricing(
         meta = {
             **_as_dict(base_pricing.get("meta")),
             "reservation_owner": "v3_scene_parent",
+            # Parent scene video fan-out can exceed the 15-minute pricing default.
+            # Pricing clamps this value at its configured one-hour maximum.
+            # This is a DEV mitigation; durable active-job reservation renewal
+            # remains necessary for jobs that exceed that maximum.
+            "ttl_seconds": 3600,
         }
         cycle_token = _pricing_cycle_token(stored)
         spec = PricingReserveSpec(
