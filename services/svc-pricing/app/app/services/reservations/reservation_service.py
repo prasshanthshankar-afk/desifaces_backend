@@ -1613,14 +1613,14 @@ async def release(
                 quote=quote,
             )
 
+        if st == "committed":
+            raise ValueError("PRICING_RESERVATION_ALREADY_COMMITTED")
+
         # A stale expiration caller must never undo a lease renewed concurrently.
         # The reservation row is locked above, so this check and the release
         # participate in the same serialization order as renew_reservation().
         if _clean_text(reason).lower() == "expired" and r["expires_at"] > _now():
             raise ValueError("PRICING_RESERVATION_RENEWED_NOT_EXPIRED")
-
-        if st == "committed":
-            raise ValueError("PRICING_RESERVATION_ALREADY_COMMITTED")
 
         balance_before = await get_balance(conn, user_id)
 
