@@ -1081,9 +1081,11 @@ async def recover_expired_stitched_scene(
     lock_key = str(body.stage_run_id)
     async with pool.acquire() as lock_conn:
         # Same session lock used by the scene coordinator.
-        await lock_conn.execute(
-            "select pg_advisory_lock(hashtextextended($1::text,0))", lock_key
+        locked = await lock_conn.fetchval(
+            "select pg_try_advisory_lock(hashtextextended($1::text,0))", lock_key
         )
+        if not locked:
+            raise HTTPException(409, "scene_recovery_coordinator_busy")
         try:
             account = await _resolve_account_or_401(lock_conn, canonical_user_id)
             scene, measured, total, minutes, lineage_hash = await _scene_measurement(
@@ -1091,6 +1093,8 @@ async def recover_expired_stitched_scene(
             )
             if UUID(str(scene["owner_user_id"])) != canonical_user_id:
                 raise HTTPException(403, "scene_recovery_owner_required")
+            if _clean(scene["current_stage"]) != "fusion":
+                raise HTTPException(409, "scene_recovery_workflow_not_at_fusion")
             contract = _scene_pricing_contract(scene, total_seconds=total, minutes=minutes)
             stored = _stored_parent_pricing(scene)
             original_id = str(body.original_reservation_id)
