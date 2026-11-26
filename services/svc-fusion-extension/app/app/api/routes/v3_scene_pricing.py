@@ -1052,3 +1052,232 @@ __all__ = [
     "_assert_preview_confirmation",
     "router",
 ]
+
+
+class ScenePricingRecoveryIn(ScenePricingKey):
+    """Existing scene only. Never starts new provider work."""
+    original_reservation_id: UUID
+    stitched_media_id: UUID
+
+
+@router.post("/recover-expired-stitched-scene", response_model=ScenePricingOut)
+async def recover_expired_stitched_scene(
+    body: ScenePricingRecoveryIn,
+    user_id: str = Depends(get_current_user_id),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+) -> ScenePricingOut:
+    """DEV candidate: idempotent replacement hold for an already-stored video.
+
+    Fail closed if pricing drifted, the original debit exists, or any lineage
+    check fails. The existing background finalizer attaches the original media.
+    """
+    canonical_user_id = UUID(str(user_id))
+    lock_key = str(body.stage_run_id)
+    async with pool.acquire() as lock_conn:
+        # Same session lock used by the scene coordinator.
+        await lock_conn.execute(
+            "select pg_advisory_lock(hashtextextended($1::text,0))", lock_key
+        )
+        try:
+            account = await _resolve_account_or_401(lock_conn, canonical_user_id)
+            scene, measured, total, minutes, lineage_hash = await _scene_measurement(
+                lock_conn, body=body, account_id=account.account_id
+            )
+            if UUID(str(scene["owner_user_id"])) != canonical_user_id:
+                raise HTTPException(403, "scene_recovery_owner_required")
+            contract = _scene_pricing_contract(scene, total_seconds=total, minutes=minutes)
+            stored = _stored_parent_pricing(scene)
+            original_id = str(body.original_reservation_id)
+            recovery = _as_dict(stored.get("recovery"))
+            current_id = _clean(stored.get("reservation_id"))
+            is_recovery = _clean(recovery.get("original_reservation_id")) == original_id
+            if _clean(scene["state"]) != "generating":
+                raise HTTPException(409, "scene_recovery_requires_generating_stage")
+            if not is_recovery and (
+                _clean(stored.get("state")) != "commit_pending" or current_id != original_id
+            ):
+                raise HTTPException(409, "scene_recovery_original_state_mismatch")
+            if is_recovery and _clean(stored.get("state")) not in {"reserved", "commit_pending", "committed"}:
+                raise HTTPException(409, "scene_recovery_invalid_recovered_state")
+            if (
+                _clean(stored.get("audio_lineage_hash")) != lineage_hash
+                or int(stored.get("estimated_units") or 0) != int(contract["units"])
+            ):
+                raise HTTPException(409, "scene_recovery_pricing_lineage_changed")
+
+            attempt = await lock_conn.fetchrow(
+                """
+                select attempt_id,metadata_json,state
+                from public.v3_studio_stage_attempts
+                where stage_run_id=$1
+                order by attempt_no desc limit 1
+                """, body.stage_run_id
+            )
+            attempt_metadata = _as_dict(attempt["metadata_json"]) if attempt else {}
+            children = list(attempt_metadata.get("children") or [])
+            if (
+                not attempt or _clean(attempt["state"]) not in {"running", "succeeded"}
+                or not children or len(children) != int(stored.get("turn_count") or 0)
+                or any(
+                    _clean(_as_dict(child).get("status")).lower()
+                    not in {"succeeded", "completed", "complete", "ready"}
+                    or not _clean(_as_dict(child).get("video_url"))
+                    for child in children
+                )
+                or _clean(attempt_metadata.get("stitched_media_id")) != str(body.stitched_media_id)
+            ):
+                raise HTTPException(409, "scene_recovery_incomplete_media_lineage")
+            media_valid = await lock_conn.fetchval(
+                """
+                select exists (
+                  select 1 from public.media_assets
+                  where id=$1 and lifecycle_state='active' and account_id=$2
+                    and project_id=$3 and user_id=$4
+                )
+                """, body.stitched_media_id, account.account_id, body.project_id,
+                canonical_user_id
+            )
+            if not media_valid:
+                raise HTTPException(409, "scene_recovery_media_not_active_or_owned")
+
+            old = await lock_conn.fetchrow(
+                """
+                select id,status,reserved_credits,job_ref,service_action,sku_code,currency,
+                       funding_summary_json
+                from public.pricing_credit_reservations
+                where id=$1 and user_id=$2
+                """, body.original_reservation_id, canonical_user_id
+            )
+            if (
+                not old or _clean(old["status"]) != "released"
+                or _clean(old["job_ref"]) != str(body.stage_run_id)
+                or _clean(_as_dict(old["funding_summary_json"]).get("released_reason")) != "expired"
+                or _clean(old["service_action"]) != _clean(contract["service_action"])
+                or _clean(old["sku_code"]) != _clean(contract["variant_code"])
+            ):
+                raise HTTPException(409, "scene_recovery_original_reservation_mismatch")
+            expected_credits = int(old["reserved_credits"])
+            if expected_credits <= 0:
+                raise HTTPException(409, "scene_recovery_original_hold_invalid")
+
+            # A prior debit under ANY reservation for this stage is a stop
+            # unless it belongs to this very recovery's canonical reservation.
+            existing_debits = await lock_conn.fetch(
+                """
+                select idempotency_key
+                from public.pricing_credit_ledger_events
+                where user_id=$1 and credits_delta<0
+                  and idempotency_key like $2
+                """, canonical_user_id,
+                f"consume:svc-fusion-extension:v3-scene:{body.stage_run_id}:commit:%"
+            )
+            expected_recovery_key = (
+                f"consume:svc-fusion-extension:v3-scene:{body.stage_run_id}:"
+                f"commit:{current_id}"
+            )
+            if existing_debits and not (
+                is_recovery and len(existing_debits) == 1
+                and _clean(existing_debits[0]["idempotency_key"]) == expected_recovery_key
+            ):
+                raise HTTPException(409, "scene_recovery_existing_scene_debit")
+
+            if not is_recovery:
+                meta = _pricing_meta(
+                    body=body, scene_id=UUID(str(scene["scene_id"])),
+                    measured=measured, total=total, minutes=minutes,
+                    lineage_hash=lineage_hash, contract=contract,
+                )
+                # Do not reprice historical completed output if pricebook or
+                # entitlements changed. Only an identical obligation is valid.
+                preview = await _pricing_client().preview(build_preview_request(
+                    PricingPreviewSpec(
+                        user_id=str(canonical_user_id),
+                        service_name=contract["service_name"],
+                        service_action=contract["service_action"],
+                        sku_code=contract["variant_code"],
+                        units=str(contract["units"]),
+                        external_ref_type="v3_scene_stage_preview",
+                        external_ref_id=str(body.stage_run_id),
+                        idempotency_key=f"svc-fusion-extension:v3-scene:{body.stage_run_id}:recovery-preview:{original_id}",
+                        meta=meta,
+                    )
+                ))
+                quoted = int(_as_dict(preview.quote_breakdown).get("total_credits") or -1)
+                if (
+                    quoted != expected_credits
+                    or not _clean(preview.quote_id)
+                    or not _clean(preview.preview_fingerprint)
+                    or _clean(preview.currency) != _clean(old["currency"])
+                ):
+                    raise HTTPException(409, "scene_recovery_quote_drift")
+                reserve = await _pricing_client().reserve(build_reserve_request(
+                    PricingReserveSpec(
+                        user_id=str(canonical_user_id),
+                        service_name=contract["service_name"],
+                        service_action=contract["service_action"],
+                        sku_code=contract["variant_code"],
+                        units=str(contract["units"]),
+                        external_ref_type="v3_scene_stage",
+                        external_ref_id=str(body.stage_run_id),
+                        idempotency_key=f"svc-fusion-extension:v3-scene:{body.stage_run_id}:recovery-reserve:{original_id}",
+                        meta={**meta, "ttl_seconds": 3600,
+                              "recovery_original_reservation_id": original_id},
+                        quote_id=preview.quote_id,
+                        preview_fingerprint=preview.preview_fingerprint,
+                    )
+                ))
+                replacement_id = _clean(reserve.reservation_id)
+                if not replacement_id or int(reserve.reserved_units or -1) != expected_credits:
+                    raise HTTPException(409, "scene_recovery_replacement_hold_mismatch")
+                base_pricing = _as_dict(stored.get("pricing"))
+                new_pricing = {
+                    **base_pricing,
+                    "state": "reserved",
+                    "reservation_id": replacement_id,
+                    "quote_id": preview.quote_id,
+                    "preview_fingerprint": preview.preview_fingerprint,
+                }
+                record = {
+                    **stored,
+                    "state": "reserved",
+                    "reservation_id": replacement_id,
+                    "quote_id": preview.quote_id,
+                    "preview_fingerprint": preview.preview_fingerprint,
+                    "pricing": new_pricing,
+                    "last_error": None,
+                    "recovery": {
+                        "original_reservation_id": original_id,
+                        "stitched_media_id": str(body.stitched_media_id),
+                        "recovery_key": f"v3-scene:{body.stage_run_id}:expired-reservation:v1",
+                    },
+                }
+                await _persist_parent_pricing_for_reservation(
+                    lock_conn, stage_run_id=body.stage_run_id,
+                    record=record, reservation_id=original_id
+                )
+
+            # Safe retry: if the replacement hold was committed before an
+            # application crash, commit_scene_pricing returns the prior receipt.
+            settled = await commit_scene_pricing(
+                body=ScenePricingKey(
+                    project_id=body.project_id, workflow_id=body.workflow_id,
+                    stage_run_id=body.stage_run_id
+                ),
+                user_id=str(canonical_user_id), pool=pool,
+            )
+
+            # Finalize using the existing checkpoint-aware implementation,
+            # which never restitches when stitched_media_id is present.
+            from app.workers.v3_scene_coordinator import _finalize_scene
+            await _finalize_scene(pool, {
+                "project_id": body.project_id, "workflow_id": body.workflow_id,
+                "stage_run_id": body.stage_run_id, "attempt_id": attempt["attempt_id"],
+                "owner_user_id": canonical_user_id, "account_id": account.account_id,
+                "stage_metadata": _as_dict(scene["metadata_json"]),
+                "attempt_metadata": attempt_metadata,
+            }, [_as_dict(child) for child in children])
+            return settled
+        finally:
+            await lock_conn.execute(
+                "select pg_advisory_unlock(hashtextextended($1::text,0))", lock_key
+            )
